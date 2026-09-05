@@ -52,10 +52,11 @@ func TestSelectChildRekeyProposalSkipsAttributedTransform(t *testing.T) {
 		},
 	}
 	raw := addUnknownTVAttributeToFirstTransform(EncodeSA([]Proposal{proposal}))
-	_, selected, _, err := selectChildRekeyProposal(raw, want)
+	selection, err := selectChildRequestProposal(raw, &want, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	selected := selection.encryption
 	if selected.UnsupportedAttributes || selected.ID != want.EncrID || selected.KeyLengthBits != want.EncrKeyBits {
 		t.Fatalf("selected transform = %#v", selected)
 	}

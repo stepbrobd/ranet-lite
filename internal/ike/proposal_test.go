@@ -78,7 +78,7 @@ func TestUnknownTransformAttributeMakesOnlyTransformUnacceptable(t *testing.T) {
 	if !decoded[0].Transforms[0].UnsupportedAttributes {
 		t.Fatal("unknown attribute was silently discarded")
 	}
-	selected, suite, _, ok := selectIKERekeyProposal(decoded[0], DH_CURVE25519)
+	selected, suite, _, ok := selectIKERekeyProposal(decoded[0], DH_CURVE25519, PRF_HMAC_SHA2_256)
 	if !ok || suite.EncrKeyBits != 128 || selected[0].KeyLengthBits != 128 {
 		t.Fatalf("selection did not skip attributed transform: selected=%#v suite=%#v", selected, suite)
 	}
@@ -97,7 +97,7 @@ func TestIKERekeyProposalRejectsUnexpectedTransformType(t *testing.T) {
 		{Type: TransDH, ID: DH_CURVE25519},
 		{Type: TransInteg, ID: 0},
 	}}
-	if _, _, _, ok := selectIKERekeyProposal(proposal, DH_CURVE25519); ok {
+	if _, _, _, ok := selectIKERekeyProposal(proposal, DH_CURVE25519, PRF_HMAC_SHA2_256); ok {
 		t.Fatal("accepted IKE rekey proposal with unexpected transform type")
 	}
 }

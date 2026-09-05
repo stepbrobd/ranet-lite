@@ -10,8 +10,8 @@ import (
 // RekeyChild replaces the current Child SA without a new Diffie-Hellman
 // exchange. Run must be active to service the serialized IKE request.
 //
-// The old Child SA is intentionally retained: retiring it requires a correct
-// INFORMATIONAL Delete exchange and an ESP overlap policy.
+// The old inbound Child SA remains installed until the INFORMATIONAL Delete
+// exchange acknowledges retirement.
 func (s *Session) RekeyChild() error {
 	return s.rekeyChild(false)
 }
@@ -157,5 +157,123 @@ func decodeChildNegotiationResponse(response []RawPayload) (childExchangePayload
 	if err := validateCompleteChildExchange(payloads); err != nil {
 		return childExchangePayloads{}, fmt.Errorf("ike: invalid Child SA negotiation response: %w", err)
 	}
+	if payloads.ke != nil {
+		return childExchangePayloads{}, fmt.Errorf("ike: Child SA response includes unrequested KE")
+	}
 	return payloads, nil
+}
+
+func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
+	s.stateMu.RLock()
+	ikeBusy := ctx != s.current || s.localRekey != nil
+	s.stateMu.RUnlock()
+	if ikeBusy || s.retiringChild().LocalSPI != 0 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+	}
+	var rekey Notify
+	for _, payload := range inner {
+		if payload.Type != PayloadN {
+			continue
+		}
+		notify, err := DecodeNotify(payload.Body)
+		if err != nil {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+		if notify.Type == N_REKEY_SA {
+			rekey = notify
+		}
+	}
+	child := s.currentChild()
+	if rekey.Type != N_REKEY_SA && (child.LocalSPI != 0 || child.RemoteSPI != 0) {
+		// Without REKEY_SA this requests a new Child SA. Reject it as an
+		// additional SA only while this single-SA profile already has one;
+		// after state loss, RFC 7296 §2.25 expects creation from scratch.
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_ADDITIONAL_SAS)
+	}
+	payloads, err := decodeChildExchangePayloads(inner)
+	if err != nil {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	var expected *ChildSA
+	if rekey.Type == N_REKEY_SA {
+		if s.childRekeying.Load() {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+		}
+		if rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+		if child.LocalSPI == 0 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
+			// RFC 7296 §2.25 requires CHILD_SA_NOT_FOUND to identify the
+			// nonexistent SA by copying the Protocol ID and SPI from REKEY_SA.
+			return s.responseNotifySA(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND, rekey.Protocol, rekey.SPI)
+		}
+		expected = &child
+	}
+	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	var group uint16
+	var peerPublic []byte
+	if payloads.ke != nil {
+		group, peerPublic, err = DecodeKE(payloads.ke.Body)
+		if err != nil || group == 0 {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+	}
+	selected, err := selectChildRequestProposal(payloads.sa.Body, expected, group)
+	if err != nil {
+		var invalidKE *invalidKEError
+		if errors.As(err, &invalidKE) {
+			data := binary.BigEndian.AppendUint16(nil, invalidKE.group)
+			return s.responseNotifyData(ctx, msgID, CREATE_CHILD_SA, N_INVALID_KE_PAYLOAD, data)
+		}
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	var sharedSecret, localPublic []byte
+	if selected.dh.ID != 0 {
+		dh, err := GenerateDH(selected.dh.ID)
+		if err != nil {
+			return nil, err
+		}
+		sharedSecret, err = dh.SharedSecret(peerPublic)
+		if err != nil {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+		localPublic = dh.PublicBytes()
+	}
+	encr := selected.encryption
+	var spi [4]byte
+	for binary.BigEndian.Uint32(spi[:]) == 0 {
+		if _, err := rand.Read(spi[:]); err != nil {
+			return nil, err
+		}
+	}
+	nr := make([]byte, 32)
+	if _, err := rand.Read(nr); err != nil {
+		return nil, err
+	}
+	initKey, respKey, err := childSAKeymat(ctx.suite.PRFID, ctx.skD, sharedSecret, payloads.nonce.Body, nr, encr.ID, encr.KeyLengthBits)
+	if err != nil {
+		return nil, err
+	}
+	replacement := ChildSA{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, LocalSPI: binary.BigEndian.Uint32(spi[:]), RemoteSPI: selected.remoteSPI, InboundKey: initKey, OutboundKey: respKey}
+	if err := s.replaceChild(replacement); err != nil {
+		return nil, err
+	}
+	responseEncr := encr
+	if responseEncr.ID == ENCR_CHACHA20_POLY1305 {
+		// RFC 7296 §3.3.6 returns selected attributes unchanged; the fixed-key
+		// ChaCha20-Poly1305 transform was offered without Key Length.
+		responseEncr.KeyLengthBits = 0
+	}
+	response := Proposal{Number: selected.proposal.Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{responseEncr, {Type: TransESN, ID: ESN_NO}}}
+	if selected.dh.Type != 0 {
+		response.Transforms = append(response.Transforms, selected.dh)
+	}
+	responsePayloads := []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}}
+	if localPublic != nil {
+		responsePayloads = append(responsePayloads, RawPayload{Type: PayloadKE, Body: EncodeKE(selected.dh.ID, localPublic)})
+	}
+	responsePayloads = append(responsePayloads, RawPayload{Type: PayloadTSi, Body: payloads.tsi.Body}, RawPayload{Type: PayloadTSr, Body: payloads.tsr.Body})
+	return s.response(ctx, msgID, CREATE_CHILD_SA, responsePayloads)
 }

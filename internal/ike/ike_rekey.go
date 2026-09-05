@@ -36,6 +36,7 @@ func (s *Session) RekeyIKE() error {
 	}()
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, spiI)
+	proposal := ikeRekeyProposal(spi, old.suite.PRFID)
 	var (
 		dh       *DHKeyPair
 		response []RawPayload
@@ -47,7 +48,7 @@ func (s *Session) RekeyIKE() error {
 			return fmt.Errorf("ike: generate IKE SA rekey DH key: %w", err)
 		}
 		response, err = s.requestLocked(CREATE_CHILD_SA, []RawPayload{
-			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms}})},
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{proposal})},
 			{Type: PayloadNonce, Body: EncodeNonce(ni)},
 			{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
 		})
@@ -122,7 +123,7 @@ func (s *Session) RekeyIKE() error {
 	}
 	for _, selected := range props[0].Transforms {
 		matched := false
-		for _, offered := range ikeProposal().Transforms {
+		for _, offered := range proposal.Transforms {
 			if selected == offered {
 				matched = true
 				break
@@ -216,8 +217,8 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	s.stateMu.RLock()
 	accept := ctx == s.current && (s.old == nil || s.localRekey != nil) && s.collision == nil
 	s.stateMu.RUnlock()
-	if !accept {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	if !accept || s.childRekeying.Load() || s.retiringChild().LocalSPI != 0 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
 	}
 	var sa, nonce, ke *RawPayload
 	for i := range inner {
@@ -262,7 +263,7 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		if proposal.Number == 0 || proposal.Protocol != ProtoIKE || len(proposal.SPI) != 8 || binary.BigEndian.Uint64(proposal.SPI) == 0 {
 			continue
 		}
-		candidate, candidateSuite, candidatePreferred, ok := selectIKERekeyProposal(proposal, group)
+		candidate, candidateSuite, candidatePreferred, ok := selectIKERekeyProposal(proposal, group, ctx.suite.PRFID)
 		if ok {
 			selected = candidate
 			suite = candidateSuite
@@ -380,7 +381,23 @@ func ikeGroupPreference(group uint16) int {
 	return preference
 }
 
-func selectIKERekeyProposal(proposal Proposal, keGroup uint16) ([]Transform, SASuite, uint16, bool) {
+// Keep the PRF across rekeys: strongSwan uses the old PRF for both SKEYSEED
+// and expansion, while RFC 7296 §2.18 specifies the new PRF for expansion.
+// Negotiating the same PRF interoperates without changing either derivation.
+func ikeRekeyProposal(spi []byte, prfID uint16) Proposal {
+	p := ikeProposal()
+	p.SPI = spi
+	transforms := p.Transforms[:0]
+	for _, transform := range p.Transforms {
+		if transform.Type != TransPRF || transform.ID == prfID {
+			transforms = append(transforms, transform)
+		}
+	}
+	p.Transforms = transforms
+	return p
+}
+
+func selectIKERekeyProposal(proposal Proposal, keGroup, prfID uint16) ([]Transform, SASuite, uint16, bool) {
 	// RFC 7296 §3.3.6 makes an entire proposal unacceptable when it contains
 	// an unknown or unsupported Transform Type. Unknown attributes are marked
 	// on individual transforms by DecodeSA and skipped by exact matching below,
@@ -390,7 +407,7 @@ func selectIKERekeyProposal(proposal Proposal, keGroup uint16) ([]Transform, SAS
 			return nil, SASuite{}, 0, false
 		}
 	}
-	offered := ikeProposal().Transforms
+	offered := ikeRekeyProposal(nil, prfID).Transforms
 	selected := make([]Transform, 0, 3)
 	for _, typ := range []TransformType{TransEncr, TransPRF} {
 		found := false
@@ -413,34 +430,14 @@ func selectIKERekeyProposal(proposal Proposal, keGroup uint16) ([]Transform, SAS
 			return nil, SASuite{}, 0, false
 		}
 	}
-	var preferredDH, matchingDH Transform
-	for _, want := range offered {
-		if want.Type != TransDH {
-			continue
-		}
-		for _, got := range proposal.Transforms {
-			if got != want {
-				continue
-			}
-			if preferredDH.Type == 0 {
-				preferredDH = got
-			}
-			if got.ID == keGroup {
-				matchingDH = got
-			}
-			break
-		}
-	}
-	if preferredDH.Type == 0 {
-		return nil, SASuite{}, 0, false
-	}
-	if matchingDH.Type == 0 {
-		return nil, SASuite{}, preferredDH.ID, false
+	matchingDH, preferredDH, ok := selectDHTransform(proposal.Transforms, keGroup, false)
+	if !ok {
+		return nil, SASuite{}, preferredDH, false
 	}
 	selected = append(selected, matchingDH)
 	suite, err := suiteFromProposal(Proposal{Number: 1, Protocol: ProtoIKE, Transforms: selected})
 	if err != nil {
 		return nil, SASuite{}, 0, false
 	}
-	return selected, suite, preferredDH.ID, true
+	return selected, suite, preferredDH, true
 }

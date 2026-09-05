@@ -547,7 +547,7 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	binary.BigEndian.PutUint64(spi, newSPIi)
 	request, err := EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, MessageID: 0}, nil, []RawPayload{
 		{Type: PayloadSA, Body: EncodeSA([]Proposal{
-			{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: []Transform{{Type: TransEncr, ID: 12, KeyLengthBits: 256}, {Type: TransPRF, ID: PRF_HMAC_SHA2_256}, {Type: TransDH, ID: DH_ECP_256}}},
+			{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256}, {Type: TransPRF, ID: PRF_HMAC_SHA2_384}, {Type: TransDH, ID: DH_ECP_256}}},
 			{Number: 2, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms},
 		})},
 		{Type: PayloadNonce, Body: EncodeNonce(ni)},
@@ -1094,6 +1094,12 @@ func testIKEAuthAuthenticatesBeforeChildFailure(t *testing.T, remoteOrganization
 			if err != nil {
 				return fmt.Errorf("encrypt IKE_AUTH response: %w", err)
 			}
+			// An SK-shaped packet with a forged tag must not terminate the exchange.
+			forged := append([]byte(nil), response...)
+			forged[len(forged)-1] ^= 1
+			if _, err := peer.WriteToUDP(withNonESPMarker(forged), clientAddr); err != nil {
+				return err
+			}
 			if _, err := peer.WriteToUDP(withNonESPMarker(response), clientAddr); err != nil {
 				return fmt.Errorf("write IKE_AUTH response: %w", err)
 			}
@@ -1134,6 +1140,11 @@ func testIKEAuthAuthenticatesBeforeChildFailure(t *testing.T, remoteOrganization
 			}, nil, nil)
 			if err != nil {
 				return fmt.Errorf("encrypt IKE Delete response: %w", err)
+			}
+			forged = append([]byte(nil), deleteResponse...)
+			forged[len(forged)-1] ^= 1
+			if _, err := peer.WriteToUDP(withNonESPMarker(forged), clientAddr); err != nil {
+				return err
 			}
 			if _, err := peer.WriteToUDP(withNonESPMarker(deleteResponse), clientAddr); err != nil {
 				return fmt.Errorf("write IKE Delete response: %w", err)

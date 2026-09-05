@@ -239,11 +239,16 @@ func putUint64(b []byte, v uint64) {
 // with no PFS: KEYMAT = prf+(SK_d, Ni | Nr), RFC 7296 §2.17. The returned
 // slice holds, in order, the initiator's key||salt then the responder's.
 func ChildSAKeymat(prfID uint16, skD, ni, nr []byte, encrID uint16, encrKeyBits uint16) (initiatorKey, responderKey []byte, err error) {
+	return childSAKeymat(prfID, skD, nil, ni, nr, encrID, encrKeyBits)
+}
+
+// With PFS the fresh DH secret precedes both nonces (RFC 7296 §2.17).
+func childSAKeymat(prfID uint16, skD, sharedSecret, ni, nr []byte, encrID uint16, encrKeyBits uint16) (initiatorKey, responderKey []byte, err error) {
 	ap, err := aeadParams(encrID, encrKeyBits)
 	if err != nil {
 		return nil, nil, err
 	}
 	each := ap.KeyLen + ap.SaltLen
-	stream := prfPlus(prfID, skD, concat(ni, nr), 2*each)
+	stream := prfPlus(prfID, skD, concat(sharedSecret, ni, nr), 2*each)
 	return stream[:each], stream[each:], nil
 }

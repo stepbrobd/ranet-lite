@@ -14,19 +14,50 @@ func validateFullRangeSelectors(tsi, tsr *RawPayload) error {
 	if tsi == nil || tsr == nil {
 		return fmt.Errorf("ike: Child SA exchange is missing traffic selectors")
 	}
-	want := fullRangeSelectors()
-	if _, err := DecodeTS(tsi.Body); err != nil || !bytes.Equal(tsi.Body, want) {
+	if !isFullRangeSelectors(tsi.Body) {
 		return fmt.Errorf("ike: unsupported initiator traffic selectors")
 	}
-	if _, err := DecodeTS(tsr.Body); err != nil || !bytes.Equal(tsr.Body, want) {
+	if !isFullRangeSelectors(tsr.Body) {
 		return fmt.Errorf("ike: unsupported responder traffic selectors")
 	}
 	return nil
 }
 
+// Selector order and reserved bytes do not change the negotiated policy.
+// Still require exactly one unrestricted selector for each address family.
+func isFullRangeSelectors(body []byte) bool {
+	selectors, err := DecodeTS(body)
+	if err != nil || len(selectors) != 2 {
+		return false
+	}
+	var v4, v6 bool
+	for _, selector := range selectors {
+		var expected TrafficSelector
+		switch selector.Type {
+		case TS_IPV4_ADDR_RANGE:
+			if v4 {
+				return false
+			}
+			v4, expected = true, FullRangeV4()
+		case TS_IPV6_ADDR_RANGE:
+			if v6 {
+				return false
+			}
+			v6, expected = true, FullRangeV6()
+		default:
+			return false
+		}
+		if selector.Protocol != 0 || selector.StartPort != 0 || selector.EndPort != 0xffff ||
+			!bytes.Equal(selector.StartAddr, expected.StartAddr) || !bytes.Equal(selector.EndAddr, expected.EndAddr) {
+			return false
+		}
+	}
+	return v4 && v6
+}
+
 type childExchangePayloads struct {
-	sa, nonce, tsi, tsr *RawPayload
-	notifies            []Notify
+	sa, nonce, ke, tsi, tsr *RawPayload
+	notifies                []Notify
 }
 
 func decodeChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, error) {
@@ -68,7 +99,7 @@ func parseChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, e
 			}
 			out.notifies = append(out.notifies, notify)
 		case PayloadKE:
-			return childExchangePayloads{}, fmt.Errorf("ike: Child SA exchange unexpectedly includes KE")
+			err = setUnique(&out.ke, payload)
 		default:
 			if payload.Critical {
 				return childExchangePayloads{}, fmt.Errorf("ike: unsupported critical payload type %d", payload.Type)
@@ -177,17 +208,26 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 	return p, encryption, remoteSPI, nil
 }
 
-// selectChildRekeyProposal selects the current Child SA's encryption suite
-// from a peer's offer. RFC 7296 §3.3.6 requires skipping an unacceptable
-// transform while continuing with other transforms of the same type.
-func selectChildRekeyProposal(body []byte, expected ChildSA) (Proposal, Transform, uint32, error) {
-	return selectChildRequestProposal(body, &expected)
+type childProposalSelection struct {
+	proposal   Proposal
+	encryption Transform
+	dh         Transform
+	remoteSPI  uint32
 }
 
-func selectChildRequestProposal(body []byte, expected *ChildSA) (Proposal, Transform, uint32, error) {
+type invalidKEError struct{ group uint16 }
+
+func (e *invalidKEError) Error() string {
+	return fmt.Sprintf("ike: peer must use DH group %d", e.group)
+}
+
+// Select an offered encryption suite and optional DH group. Unknown transform
+// types reject the proposal, while unsupported alternatives of a known type
+// are skipped (RFC 7296 §3.3.6).
+func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) (childProposalSelection, error) {
 	props, err := DecodeSA(body)
 	if err != nil {
-		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal")
+		return childProposalSelection{}, fmt.Errorf("ike: invalid Child SA proposal")
 	}
 	var want *Transform
 	if expected != nil {
@@ -197,10 +237,11 @@ func selectChildRequestProposal(body []byte, expected *ChildSA) (Proposal, Trans
 		}
 		canonical, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
 		if err != nil {
-			return Proposal{}, Transform{}, 0, err
+			return childProposalSelection{}, err
 		}
 		want = &canonical
 	}
+	var preferredDH uint16
 	for _, p := range props {
 		if p.Number == 0 || p.Protocol != ProtoESP || len(p.SPI) != 4 || binary.BigEndian.Uint32(p.SPI) == 0 {
 			continue
@@ -219,15 +260,26 @@ func selectChildRequestProposal(body []byte, expected *ChildSA) (Proposal, Trans
 				if !haveESN && transform.ID == ESN_NO && transform.KeyLengthBits == 0 && !transform.UnsupportedAttributes {
 					haveESN = true
 				}
+			case TransDH:
+				// Selected below after checking encryption and ESN.
 			default:
 				unacceptable = true
 			}
 		}
 		if !unacceptable && haveEncryption && haveESN {
-			return p, encryption, binary.BigEndian.Uint32(p.SPI), nil
+			dh, preferred, ok := selectDHTransform(p.Transforms, keGroup, true)
+			if ok {
+				return childProposalSelection{p, encryption, dh, binary.BigEndian.Uint32(p.SPI)}, nil
+			}
+			if preferredDH == 0 {
+				preferredDH = preferred
+			}
 		}
 	}
-	return Proposal{}, Transform{}, 0, fmt.Errorf("ike: no acceptable Child SA proposal")
+	if preferredDH != 0 {
+		return childProposalSelection{}, &invalidKEError{preferredDH}
+	}
+	return childProposalSelection{}, fmt.Errorf("ike: no acceptable Child SA proposal")
 }
 
 func childEncryptionAccepted(candidate Transform, expected *Transform) bool {
@@ -244,4 +296,46 @@ func childEncryptionAccepted(candidate Transform, expected *Transform) bool {
 		}
 	}
 	return false
+}
+
+// Prefer an offered group matching KE. For Child SAs only, an omitted DH
+// transform or explicit NONE permits deriving keys without a fresh exchange.
+func selectDHTransform(transforms []Transform, keGroup uint16, optional bool) (Transform, uint16, bool) {
+	var haveDH, haveNone bool
+	for _, got := range transforms {
+		if got.Type == TransDH {
+			haveDH = true
+			haveNone = haveNone || got == (Transform{Type: TransDH})
+		}
+	}
+	var preferredDH, matchingDH Transform
+	for _, want := range ikeProposal().Transforms {
+		if want.Type != TransDH {
+			continue
+		}
+		for _, got := range transforms {
+			if got != want {
+				continue
+			}
+			if preferredDH.Type == 0 {
+				preferredDH = got
+			}
+			if got.ID == keGroup {
+				matchingDH = got
+			}
+			break
+		}
+	}
+	if matchingDH.Type != 0 {
+		return matchingDH, preferredDH.ID, true
+	}
+	if optional {
+		if !haveDH {
+			return Transform{}, 0, true
+		}
+		if haveNone {
+			return Transform{Type: TransDH}, 0, true
+		}
+	}
+	return Transform{}, preferredDH.ID, false
 }

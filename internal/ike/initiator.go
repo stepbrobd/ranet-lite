@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
@@ -90,6 +91,10 @@ type Session struct {
 	childMu  sync.RWMutex
 	Child    ChildSA
 	retiring ChildSA
+	// Run expires replaced inbound SAs after an overlap period, allowing
+	// queued and reordered ESP to finish after the Delete acknowledgement.
+	retired          []childRetirement
+	childRetireDelay time.Duration
 
 	handlerMu     sync.RWMutex
 	onChild       func(ChildSA) error
@@ -193,134 +198,6 @@ func validRekeyTiming(interval, margin, jitter time.Duration) bool {
 	return interval == 0 || (margin < interval && jitter < interval-margin)
 }
 
-// SetChildHandler installs replacement ESP SAs before Run acknowledges a
-// peer-initiated rekey, as required by RFC 7296 section 2.8.
-func (s *Session) SetChildHandler(fn func(ChildSA) error) {
-	s.handlerMu.Lock()
-	s.onChild = fn
-	s.handlerMu.Unlock()
-}
-
-// SetChildRetireHandler removes an inbound ESP SA when its paired Child SA is
-// deleted, either after a local rekey or at the peer's request.
-func (s *Session) SetChildRetireHandler(fn func(uint32) error) {
-	s.handlerMu.Lock()
-	s.onRetire = fn
-	s.handlerMu.Unlock()
-}
-
-func (s *Session) replaceChild(child ChildSA) error {
-	s.childMu.Lock()
-	defer s.childMu.Unlock()
-	if s.retiring.LocalSPI != 0 {
-		return fmt.Errorf("ike: Child SA %08x is still awaiting retirement", s.retiring.LocalSPI)
-	}
-	if err := s.mux.RegisterESP(child.LocalSPI); err != nil {
-		return err
-	}
-	s.handlerMu.RLock()
-	fn := s.onChild
-	s.handlerMu.RUnlock()
-	if fn != nil {
-		if err := fn(child); err != nil {
-			s.mux.UnregisterESP(child.LocalSPI)
-			return err
-		}
-	}
-	old := s.Child
-	s.Child = child
-	if old.LocalSPI != 0 {
-		s.retiring = old
-	}
-	return nil
-}
-
-func (s *Session) currentChild() ChildSA {
-	s.childMu.RLock()
-	defer s.childMu.RUnlock()
-	return s.Child
-}
-
-func (s *Session) retiringChild() ChildSA {
-	s.childMu.RLock()
-	defer s.childMu.RUnlock()
-	return s.retiring
-}
-
-func (s *Session) retireChild(remoteSPI uint32) error {
-	s.childMu.Lock()
-	defer s.childMu.Unlock()
-	retiring := s.retiring
-	if retiring.RemoteSPI != remoteSPI {
-		return fmt.Errorf("ike: no retiring Child SA with remote SPI %08x", remoteSPI)
-	}
-	s.handlerMu.RLock()
-	fn := s.onRetire
-	s.handlerMu.RUnlock()
-	if fn != nil {
-		if err := fn(retiring.LocalSPI); err != nil {
-			return err
-		}
-	}
-	s.mux.UnregisterESP(retiring.LocalSPI)
-	s.retiring = ChildSA{}
-	return nil
-}
-
-func (s *Session) forgetChild(child ChildSA) error {
-	s.childMu.Lock()
-	defer s.childMu.Unlock()
-	if s.Child.LocalSPI == 0 {
-		return nil
-	}
-	if s.Child.LocalSPI != child.LocalSPI || s.Child.RemoteSPI != child.RemoteSPI {
-		return fmt.Errorf("ike: Child SA changed while handling CHILD_SA_NOT_FOUND")
-	}
-	s.handlerMu.RLock()
-	fn := s.onRetire
-	s.handlerMu.RUnlock()
-	if fn != nil {
-		if err := fn(child.LocalSPI); err != nil {
-			return err
-		}
-	}
-	s.mux.UnregisterESP(child.LocalSPI)
-	s.Child = ChildSA{}
-	return nil
-}
-
-// deleteChildren closes every locally known Child SA designated by the peer's
-// inbound SPIs and returns our paired inbound SPIs for the Delete response
-// (RFC 7296 §1.4.1). Unknown SPIs are ignored.
-func (s *Session) deleteChildren(remoteSPIs []uint32) ([]uint32, error) {
-	s.childMu.Lock()
-	defer s.childMu.Unlock()
-	localSPIs := make([]uint32, 0, len(remoteSPIs))
-	for _, remoteSPI := range remoteSPIs {
-		var child *ChildSA
-		switch {
-		case s.Child.LocalSPI != 0 && s.Child.RemoteSPI == remoteSPI:
-			child = &s.Child
-		case s.retiring.LocalSPI != 0 && s.retiring.RemoteSPI == remoteSPI:
-			child = &s.retiring
-		default:
-			continue
-		}
-		s.handlerMu.RLock()
-		fn := s.onRetire
-		s.handlerMu.RUnlock()
-		if fn != nil {
-			if err := fn(child.LocalSPI); err != nil {
-				return nil, err
-			}
-		}
-		s.mux.UnregisterESP(child.LocalSPI)
-		localSPIs = append(localSPIs, child.LocalSPI)
-		*child = ChildSA{}
-	}
-	return localSPIs, nil
-}
-
 // NoteTraffic records successfully authenticated ESP traffic for the DPD
 // policy. RFC 7296 section 2.4 treats it as proof that the IKE SA is alive.
 // Run consumes this edge and timestamps it at its existing 100 ms poll, so
@@ -396,17 +273,24 @@ func espProposal(spi []byte) Proposal {
 // strongSwan deployments require: raw Ed25519 signature auth and
 // unconditional UDP encapsulation on that one explicit port — every IKE
 // message, from IKE_SA_INIT onward, carries the non-ESP marker; there is
-// no NAT-T floating to a separate port (no certs, no EAP, no MOBIKE, no
-// rekey).
+// no NAT-T floating to a separate port, certificates, EAP, or MOBIKE.
 func Initiate(cfg PeerConfig) (*Session, error) {
+	return InitiateContext(context.Background(), cfg)
+}
+
+// InitiateContext cancels only the handshake's mux. It does not close a shared
+// hub or bind the established session's lifetime to ctx; Session.Run owns that.
+func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	local := ""
 	if cfg.LocalAddr != nil {
 		local = cfg.LocalAddr.String()
 	}
-	local = fmt.Sprintf("%s:%d", local, cfg.LocalPort)
+	local = net.JoinHostPort(local, fmt.Sprint(cfg.LocalPort))
 
 	var mux *transport.Mux
-	var err error
 	if cfg.Hub != nil {
 		mux, err = cfg.Hub.NewMux(cfg.RemoteAddr, cfg.RemotePort)
 	} else {
@@ -415,6 +299,15 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	stopCancel := context.AfterFunc(ctx, func() { _ = mux.Close() })
+	defer func() {
+		stopCancel()
+		if ctx.Err() != nil {
+			_ = mux.Close()
+			session, err = nil, ctx.Err()
+		}
+	}()
 
 	spiI := randUint64Nonzero()
 	group := uint16(DH_CURVE25519)
@@ -571,7 +464,8 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	}
 
 	sess := &Session{
-		mux: mux,
+		childRetireDelay: 5 * time.Second,
+		mux:              mux,
 		current: &ikeContext{suite: suite,
 			skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr,
 			spiI: spiI, spiR: spiR, nextLocalMID: 2},
@@ -699,18 +593,7 @@ func (s *Session) deleteAuthenticatedIKE() error {
 	if err != nil {
 		return fmt.Errorf("ike: build IKE Delete: %w", err)
 	}
-	respRaw, err := sendRecv(s.mux, req, func(raw []byte) bool {
-		m, err := DecodeMessage(raw)
-		return err == nil && m.find(PayloadSK) != nil
-	})
-	if err != nil {
-		return err
-	}
-	resp, err := DecodeMessage(respRaw)
-	if err != nil {
-		return fmt.Errorf("ike: decode IKE Delete response: %w", err)
-	}
-	inner, err := DecryptMessage(ctx.suite, ctx.peerEncryptionKey(), respRaw, resp)
+	resp, inner, err := encryptedRoundTrip(s.mux, ctx, req)
 	if err != nil {
 		return err
 	}
@@ -757,22 +640,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		return false, err
 	}
 
-	// A response with no SK payload is a bare, unauthenticated notify --
-	// RFC 7815 §2.1 says to ignore these rather than abort, since anyone
-	// able to spoof our SPI can forge one; sendRecv keeps retransmitting
-	// until a real (encrypted) response arrives or it times out.
-	respRaw, err := sendRecv(s.mux, req, func(raw []byte) bool {
-		m, err := DecodeMessage(raw)
-		return err == nil && m.find(PayloadSK) != nil
-	})
-	if err != nil {
-		return false, err
-	}
-	resp, err := DecodeMessage(respRaw)
-	if err != nil {
-		return false, fmt.Errorf("ike: decode IKE_AUTH response: %w", err)
-	}
-	respInner, err := DecryptMessage(s.current.suite, s.current.sker, respRaw, resp)
+	resp, respInner, err := encryptedRoundTrip(s.mux, s.current, req)
 	if err != nil {
 		return false, err
 	}
@@ -844,70 +712,4 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		return true, err
 	}
 	return true, nil
-}
-
-// sendRecv sends req and waits for a correlated response, retransmitting on
-// timeout. accept is consulted for every response matching req's SPI and
-// Message ID: RFC 7815 §2.1 requires ignoring unauthenticated error
-// notifications and simply continuing to retransmit until timeout, since an
-// IKE_SA_INIT response (and the outer, pre-decryption layer of an IKE_AUTH
-// response) carries no integrity protection of its own -- anyone able to
-// spoof the initiator's SPI, visible in the plaintext request, can inject a
-// forged error notify to abort an in-progress handshake otherwise. accept
-// lets each exchange decide what counts as a real response worth stopping
-// for; a nil accept treats any correlated response as final.
-func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte, error) {
-	reqHdr, err := decodeHeader(req)
-	if err != nil {
-		return nil, err
-	}
-	// Register before the first transmission so a response cannot race the
-	// receive loop on a shared hub.
-	if err := mux.RegisterIKE(reqHdr.SPIInitiator); err != nil {
-		return nil, err
-	}
-	for attempt := 0; attempt < maxRetransmits; attempt++ {
-		if err := mux.SendIKE(req); err != nil {
-			return nil, err
-		}
-		deadline := time.Now().Add(retransmitDelay(attempt + 1))
-		for time.Now().Before(deadline) {
-			raw, err := mux.RecvIKEUntil(deadline)
-			if err != nil {
-				break // timeout, retransmit
-			}
-			h, err := decodeHeader(raw)
-			if err != nil {
-				continue
-			}
-			if validResponseHeader(reqHdr, h, len(raw)) {
-				if accept == nil || accept(raw) {
-					return raw, nil
-				}
-				// Correlated but rejected by accept (e.g. a bare,
-				// unauthenticated error notify): keep waiting instead of
-				// treating a possibly-forged message as authoritative.
-				continue
-			}
-			// Not our response (e.g. an unrelated request); ignore and keep waiting.
-		}
-	}
-	return nil, fmt.Errorf("ike: no response after %d attempts", maxRetransmits)
-}
-
-func validResponseHeader(request, response *Header, rawLen int) bool {
-	if response.MajorVersion != 2 || response.ExchangeType != request.ExchangeType ||
-		response.MessageID != request.MessageID || !response.IsResponse() ||
-		response.IsInitiator() == request.IsInitiator() ||
-		response.SPIInitiator != request.SPIInitiator || response.Length != uint32(rawLen) {
-		return false
-	}
-	if request.SPIResponder == 0 {
-		// IKE_SA_INIT error responses such as COOKIE and
-		// INVALID_KE_PAYLOAD carry a zero responder SPI (RFC 7296
-		// §2.6.1). The exchange-specific accept callback validates the
-		// payload before treating such an unauthenticated response as useful.
-		return request.ExchangeType == IKE_SA_INIT
-	}
-	return response.SPIResponder == request.SPIResponder
 }

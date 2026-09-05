@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/transport"
@@ -151,7 +152,11 @@ func nextDueRekey(schedules []*rekeySchedule, running *rekeySchedule) *rekeySche
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
 func (s *Session) Run(ctx context.Context) error {
-	defer s.mux.Close()
+	var rekeys sync.WaitGroup
+	defer func() {
+		_ = s.mux.Close() // unblock pending exchanges before joining them
+		rekeys.Wait()
+	}()
 	stop := context.AfterFunc(ctx, func() { _ = s.mux.Close() })
 	defer stop()
 	lastAuthenticated := time.Now()
@@ -182,7 +187,7 @@ func (s *Session) Run(ctx context.Context) error {
 	startRekey := func(schedule *rekeySchedule) {
 		running = schedule
 		slog.Info("ike scheduled rekey starting", "sa", schedule.name)
-		go func() { rekeyResult <- rekeyScheduleResult{schedule, schedule.run()} }()
+		rekeys.Go(func() { rekeyResult <- rekeyScheduleResult{schedule, schedule.run()} })
 	}
 	startDueRekey := func() {
 		if schedule := nextDueRekey(schedules, running); schedule != nil {
@@ -190,6 +195,9 @@ func (s *Session) Run(ctx context.Context) error {
 		}
 	}
 	for {
+		if err := s.expireRetiredChildren(time.Now()); err != nil {
+			return err
+		}
 		select {
 		case result := <-rekeyResult:
 			if result.err != nil {
@@ -324,9 +332,17 @@ func (s *Session) requestOnLocked(context *ikeContext, exchange ExchangeType, in
 }
 
 func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
+	s.stateMu.RLock()
 	context := req.context
 	if context == nil {
-		context = s.currentContext()
+		context = s.current
+	}
+	retired := context != s.current
+	s.stateMu.RUnlock()
+	// A peer rekey may replace the context after a local caller queues work.
+	// Do not send a fresh negotiation on an SA the peer is already deleting.
+	if req.exchange == CREATE_CHILD_SA && retired {
+		return nil, fmt.Errorf("ike: IKE SA changed before Child SA exchange started")
 	}
 	// Leave the final 32-bit value unused so incrementing the next local ID
 	// can never wrap. RFC 7296 §2.2 requires rekeying or closing first.
@@ -579,81 +595,6 @@ func supportedPayloadType(payloadType PayloadType) bool {
 	default:
 		return false
 	}
-}
-
-func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
-	var rekey Notify
-	for _, payload := range inner {
-		if payload.Type != PayloadN {
-			continue
-		}
-		notify, err := DecodeNotify(payload.Body)
-		if err != nil {
-			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-		}
-		if notify.Type == N_REKEY_SA {
-			rekey = notify
-		}
-	}
-	child := s.currentChild()
-	if rekey.Type != N_REKEY_SA && (child.LocalSPI != 0 || child.RemoteSPI != 0) {
-		// Without REKEY_SA this requests a new Child SA. Reject it as an
-		// additional SA only while this single-SA profile already has one;
-		// after state loss, RFC 7296 §2.25 expects creation from scratch.
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_ADDITIONAL_SAS)
-	}
-	payloads, err := decodeChildExchangePayloads(inner)
-	if err != nil {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	var expected *ChildSA
-	if rekey.Type == N_REKEY_SA {
-		if s.childRekeying.Load() {
-			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
-		}
-		if rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 {
-			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-		}
-		if child.LocalSPI == 0 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
-			// RFC 7296 §2.25 requires CHILD_SA_NOT_FOUND to identify the
-			// nonexistent SA by copying the Protocol ID and SPI from REKEY_SA.
-			return s.responseNotifySA(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND, rekey.Protocol, rekey.SPI)
-		}
-		expected = &child
-	}
-	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	p, encr, remoteSPI, err := selectChildRequestProposal(payloads.sa.Body, expected)
-	if err != nil {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	var spi [4]byte
-	for binary.BigEndian.Uint32(spi[:]) == 0 {
-		if _, err := rand.Read(spi[:]); err != nil {
-			return nil, err
-		}
-	}
-	nr := make([]byte, 32)
-	if _, err := rand.Read(nr); err != nil {
-		return nil, err
-	}
-	initKey, respKey, err := ChildSAKeymat(ctx.suite.PRFID, ctx.skD, payloads.nonce.Body, nr, encr.ID, encr.KeyLengthBits)
-	if err != nil {
-		return nil, err
-	}
-	replacement := ChildSA{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, LocalSPI: binary.BigEndian.Uint32(spi[:]), RemoteSPI: remoteSPI, InboundKey: initKey, OutboundKey: respKey}
-	if err := s.replaceChild(replacement); err != nil {
-		return nil, err
-	}
-	responseEncr := encr
-	if responseEncr.ID == ENCR_CHACHA20_POLY1305 {
-		// RFC 7296 §3.3.6 returns selected attributes unchanged; the fixed-key
-		// ChaCha20-Poly1305 transform was offered without Key Length.
-		responseEncr.KeyLengthBits = 0
-	}
-	response := Proposal{Number: p.Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{responseEncr, {Type: TransESN, ID: ESN_NO}}}
-	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: payloads.tsi.Body}, {Type: PayloadTSr, Body: payloads.tsr.Body}})
 }
 
 func (s *Session) response(ctx *ikeContext, msgID uint32, exchange ExchangeType, inner []RawPayload) ([]byte, error) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
@@ -72,6 +73,27 @@ func TestReplaceChildRollsBackSPIRegistration(t *testing.T) {
 	}
 }
 
+func TestReplaceChildDoesNotReuseInstalledSPI(t *testing.T) {
+	for _, draining := range []bool{false, true} {
+		mux, other := lifecycleMuxes(t)
+		s := &Session{mux: mux}
+		if err := mux.RegisterESP(42); err != nil {
+			t.Fatal(err)
+		}
+		if draining {
+			s.retired = []childRetirement{{spi: 42}}
+		} else {
+			s.Child.LocalSPI = 42
+		}
+		if err := s.replaceChild(ChildSA{LocalSPI: 42}); err == nil {
+			t.Fatal("reused an SPI whose inbound keys are still installed")
+		}
+		if err := other.RegisterESP(42); err == nil {
+			t.Fatal("failed replacement released the existing SPI registration")
+		}
+	}
+}
+
 func TestRetireChildPreservesRetryableStateOnFailure(t *testing.T) {
 	mux, other := lifecycleMuxes(t)
 	old := ChildSA{LocalSPI: 0x10203040, RemoteSPI: 0x50607080}
@@ -104,6 +126,50 @@ func TestReplaceChildRejectsOverlappingRetirement(t *testing.T) {
 	s := &Session{mux: mux, retiring: ChildSA{LocalSPI: 1, RemoteSPI: 2}}
 	if err := s.replaceChild(ChildSA{LocalSPI: 3, RemoteSPI: 4}); err == nil {
 		t.Fatal("replaceChild replaced an SA while an earlier one was still retiring")
+	}
+}
+
+func TestRekeyRetirementAllowsQueuedESPToDrain(t *testing.T) {
+	for _, peerDelete := range []bool{false, true} {
+		mux, other := lifecycleMuxes(t)
+		old := ChildSA{LocalSPI: 1, RemoteSPI: 2}
+		if err := mux.RegisterESP(old.LocalSPI); err != nil {
+			t.Fatal(err)
+		}
+		s := &Session{mux: mux, retiring: old, childRetireDelay: time.Second}
+		removed := false
+		s.SetChildRetireHandler(func(spi uint32) error {
+			if spi != old.LocalSPI {
+				t.Fatalf("retired SPI = %d, want %d", spi, old.LocalSPI)
+			}
+			removed = true
+			return nil
+		})
+		var err error
+		if peerDelete {
+			_, err = s.deleteChildren([]uint32{old.RemoteSPI})
+		} else {
+			err = s.retireChild(old.RemoteSPI)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if removed || s.retiringChild().LocalSPI != 0 {
+			t.Fatal("retirement removed inbound keys immediately or blocked the next rekey")
+		}
+		if err := other.RegisterESP(old.LocalSPI); err == nil {
+			t.Fatal("inbound SPI was released before queued ESP could drain")
+		}
+		deadline := s.retired[0].expiresAt
+		if err := s.expireRetiredChildren(deadline.Add(-time.Nanosecond)); err != nil || removed {
+			t.Fatalf("expired inbound SA too early: %v", err)
+		}
+		if err := s.expireRetiredChildren(deadline); err != nil || !removed {
+			t.Fatalf("did not remove expired inbound SA: %v", err)
+		}
+		if err := other.RegisterESP(old.LocalSPI); err != nil {
+			t.Fatalf("expired inbound SPI is still registered: %v", err)
+		}
 	}
 }
 

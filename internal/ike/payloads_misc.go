@@ -209,10 +209,16 @@ func DecodeTS(body []byte) ([]TrafficSelector, error) {
 			EndPort:   binary.BigEndian.Uint16(rest[6:8]),
 		}
 		alen := (int(tlen) - 8) / 2
+		if (ts.Type == TS_IPV4_ADDR_RANGE && alen != 4) || (ts.Type == TS_IPV6_ADDR_RANGE && alen != 16) {
+			return nil, fmt.Errorf("ike: traffic selector address length does not match its type")
+		}
 		ts.StartAddr = append([]byte{}, rest[8:8+alen]...)
 		ts.EndAddr = append([]byte{}, rest[8+alen:8+2*alen]...)
 		out = append(out, ts)
 		rest = rest[tlen:]
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("ike: trailing data after traffic selectors")
 	}
 	return out, nil
 }
