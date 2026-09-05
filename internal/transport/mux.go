@@ -26,8 +26,6 @@ const (
 	espChanSize = 4096
 )
 
-var espPackedPool = sync.Pool{New: func() any { return new([]byte) }}
-
 // Hub owns one local UDP port and routes incoming packets to registered Muxes.
 type Hub struct {
 	bind conn.Bind
@@ -268,6 +266,9 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 func (m *Mux) LocalAddr() net.Addr { return m.hub.LocalAddr() }
 func (m *Mux) IsClosed() bool      { return m.closed.Load() || m.hub.closed.Load() }
 
+// Done is closed when this peer's transport becomes unavailable.
+func (m *Mux) Done() <-chan struct{} { return m.done }
+
 // RegisterIKE routes packets whose marked IKE header has spi as SPIi to m.
 func (m *Mux) RegisterIKE(spi uint64) error { return m.registerIKE(spi) }
 func (m *Mux) registerIKE(spi uint64) error {
@@ -343,9 +344,11 @@ func (m *Mux) SendIKETo(b []byte, endpoint Endpoint) error {
 }
 func (m *Mux) SendESP(b []byte) error { return m.SendESPBatch([][]byte{b}) }
 
-// SendESPBatch writes directly to the shared UDP bind. The calling data-plane
-// worker retains ownership all the way through sendmmsg/UDP GSO, avoiding a
-// channel handoff and making completion the peer's ordered-send boundary.
+// SendESPBatch writes directly to the shared UDP bind. Production batches are
+// already adjacent slices of one encryption allocation, which lets Bind use
+// UDP GSO without another packing copy. Bind may append into spare capacity
+// while coalescing, so callers transfer exclusive ownership of that capacity
+// for the duration of the send, just as for the packet contents themselves.
 func (m *Mux) SendESPBatch(bufs [][]byte) error {
 	if len(bufs) == 0 {
 		return nil
@@ -356,45 +359,15 @@ func (m *Mux) SendESPBatch(bufs [][]byte) error {
 	default:
 	}
 
-	packedPtr := espPackedPool.Get().(*[]byte)
-	packed := (*packedPtr)[:0]
-	defer func() {
-		*packedPtr = packed[:0]
-		espPackedPool.Put(packedPtr)
-	}()
 	endpoint := m.currentEndpoint()
-	var storage [espSendBatch][]byte
 	for len(bufs) != 0 {
-		n := min(len(bufs), len(storage))
-		batch := storage[:n]
-		copy(batch, bufs[:n])
-		if n > 1 {
-			packed = packForGSO(packed, batch)
-		}
-		if err := m.hub.bind.Send(batch, endpoint); err != nil {
+		n := min(len(bufs), espSendBatch)
+		if err := m.hub.bind.Send(bufs[:n], endpoint); err != nil {
 			return fmt.Errorf("transport: send ESP batch: %w", err)
 		}
 		bufs = bufs[n:]
 	}
 	return nil
-}
-
-func packForGSO(dst []byte, bufs [][]byte) []byte {
-	total := 0
-	for _, b := range bufs {
-		total += len(b)
-	}
-	if cap(dst) < total {
-		dst = make([]byte, 0, total)
-	} else {
-		dst = dst[:0]
-	}
-	for i, b := range bufs {
-		start := len(dst)
-		dst = append(dst, b...)
-		bufs[i] = dst[start:len(dst)]
-	}
-	return dst
 }
 
 func (m *Mux) RecvIKE() ([]byte, error) {

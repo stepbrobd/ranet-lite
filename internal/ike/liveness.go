@@ -151,6 +151,7 @@ func nextDueRekey(schedules []*rekeySchedule, running *rekeySchedule) *rekeySche
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
 func (s *Session) Run(ctx context.Context) error {
+	defer s.mux.Close()
 	stop := context.AfterFunc(ctx, func() { _ = s.mux.Close() })
 	defer stop()
 	lastAuthenticated := time.Now()
@@ -235,7 +236,7 @@ func (s *Session) Run(ctx context.Context) error {
 		}
 
 		deadline := lastAuthenticated.Add(dpdInterval)
-		if pending != nil && pending.deadline.Before(deadline) {
+		if pending != nil {
 			deadline = pending.deadline
 		}
 		for _, schedule := range schedules {
@@ -256,14 +257,14 @@ func (s *Session) Run(ctx context.Context) error {
 				return err
 			}
 			if pending != nil && !time.Now().Before(pending.deadline) {
-				if pendingRetransmitsExhausted(pending) {
+				if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
 					s.mux.Close()
-					return fmt.Errorf("ike: DPD failed: no response after %d attempts", maxRetransmits)
+					return fmt.Errorf("ike: peer unresponsive after %d attempts", maxRetransmits)
 				}
 				// RFC 7296 §2.1 requires retaining and retransmitting the
 				// bitwise-identical request until a response arrives or the IKE SA
-				// is declared failed. Ordinary exchanges keep retrying at the
-				// capped interval; only DPD applies the finite failure policy.
+				// is declared failed. Other authenticated traffic can keep an
+				// ordinary exchange alive; a silent peer must still time out.
 				if err := s.sendPending(pending); err != nil {
 					if pending.dpd {
 						s.mux.Close()
@@ -303,9 +304,23 @@ func (s *Session) requestLocked(exchange ExchangeType, inner []RawPayload) ([]Ra
 
 func (s *Session) requestOnLocked(context *ikeContext, exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
 	req := &localRequest{exchange: exchange, inner: inner, context: context, result: make(chan requestResult, 1)}
-	s.requests <- req
-	result := <-req.result
-	return result.inner, result.err
+	select {
+	case s.requests <- req:
+	case <-s.mux.Done():
+		return nil, fmt.Errorf("ike: session closed")
+	}
+	select {
+	case result := <-req.result:
+		return result.inner, result.err
+	case <-s.mux.Done():
+		// Run may have supplied a specific failure immediately before closing.
+		select {
+		case result := <-req.result:
+			return result.inner, result.err
+		default:
+		}
+		return nil, fmt.Errorf("ike: session closed")
+	}
 }
 
 func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
@@ -342,15 +357,15 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 func (s *Session) sendPending(pending *pendingRequest) error {
 	nextAttempt := min(pending.attempts+1, maxRetransmits)
 	pending.deadline = time.Now().Add(retransmitDelay(nextAttempt))
+	pending.attempts = nextAttempt
 	if err := s.mux.SendIKE(pending.raw); err != nil {
 		return err
 	}
-	pending.attempts = nextAttempt
 	return nil
 }
 
-func pendingRetransmitsExhausted(pending *pendingRequest) bool {
-	return pending.dpd && pending.attempts >= maxRetransmits
+func pendingRetransmitsExhausted(pending *pendingRequest, peerAlive bool) bool {
+	return pending.attempts >= maxRetransmits && (pending.dpd || !peerAlive)
 }
 
 func retransmitDelay(attempt int) time.Duration {

@@ -133,7 +133,10 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	return o.sealWithSequence(innerIPPacket, nextHeader, seq)
+	nonceLen := o.aead.NonceSize()
+	storage := make([]byte, nonceLen, nonceLen+o.sealedLen(len(innerIPPacket)))
+	storage = o.appendSealed(storage, storage[:nonceLen], innerIPPacket, nextHeader, seq)
+	return storage[nonceLen:], nil
 }
 
 // ReserveSequenceRange atomically reserves count consecutive ESP sequence
@@ -176,22 +179,58 @@ func (r *SequenceRange) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, err
 	}
 	seq := r.next
 	r.next++
-	return r.sa.sealWithSequence(innerIPPacket, nextHeader, seq)
+	nonceLen := r.sa.aead.NonceSize()
+	storage := make([]byte, nonceLen, nonceLen+r.sa.sealedLen(len(innerIPPacket)))
+	storage = r.sa.appendSealed(storage, storage[:nonceLen], innerIPPacket, nextHeader, seq)
+	return storage[nonceLen:], nil
 }
 
-func (o *OutboundSA) sealWithSequence(innerIPPacket []byte, nextHeader byte, seq uint64) ([]byte, error) {
+// SealBatch consumes the rest of the range and encrypts it into one backing
+// allocation. Besides reducing allocator traffic, the adjacent packet slices
+// let the UDP transport use GSO without first repacking the ciphertext.
+func (r *SequenceRange) SealBatch(innerIPPackets [][]byte, nextHeaders []byte) ([][]byte, error) {
+	if r == nil || r.sa == nil || len(innerIPPackets) != len(nextHeaders) {
+		return nil, fmt.Errorf("esp: invalid sequence batch")
+	}
+	if r.next > r.end || uint64(len(innerIPPackets)) != r.end-r.next+1 {
+		return nil, fmt.Errorf("esp: sequence batch has %d packets, range has %d", len(innerIPPackets), r.end-r.next+1)
+	}
+	total := 0
+	for _, packet := range innerIPPackets {
+		total += r.sa.sealedLen(len(packet))
+	}
+	nonceLen := r.sa.aead.NonceSize()
+	storage := make([]byte, nonceLen, nonceLen+total)
+	nonce := storage[:nonceLen]
+	sealed := make([][]byte, 0, len(innerIPPackets))
+	for i, packet := range innerIPPackets {
+		start := len(storage)
+		storage = r.sa.appendSealed(storage, nonce, packet, nextHeaders[i], r.next)
+		r.next++
+		sealed = append(sealed, storage[start:])
+	}
+	return sealed, nil
+}
 
-	trailerLen := 2 // pad length + next header octets
+func (o *OutboundSA) sealedLen(innerLen int) int {
+	const trailerLen = 2 // pad length + next header octets
+	padLen := (4 - (innerLen+trailerLen)%4) % 4
+	return headerLen + o.params.IVLen + innerLen + padLen + trailerLen + o.params.ICVLen
+}
+
+func (o *OutboundSA) appendSealed(dst, nonce, innerIPPacket []byte, nextHeader byte, seq uint64) []byte {
+	const trailerLen = 2 // pad length + next header octets
 	total := len(innerIPPacket) + trailerLen
 	padLen := (4 - total%4) % 4
 
 	framingLen := headerLen + o.params.IVLen
 	plainLen := len(innerIPPacket) + padLen + trailerLen
 	packetLen := framingLen + plainLen + o.params.ICVLen
-	nonceLen := o.aead.NonceSize()
-	storage := make([]byte, nonceLen+framingLen+plainLen, nonceLen+packetLen)
-	nonce := storage[:nonceLen]
-	out := storage[nonceLen : nonceLen+framingLen+plainLen]
+	start := len(dst)
+	// Callers reserve the complete output capacity before encrypting. Extending
+	// the slice avoids a temporary zero buffer under race instrumentation.
+	dst = dst[:start+packetLen]
+	out := dst[start : start+framingLen+plainLen]
 	binary.BigEndian.PutUint32(out[0:4], o.spi)
 	binary.BigEndian.PutUint32(out[4:8], uint32(seq))
 	binary.BigEndian.PutUint64(out[8:framingLen], seq) // unique per packet, monotonic
@@ -207,7 +246,8 @@ func (o *OutboundSA) sealWithSequence(innerIPPacket []byte, nextHeader byte, seq
 	copy(nonce, o.salt)
 	copy(nonce[len(o.salt):], out[headerLen:framingLen])
 	aad := out[:headerLen]
-	return o.aead.Seal(out[:framingLen], nonce, plain, aad), nil
+	sealed := o.aead.Seal(out[:framingLen], nonce, plain, aad)
+	return dst[:start+len(sealed)]
 }
 
 // Authenticate validates the SPI and AEAD tag without advancing the replay
@@ -215,6 +255,18 @@ func (o *OutboundSA) sealWithSequence(innerIPPacket []byte, nextHeader byte, seq
 // Commit repeats that check atomically with advancing the window after
 // parallel authentication completes.
 func (in *InboundSA) Authenticate(pkt []byte) (*AuthenticatedPacket, error) {
+	return in.authenticate(pkt, false)
+}
+
+// AuthenticateInPlace is the zero-copy data-plane form of Authenticate. It
+// decrypts over pkt's ciphertext after authenticating it, so callers must own
+// pkt and must not use its encrypted contents again. The returned plaintext
+// remains valid as long as pkt's backing storage remains reachable.
+func (in *InboundSA) AuthenticateInPlace(pkt []byte) (*AuthenticatedPacket, error) {
+	return in.authenticate(pkt, true)
+}
+
+func (in *InboundSA) authenticate(pkt []byte, inPlace bool) (*AuthenticatedPacket, error) {
 	if len(pkt) < headerLen+in.params.IVLen+in.params.ICVLen {
 		return nil, fmt.Errorf("esp: packet too short")
 	}
@@ -232,14 +284,20 @@ func (in *InboundSA) Authenticate(pkt []byte) (*AuthenticatedPacket, error) {
 
 	iv := pkt[headerLen : headerLen+in.params.IVLen]
 	ciphertext := pkt[headerLen+in.params.IVLen:]
-	nonce := append(append([]byte{}, in.salt...), iv...)
+	var nonce [12]byte // every supported ESP AEAD uses a 4-byte salt + 8-byte IV
+	copy(nonce[:], in.salt)
+	copy(nonce[len(in.salt):], iv)
 	aad := pkt[:headerLen]
+	var dst []byte
+	if inPlace {
+		dst = ciphertext[:0]
+	}
 
 	// The AEAD compute itself touches no shared state, so it runs
 	// unlocked — this is the expensive part, and the whole point of
 	// checking once before it (fail fast) and again after (see below) is
 	// to avoid holding the lock for its duration.
-	plain, err := in.aead.Open(nil, nonce, ciphertext, aad)
+	plain, err := in.aead.Open(dst, nonce[:], ciphertext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("esp: authentication failed: %w", err)
 	}

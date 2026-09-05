@@ -60,13 +60,33 @@ type Mesh struct {
 
 	devs               []tun.Device
 	outboundBufferSize int
+	outboundJobs       chan *outboundBatch
+	outboundFree       chan *outboundBatch
+	outboundDispatchMu sync.Mutex
 	inboundWriters     []chan inboundWriteBatch
 	closed             chan struct{}
 	closeOnce          sync.Once
 	deliveryMu         sync.Mutex
 	deliveryWG         sync.WaitGroup
 	closing            bool
+	outboundReaderWG   sync.WaitGroup
+	outboundWorkerWG   sync.WaitGroup
 	writerWG           sync.WaitGroup
+}
+
+// outboundBatch owns the TUN buffers from one read until a crypto worker has
+// encrypted every routed packet. Readers can therefore immediately continue
+// with another buffer set instead of tying one encryption worker to each TUN
+// queue (and to whatever flows the kernel happened to hash onto that queue).
+type outboundBatch struct {
+	n         int
+	bufs      [][]byte
+	sizes     []int
+	peers     []*Peer
+	headers   []byte
+	counts    map[*Peer]int
+	batches   map[*Peer]*peerBatch
+	peerOrder []*Peer
 }
 
 type inboundWriteBatch struct {
@@ -105,6 +125,12 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netstack: create tun device: %w", err)
 	}
+	if err := bringTUNUp(actualName); err != nil {
+		for _, dev := range devs {
+			_ = dev.Close()
+		}
+		return nil, fmt.Errorf("netstack: bring tun device up: %w", err)
+	}
 	m := &Mesh{
 		Routes:             NewRouteTable(),
 		Name:               actualName,
@@ -113,73 +139,134 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		closed:             make(chan struct{}),
 	}
 	m.startInboundWriters()
-	// One long-lived worker owns each multiqueue TUN descriptor. This removes
-	// the single device read lock while retaining a direct serial path on
-	// single-core nodes.
-	for _, dev := range m.devs {
-		go m.outboundWorker(dev)
-	}
+	m.startOutboundPipeline()
 	return m, nil
 }
 
 // QueueCount reports the number of independent TUN I/O lanes.
 func (m *Mesh) QueueCount() int { return len(m.devs) }
 
-// outboundWorker owns a complete packet batch from TUN read through UDP send.
-// Every worker reads a different kernel TUN queue, then owns a complete packet
-// batch through route lookup and encryption. A peer's reservation lock defines
-// the accepted cross-queue order; its final transmission gate sends completed
-// ranges in that order, keeping ESP sequence numbers monotonic even when a
-// later worker finishes first.
-func (m *Mesh) outboundWorker(dev tun.Device) {
-	batch := dev.BatchSize()
-	bufs := make([][]byte, batch)
-	sizes := make([]int, batch)
-	peers := make([]*Peer, batch)
-	headers := make([]byte, batch)
-	for i := range bufs {
-		bufs[i] = make([]byte, m.outboundBufferSize)
+func (m *Mesh) startOutboundPipeline() {
+	workers := max(1, runtime.GOMAXPROCS(0))
+	m.outboundJobs = make(chan *outboundBatch, 2*workers)
+	batchSize := 1
+	for _, dev := range m.devs {
+		batchSize = max(batchSize, dev.BatchSize())
 	}
-	counts := make(map[*Peer]int)
-	batches := make(map[*Peer]*peerBatch)
-	peerOrder := make([]*Peer, 0, batch)
+	m.outboundFree = make(chan *outboundBatch, cap(m.outboundJobs)+len(m.devs))
+	for range cap(m.outboundFree) {
+		m.outboundFree <- m.newOutboundBatch(batchSize)
+	}
+	for range workers {
+		m.outboundWorkerWG.Add(1)
+		go m.outboundWorker()
+	}
+	for _, dev := range m.devs {
+		m.outboundReaderWG.Add(1)
+		go m.outboundReader(dev)
+	}
+}
 
+func (m *Mesh) newOutboundBatch(size int) *outboundBatch {
+	b := &outboundBatch{
+		bufs:      make([][]byte, size),
+		sizes:     make([]int, size),
+		peers:     make([]*Peer, size),
+		headers:   make([]byte, size),
+		counts:    make(map[*Peer]int),
+		batches:   make(map[*Peer]*peerBatch),
+		peerOrder: make([]*Peer, 0, size),
+	}
+	for i := range b.bufs {
+		b.bufs[i] = make([]byte, m.outboundBufferSize)
+	}
+	return b
+}
+
+// outboundReader only reads and classifies packets. Reserving each peer's ESP
+// sequence range here fixes the order before independently scheduled workers
+// encrypt later batches, so the ordered sender can restore per-flow FIFO.
+func (m *Mesh) outboundReader(dev tun.Device) {
+	defer m.outboundReaderWG.Done()
 	for {
-		n, err := dev.Read(bufs, sizes, 0)
+		var b *outboundBatch
+		select {
+		case b = <-m.outboundFree:
+		case <-m.closed:
+			return
+		}
+		n, err := dev.Read(b.bufs, b.sizes, 0)
 		if err != nil {
 			return // device closed
 		}
-		clear(counts)
-		clear(batches)
-		peerOrder = peerOrder[:0]
+		b.n = n
 		for i := 0; i < n; i++ {
-			peers[i] = nil
-			raw := bufs[i][:sizes[i]]
+			raw := b.bufs[i][:b.sizes[i]]
 			if src, dst, nh, ok := addrsOf(raw); ok {
 				if peer, ok := m.Routes.Lookup(src, dst); ok {
-					peers[i], headers[i] = peer, nh
-					if counts[peer] == 0 {
-						peerOrder = append(peerOrder, peer)
+					b.peers[i], b.headers[i] = peer, nh
+					if b.counts[peer] == 0 {
+						b.peerOrder = append(b.peerOrder, peer)
 					}
-					counts[peer]++
+					b.counts[peer]++
 				}
 			}
 		}
-		for _, peer := range peerOrder {
-			batches[peer] = peer.reserveBatch(counts[peer])
+		if len(b.peerOrder) == 0 {
+			b.reset()
+			m.outboundFree <- b
+			continue
 		}
+		m.dispatchOutbound(b)
+	}
+}
 
-		for i := 0; i < n; i++ {
-			if peer := peers[i]; peer != nil {
-				batches[peer].seal(bufs[i][:sizes[i]], headers[i])
+// Reserve and submit each batch as one operation. Otherwise two readers can
+// retain the first tickets for different peers while later completed batches
+// fill both peers' slots, preventing either reader from reserving its second
+// peer. Submission order also keeps compatibility workers from all waiting on
+// an earlier ticket that is still queued behind them.
+func (m *Mesh) dispatchOutbound(b *outboundBatch) {
+	m.outboundDispatchMu.Lock()
+	defer m.outboundDispatchMu.Unlock()
+	for _, peer := range b.peerOrder {
+		b.batches[peer] = peer.reserveBatchUntil(b.counts[peer], m.closed)
+	}
+	// Workers drain this queue during Close, including every reserved ticket.
+	m.outboundJobs <- b
+}
+
+func (m *Mesh) outboundWorker() {
+	defer m.outboundWorkerWG.Done()
+	for b := range m.outboundJobs {
+		for i := 0; i < b.n; i++ {
+			if peer := b.peers[i]; peer != nil {
+				b.batches[peer].append(b.bufs[i][:b.sizes[i]], b.headers[i])
 			}
 		}
-		for _, peer := range peerOrder {
-			if err := batches[peer].enqueue(); err != nil {
+		for _, peer := range b.peerOrder {
+			if err := b.batches[peer].enqueue(); err != nil {
 				log.Printf("netstack: send batch through peer %s: %v", peer.ID, err)
 			}
 		}
+		b.reset()
+		select {
+		case m.outboundFree <- b:
+		case <-m.closed:
+		}
 	}
+}
+
+func (b *outboundBatch) reset() {
+	for i := 0; i < b.n; i++ {
+		b.peers[i] = nil
+		b.sizes[i] = 0
+	}
+	b.n = 0
+	clear(b.counts)
+	clear(b.batches)
+	clear(b.peerOrder)
+	b.peerOrder = b.peerOrder[:0]
 }
 
 // addrsOf extracts both the source and destination address from a raw IP
@@ -243,7 +330,11 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	m.deliveryMu.Unlock()
 	defer m.deliveryWG.Done()
 	if len(m.devs) == 1 {
-		m.writeInbound(0, copyInboundPackets(raw))
+		for len(raw) != 0 {
+			n := min(len(raw), inboundWriteBatchSize)
+			m.writeInbound(0, copyInboundPackets(raw[:n]))
+			raw = raw[n:]
+		}
 		return
 	}
 
@@ -412,6 +503,11 @@ func (m *Mesh) Close() {
 		for _, dev := range m.devs {
 			_ = dev.Close()
 		}
+		m.outboundReaderWG.Wait()
+		if m.outboundJobs != nil {
+			close(m.outboundJobs)
+		}
+		m.outboundWorkerWG.Wait()
 		m.deliveryWG.Wait()
 		m.writerWG.Wait()
 	})

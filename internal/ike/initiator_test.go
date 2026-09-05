@@ -999,6 +999,15 @@ func withNonESPMarker(b []byte) []byte {
 }
 
 func TestIKEAuthAuthenticatesBeforeChildFailure(t *testing.T) {
+	testIKEAuthAuthenticatesBeforeChildFailure(t, "")
+}
+
+func TestIKEAuthAcrossOrganizations(t *testing.T) {
+	testIKEAuthAuthenticatesBeforeChildFailure(t, "remote-org")
+}
+
+func testIKEAuthAuthenticatesBeforeChildFailure(t *testing.T, remoteOrganization string) {
+	t.Helper()
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
 	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
@@ -1016,13 +1025,14 @@ func TestIKEAuthAuthenticatesBeforeChildFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := PeerConfig{
-		Organization:     "ranet-test",
-		LocalCommonName:  "initiator",
-		LocalSerial:      "1",
-		LocalPrivateKey:  localPrivate,
-		RemoteCommonName: "responder",
-		RemoteSerial:     "2",
-		RemotePublicKey:  remotePublic,
+		Organization:       "ranet-test",
+		RemoteOrganization: remoteOrganization,
+		LocalCommonName:    "initiator",
+		LocalSerial:        "1",
+		LocalPrivateKey:    localPrivate,
+		RemoteCommonName:   "responder",
+		RemoteSerial:       "2",
+		RemotePublicKey:    remotePublic,
 	}
 
 	const spiI = 0x0102030405060708
@@ -1066,7 +1076,11 @@ func TestIKEAuthAuthenticatesBeforeChildFailure(t *testing.T) {
 				return fmt.Errorf("decrypt IKE_AUTH request: %w", err)
 			}
 
-			idr := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(cfg.Organization, cfg.RemoteCommonName, cfg.RemoteSerial))
+			serverOrganization := cfg.Organization
+			if remoteOrganization != "" {
+				serverOrganization = remoteOrganization
+			}
+			idr := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(serverOrganization, cfg.RemoteCommonName, cfg.RemoteSerial))
 			macedID := prf(suite.PRFID, s.current.skpr, idr)
 			auth := BuildAuth(remotePrivate, concat(realMessage2, ni, macedID))
 			response, err := EncryptMessage(suite, s.current.sker, Header{

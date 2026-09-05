@@ -1,4 +1,9 @@
-{ pkgs, ranetLite }:
+{
+  pkgs,
+  ranetLite,
+  cores ? 1,
+  profile ? false,
+}:
 
 let
   gatewayTunnel = "fd00:99::1";
@@ -7,6 +12,7 @@ let
 
   common = {
     virtualisation.vlans = [ 1 ];
+    virtualisation.cores = cores;
     networking = {
       useNetworkd = true;
       useDHCP = false;
@@ -177,10 +183,16 @@ in
         imports = [ common ];
 
         boot.kernelModules = [ "tun" ];
-        environment.systemPackages = with pkgs; [
-          iperf3
-          iproute2
-        ];
+        environment.systemPackages =
+          with pkgs;
+          [
+            iperf3
+            iproute2
+          ]
+          ++ lib.optionals profile [
+            curl
+            go
+          ];
 
         systemd.network = {
           netdevs."20-ranet0" = {
@@ -269,7 +281,10 @@ in
           wants = [ "network-online.target" ];
           after = [ "network-online.target" ];
           serviceConfig = {
-            ExecStart = "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug";
+            ExecStart =
+              "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug"
+              + pkgs.lib.optionalString profile " -pprof 127.0.0.1:6060";
+            TimeoutStopSec = "15s";
             Restart = "on-failure";
             AmbientCapabilities = [ "CAP_NET_ADMIN" ];
             CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
@@ -296,8 +311,21 @@ in
         print(gateway.succeed("swanctl --rekey --ike ranet"))
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
-        print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5"))
-        print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5 --reverse"))
+        profile = ${if profile then "True" else "False"}
+        duration = 25 if profile else 5
+        for direction, flags in [("outbound", ""), ("inbound", "--reverse")]:
+            if profile:
+                client.succeed(f"systemd-run --unit=ranet-{direction}-profile --collect curl --silent --show-error 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' --output /tmp/{direction}.pprof")
+            print(client.succeed(f"iperf3 --client ${gatewayTunnel} --parallel 8 --time {duration} {flags}"))
+            if profile:
+                client.wait_until_succeeds(f"test -s /tmp/{direction}.pprof")
+                print(client.succeed(f"CGO_ENABLED=0 go tool pprof -top -nodecount=50 /tmp/{direction}.pprof"))
+
+        # Closing an idle TUN read must stop promptly without SIGKILL.
+        client.succeed("systemctl stop ranet-lite.service")
+        assert client.succeed("systemctl show -p Result --value ranet-lite.service").strip() == "success"
+        client.succeed("systemctl start ranet-lite.service")
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
     finally:
         print(gateway.succeed("swanctl --list-sas"))
         print(gateway.succeed("birdc show babel neighbors"))

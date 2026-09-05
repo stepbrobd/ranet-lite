@@ -4,6 +4,9 @@ package netstack
 
 import "golang.zx2c4.com/wireguard/tun"
 
+// Keep the platform TUN backend's existing behavior outside Linux.
+func bringTUNUp(string) error { return nil }
+
 func createTUNQueues(name string, mtu, _ int) ([]tun.Device, string, error) {
 	device, err := tun.CreateTUN(name, mtu)
 	if err != nil {

@@ -13,7 +13,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
 
-func TestInboundBatchOrderDeliversCompletedBatchesInReceiveOrder(t *testing.T) {
+func TestInboundBatchOrderMergesConsecutiveCompletedBatches(t *testing.T) {
 	const first, second = 0, 1
 
 	firstResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}
@@ -22,12 +22,16 @@ func TestInboundBatchOrderDeliversCompletedBatchesInReceiveOrder(t *testing.T) {
 	recycled := make(chan *inboundBatch, 2)
 	delivered := make(chan byte, 2)
 	emitterDone := make(chan struct{})
+	calls := 0
 	go func() {
 		emitInboundBatches(completed, recycled, func(results []inboundDecrypted) {
-			if results[0].authenticated == firstResult.authenticated {
-				delivered <- 1
-			} else {
-				delivered <- 2
+			calls++
+			for _, result := range results {
+				if result.authenticated == firstResult.authenticated {
+					delivered <- 1
+				} else {
+					delivered <- 2
+				}
 			}
 		})
 		close(emitterDone)
@@ -49,6 +53,9 @@ func TestInboundBatchOrderDeliversCompletedBatchesInReceiveOrder(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte{1, 2}) {
 		t.Fatalf("delivery order = %v, want [1 2]", got)
+	}
+	if calls != 1 {
+		t.Fatalf("emit called %d times, want one merged call", calls)
 	}
 }
 

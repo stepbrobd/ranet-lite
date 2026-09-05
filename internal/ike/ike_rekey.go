@@ -160,14 +160,21 @@ func (s *Session) RekeyIKE() error {
 			if err := s.mux.RegisterIKE(spiI); err != nil {
 				return fmt.Errorf("ike: register redundant IKE SA: %w", err)
 			}
+			// Both the winner and the redundant context must remain visible
+			// to dispatch while the Delete exchange is outstanding.
+			s.stateMu.Lock()
+			s.old = old
+			s.current = collision
+			s.collision = newContext
+			s.stateMu.Unlock()
 			if _, err := s.requestOnLocked(newContext, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
 				return fmt.Errorf("ike: delete redundant local IKE SA: %w", err)
 			}
 			s.mux.UnregisterIKE(spiI)
 			s.stateMu.Lock()
-			s.old = old
-			s.current = collision
-			s.collision = nil
+			if s.collision == newContext {
+				s.collision = nil
+			}
 			s.stateMu.Unlock()
 			return nil
 		}

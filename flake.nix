@@ -22,11 +22,20 @@
         default = ranet-lite;
       };
 
-      checks.${system}.integration = pkgs.testers.runNixOSTest (
-        import ./integration/nixos-test.nix {
-          inherit pkgs;
-          ranetLite = ranet-lite;
-        }
-      );
+      checks.${system} = {
+        integration = pkgs.testers.runNixOSTest (
+          import ./integration/nixos-test.nix {
+            inherit pkgs;
+            ranetLite = ranet-lite;
+          }
+        );
+        integration-multicore = pkgs.testers.runNixOSTest (
+          import ./integration/nixos-test.nix {
+            inherit pkgs;
+            ranetLite = ranet-lite;
+            cores = 4;
+          }
+        );
+      };
     };
 }

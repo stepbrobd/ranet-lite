@@ -25,9 +25,10 @@ type PeerConfig struct {
 	LocalSerial     string
 	LocalPrivateKey ed25519.PrivateKey
 
-	RemoteCommonName string
-	RemoteSerial     string
-	RemotePublicKey  ed25519.PublicKey
+	RemoteCommonName   string
+	RemoteOrganization string // empty defaults to Organization
+	RemoteSerial       string
+	RemotePublicKey    ed25519.PublicKey
 
 	LocalAddr  net.IP // "" => wildcard
 	LocalPort  int    // 0 => ephemeral
@@ -731,7 +732,11 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	binary.BigEndian.PutUint32(spiBuf, mySPI)
 
 	idiBody := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(cfg.Organization, cfg.LocalCommonName, cfg.LocalSerial))
-	idrBody := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(cfg.Organization, cfg.RemoteCommonName, cfg.RemoteSerial))
+	remoteOrganization := cfg.RemoteOrganization
+	if remoteOrganization == "" {
+		remoteOrganization = cfg.Organization
+	}
+	idrBody := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(remoteOrganization, cfg.RemoteCommonName, cfg.RemoteSerial))
 
 	macedIDForI := prf(s.current.suite.PRFID, s.current.skpi, idiBody)
 	signedOctets := concat(realMessage1, nr, macedIDForI)

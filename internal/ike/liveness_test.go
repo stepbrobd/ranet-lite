@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -23,6 +24,32 @@ func TestSessionRunStopsOnContextCancellation(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Session.Run did not stop after context cancellation")
+	}
+}
+
+func TestRequestReturnsWhenTransportCloses(t *testing.T) {
+	for _, waitingForResponse := range []bool{false, true} {
+		t.Run(fmt.Sprint(waitingForResponse), func(t *testing.T) {
+			mux, _ := lifecycleMuxes(t)
+			s := &Session{mux: mux, current: &ikeContext{}, requests: make(chan *localRequest)}
+			done := make(chan error, 1)
+			go func() {
+				_, err := s.request(CREATE_CHILD_SA, nil)
+				done <- err
+			}()
+			if waitingForResponse {
+				<-s.requests
+			}
+			mux.Close()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("request succeeded after transport closed")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("request remained blocked after transport closed")
+			}
+		})
 	}
 }
 
@@ -77,13 +104,16 @@ func TestRequestRetransmitDelayIsExponential(t *testing.T) {
 	}
 }
 
-func TestOnlyDPDExhaustsPostHandshakeRetransmits(t *testing.T) {
+func TestPostHandshakeRetransmitsRequireLivePeerToContinue(t *testing.T) {
 	ordinary := &pendingRequest{attempts: maxRetransmits}
-	if pendingRetransmitsExhausted(ordinary) {
-		t.Fatal("ordinary request exhausted retransmissions")
+	if pendingRetransmitsExhausted(ordinary, true) {
+		t.Fatal("ordinary request exhausted retransmissions while receiving authenticated traffic")
+	}
+	if !pendingRetransmitsExhausted(ordinary, false) {
+		t.Fatal("unanswered rekey kept a silent peer alive indefinitely")
 	}
 	dpd := &pendingRequest{attempts: maxRetransmits, localRequest: localRequest{dpd: true}}
-	if !pendingRetransmitsExhausted(dpd) {
+	if !pendingRetransmitsExhausted(dpd, true) {
 		t.Fatal("DPD request did not exhaust retransmissions")
 	}
 }

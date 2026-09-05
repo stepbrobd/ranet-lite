@@ -45,7 +45,7 @@ func (d *recordingDevice) Events() <-chan tun.Event { return d.events }
 func (d *recordingDevice) Close() error             { return nil }
 func (d *recordingDevice) BatchSize() int           { return 128 }
 
-func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
+func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T) {
 	started := make(chan byte, 2)
 	releaseFirst := make(chan struct{})
 	transmitted := make(chan byte, 2)
@@ -54,13 +54,16 @@ func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
 		first := nextSequence
 		nextSequence += byte(count)
 		next := first
-		return func(raw []byte, _ byte) ([]byte, error) {
-			started <- raw[0]
-			if raw[0] == 1 {
-				<-releaseFirst
+		return func(raw [][]byte, _ []byte) ([][]byte, error) {
+			sealed := make([][]byte, 0, len(raw))
+			for _, packet := range raw {
+				started <- packet[0]
+				if packet[0] == 1 {
+					<-releaseFirst
+				}
+				sealed = append(sealed, []byte{next, packet[0]})
+				next++
 			}
-			sealed := []byte{next, raw[0]}
-			next++
 			return sealed, nil
 		}, nil
 	}, func(sealed [][]byte) error {
@@ -69,18 +72,32 @@ func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
 	})
 	defer peer.Close()
 
-	first := peer.reserveBatch(1)
-	second := peer.reserveBatch(1)
-	var wg sync.WaitGroup
-	for i, b := range []*peerBatch{first, second} {
-		wg.Add(1)
-		go func(raw byte, b *peerBatch) {
-			defer wg.Done()
-			b.seal([]byte{raw}, 0)
-			if err := b.transmit(); err != nil {
-				t.Errorf("transmit batch %d: %v", raw, err)
-			}
-		}(byte(i+1), b)
+	m := &Mesh{
+		closed:       make(chan struct{}),
+		outboundJobs: make(chan *outboundBatch, 2),
+		outboundFree: make(chan *outboundBatch, 2),
+	}
+	m.outboundWorkerWG.Add(2)
+	go m.outboundWorker()
+	go m.outboundWorker()
+	defer func() {
+		close(m.closed)
+		close(m.outboundJobs)
+		m.outboundWorkerWG.Wait()
+	}()
+
+	for marker := byte(1); marker <= 2; marker++ {
+		b := &outboundBatch{
+			n:         1,
+			bufs:      [][]byte{{marker}},
+			sizes:     []int{1},
+			peers:     []*Peer{peer},
+			headers:   []byte{0},
+			counts:    map[*Peer]int{peer: 1},
+			batches:   map[*Peer]*peerBatch{peer: peer.reserveBatch(1)},
+			peerOrder: []*Peer{peer},
+		}
+		m.outboundJobs <- b
 	}
 
 	for i := 0; i < 2; i++ {
@@ -96,12 +113,14 @@ func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
 	default:
 	}
 	close(releaseFirst)
-	wg.Wait()
-	close(transmitted)
-
-	var got []byte
-	for seq := range transmitted {
-		got = append(got, seq)
+	got := make([]byte, 0, 2)
+	for range 2 {
+		select {
+		case seq := <-transmitted:
+			got = append(got, seq)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for ordered transmission")
+		}
 	}
 	if !bytes.Equal(got, []byte{1, 2}) {
 		t.Fatalf("transmission sequence order = %v, want [1 2]", got)
@@ -117,7 +136,7 @@ func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
 	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
 		sequence := nextSequence
 		nextSequence++
-		return func([]byte, byte) ([]byte, error) { return []byte{sequence}, nil }, nil
+		return func([][]byte, []byte) ([][]byte, error) { return [][]byte{{sequence}}, nil }, nil
 	}, func(sealed [][]byte) error {
 		if sealed[0][0] == 1 {
 			close(startedSend)
@@ -132,7 +151,7 @@ func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
 	})
 
 	first := peer.reserveBatch(1)
-	first.seal([]byte{1}, 0)
+	first.append([]byte{1}, 0)
 	if err := first.enqueue(); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +162,7 @@ func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
 	}
 
 	second := peer.reserveBatch(1)
-	second.seal([]byte{2}, 0)
+	second.append([]byte{2}, 0)
 	enqueued := make(chan error, 1)
 	go func() { enqueued <- second.enqueue() }()
 	select {

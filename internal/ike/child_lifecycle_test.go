@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -8,6 +9,37 @@ import (
 
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
+
+func TestChildNegotiationUsesRequestIKEKeys(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	old := &ikeContext{suite: SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}, skD: bytes.Repeat([]byte{1}, 32)}
+	s := &Session{mux: mux, current: old, requests: make(chan *localRequest)}
+	done := make(chan error, 1)
+	go func() { done <- s.negotiateChild(nil) }()
+	req := <-s.requests
+	// A peer IKE rekey can finish before the Child response is processed.
+	s.stateMu.Lock()
+	s.current = &ikeContext{suite: old.suite, skD: bytes.Repeat([]byte{2}, 32)}
+	s.stateMu.Unlock()
+	nonce := make([]byte, 32)
+	req.result <- requestResult{inner: []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: []byte{1, 2, 3, 4}, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}}}})},
+		{Type: PayloadNonce, Body: nonce},
+		{Type: PayloadTSi, Body: fullRangeSelectors()},
+		{Type: PayloadTSr, Body: fullRangeSelectors()},
+	}}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	wantOut, wantIn, err := ChildSAKeymat(old.suite.PRFID, old.skD, findType(req.inner, PayloadNonce).Body, nonce, ENCR_AES_GCM_16, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := s.currentChild()
+	if !bytes.Equal(child.OutboundKey, wantOut) || !bytes.Equal(child.InboundKey, wantIn) {
+		t.Fatal("Child SA used the replacement IKE SA's keys instead of its request context")
+	}
+}
 
 func lifecycleMuxes(t *testing.T) (*transport.Mux, *transport.Mux) {
 	t.Helper()

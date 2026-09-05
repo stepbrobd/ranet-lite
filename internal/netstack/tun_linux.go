@@ -12,6 +12,23 @@ import (
 
 const cloneDevicePath = "/dev/net/tun"
 
+func bringTUNUp(name string) error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		return err
+	}
+	if err := unix.IoctlIfreq(fd, unix.SIOCGIFFLAGS, ifr); err != nil {
+		return err
+	}
+	ifr.SetUint16(ifr.Uint16() | unix.IFF_UP)
+	return unix.IoctlIfreq(fd, unix.SIOCSIFFLAGS, ifr)
+}
+
 // createTUNQueues opens one file descriptor per Linux multiqueue TUN lane.
 // Each descriptor is wrapped in its own wireguard-go Device, which gives every
 // data-plane worker independent read buffers, GRO tables, and I/O locks.
@@ -51,6 +68,11 @@ func createTUNQueues(name string, mtu, queueCount int) ([]tun.Device, string, er
 
 		var device tun.Device
 		if i == 0 {
+			if err := unix.SetNonblock(fd, true); err != nil {
+				_ = unix.Close(fd)
+				closeDevices()
+				return nil, "", fmt.Errorf("make tun %q nonblocking: %w", actualName, err)
+			}
 			file := os.NewFile(uintptr(fd), cloneDevicePath)
 			device, err = tun.CreateTUNFromFile(file, mtu)
 			if err != nil {

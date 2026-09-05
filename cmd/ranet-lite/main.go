@@ -60,24 +60,31 @@ type inboundBatch struct {
 }
 
 // emitInboundBatches absorbs out-of-order worker completions and emits only
-// the next receive-order batch. recycle bounds the entire pipeline: workers
-// cannot receive another batch until the emitter returns one of these objects.
+// receive-order results. Consecutive batches that are already complete are
+// merged into one call so flow bucketing and TUN GRO see a larger vector
+// without delaying a lone packet.
 func emitInboundBatches(completed <-chan *inboundBatch, recycle chan<- *inboundBatch, emit func([]inboundDecrypted)) {
 	pending := make(map[uint64]*inboundBatch, cap(completed))
+	merged := make([]inboundDecrypted, 0, 128)
 	next := uint64(0)
 	for batch := range completed {
 		pending[batch.ticket] = batch
+		merged = merged[:0]
 		for {
 			ready := pending[next]
 			if ready == nil {
 				break
 			}
 			delete(pending, next)
-			emit(ready.results)
+			merged = append(merged, ready.results...)
 			clear(ready.results)
 			ready.results = ready.results[:0]
 			recycle <- ready
 			next++
+		}
+		if len(merged) != 0 {
+			emit(merged)
+			clear(merged)
 		}
 	}
 }
@@ -363,6 +370,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		LocalSerial:        local.SerialNumber,
 		LocalPrivateKey:    priv,
 		RemoteCommonName:   node.CommonName,
+		RemoteOrganization: p.Organization,
 		RemoteSerial:       ep.SerialNumber,
 		RemotePublicKey:    remotePub,
 		RemoteAddr:         remoteIP,
@@ -460,7 +468,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 			sess.Mux().Close()
 			return nil, err
 		}
-		return sequenceRange.Seal, nil
+		return sequenceRange.SealBatch, nil
 	}, sess.Mux().SendESPBatch)
 	defer peer.Close()
 	peerHandle := speaker.AddPeer(peer)
@@ -470,18 +478,24 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	// batches enter one bounded queue; a dedicated emitter commits replay state
 	// and writes TUN batches in receive order. Crypto workers therefore never
 	// occupy all execution contexts waiting for the serialized TUN boundary.
-	decrypt := func(pkt []byte) inboundDecrypted {
+	// Hold the SA read lock for one bounded socket batch. That avoids allocating
+	// a copied candidate list for every batch, while a rekey writer still gets
+	// priority over subsequent readers and waits only for authentication already
+	// in flight.
+	decryptBatch := func(packets [][]byte, results []inboundDecrypted) []inboundDecrypted {
 		saMu.RLock()
-		candidates := append([]inboundSA(nil), inbound...)
-		saMu.RUnlock()
-		var r inboundDecrypted
-		for _, candidate := range candidates {
-			r.authenticated, r.err = candidate.sa.Authenticate(pkt)
-			if r.err == nil {
-				break
+		defer saMu.RUnlock()
+		for _, pkt := range packets {
+			var result inboundDecrypted
+			for _, candidate := range inbound {
+				result.authenticated, result.err = candidate.sa.AuthenticateInPlace(pkt)
+				if result.err == nil {
+					break
+				}
 			}
+			results = append(results, result)
 		}
-		return r
+		return results
 	}
 	innerPacket := func(r inboundDecrypted) []byte {
 		if r.err != nil {
@@ -541,9 +555,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 				}
 
 				batch.ticket = ticket
-				for _, pkt := range packets {
-					batch.results = append(batch.results, decrypt(pkt))
-				}
+				batch.results = decryptBatch(packets, batch.results)
 				completed <- batch
 			}
 		}

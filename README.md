@@ -26,8 +26,8 @@ nodes rather than participating in ranet's full N-to-N reconciliation.
 - A real **TUN device**, so local applications talk to the mesh over
   ordinary IP sockets through the kernel's own TCP/IP stack — no SOCKS5
   proxy, no userspace network stack. Creating the device needs
-  `CAP_NET_ADMIN`; assigning it an address and adding routes does not, and
-  ranet-lite never does either itself (see [Configuration](#configuration)).
+  `CAP_NET_ADMIN`. Address and route configuration also require administrative
+  privileges and are managed separately (see [Configuration](#configuration)).
 - An embedded minimal **Babel** speaker
   ([RFC 8966](https://www.rfc-editor.org/rfc/rfc8966)), including the RTT
   extension ([RFC 9616](https://www.rfc-editor.org/rfc/rfc9616)).
@@ -63,7 +63,8 @@ and keeps inner flows on a stable lane. When more than one execution context
 is available, an existing named TUN must therefore be created with
 `IFF_MULTI_QUEUE` (for a systemd-networkd `.netdev`, set `MultiQueue=yes` in
 its `[Tun]` section). Single-core processes can also attach to a legacy
-single-queue TUN and retain the direct packet path.
+single-queue TUN. TUN readers hand bounded batches to shared encryption workers;
+sequence reservation and queue submission preserve packet order across workers.
 
 ## Deliberate protocol deviations
 
@@ -209,7 +210,7 @@ either; only synthetic fixtures belong in version control (see
 ## Repository layout
 
 - `internal/ike` — the IKEv2 initiator.
-- `internal/esp` — userspace ESP AEAD encap/decap and anti-replay.
+- `esp` — userspace ESP AEAD encap/decap and anti-replay.
 - `internal/transport` — the shared UDP socket mux (IKE vs. ESP framing).
 - `internal/netstack` — the TUN device and the `(source, destination)`
   route table.
@@ -238,7 +239,13 @@ measures TCP bandwidth through the negotiated ESP tunnel:
 
 ```sh
 nix build .#checks.x86_64-linux.integration -L
+nix build .#checks.x86_64-linux.integration-multicore -L
 ```
+
+These checks exercise one-core and four-core clients, including a clean
+stop/restart with an idle TUN read. The integration test also accepts
+`profile = true` when imported from Nix to capture CPU profiles during longer
+throughput runs.
 
 The VM console, systemd, strongSwan, BIRD, ranet-lite, and iperf3 output is
 streamed by the Nix test driver. A failed convergence check also prints both

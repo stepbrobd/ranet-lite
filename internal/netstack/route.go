@@ -37,9 +37,9 @@ type Peer struct {
 }
 
 // BatchSealer consumes a sequence range previously reserved from one outbound
-// SA. Calls are made serially by its owning worker; different BatchSealers may
-// encrypt concurrently.
-type BatchSealer func(raw []byte, nextHeader byte) ([]byte, error)
+// SA. It returns packet slices backed by one packed allocation so the transport
+// can hand them to UDP GSO without another copy.
+type BatchSealer func(raw [][]byte, nextHeaders []byte) ([][]byte, error)
 
 func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitFn func(sealed []byte) error) *Peer {
 	return NewPeerBatched(id, encryptFn, func(sealed [][]byte) error {
@@ -97,27 +97,32 @@ func (p *Peer) Close() {
 // TUN batches.
 func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
 	b := p.reserveBatch(1)
-	b.seal(raw, nextHeader)
+	b.append(raw, nextHeader)
 	return b.transmit()
 }
 
 type peerBatch struct {
-	peer     *Peer
-	ticket   uint64
-	reserved bool
-	sealer   BatchSealer
-	sealed   [][]byte
-	raw      [][]byte
-	headers  []byte
-	err      error
-	done     chan error
-	hasSlot  bool
+	peer      *Peer
+	ticket    uint64
+	reserved  bool
+	sealer    BatchSealer
+	sealed    [][]byte
+	raw       [][]byte
+	headers   []byte
+	encrypted bool
+	err       error
+	done      chan error
+	hasSlot   bool
 }
 
 // reserveBatch assigns both the peer's transmission ticket and, when
 // supported, its ESP sequence range under one lock. Consequently ticket order,
 // sequence-range order, and the TUN intake order established by Mesh agree.
 func (p *Peer) reserveBatch(count int) *peerBatch {
+	return p.reserveBatchUntil(count, nil)
+}
+
+func (p *Peer) reserveBatchUntil(count int, canceled <-chan struct{}) *peerBatch {
 	hasSlot := false
 	if p.slots != nil {
 		select {
@@ -125,6 +130,8 @@ func (p *Peer) reserveBatch(count int) *peerBatch {
 			hasSlot = true
 		case <-p.stop:
 			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: peer %s closed", p.ID)}
+		case <-canceled:
+			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: packet intake closed")}
 		}
 	}
 	p.reserveMu.Lock()
@@ -135,33 +142,36 @@ func (p *Peer) reserveBatch(count int) *peerBatch {
 		b.sealer, b.err = p.reserveFn(count)
 	}
 	p.reserveMu.Unlock()
-	if b.reserved {
-		b.sealed = make([][]byte, 0, count)
-	} else {
-		b.raw = make([][]byte, 0, count)
-		b.headers = make([]byte, 0, count)
-	}
+	b.raw = make([][]byte, 0, count)
+	b.headers = make([]byte, 0, count)
 	return b
 }
 
-// seal performs AEAD immediately for a range-reserving peer. Compatibility
-// peers retain the plaintext until their ordered transmission turn, because
-// their encryptFn allocates sequence numbers as part of encryption.
-func (b *peerBatch) seal(raw []byte, nextHeader byte) {
-	if b.reserved {
-		if b.err != nil {
-			return
-		}
-		sealed, err := b.sealer(raw, nextHeader)
-		if err != nil {
-			b.err = err
-			return
-		}
-		b.sealed = append(b.sealed, sealed)
-		return
-	}
+// append retains a view of plaintext owned by the surrounding TUN batch.
+// enqueue performs reserved batch encryption in that same worker before the
+// TUN buffers are recycled.
+func (b *peerBatch) append(raw []byte, nextHeader byte) {
 	b.raw = append(b.raw, raw)
 	b.headers = append(b.headers, nextHeader)
+}
+
+func (b *peerBatch) encrypt() {
+	if b.encrypted || b.err != nil {
+		return
+	}
+	b.encrypted = true
+	if b.reserved {
+		b.sealed, b.err = b.sealer(b.raw, b.headers)
+		return
+	}
+	for i, raw := range b.raw {
+		sealed, err := b.peer.encryptFn(raw, b.headers[i])
+		if err != nil {
+			b.err = err
+			continue
+		}
+		b.sealed = append(b.sealed, sealed)
+	}
 }
 
 // enqueue hands a completed reserved batch to the dedicated ordered sender and
@@ -173,6 +183,10 @@ func (b *peerBatch) enqueue() error {
 	if p.completed == nil {
 		return b.transmit()
 	}
+	if !b.hasSlot {
+		return b.err // canceled before receiving a transmission ticket
+	}
+	b.encrypt()
 	select {
 	case p.completed <- b:
 		return nil
@@ -214,15 +228,8 @@ func (b *peerBatch) transmit() error {
 
 func (b *peerBatch) send() error {
 	p := b.peer
-	if !b.reserved && b.err == nil {
-		for i, raw := range b.raw {
-			sealed, err := p.encryptFn(raw, b.headers[i])
-			if err != nil {
-				b.err = err
-				continue
-			}
-			b.sealed = append(b.sealed, sealed)
-		}
+	if !b.reserved {
+		b.encrypt()
 	}
 	if len(b.sealed) != 0 {
 		if err := p.transmitBatchFn(b.sealed); err != nil && b.err == nil {

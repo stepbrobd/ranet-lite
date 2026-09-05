@@ -56,6 +56,9 @@ func (s *Session) rekeyChild(alreadyRunningIsSuccess bool) error {
 }
 
 func (s *Session) negotiateChild(old *ChildSA) error {
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+	context := s.currentContext()
 	localSPI := randUint32Nonzero()
 	for old != nil && localSPI == old.LocalSPI {
 		localSPI = randUint32Nonzero()
@@ -81,7 +84,7 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		// initiator expects in inbound ESP packets (RFC 7296 §1.3.3).
 		inner = append([]RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: ProtoESP, SPI: oldLocalSPI, Type: N_REKEY_SA})}}, inner...)
 	}
-	response, err := s.request(CREATE_CHILD_SA, inner)
+	response, err := s.requestOnLocked(context, CREATE_CHILD_SA, inner)
 	if err != nil {
 		return fmt.Errorf("ike: Child SA negotiation request: %w", err)
 	}
@@ -97,7 +100,6 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 	if err != nil {
 		return fmt.Errorf("ike: invalid Child SA response proposal: %w", err)
 	}
-	context := s.currentContext()
 	initKey, respKey, err := ChildSAKeymat(context.suite.PRFID, context.skD, nonce, payloads.nonce.Body, encr.ID, encr.KeyLengthBits)
 	if err != nil {
 		return err
@@ -112,7 +114,7 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 	if old == nil {
 		return nil
 	}
-	deleted, err := s.request(INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{oldLocalSPI}})}})
+	deleted, err := s.requestLocked(INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{oldLocalSPI}})}})
 	if err != nil {
 		return fmt.Errorf("ike: retire replaced Child SA: %w", err)
 	}

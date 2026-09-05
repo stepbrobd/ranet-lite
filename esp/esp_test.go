@@ -119,6 +119,35 @@ func TestReservedSequenceRangesRemainContiguousWhenSealedOutOfOrder(t *testing.T
 	}
 }
 
+func TestSealBatchProducesAdjacentPackets(t *testing.T) {
+	out, err := NewOutbound(testChild(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := out.ReserveSequenceRange(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packets, err := r.SealBatch(
+		[][]byte{[]byte("first"), []byte("second"), []byte("tail")},
+		[]byte{NextHeaderIPv4, NextHeaderIPv4, NextHeaderIPv4},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, packet := range packets {
+		if got, want := binary.BigEndian.Uint32(packet[4:8]), uint32(i+1); got != want {
+			t.Fatalf("packet %d sequence = %d, want %d", i, got, want)
+		}
+	}
+	for i := 0; i+1 < len(packets); i++ {
+		end := len(packets[i]) + len(packets[i+1])
+		if cap(packets[i]) < end || !bytes.Equal(packets[i][:end][len(packets[i]):], packets[i+1]) {
+			t.Fatalf("packets %d and %d are not adjacent", i, i+1)
+		}
+	}
+}
+
 func testChild(t *testing.T) ChildSA {
 	t.Helper()
 	key := make([]byte, 20) // AES-128-GCM: 16-byte key + 4-byte salt
@@ -158,6 +187,53 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("payload mismatch: got %q want %q", got, payload)
+	}
+}
+
+func TestAuthenticateInPlaceReusesCiphertextStorage(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newInbound := func() *InboundSA {
+		in, err := NewInbound(ChildSA{
+			EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
+			LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in
+	}
+
+	payload := []byte("owned receive buffer")
+	packet, err := out.Seal(payload, NextHeaderIPv4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := bytes.Clone(packet)
+	if _, err := newInbound().Authenticate(packet); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(packet, original) {
+		t.Fatal("Authenticate modified its input")
+	}
+
+	authenticated, err := newInbound().AuthenticateInPlace(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertextStart := headerLen + out.params.IVLen
+	if &authenticated.plain[0] != &packet[ciphertextStart] {
+		t.Fatal("AuthenticateInPlace allocated separate plaintext storage")
+	}
+	plain, nextHeader, err := authenticated.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextHeader != NextHeaderIPv4 || !bytes.Equal(plain, payload) {
+		t.Fatalf("round trip mismatch: header %d, payload %q", nextHeader, plain)
 	}
 }
 
@@ -236,6 +312,23 @@ func TestSealAllocations(t *testing.T) {
 	})
 	if allocs > 1 {
 		t.Fatalf("Seal allocated %.1f times per packet, want at most one output buffer", allocs)
+	}
+
+	const batchSize = 128
+	batch := make([][]byte, batchSize)
+	headers := make([]byte, batchSize)
+	for i := range batch {
+		batch[i], headers[i] = payload, NextHeaderIPv4
+	}
+	r := SequenceRange{sa: out}
+	allocs = testing.AllocsPerRun(100, func() {
+		r.next, r.end = 1, batchSize
+		if _, err := r.SealBatch(batch, headers); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 2 {
+		t.Fatalf("SealBatch allocated %.1f times per batch, want one packet vector and one output buffer", allocs)
 	}
 }
 
