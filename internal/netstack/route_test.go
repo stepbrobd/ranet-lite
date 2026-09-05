@@ -62,7 +62,7 @@ func TestRouteTableDestSpecificityBeatsSourceSpecificity(t *testing.T) {
 	// A source-specific route to a *less specific* destination must not
 	// beat an any-source route to a *more specific* destination — the
 	// destination match is resolved first, per
-	// draft-ietf-babel-source-specific.
+	// RFC 9079.
 	rt.Set(mustPrefix("2001:db8:1::/48"), mustPrefix("2001:db8::/32"), broad)
 	rt.Set(netip.Prefix{}, mustPrefix("2001:db8::/48"), narrow)
 

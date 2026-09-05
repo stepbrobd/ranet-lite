@@ -18,6 +18,9 @@ func DecodeRouterID(body []byte) ([8]byte, error) {
 	if len(body) < 10 {
 		return id, fmt.Errorf("babel: short Router-Id TLV")
 	}
+	if _, err := decodeOptionalSubTLVs(body[10:]); err != nil {
+		return id, err
+	}
 	copy(id[:], body[2:10])
 	return id, nil
 }
@@ -35,7 +38,18 @@ func DecodeNextHop(body []byte) (net.IP, error) {
 	if len(body) < 2 {
 		return nil, fmt.Errorf("babel: short NextHop TLV")
 	}
-	return decodeAddress(body[0], body[2:])
+	addr, err := decodeAddress(body[0], body[2:])
+	if err != nil {
+		return nil, err
+	}
+	length := len(addr)
+	if body[0] == AEIPv6LinkLocal {
+		length = 8
+	}
+	if _, err := decodeOptionalSubTLVs(body[2+length:]); err != nil {
+		return nil, err
+	}
+	return addr, nil
 }
 
 // AckReq / Ack, RFC 8966 §4.6.2/§4.6.3 — used for reliable signaling of
@@ -50,8 +64,11 @@ func EncodeAckReq(nonce uint16, interval uint16) RawTLV {
 }
 
 func DecodeAckReq(body []byte) (nonce uint16, err error) {
-	if len(body) < 4 {
+	if len(body) < 6 {
 		return 0, fmt.Errorf("babel: short AckReq TLV")
+	}
+	if _, err := decodeOptionalSubTLVs(body[6:]); err != nil {
+		return 0, err
 	}
 	return binary.BigEndian.Uint16(body[2:4]), nil
 }

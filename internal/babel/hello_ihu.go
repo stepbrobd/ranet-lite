@@ -50,7 +50,7 @@ func DecodeHello(body []byte) (Hello, error) {
 		Interval: binary.BigEndian.Uint16(body[4:6]),
 		Unicast:  binary.BigEndian.Uint16(body[0:2])&0x8000 != 0,
 	}
-	subs, err := decodeSubTLVs(body[6:])
+	subs, err := decodeOptionalSubTLVs(body[6:])
 	if err != nil {
 		return Hello{}, err
 	}
@@ -117,7 +117,7 @@ func DecodeIHU(body []byte) (IHU, net.IP, error) {
 		}
 		rest = rest[alen:]
 	}
-	subs, err := decodeSubTLVs(rest)
+	subs, err := decodeOptionalSubTLVs(rest)
 	if err != nil {
 		return IHU{}, nil, err
 	}

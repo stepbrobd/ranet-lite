@@ -154,7 +154,7 @@ func TestWildcardUpdateRequiresInfiniteMetric(t *testing.T) {
 }
 
 // TestUpdateWithSourcePrefix guards real-world SADR interop (e.g. BIRD's
-// "ipv6 sadr" tables, draft-ietf-babel-source-specific): a well-formed
+// "ipv6 sadr" tables, RFC 9079): a well-formed
 // Source Prefix sub-TLV (type 128, mandatory bit set per RFC 8966 §4.4)
 // must be parsed into Update.SourcePrefix, not treated as an ordinary
 // destination-only route or blanket-ignored — Speaker decides relevance

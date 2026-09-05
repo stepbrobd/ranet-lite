@@ -2,214 +2,132 @@ package babel
 
 import (
 	"net/netip"
-	"sync"
 	"time"
 )
 
-// routeKey identifies one routing table entry: an ordinary route has an
-// invalid (zero-value) Source, matching any source address; a
-// source-specific (SADR) route has a real Source prefix and is tracked
-// completely independently from any ordinary route to the same
-// destination, exactly as draft-ietf-babel-source-specific requires.
+// An invalid source denotes an ordinary route. Source-specific routes are
+// independent entries, resolved by destination first at the forwarding table.
 type routeKey struct {
 	source netip.Prefix
 	dest   netip.Prefix
 }
 
-// routeInfo is what we know about one candidate path to a routeKey,
-// learned from a single neighbor's Update TLVs.
 type routeInfo struct {
-	neighbor  *neighborState
-	routerID  [8]byte
-	seqno     uint16
-	rxMetric  uint16 // metric as advertised by the neighbor (their cost to the prefix)
-	cost      uint16 // our total cost via this neighbor: link cost + rxMetric
+	rxMetric  uint16
 	expiresAt time.Time
 }
 
-func (r *routeInfo) reachable() bool {
-	return r.cost < MetricInfinity && time.Now().Before(r.expiresAt)
+// A selection is a value, independent of mutable candidate and neighbor state.
+type routeSelection struct {
+	neighbor *neighborState
+	cost     uint16
 }
 
-func sameSelection(a, b *routeInfo) bool {
-	return a == b || (a != nil && b != nil && a.neighbor == b.neighbor && a.cost == b.cost)
-}
-
-// recomputeNeighbor applies changed Hello/IHU/RTT state to every candidate
-// learned through n and immediately updates installed selections.
-func (rt *routeTable) recomputeNeighbor(n *neighborState, install func(routeKey, *routeInfo)) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	linkCost := n.linkCost()
-	for key, entry := range rt.entries {
-		route := entry.routes[n]
-		if route == nil {
-			continue
-		}
-		previous := entry.selected
-		if route.rxMetric < MetricInfinity {
-			route.cost = saturatingAdd(linkCost, route.rxMetric)
-		}
-		best := entry.bestReachable()
-		if entry.selected == nil || !entry.selected.reachable() || (best != nil && best.cost < entry.selected.cost) {
-			entry.selected = best
-		}
-		if !sameSelection(previous, entry.selected) {
-			install(key, entry.selected)
-		}
-	}
-}
-
-// feasible implements the RFC 8966 §3.5.1 feasibility condition against
-// the current best route for the same prefix: a candidate replaces the
-// selected route only if it strictly improves (lower seqno-adjusted
-// metric) or comes from a newer seqno — this is what prevents routing
-// loops in a distance-vector protocol.
-func feasible(candidate, current *routeInfo) bool {
-	if current == nil {
-		return true
-	}
-	if seqnoGT(candidate.seqno, current.seqno) {
-		return true
-	}
-	if candidate.seqno == current.seqno && candidate.rxMetric < current.rxMetric {
-		return true
-	}
-	return false
-}
-
-// seqnoGT compares Babel sequence numbers with the wraparound-aware rule
-// from RFC 8966 §3.2.2 (i.e. "greater" means "less than 32768 ahead of").
-func seqnoGT(a, b uint16) bool {
-	return int16(a-b) > 0
-}
-
-// keyEntry tracks every known candidate route to a routeKey plus which one
-// is currently selected/installed.
 type keyEntry struct {
-	key      routeKey
-	routes   map[*neighborState]*routeInfo // one candidate per neighbor
-	selected *routeInfo
+	routes   map[*neighborState]routeInfo
+	selected routeSelection
 }
 
-// routeTable is shared between the receive loop (handlePacket -> update)
-// and the timer loop (flushUpdates / sweepExpired), so every access must
-// go through mu.
+// Speaker.mu owns the candidate table AND forwarding-table publication. No
+// selection may escape that critical section and later overwrite a newer one.
+//
+// This is an RFC 8966 Appendix E stub: learned routes are never advertised,
+// and local prefixes always take precedence. Consequently feasibility state
+// and comparisons between different origins' sequence numbers are unnecessary.
 type routeTable struct {
-	mu      sync.Mutex
 	entries map[routeKey]*keyEntry
+	install func(routeKey, routeSelection)
 }
 
-func newRouteTable() *routeTable {
-	return &routeTable{entries: map[routeKey]*keyEntry{}}
+func newRouteTable(install func(routeKey, routeSelection)) *routeTable {
+	return &routeTable{entries: make(map[routeKey]*keyEntry), install: install}
 }
 
-// update processes one received Update and reports whether the selected
-// route for this key changed (so the caller can push it to
-// netstack.RouteTable and re-advertise to other peers).
-func (rt *routeTable) update(n *neighborState, key routeKey, routerID [8]byte, seqno, metric uint16, ttl time.Duration) (changed bool, sel *routeInfo) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	ke, ok := rt.entries[key]
-	if !ok {
-		ke = &keyEntry{key: key, routes: map[*neighborState]*routeInfo{}}
-		rt.entries[key] = ke
+func (rt *routeTable) update(n *neighborState, key routeKey, metric uint16, ttl time.Duration, now time.Time) {
+	entry := rt.entries[key]
+	if entry == nil {
+		if metric == MetricInfinity || ttl <= 0 {
+			return
+		}
+		entry = &keyEntry{routes: make(map[*neighborState]routeInfo)}
+		rt.entries[key] = entry
 	}
-
-	cost := metric
-	if metric < MetricInfinity {
-		cost = saturatingAdd(n.linkCost(), metric)
+	if metric == MetricInfinity {
+		delete(entry.routes, n)
+	} else {
+		entry.routes[n] = routeInfo{rxMetric: metric, expiresAt: now.Add(ttl)}
 	}
-	cand := &routeInfo{neighbor: n, routerID: routerID, seqno: seqno, rxMetric: metric, cost: cost, expiresAt: time.Now().Add(ttl)}
-	ke.routes[n] = cand
-
-	prevSelected := ke.selected
-	switch {
-	case ke.selected == nil || ke.selected.neighbor == n:
-		// Always accept a refresh/change from the currently selected
-		// neighbor (including retraction via MetricInfinity).
-		ke.selected = cand
-	case metric < MetricInfinity && feasible(cand, ke.selected) && cand.cost < ke.selected.cost:
-		ke.selected = cand
-	}
-
-	if ke.selected != nil && !ke.selected.reachable() {
-		ke.selected = ke.bestReachable()
-	}
-
-	changed = prevSelected != ke.selected &&
-		(prevSelected == nil || ke.selected == nil || prevSelected.neighbor != ke.selected.neighbor || prevSelected.cost != ke.selected.cost)
-	return changed, ke.selected
+	rt.selectRoute(key, entry, now)
 }
 
-func (ke *keyEntry) bestReachable() *routeInfo {
-	var best *routeInfo
-	for _, r := range ke.routes {
-		if !r.reachable() {
+// Every change uses the same selection procedure, including a metric increase
+// on the selected route, a link-cost change, expiry, and neighbor removal.
+func (rt *routeTable) selectRoute(key routeKey, entry *keyEntry, now time.Time) {
+	best := routeSelection{}
+	for n, r := range entry.routes {
+		if !now.Before(r.expiresAt) {
+			delete(entry.routes, n)
 			continue
 		}
-		if best == nil || r.cost < best.cost {
-			best = r
+		cost := saturatingAdd(n.linkCost(now), r.rxMetric)
+		if cost == MetricInfinity {
+			continue // retain the candidate until its Update expires
+		}
+		// Keep the existing next hop on equal cost. Otherwise break ties by
+		// peer ID so map iteration cannot affect the initial choice.
+		if best.neighbor == nil || cost < best.cost || (cost == best.cost &&
+			(n == entry.selected.neighbor || (best.neighbor != entry.selected.neighbor && n.peer.ID < best.neighbor.peer.ID))) {
+			best = routeSelection{neighbor: n, cost: cost}
 		}
 	}
-	return best
-}
-
-// expireNeighbor drops every route learned from a neighbor that just went
-// down, re-selecting a fallback route per key where one exists.
-func (rt *routeTable) expireNeighbor(n *neighborState) (changed []routeKey) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	for key, ke := range rt.entries {
-		if _, ok := ke.routes[n]; !ok {
-			continue
-		}
-		delete(ke.routes, n)
-		if ke.selected != nil && ke.selected.neighbor == n {
-			ke.selected = ke.bestReachable()
-			changed = append(changed, key)
-		}
-		if len(ke.routes) == 0 {
-			delete(rt.entries, key)
-		}
+	if best != entry.selected {
+		entry.selected = best
+		rt.install(key, best)
 	}
-	return changed
+	if len(entry.routes) == 0 {
+		delete(rt.entries, key)
+	}
 }
 
-// sweepExpired re-evaluates every selected route's TTL — needed because
-// update() only re-checks reachability reactively, when a fresh Update for
-// that key arrives. A neighbor that stops sending updates entirely (not
-// just Hello) would otherwise never be noticed. install is called with the
-// new selected route (nil if the key is now unreachable) for every key
-// whose selection changed.
-func (rt *routeTable) sweepExpired(install func(key routeKey, sel *routeInfo)) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	for key, ke := range rt.entries {
-		previous := ke.selected
-		for neighbor, route := range ke.routes {
-			if !route.reachable() {
-				delete(ke.routes, neighbor)
-			}
-		}
-		if previous != nil {
-			if _, ok := ke.routes[previous.neighbor]; !ok {
-				ke.selected = ke.bestReachable()
-				install(key, ke.selected)
-			}
-		}
-		if len(ke.routes) == 0 {
-			delete(rt.entries, key)
+func (rt *routeTable) recomputeNeighbor(n *neighborState, now time.Time) {
+	for key, entry := range rt.entries {
+		if _, ok := entry.routes[n]; ok {
+			rt.selectRoute(key, entry, now)
 		}
 	}
 }
 
-// selectedFor returns the currently selected route for key, if any.
-func (rt *routeTable) selectedFor(key routeKey) *routeInfo {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	if ke := rt.entries[key]; ke != nil {
-		return ke.selected
+func (rt *routeTable) expireNeighbor(n *neighborState, now time.Time) {
+	for key, entry := range rt.entries {
+		if _, ok := entry.routes[n]; ok {
+			delete(entry.routes, n)
+			rt.selectRoute(key, entry, now)
+		}
 	}
-	return nil
 }
+
+func (rt *routeTable) sweepExpired(now time.Time) {
+	for key, entry := range rt.entries {
+		rt.selectRoute(key, entry, now)
+	}
+}
+
+func (rt *routeTable) nextExpiry() time.Time {
+	var deadline time.Time
+	for _, entry := range rt.entries {
+		for _, route := range entry.routes {
+			deadline = earlier(deadline, route.expiresAt)
+		}
+	}
+	return deadline
+}
+
+func earlier(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
+}
+
+// Babel sequence numbers wrap at 16 bits (RFC 8966 section 3.2.2).
+func seqnoGT(a, b uint16) bool { return int16(a-b) > 0 }

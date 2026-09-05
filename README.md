@@ -30,7 +30,9 @@ nodes rather than participating in ranet's full N-to-N reconciliation.
   privileges and are managed separately (see [Configuration](#configuration)).
 - An embedded minimal **Babel** speaker
   ([RFC 8966](https://www.rfc-editor.org/rfc/rfc8966)), including the RTT
-  extension ([RFC 9616](https://www.rfc-editor.org/rfc/rfc9616)).
+  extension ([RFC 9616](https://www.rfc-editor.org/rfc/rfc9616)) and IPv4
+  announcements with an IPv6 next hop
+  ([RFC 9229](https://www.rfc-editor.org/rfc/rfc9229)).
   Interoperates with [BIRD](https://bird.network.cz/) as the reference
   peer implementation.
 
@@ -43,7 +45,7 @@ this binary enables IP forwarding, so claiming transit capability in the
 routing protocol would just mean announced paths blackhole.
 
 It implements genuine source-specific routing
-([SADR](https://datatracker.ietf.org/doc/draft-ietf-babel-source-specific/)):
+([SADR, RFC 9079](https://www.rfc-editor.org/rfc/rfc9079)):
 the mesh's route table is keyed by `(source, destination)` prefix pairs,
 resolved per RFC 8966/SADR's rule (longest destination match first, source
 prefix as a tiebreaker among equally-specific destinations) using each
@@ -52,11 +54,14 @@ approximation based on a single configured "our address".
 
 **ranet-lite never manages the TUN device's address or routes.** It
 creates the device and brings it up, or attaches to the configured `tun`
-device; everything else — assigning it an
-address, adding a default route or more specific routes, or running a
-separate routing daemon (e.g. BIRD) that peers with the embedded Babel
-speaker over the device for fully automatic route installation — is up to
-whoever runs it.
+device. Assign its addresses and kernel routes externally. Babel only exchanges
+control packets inside authenticated ESP tunnels; a local routing daemon cannot
+peer with the embedded speaker over the TUN. Learned routes select the outgoing
+ESP peer after the kernel has routed a packet to the TUN.
+
+IPv4 announcements use the control link's IPv6 link-local next hop (AE 4).
+The BIRD peer needs Babel's `extended next hop` support, enabled by default
+in BIRD 3. Both ordinary IPv4 updates and AE 4 updates are accepted on receive.
 
 On Linux, ranet-lite opens one multiqueue TUN lane per Go execution context
 and keeps inner flows on a stable lane. When more than one execution context
@@ -65,6 +70,21 @@ is available, an existing named TUN must therefore be created with
 its `[Tun]` section). Single-core processes can also attach to a legacy
 single-queue TUN. TUN readers hand bounded batches to shared encryption workers;
 sequence reservation and queue submission preserve packet order across workers.
+
+The Babel control state and forwarding publication share one mutex. A stub
+selects the cheapest live candidate without a feasibility/source table, as
+permitted by [RFC 8966 Appendix E](https://www.rfc-editor.org/rfc/rfc8966.html#appendix-E).
+Local prefixes take precedence even after a router-ID change. Remote Hello,
+IHU, and Update expiration is scheduled independently of local send intervals.
+
+Packet lookups read an immutable SADR trie snapshot without locking. Route
+changes copy the affected path and publish it atomically; diagnostics iterate
+the same snapshot. ESP batches similarly capture an immutable set of installed
+SAs, retaining keys for work already in flight during a rekey. One-core receive
+processing runs inline; multicore receive workers authenticate concurrently and
+commit replay state in intake order before delivering TUN batches.
+Replaced inbound SAs remain usable for five seconds after their Delete
+acknowledgement so queued and reordered packets can drain during a rekey.
 
 ## Deliberate protocol deviations
 
@@ -112,6 +132,14 @@ certificates or EAP, omission of COOKIE handling, and refusal to create
 additional Child SAs are all within the
 [RFC 7815 minimal-initiator profile](https://www.rfc-editor.org/rfc/rfc7815.html).
 
+IKE rekeys retain the negotiated PRF. This avoids differing key expansion
+behavior between [strongSwan](https://github.com/strongswan/strongswan/blob/master/src/libcharon/sa/ikev2/keymat_v2.c)
+and [RFC 7296 section 2.18](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.18)
+when the PRF changes, while allowing
+fresh DH keys and a different encryption algorithm. Peer Child-SA rekeys can
+use X25519, P-256, or P-384 for PFS; locally initiated Child rekeys derive keys
+from the IKE SA without an additional DH exchange.
+
 ## Building
 
 ```sh
@@ -132,7 +160,7 @@ flow until you configure it yourself, e.g.:
 
 ```sh
 ip addr add 10.66.0.5/32 dev ranet0
-ip route add ::/0 dev ranet0
+ip route add 10.66.0.0/16 dev ranet0
 ```
 
 ## Configuration
@@ -210,11 +238,14 @@ either; only synthetic fixtures belong in version control (see
 ## Repository layout
 
 - `internal/ike` — the IKEv2 initiator.
+- `internal/client` — runtime ownership, peer reconnection, and the ESP pipeline.
 - `esp` — userspace ESP AEAD encap/decap and anti-replay.
 - `internal/transport` — the shared UDP socket mux (IKE vs. ESP framing).
 - `internal/netstack` — the TUN device and the `(source, destination)`
   route table.
 - `internal/babel` — the embedded Babel speaker.
+- `internal/packet` — shared validation of TUN and decrypted IP packets.
+- `sadr` — immutable source/destination routing trie and snapshot iteration.
 - `internal/registry` — ranet-compatible `registry.json` and Ed25519 key
   loading.
 - `internal/config` — ranet-lite's own config format.
@@ -242,14 +273,31 @@ nix build .#checks.x86_64-linux.integration -L
 nix build .#checks.x86_64-linux.integration-multicore -L
 ```
 
-These checks exercise one-core and four-core clients, including a clean
+These checks exercise one-core and four-core clients, IPv4 and IPv6 routes,
+locally scheduled and peer-initiated rekeys, BIRD withdrawal/recovery, and a clean
 stop/restart with an idle TUN read. The integration test also accepts
 `profile = true` when imported from Nix to capture CPU profiles during longer
 throughput runs.
 
+To compare routing and packet classification across CPU counts:
+
+```sh
+go test ./sadr ./internal/babel -run '^$' \
+  -bench 'BenchmarkLookup|BenchmarkRouteChange|BenchmarkReceiveData' \
+  -benchmem -cpu=1,2,4,8 -count=5
+```
+
+Compare runs on the same idle host. Lookup throughput, route-update cost, and
+full-tunnel TCP bandwidth measure different work; VM throughput also includes
+the gateway's kernel IPsec and virtual networking overhead.
+
+Immutable snapshots favor packet lookups over route-write latency. Each changed
+route allocates the copied trie path; this costs more than an in-place update,
+but readers never contend with other readers or wait for a route writer.
+
 The VM console, systemd, strongSwan, BIRD, ranet-lite, and iperf3 output is
-streamed by the Nix test driver. A failed convergence check also prints both
-machines' journals, routes, XFRM state and policies, and BIRD protocol state.
+streamed by the Nix test driver. The test also prints strongSwan SA state and
+BIRD neighbors and routes on exit, including after a failed check.
 
 ## License
 

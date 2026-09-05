@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NickCao/ranet-lite/internal/babel"
 	"gopkg.in/yaml.v3"
 )
 
@@ -182,14 +183,6 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: at least one peer is required")
 	case c.ReplayWindow != nil && *c.ReplayWindow > 1<<20:
 		return fmt.Errorf("config: replay_window must not exceed %d", uint32(1<<20))
-	case c.Babel.HelloInterval < 0 || c.Babel.UpdateInterval < 0:
-		return fmt.Errorf("config: babel intervals must be nonnegative")
-	case c.Babel.HelloInterval > 0 && c.Babel.HelloInterval < 10*time.Millisecond:
-		return fmt.Errorf("config: babel hello_interval must be at least 10ms")
-	case c.Babel.UpdateInterval > 0 && c.Babel.UpdateInterval < 10*time.Millisecond:
-		return fmt.Errorf("config: babel update_interval must be at least 10ms")
-	case c.Babel.HelloInterval > 655350*time.Millisecond || c.Babel.UpdateInterval > 655350*time.Millisecond:
-		return fmt.Errorf("config: babel intervals must fit the protocol's 16-bit centisecond field")
 	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
 		return fmt.Errorf("config: child_rekey_interval must be nonnegative when set")
 	case c.IKERekeyInterval != nil && time.Duration(*c.IKERekeyInterval) < 0:
@@ -208,6 +201,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than child_rekey_interval")
 	case !validRekeyTiming(c.IKERekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
 		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than ike_rekey_interval")
+	}
+	if err := (babel.Config{HelloInterval: c.Babel.HelloInterval, UpdateInterval: c.Babel.UpdateInterval}).Validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 	endpointSerials := make(map[string]struct{}, len(c.Endpoints))
 	for _, ep := range c.Endpoints {

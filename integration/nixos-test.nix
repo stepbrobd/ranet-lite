@@ -8,6 +8,8 @@
 let
   gatewayTunnel = "fd00:99::1";
   clientTunnel = "fd00:88::2";
+  gatewayTunnelV4 = "10.99.0.1";
+  clientTunnelV4 = "10.88.0.2";
   publicKey = builtins.readFile ./org-pub.pem;
 
   common = {
@@ -64,6 +66,7 @@ in
               addresses = [
                 { Address = "fe80::1/64"; }
                 { Address = "${gatewayTunnel}/64"; }
+                { Address = "${gatewayTunnelV4}/24"; }
               ];
             };
           };
@@ -147,7 +150,23 @@ in
               route fd00:99::/64 from ::/0 unreachable;
             }
 
+            protocol kernel kernel4 {
+              ipv4 {
+                export all;
+                import none;
+              };
+            }
+
+            protocol static static4 {
+              ipv4;
+              route 10.99.0.0/24 unreachable;
+            }
+
             protocol babel {
+              ipv4 {
+                export all;
+                import all;
+              };
               ipv6 sadr {
                 export all;
                 import all;
@@ -213,8 +232,14 @@ in
               RequiredForOnline = false;
             };
             networkConfig.ConfigureWithoutCarrier = true;
-            addresses = [ { Address = "${clientTunnel}/128"; } ];
-            routes = [ { Destination = "fd00:99::/64"; } ];
+            addresses = [
+              { Address = "${clientTunnel}/128"; }
+              { Address = "${clientTunnelV4}/32"; }
+            ];
+            routes = [
+              { Destination = "fd00:99::/64"; }
+              { Destination = "10.99.0.0/24"; }
+            ];
           };
         };
 
@@ -263,9 +288,12 @@ in
             registry: /etc/ranet-lite/registry.json
             originate:
               - "${clientTunnel}/128"
+              - "${clientTunnelV4}/32"
             tun: ranet0
-            child_rekey_interval: 0
-            ike_rekey_interval: 0
+            child_rekey_interval: ${if profile then "0" else "5s"}
+            ike_rekey_interval: ${if profile then "0" else "15s"}
+            rekey_margin: 0
+            rekey_jitter: 0
             peers:
               - common_name: server
                 serial_number: "1"
@@ -298,6 +326,11 @@ in
 
     timeout = dt.timedelta(seconds=30)
 
+    def journal_after(machine, unit):
+        output = machine.succeed(f"journalctl -u {unit} -n 1 --show-cursor --no-pager")
+        cursor = output.rsplit("-- cursor: ", 1)[1].strip()
+        return f"journalctl -u {unit} --after-cursor='{cursor}' --no-pager"
+
     start_all()
 
     try:
@@ -308,7 +341,15 @@ in
         client.wait_for_unit("ranet-lite.service")
 
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
+        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+        print(gateway.succeed("swanctl --rekey --child default"))
+        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'parsed CREATE_CHILD_SA response.*SA No KE TSi TSr'", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
         print(gateway.succeed("swanctl --rekey --ike ranet"))
+        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'IKE_SA ranet.* rekeyed between'", timeout=timeout)
+        local_rekeys = journal_after(client, "ranet-lite.service")
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
         profile = ${if profile then "True" else "False"}
@@ -321,14 +362,32 @@ in
                 client.wait_until_succeeds(f"test -s /tmp/{direction}.pprof")
                 print(client.succeed(f"CGO_ENABLED=0 go tool pprof -top -nodecount=50 /tmp/{direction}.pprof"))
 
+        if not profile:
+            # Verify both new IKE keys and subsequent ESP keys are usable.
+            # swanctl's exit status alone does not prove a rekey succeeded.
+            for sa in ["Child SA", "IKE SA"]:
+                client.wait_until_succeeds(f"{local_rekeys} | grep -F 'ike scheduled rekey completed' | grep -F 'sa=\"{sa}\"'", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+
+        # A graceful BIRD stop retracts routes, then fresh announcements restore
+        # them without reconnecting IKE. Check the client publication as well as IP.
+        withdrawal = journal_after(client, "ranet-lite.service")
+        gateway.succeed("systemctl stop bird.service")
+        client.wait_until_succeeds(f"{withdrawal} | grep -F 'babel route retracted'", timeout=timeout)
+        gateway.succeed("systemctl start bird.service")
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
+        assert client.succeed("journalctl -u ranet-lite.service --no-pager | grep -c ': connected (SPI'").strip() == "1"
+        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
+        gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
+
         # Closing an idle TUN read must stop promptly without SIGKILL.
         client.succeed("systemctl stop ranet-lite.service")
         assert client.succeed("systemctl show -p Result --value ranet-lite.service").strip() == "success"
         client.succeed("systemctl start ranet-lite.service")
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
     finally:
-        print(gateway.succeed("swanctl --list-sas"))
-        print(gateway.succeed("birdc show babel neighbors"))
-        print(gateway.succeed("birdc show babel routes"))
+        for command in ["swanctl --list-sas", "birdc show babel neighbors", "birdc show babel routes"]:
+            print(gateway.execute(command)[1])
   '';
 }

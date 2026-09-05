@@ -121,6 +121,21 @@ func decodeSubTLVs(b []byte) ([]SubTLV, error) {
 	return out, nil
 }
 
+// Only Update supports a mandatory extension (Source Prefix). All other
+// understood TLVs must reject unknown mandatory sub-TLVs, even in a stub.
+func decodeOptionalSubTLVs(b []byte) ([]SubTLV, error) {
+	subs, err := decodeSubTLVs(b)
+	if err != nil {
+		return nil, err
+	}
+	for _, sub := range subs {
+		if sub.Type >= 128 {
+			return nil, fmt.Errorf("babel: unsupported mandatory sub-TLV %d", sub.Type)
+		}
+	}
+	return subs, nil
+}
+
 func findSubTLV(subs []SubTLV, t uint8) ([]byte, bool) {
 	for _, s := range subs {
 		if s.Type == t {

@@ -8,9 +8,8 @@
 //
 // This package never touches the device's address or route configuration —
 // creating it and bringing it up is all it does. Assigning an address,
-// adding routes (e.g. a default route), and running any local routing daemon
-// that wants to peer with the embedded babel speaker are entirely up to
-// whoever runs this binary.
+// and adding kernel routes to the TUN are the operator's responsibility.
+// The embedded Babel speaker exchanges control traffic only inside ESP.
 package netstack
 
 import (
@@ -22,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/NickCao/ranet-lite/esp"
+	"github.com/NickCao/ranet-lite/internal/packet"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -273,35 +273,14 @@ func (b *outboundBatch) reset() {
 // packet — the route table needs both to support source-specific (SADR)
 // routes, not just the destination.
 func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
-	if len(raw) < 1 {
-		return netip.Addr{}, netip.Addr{}, 0, false
-	}
-	switch raw[0] >> 4 {
+	src, dst, version := packet.Addrs(raw)
+	switch version {
 	case 4:
-		if len(raw) < 20 {
-			return netip.Addr{}, netip.Addr{}, 0, false
-		}
-		headerLength := int(raw[0]&0x0f) * 4
-		totalLength := int(raw[2])<<8 | int(raw[3])
-		if headerLength < 20 || headerLength > len(raw) || totalLength < headerLength || totalLength != len(raw) {
-			return netip.Addr{}, netip.Addr{}, 0, false
-		}
-		s, sok := netip.AddrFromSlice(raw[12:16])
-		d, dok := netip.AddrFromSlice(raw[16:20])
-		return s, d, esp.NextHeaderIPv4, sok && dok
+		return src, dst, esp.NextHeaderIPv4, true
 	case 6:
-		if len(raw) < 40 {
-			return netip.Addr{}, netip.Addr{}, 0, false
-		}
-		payloadLength := int(raw[4])<<8 | int(raw[5])
-		if 40+payloadLength != len(raw) {
-			return netip.Addr{}, netip.Addr{}, 0, false
-		}
-		s, sok := netip.AddrFromSlice(raw[8:24])
-		d, dok := netip.AddrFromSlice(raw[24:40])
-		return s, d, esp.NextHeaderIPv6, sok && dok
+		return src, dst, esp.NextHeaderIPv6, true
 	default:
-		return netip.Addr{}, netip.Addr{}, 0, false
+		return src, dst, 0, false
 	}
 }
 
@@ -384,12 +363,11 @@ func (m *Mesh) startInboundWriters() {
 				}
 
 				pending = collectReadyInbound(first, queue, pending)
-				for len(pending) != 0 {
-					n := min(len(pending), inboundWriteBatchSize)
-					m.writeInbound(lane, copyInboundPackets(pending[:n]))
-					clear(pending[:n])
-					pending = pending[n:]
+				for offset := 0; offset < len(pending); offset += inboundWriteBatchSize {
+					end := min(offset+inboundWriteBatchSize, len(pending))
+					m.writeInbound(lane, copyInboundPackets(pending[offset:end]))
 				}
+				clear(pending)
 				pending = pending[:0]
 			}
 		}()

@@ -7,13 +7,8 @@ import (
 	"net/netip"
 )
 
-// SubTLVSourcePrefix carries a source prefix for source-specific routing
-// (draft-ietf-babel-source-specific, a.k.a. SADR — Source Address
-// Dependent Routing; real deployments send this from e.g. BIRD's "ipv6
-// sadr" tables). Its type is 128, the first mandatory sub-TLV value (RFC
-// 8966 §4.4: types 128-255 have the mandatory bit set), so an
-// implementation that doesn't recognize it MUST ignore the whole
-// enclosing TLV rather than silently treat it as an ordinary route.
+// SubTLVSourcePrefix is the mandatory Source Prefix sub-TLV (RFC 9079).
+// Unknown mandatory sub-TLVs invalidate the enclosing Update.
 const SubTLVSourcePrefix uint8 = 128
 
 const (
@@ -46,13 +41,8 @@ type Update struct {
 	// this is a flag on a fully-decoded Update rather than a decode error.
 	Ignore bool
 
-	// SourcePrefix is set when this Update carries a well-formed Source
-	// Prefix sub-TLV (source-specific routing). We don't implement a full
-	// source-and-destination-keyed route table; the special case we do
-	// support (see Speaker) is installing it as an ordinary route exactly
-	// when SourcePrefix covers our own outbound source address — i.e.
-	// "this route applies to traffic we'd actually originate" — and
-	// ignoring it otherwise.
+	// SourcePrefix identifies an independent SADR entry. The forwarding table
+	// matches the actual source of each packet, with destination precedence.
 	SourcePrefix netip.Prefix
 }
 
@@ -62,7 +52,7 @@ func EncodeUpdate(u Update) RawTLV {
 	total := prefixByteLen(u.Plen)
 	var raw []byte
 	switch u.AE {
-	case AEIPv4:
+	case AEIPv4, AEIPv4ViaIPv6:
 		raw = u.Prefix.To4()
 	case AEIPv6:
 		raw = u.Prefix.To16()
@@ -85,11 +75,15 @@ func EncodeUpdate(u Update) RawTLV {
 // requires: each Update's Omitted bytes refer to the previous prefix *of
 // the same address family sent within this packet*. Create one per
 // incoming packet, not one per neighbor.
+type prefixState struct {
+	last [16]byte
+	have bool
+}
+
 type PrefixDecoder struct {
-	lastV4 [4]byte
-	lastV6 [16]byte
-	haveV4 bool
-	haveV6 bool
+	// AE 1 and AE 4 have independent compression state, even though both
+	// encode IPv4 prefixes (RFC 9229 section 4.1).
+	prefixes [AEIPv4ViaIPv6 + 1]prefixState
 }
 
 func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
@@ -110,18 +104,18 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		if plen != 0 || omitted != 0 {
 			return Update{}, fmt.Errorf("babel: wildcard Update has a nonzero prefix length")
 		}
-	case AEIPv4:
+	case AEIPv4, AEIPv4ViaIPv6:
 		if plen > 32 {
 			return Update{}, fmt.Errorf("babel: IPv4 Update prefix length %d exceeds 32", plen)
 		}
-		if omitted > 0 && !d.haveV4 {
+		if omitted > 0 && !d.prefixes[ae].have {
 			return Update{}, fmt.Errorf("babel: compressed IPv4 Update has no default prefix")
 		}
 	case AEIPv6:
 		if plen > 128 {
 			return Update{}, fmt.Errorf("babel: IPv6 Update prefix length %d exceeds 128", plen)
 		}
-		if omitted > 0 && !d.haveV6 {
+		if omitted > 0 && !d.prefixes[ae].have {
 			return Update{}, fmt.Errorf("babel: compressed IPv6 Update has no default prefix")
 		}
 	default:
@@ -137,28 +131,21 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	}
 
 	var ip net.IP
-	switch ae {
-	case AEWildcard:
-		// A Wildcard-AE Update with Plen 0 is a "route retraction for all
-		// prefixes" marker in some implementations' keepalive behavior;
-		// we don't originate it, but tolerate it as an empty/no-op prefix.
+	if ae == AEWildcard {
 		ip = net.IPv4zero
-	case AEIPv4:
-		buf := make([]byte, 4)
-		copy(buf, d.lastV4[:omitted])
-		copy(buf[omitted:], sent[:sentLen])
-		clearPrefixTail(buf, plen)
-		if flags&updateFlagPrefix != 0 {
-			d.lastV4, d.haveV4 = [4]byte(buf), true
+	} else {
+		size := 16
+		if ae == AEIPv4 || ae == AEIPv4ViaIPv6 {
+			size = 4
 		}
-		ip = net.IPv4(buf[0], buf[1], buf[2], buf[3])
-	case AEIPv6:
-		buf := make([]byte, 16)
-		copy(buf, d.lastV6[:omitted])
+		buf := make([]byte, size)
+		copy(buf, d.prefixes[ae].last[:omitted])
 		copy(buf[omitted:], sent[:sentLen])
 		clearPrefixTail(buf, plen)
 		if flags&updateFlagPrefix != 0 {
-			d.lastV6, d.haveV6 = [16]byte(buf), true
+			clear(d.prefixes[ae].last[:])
+			copy(d.prefixes[ae].last[:], buf)
+			d.prefixes[ae].have = true
 		}
 		ip = net.IP(buf)
 	}
@@ -166,7 +153,7 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	u := Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}
 	if flags&updateFlagRouterID != 0 && ae != AEWildcard {
 		raw := ip.To16()
-		if ae == AEIPv4 {
+		if ae == AEIPv4 || ae == AEIPv4ViaIPv6 {
 			raw = ip.To4()
 		}
 		copy(u.RouterID[8-min(8, len(raw)):], raw[max(0, len(raw)-8):])
@@ -209,8 +196,8 @@ func clearPrefixTail(raw []byte, plen int) {
 	}
 }
 
-// decodeSourcePrefix parses a Source Prefix sub-TLV body (draft-ietf-babel
-// -source-specific §7.1): SourcePlen(1) + SourcePrefix bytes, ceil(plen/8)
+// decodeSourcePrefix parses an RFC 9079 Source Prefix sub-TLV:
+// SourcePlen(1) + SourcePrefix bytes, ceil(plen/8)
 // of them, uncompressed, interpreted under the enclosing TLV's AE.
 func decodeSourcePrefix(ae uint8, body []byte) (netip.Prefix, bool) {
 	if len(body) < 1 {
@@ -226,7 +213,7 @@ func decodeSourcePrefix(ae uint8, body []byte) (netip.Prefix, bool) {
 	}
 	raw := body[1 : 1+n]
 	switch ae {
-	case AEIPv4:
+	case AEIPv4, AEIPv4ViaIPv6:
 		if plen > 32 {
 			return netip.Prefix{}, false
 		}

@@ -91,10 +91,8 @@ func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
 	for time.Now().Before(deadline) {
 		speakerA.mu.Lock()
 		n := speakerA.neighbors["b"]
-		speakerA.mu.Unlock()
-		n.mu.Lock()
 		have := n.haveRTT
-		n.mu.Unlock()
+		speakerA.mu.Unlock()
 		if have {
 			return
 		}
@@ -103,16 +101,8 @@ func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
 	t.Fatal("A never measured RTT to B within the deadline")
 }
 
-// TestSpeakerIgnoresEchoedOwnPrefix guards against a real bug found during
-// BIRD interop: a peer that doesn't implement split horizon (BIRD doesn't,
-// at least over "type tunnel") re-sends our own originated prefix back to
-// us. Split horizon (RFC 8966 §3.7.4) only ever suppresses re-advertising
-// back out the *one* interface a route was learned on — it says nothing
-// about our own prefix looping back via a *different* peer after crossing
-// other nodes in an actual mesh, so the real guard has to be router-id
-// based, not "did this arrive on the peer I sent it to". This injects a
-// non-compliant Update tagged with our own router-id, exactly what BIRD
-// was observed sending on the wire.
+// A peer may reflect an originated route back to us across a mesh. A stub
+// must prefer its direct route, including when the reflected router ID is ours.
 func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 	meshA, _, speakerA, _ := wireSpeakerPair(t, Config{})
 
@@ -123,14 +113,12 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 	if n == nil {
 		t.Fatal("peer \"b\" not registered")
 	}
-	n.mu.Lock()
 	n.alive = true
 	n.lastHelloTime = time.Now()
 	n.helloInterval = time.Minute
 	n.haveReportedCost = true
 	n.reportedCost = 32
 	n.ihuExpiry = time.Now().Add(time.Minute)
-	n.mu.Unlock()
 	pkt := buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
 		EncodeRouterID(speakerA.cfg.RouterID), // as if reflected back via another mesh node
 		EncodeUpdate(Update{AE: AEIPv6, Plen: mine.Bits(), Seqno: 1, Metric: 32, Prefix: net.IP(mine.Addr().AsSlice())}),
@@ -143,7 +131,7 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 }
 
 // sourceSpecificUpdateTLV hand-builds an Update TLV with a trailing Source
-// Prefix sub-TLV (draft-ietf-babel-source-specific §7.1) — EncodeUpdate
+// Prefix sub-TLV (RFC 9079 section 5.1) — EncodeUpdate
 // doesn't support this (we never originate source-specific routes), so
 // tests exercising receive-side handling build the bytes directly, same
 // as tlv_test.go's TestUpdateWithSourcePrefix.
@@ -173,14 +161,12 @@ func sourceSpecificUpdateTLV(dest netip.Prefix, source netip.Prefix, metric uint
 }
 
 func makeNeighborReachable(n *neighborState) {
-	n.mu.Lock()
 	n.alive = true
 	n.lastHelloTime = time.Now()
 	n.helloInterval = time.Minute
 	n.haveReportedCost = true
 	n.reportedCost = 32
 	n.ihuExpiry = time.Now().Add(time.Minute)
-	n.mu.Unlock()
 }
 
 // TestSpeakerSADR covers genuine source-specific (SADR) route handling:
@@ -284,8 +270,8 @@ func TestPeerHandleRemovesExactNeighborAndRoutes(t *testing.T) {
 	n := speaker.neighbors[peer.ID]
 	dest := netip.MustParsePrefix("10.88.0.0/16")
 	key := routeKey{dest: dest}
-	_, selected := speaker.routes.update(n, key, [8]byte{1}, 1, 1, time.Minute)
-	speaker.installRoute(key, selected)
+	makeNeighborReachable(n)
+	speaker.routes.update(n, key, 1, time.Minute, time.Now())
 
 	handle.Close()
 	handle.Close()
@@ -318,8 +304,7 @@ func TestWildcardUpdateRetractsEveryRouteFromNeighbor(t *testing.T) {
 	makeNeighborReachable(neighbor)
 	for _, dest := range []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("10.2.0.0/16")} {
 		key := routeKey{dest: dest}
-		_, selected := speaker.routes.update(neighbor, key, [8]byte{1}, 1, 1, time.Minute)
-		speaker.installRoute(key, selected)
+		speaker.routes.update(neighbor, key, 1, time.Minute, time.Now())
 	}
 	body := []byte{AEWildcard, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{{Type: TLVUpdate, Body: body}}))
@@ -343,7 +328,7 @@ func TestAcknowledgmentUsesUnicastDestination(t *testing.T) {
 	defer handle.Close()
 	neighbor := speaker.neighbors[peer.ID]
 	destination := netip.MustParseAddr("fe80::2")
-	neighbor.learnAddr(destination)
+	neighbor.addr = destination
 	speaker.sendTo(neighbor, destination, []RawTLV{EncodeAck(1)})
 	got, ok := netip.AddrFromSlice(sent[24:40])
 	if !ok || got != destination {
@@ -365,20 +350,16 @@ func captureSpeaker(t *testing.T, cfg Config) (*Speaker, *neighborState, *[][]by
 	})
 	speaker.AddPeer(peer)
 	neighbor := speaker.neighbors[peer.ID]
-	neighbor.learnAddr(netip.MustParseAddr("fe80::2"))
+	neighbor.addr = netip.MustParseAddr("fe80::2")
 	return speaker, neighbor, packets
 }
 
 func TestUnscheduledAndUnicastHelloState(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 1, Interval: 100})}))
-	neighbor.mu.Lock()
 	deadline := neighbor.lastHelloTime.Add(deadTimeout(neighbor.helloInterval))
-	neighbor.mu.Unlock()
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 2, Interval: 0})}))
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 3, Interval: 200, Unicast: true})}))
-	neighbor.mu.Lock()
-	defer neighbor.mu.Unlock()
 	if got := neighbor.lastHelloTime.Add(deadTimeout(neighbor.helloInterval)); !got.Equal(deadline) {
 		t.Fatalf("unscheduled Hello moved deadline from %v to %v", deadline, got)
 	}
@@ -390,18 +371,13 @@ func TestUnscheduledAndUnicastHelloState(t *testing.T) {
 func TestIHUAddressAndRTTOrder(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	now := nowMicros()
-	neighbor.mu.Lock()
-	neighbor.ourHelloTxTS, neighbor.haveOurHello = now-10_000, true
-	neighbor.mu.Unlock()
 	// First, an explicitly addressed IHU for another interface is ignored.
 	body := make([]byte, 22)
 	body[0] = AEIPv6
 	body[2], body[3], body[4], body[5] = 0, 77, 0, 100
 	copy(body[6:], net.ParseIP("fe80::dead").To16())
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{{Type: TLVIHU, Body: body}}))
-	neighbor.mu.Lock()
 	haveCost := neighbor.haveReportedCost
-	neighbor.mu.Unlock()
 	if haveCost {
 		t.Fatal("accepted IHU addressed to a different local interface")
 	}
@@ -410,9 +386,7 @@ func TestIHUAddressAndRTTOrder(t *testing.T) {
 	ihu := EncodeIHU(IHU{RxCost: 64, Interval: 100, OriginTS: now - 10_000, ReceiveTS: 1_000, HasTS: true})
 	hello := EncodeHello(Hello{Seqno: 1, Interval: 100, TxTS: 1_500, HasTS: true})
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{ihu, hello}))
-	neighbor.mu.Lock()
 	haveRTT := neighbor.haveRTT
-	neighbor.mu.Unlock()
 	if !haveRTT {
 		t.Fatal("IHU-before-Hello packet did not produce an RTT sample")
 	}

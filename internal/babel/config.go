@@ -1,0 +1,64 @@
+package babel
+
+import (
+	"crypto/rand"
+	"fmt"
+	"net/netip"
+	"time"
+
+	"github.com/NickCao/ranet-lite/internal/netstack"
+)
+
+// Config controls the point-to-point stub speaker. Zero fields use defaults.
+type Config struct {
+	RouterID       [8]byte
+	LinkLocalAddr  netip.Addr
+	HelloInterval  time.Duration
+	UpdateInterval time.Duration
+	Cost           CostParams
+	// Maximum Babel UDP payload, including its four-byte protocol header.
+	PacketSize int
+}
+
+const maxInterval = 65535 * 10 * time.Millisecond
+
+func (c *Config) setDefaults() {
+	if c.HelloInterval == 0 {
+		c.HelloInterval = 20 * time.Second
+	}
+	if c.UpdateInterval == 0 {
+		// Cap before multiplying, including for invalid very large inputs.
+		c.UpdateInterval = 4 * min(c.HelloInterval, maxInterval/4)
+	}
+	if c.Cost == (CostParams{}) {
+		c.Cost = DefaultCostParams()
+	}
+	if c.PacketSize == 0 {
+		c.PacketSize = netstack.DefaultMTU - ipv6HeaderLen - udpHeaderLen
+	}
+}
+
+// Validate checks the effective configuration, including default intervals.
+func (c Config) Validate() error {
+	c.setDefaults()
+	for _, interval := range []time.Duration{c.HelloInterval, c.UpdateInterval} {
+		if interval < 10*time.Millisecond || interval > maxInterval {
+			return fmt.Errorf("babel: intervals must be between 10ms and %s", maxInterval)
+		}
+	}
+	if c.LinkLocalAddr.IsValid() && (!c.LinkLocalAddr.Is6() || !c.LinkLocalAddr.IsLinkLocalUnicast() || c.LinkLocalAddr.Zone() != "") {
+		return fmt.Errorf("babel: local address must be an unzoned IPv6 link-local address")
+	}
+	// A full IPv6 Update with its Router-Id must fit in one packet.
+	if c.PacketSize < 44 || c.PacketSize > 65535-udpHeaderLen {
+		return fmt.Errorf("babel: packet size must be between 44 and %d", 65535-udpHeaderLen)
+	}
+	return nil
+}
+
+func randomLinkLocal() netip.Addr {
+	var b [16]byte
+	b[0], b[1] = 0xfe, 0x80
+	rand.Read(b[8:])
+	return netip.AddrFrom16(b)
+}

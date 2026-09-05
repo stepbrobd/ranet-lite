@@ -2,16 +2,26 @@
 package sadr
 
 import (
+	"encoding/binary"
+	"iter"
 	"math/bits"
 	"net/netip"
+	"slices"
 	"sync"
+	"sync/atomic"
 )
 
-// Table maps source and destination prefix pairs to values. Lookup resolves
-// the longest matching destination first, then the longest matching source
-// only among entries at that destination prefix.
+// Table resolves the longest matching destination, then the longest matching
+// source at that destination. Its zero value is ready to use.
+//
+// Writers copy only the changed trie path and publish a new immutable root.
+// Lookups and iteration use one snapshot without locks or shared counters.
 type Table[V comparable] struct {
-	mu   sync.RWMutex
+	mu    sync.Mutex
+	roots atomic.Pointer[roots[V]]
+}
+
+type roots[V comparable] struct {
 	ipv4 *trieNode[V]
 	ipv6 *trieNode[V]
 }
@@ -22,244 +32,246 @@ type srcEntry[V comparable] struct {
 }
 
 type trieNode[V comparable] struct {
-	srcs       []srcEntry[V]
-	child      [2]*trieNode[V]
-	parent     *trieNode[V]
-	parentBit  byte
-	cidr       uint8
-	bitAtByte  uint8
-	bitAtShift uint8
-	bits       []byte
+	// Only the first prefixLen bits of address are significant. IPv4 uses
+	// its mapped 128-bit representation, with lengths from 96 through 128.
+	address   [16]byte
+	prefixLen uint8
+	byteIndex uint8 // cached branch position; fits in the node's padding
+	bitShift  uint8
+	srcs      []srcEntry[V]
+	child     [2]*trieNode[V]
 }
 
-func commonBits(a, b []byte) uint8 {
-	for i := range a {
-		if a[i] != b[i] {
-			return uint8(i)*8 + uint8(bits.LeadingZeros8(a[i]^b[i]))
+// Route is one canonical source/destination entry. An invalid Source matches
+// every source address.
+type Route[V comparable] struct {
+	Source      netip.Prefix
+	Destination netip.Prefix
+	Value       V
+}
+
+func branch(address [16]byte, bit uint8) int {
+	return int(address[bit/8] >> (7 - bit%8) & 1)
+}
+
+func newTrieNode[V comparable](address [16]byte, prefixLen uint8, srcs []srcEntry[V]) *trieNode[V] {
+	return &trieNode[V]{address: address, prefixLen: prefixLen,
+		byteIndex: prefixLen / 8, bitShift: 7 - prefixLen%8, srcs: srcs}
+}
+
+func commonBits(a, b [16]byte) uint8 {
+	common := bits.LeadingZeros64(binary.BigEndian.Uint64(a[:8]) ^ binary.BigEndian.Uint64(b[:8]))
+	if common == 64 {
+		common += bits.LeadingZeros64(binary.BigEndian.Uint64(a[8:]) ^ binary.BigEndian.Uint64(b[8:]))
+	}
+	return uint8(common)
+}
+
+// Lookup needs only a prefix comparison, not the full common-prefix length
+// used by insertion. Convert the packet address to words once per lookup.
+func (n *trieNode[V]) matches(hi, lo uint64) bool {
+	highDiff := binary.BigEndian.Uint64(n.address[:8]) ^ hi
+	if n.prefixLen <= 64 {
+		return highDiff>>(64-n.prefixLen) == 0
+	}
+	return highDiff == 0 && (binary.BigEndian.Uint64(n.address[8:])^lo)>>(128-n.prefixLen) == 0
+}
+
+// edit returns a new path; published nodes and source slices are never mutated.
+func edit[V comparable](n *trieNode[V], address [16]byte, prefixLen uint8, change func([]srcEntry[V]) []srcEntry[V]) *trieNode[V] {
+	if n == nil {
+		srcs := change(nil)
+		if len(srcs) == 0 {
+			return nil
 		}
+		return newTrieNode(address, prefixLen, srcs)
 	}
-	return uint8(len(a)) * 8
+	common := min(commonBits(n.address, address), n.prefixLen, prefixLen)
+	if common < n.prefixLen {
+		srcs := change(nil)
+		if len(srcs) == 0 {
+			return n // removing an absent destination
+		}
+		parent := newTrieNode[V](address, common, nil)
+		parent.child[branch(n.address, common)] = n
+		if common == prefixLen {
+			parent.srcs = srcs
+		} else {
+			parent.child[branch(address, common)] = newTrieNode(address, prefixLen, srcs)
+		}
+		return parent
+	}
+	copy := *n
+	if n.prefixLen == prefixLen {
+		copy.srcs = change(n.srcs)
+	} else {
+		bit := branch(address, n.prefixLen)
+		copy.child[bit] = edit(n.child[bit], address, prefixLen, change)
+	}
+	return compact(&copy)
 }
 
-func (n *trieNode[V]) choose(ip []byte) byte {
-	return (ip[n.bitAtByte] >> n.bitAtShift) & 1
-}
-
-func newTrieNode[V comparable](ip []byte, cidr uint8) *trieNode[V] {
-	n := &trieNode[V]{
-		bits:       append([]byte(nil), ip...),
-		cidr:       cidr,
-		bitAtByte:  cidr / 8,
-		bitAtShift: 7 - cidr%8,
-	}
-	for i := range n.bits {
-		bitOffset := i * 8
-		switch {
-		case bitOffset >= int(cidr):
-			n.bits[i] = 0
-		case bitOffset+8 > int(cidr):
-			n.bits[i] &= ^byte(0) << (8 - (int(cidr) - bitOffset))
+func compact[V comparable](n *trieNode[V]) *trieNode[V] {
+	if len(n.srcs) == 0 {
+		if n.child[0] == nil {
+			return n.child[1]
+		}
+		if n.child[1] == nil {
+			return n.child[0]
 		}
 	}
 	return n
 }
 
-func (n *trieNode[V]) nodePlacement(ip []byte, cidr uint8) (parent *trieNode[V], exact bool) {
-	for n != nil && n.cidr <= cidr && commonBits(n.bits, ip) >= n.cidr {
-		parent = n
-		if parent.cidr == cidr {
-			return parent, true
-		}
-		n = n.child[n.choose(ip)]
-	}
-	return parent, false
+func validPrefixes(src, dst netip.Prefix) bool {
+	return dst.IsValid() && (!src.IsValid() || src.Addr().BitLen() == dst.Addr().BitLen())
 }
 
-func attach[V comparable](root **trieNode[V], parent, node *trieNode[V]) {
-	if parent == nil {
-		node.parent = nil
-		*root = node
+func (t *Table[V]) change(src, dst netip.Prefix, fn func([]srcEntry[V]) []srcEntry[V]) {
+	if !validPrefixes(src, dst) {
 		return
 	}
-	bit := parent.choose(node.bits)
-	node.parent, node.parentBit = parent, bit
-	parent.child[bit] = node
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var next roots[V]
+	if current := t.roots.Load(); current != nil {
+		next = *current
+	}
+	root := &next.ipv6
+	prefixLen := uint8(dst.Bits())
+	if dst.Addr().Is4() {
+		root = &next.ipv4
+		prefixLen += 96
+	}
+	*root = edit(*root, dst.Addr().As16(), prefixLen, fn)
+	t.roots.Store(&next)
 }
 
-func insertDest[V comparable](root **trieNode[V], ip []byte, cidr uint8) *trieNode[V] {
-	if *root == nil {
-		*root = newTrieNode[V](ip, cidr)
-		return *root
-	}
-	parent, exact := (*root).nodePlacement(ip, cidr)
-	if exact {
-		return parent
-	}
-	newNode := newTrieNode[V](ip, cidr)
-	var down *trieNode[V]
-	if parent == nil {
-		down = *root
-	} else {
-		bit := parent.choose(ip)
-		down = parent.child[bit]
-		if down == nil {
-			newNode.parent, newNode.parentBit = parent, bit
-			parent.child[bit] = newNode
-			return newNode
-		}
-	}
-	branchCidr := cidr
-	if common := commonBits(down.bits, ip); common < branchCidr {
-		branchCidr = common
-	}
-	if newNode.cidr == branchCidr {
-		bit := newNode.choose(down.bits)
-		down.parent, down.parentBit = newNode, bit
-		newNode.child[bit] = down
-		attach(root, parent, newNode)
-		return newNode
-	}
-	branch := newTrieNode[V](newNode.bits, branchCidr)
-	bit := branch.choose(down.bits)
-	down.parent, down.parentBit = branch, bit
-	branch.child[bit] = down
-	bit = branch.choose(newNode.bits)
-	newNode.parent, newNode.parentBit = branch, bit
-	branch.child[bit] = newNode
-	attach(root, parent, branch)
-	return newNode
-}
-
-func removeNode[V comparable](root **trieNode[V], n *trieNode[V]) {
-	if len(n.srcs) > 0 || (n.child[0] != nil && n.child[1] != nil) {
-		return
-	}
-	child := n.child[0]
-	if child == nil {
-		child = n.child[1]
-	}
-	if child != nil {
-		child.parent, child.parentBit = n.parent, n.parentBit
-	}
-	if n.parent == nil {
-		*root = child
-		return
-	}
-	n.parent.child[n.parentBit] = child
-	removeNode(root, n.parent)
-}
-
-func lookupApplicable[V comparable](root *trieNode[V], dst []byte, src netip.Addr) *srcEntry[V] {
-	var found *srcEntry[V]
-	for n := root; n != nil && commonBits(n.bits, dst) >= n.cidr; n = n.child[n.choose(dst)] {
-		var best *srcEntry[V]
-		for i := range n.srcs {
-			entry := &n.srcs[i]
-			if entry.src.IsValid() && !entry.src.Contains(src) {
-				continue
-			}
-			if best == nil || sourceBits(entry.src) > sourceBits(best.src) {
-				best = entry
-			}
-		}
-		if best != nil {
-			found = best
-		}
-		if n.bitAtByte == uint8(len(dst)) {
-			break
-		}
-	}
-	return found
-}
-
-func (t *Table[V]) rootFor(p netip.Prefix) **trieNode[V] {
-	if p.Addr().Is4() {
-		return &t.ipv4
-	}
-	return &t.ipv6
-}
-
-// Set installs or replaces the value for (src, dst). An invalid src matches
-// every source address.
+// Set installs or replaces an entry. Prefixes are masked before comparison.
+// Invalid destinations or source/destination family mismatches are ignored.
 func (t *Table[V]) Set(src, dst netip.Prefix, value V) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	node := insertDest(t.rootFor(dst), dst.Addr().AsSlice(), uint8(dst.Bits()))
-	for i := range node.srcs {
-		if node.srcs[i].src == src {
-			node.srcs[i].value = value
-			return
+	src = src.Masked()
+	t.change(src, dst, func(entries []srcEntry[V]) []srcEntry[V] {
+		next := slices.Clone(entries)
+		for i := range next {
+			if next[i].src == src {
+				next[i].value = value
+				return next
+			}
 		}
-	}
-	node.srcs = append(node.srcs, srcEntry[V]{src: src, value: value})
+		return append(next, srcEntry[V]{src: src, value: value})
+	})
 }
 
-// Remove deletes the value for (src, dst), if present.
+// Remove deletes an entry, accepting canonical or unmasked prefixes.
 func (t *Table[V]) Remove(src, dst netip.Prefix) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	root := t.rootFor(dst)
-	node, exact := (*root).nodePlacement(dst.Addr().AsSlice(), uint8(dst.Bits()))
-	if !exact {
-		return
-	}
-	for i := range node.srcs {
-		if node.srcs[i].src == src {
-			node.srcs = append(node.srcs[:i], node.srcs[i+1:]...)
-			removeNode(root, node)
-			return
+	src = src.Masked()
+	t.change(src, dst, func(entries []srcEntry[V]) []srcEntry[V] {
+		for i, entry := range entries {
+			if entry.src == src {
+				next := make([]srcEntry[V], 0, len(entries)-1)
+				next = append(next, entries[:i]...)
+				return append(next, entries[i+1:]...)
+			}
 		}
-	}
+		return entries
+	})
 }
 
-// RemoveValue deletes every route whose value equals value.
+// RemoveValue atomically removes all routes with the given value.
 func (t *Table[V]) RemoveValue(value V) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	removeValueFromTrie(&t.ipv4, t.ipv4, value)
-	removeValueFromTrie(&t.ipv6, t.ipv6, value)
-}
-
-func removeValueFromTrie[V comparable](root **trieNode[V], n *trieNode[V], value V) {
-	if n == nil {
+	current := t.roots.Load()
+	if current == nil {
 		return
 	}
-	removeValueFromTrie(root, n.child[0], value)
-	removeValueFromTrie(root, n.child[1], value)
-	kept := n.srcs[:0]
-	changed := false
-	for _, entry := range n.srcs {
-		if entry.value == value {
-			changed = true
-			continue
+	t.roots.Store(&roots[V]{
+		ipv4: removeValue(current.ipv4, value),
+		ipv6: removeValue(current.ipv6, value),
+	})
+}
+
+func removeValue[V comparable](n *trieNode[V], value V) *trieNode[V] {
+	if n == nil {
+		return nil
+	}
+	left, right := removeValue(n.child[0], value), removeValue(n.child[1], value)
+	match := slices.ContainsFunc(n.srcs, func(entry srcEntry[V]) bool { return entry.value == value })
+	if !match && left == n.child[0] && right == n.child[1] {
+		return n
+	}
+	copy := *n
+	copy.child = [2]*trieNode[V]{left, right}
+	if match {
+		copy.srcs = make([]srcEntry[V], 0, len(n.srcs))
+		for _, entry := range n.srcs {
+			if entry.value != value {
+				copy.srcs = append(copy.srcs, entry)
+			}
 		}
-		kept = append(kept, entry)
 	}
-	if changed {
-		n.srcs = kept
-		removeNode(root, n)
-	}
+	return compact(&copy)
 }
 
-// Lookup returns the value for traffic from src to dst.
 func (t *Table[V]) Lookup(src, dst netip.Addr) (V, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	var zero V
-	root := t.ipv6
+	var result V
+	current := t.roots.Load()
+	if current == nil || !dst.IsValid() {
+		return result, false
+	}
+	n := current.ipv6
 	if dst.Is4() {
-		root = t.ipv4
+		n = current.ipv4
 	}
-	best := lookupApplicable(root, dst.AsSlice(), src)
-	if best == nil {
-		return zero, false
+	found := false
+	address := dst.As16()
+	hi, lo := binary.BigEndian.Uint64(address[:8]), binary.BigEndian.Uint64(address[8:])
+	for n != nil && n.matches(hi, lo) {
+		bestBits := -2
+		for _, entry := range n.srcs {
+			if entry.src.IsValid() && !entry.src.Contains(src) {
+				continue
+			}
+			if entry.src.Bits() > bestBits {
+				result, found, bestBits = entry.value, true, entry.src.Bits()
+			}
+		}
+		if n.prefixLen == 128 {
+			break
+		}
+		n = n.child[(address[n.byteIndex]>>n.bitShift)&1]
 	}
-	return best.value, true
+	return result, found
 }
 
-func sourceBits(p netip.Prefix) int {
-	if !p.IsValid() {
-		return -1
+// All captures a consistent snapshot at the call. The caller may modify the
+// table while iterating; those modifications do not change the snapshot.
+func (t *Table[V]) All() iter.Seq[Route[V]] {
+	snapshot := t.roots.Load()
+	return func(yield func(Route[V]) bool) {
+		if snapshot == nil {
+			return
+		}
+		var walk func(*trieNode[V], bool) bool
+		walk = func(n *trieNode[V], ipv4 bool) bool {
+			if n == nil {
+				return true
+			}
+			address, prefixLen := netip.AddrFrom16(n.address), int(n.prefixLen)
+			if ipv4 {
+				address, prefixLen = address.Unmap(), prefixLen-96
+			}
+			prefix := netip.PrefixFrom(address, prefixLen).Masked()
+			for _, entry := range n.srcs {
+				if !yield(Route[V]{Source: entry.src, Destination: prefix, Value: entry.value}) {
+					return false
+				}
+			}
+			return walk(n.child[0], ipv4) && walk(n.child[1], ipv4)
+		}
+		if walk(snapshot.ipv4, true) {
+			walk(snapshot.ipv6, false)
+		}
 	}
-	return p.Bits()
 }

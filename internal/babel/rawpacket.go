@@ -6,13 +6,8 @@ import (
 	"net/netip"
 )
 
-// Babel runs entirely over multicast in this design, and every peer is its
-// own point-to-point ESP tunnel — there's no shared L2 segment for gvisor's
-// generic IP routing to make sense of "send multicast through peer P".
-// So Speaker doesn't use the mesh's netstack for its own wire I/O at all:
-// it hand-builds/parses minimal IPv6+UDP packets and hands them directly
-// to/from each netstack.Peer's send function and ESP receive loop. Only
-// the *routes it learns* go into the shared netstack.RouteTable.
+// Babel multicast and unicast packets travel directly through each peer's
+// ESP tunnel. Only learned routes are installed in the TUN forwarding table.
 
 const (
 	nextHeaderUDP = 17
@@ -40,6 +35,14 @@ func buildPacket(src, dst netip.Addr, payload []byte) []byte {
 	copy(udp[8:], payload)
 	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(src, dst, udp))
 	return b
+}
+
+// isBabelPacket keeps ordinary IP traffic off the control parser without
+// allocations, checksum work, or a protocol-state lock. It is only a filter;
+// parsePacket performs full validation before any control state is changed.
+func isBabelPacket(raw []byte) bool {
+	return len(raw) >= ipv6HeaderLen+udpHeaderLen && raw[0]>>4 == 6 &&
+		raw[6] == nextHeaderUDP && binary.BigEndian.Uint16(raw[42:44]) == Port
 }
 
 // parsePacket extracts the Babel payload and source address from a raw
@@ -85,9 +88,9 @@ func parsePacket(raw []byte, localAddr netip.Addr) (src netip.Addr, payload []by
 	if receivedChecksum == 0 {
 		return netip.Addr{}, nil, fmt.Errorf("babel: missing IPv6 UDP checksum")
 	}
-	checksumInput := append([]byte(nil), udp...)
-	checksumInput[6], checksumInput[7] = 0, 0
-	if udpChecksum(srcAddr, dstAddr, checksumInput) != receivedChecksum {
+	// Including a valid checksum folds to all ones. No packet copy or
+	// mutation is needed to validate it.
+	if udpChecksum(srcAddr, dstAddr, udp) != 0xffff {
 		return netip.Addr{}, nil, fmt.Errorf("babel: invalid UDP checksum")
 	}
 	return srcAddr, udp[udpHeaderLen:udpLen], nil
@@ -114,7 +117,7 @@ func udpChecksum(src, dst netip.Addr, udp []byte) uint16 {
 	var nextHdr [4]byte
 	nextHdr[3] = nextHeaderUDP
 	add(nextHdr[:])
-	add(udp) // checksum field is zero at this point, contributes 0
+	add(udp) // includes the checksum when validating a received packet
 
 	for sum>>16 != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)

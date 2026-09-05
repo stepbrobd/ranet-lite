@@ -33,16 +33,22 @@ func decodeRequestPrefix(ae uint8, plen int, raw []byte, out RouteRequest) (Rout
 		if plen != 0 {
 			return RouteRequest{}, fmt.Errorf("babel: wildcard request has nonzero prefix length")
 		}
+		if _, err := decodeOptionalSubTLVs(raw); err != nil {
+			return RouteRequest{}, err
+		}
 		return out, nil
 	}
 	bits := 128
-	if ae == AEIPv4 {
+	if ae == AEIPv4 || ae == AEIPv4ViaIPv6 {
 		bits = 32
 	} else if ae != AEIPv6 {
 		return RouteRequest{}, fmt.Errorf("babel: request has unsupported AE %d", ae)
 	}
 	if plen > bits || len(raw) < prefixByteLen(plen) {
 		return RouteRequest{}, fmt.Errorf("babel: malformed request prefix")
+	}
+	if _, err := decodeOptionalSubTLVs(raw[prefixByteLen(plen):]); err != nil {
+		return RouteRequest{}, err
 	}
 	buf := make([]byte, bits/8)
 	copy(buf, raw[:prefixByteLen(plen)])
