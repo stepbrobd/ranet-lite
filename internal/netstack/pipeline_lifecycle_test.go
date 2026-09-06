@@ -1,6 +1,7 @@
 package netstack
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
@@ -14,7 +15,13 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 	var releaseOnce, firstOnce sync.Once
 	secondReserved := make(chan struct{}, 2)
 	transmitted := make(chan struct{}, 4)
-	sealer := func(raw [][]byte, _ []byte) ([][]byte, error) { return raw, nil }
+	sealer := func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) {
+		sealed := make([][]byte, len(raw))
+		for i := range raw {
+			sealed[i] = bytes.Clone(raw[i])
+		}
+		return sealed, nil
+	}
 	send := func(packets [][]byte) error {
 		for range packets {
 			transmitted <- struct{}{}
@@ -67,7 +74,7 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 
 func TestMeshCloseCancelsReservationsAndDrainsQueuedTickets(t *testing.T) {
 	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
-		return func(raw [][]byte, _ []byte) ([][]byte, error) { return raw, nil }, nil
+		return func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) { return [][]byte{bytes.Clone(raw[0])}, nil }, nil
 	}, func([][]byte) error { return nil })
 	defer peer.Close()
 	// Keep the sender waiting on its first ticket, filling every reservation

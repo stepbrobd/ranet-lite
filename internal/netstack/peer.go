@@ -25,6 +25,7 @@ type Peer struct {
 	stop       chan struct{}
 	senderDone chan struct{}
 	closeOnce  sync.Once
+	sealedPool sync.Pool // *[][]byte, returned only after the transport finishes
 
 	// Compatibility peers allocate their sequence number during encryption,
 	// so their complete encrypt/send operation remains synchronously ordered.
@@ -35,8 +36,10 @@ type Peer struct {
 
 // BatchSealer consumes a sequence range previously reserved from one outbound
 // SA. It returns packet slices backed by one packed allocation so the transport
-// can hand them to UDP GSO without another copy.
-type BatchSealer func(raw [][]byte, nextHeaders []byte) ([][]byte, error)
+// can hand them to UDP GSO without another copy. reuse is a previous result
+// whose transport has finished; the sealer may overwrite it or replace it.
+// Output must not alias raw, whose TUN buffers are recycled after encryption.
+type BatchSealer func(raw [][]byte, nextHeaders []byte, reuse [][]byte) ([][]byte, error)
 
 func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitFn func(sealed []byte) error) *Peer {
 	return NewPeerBatched(id, encryptFn, func(sealed [][]byte) error {
@@ -59,6 +62,7 @@ func NewPeerBatched(id string, encryptFn func(raw []byte, nextHeader byte) ([]by
 // NewPeerReserved constructs a peer whose expensive encryption can run in
 // parallel. reserveFn is called in packet-intake order and must return a sealer
 // owning count consecutive sequence numbers from the current outbound SA.
+// transmitBatchFn must finish using every packet before returning.
 func NewPeerReserved(id string, reserveFn func(count int) (BatchSealer, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
 	return newPeer(id, nil, reserveFn, transmitBatchFn)
 }
@@ -104,6 +108,7 @@ type peerBatch struct {
 	reserved  bool
 	sealer    BatchSealer
 	sealed    [][]byte
+	storage   *[][]byte
 	raw       [][]byte
 	headers   []byte
 	encrypted bool
@@ -158,7 +163,11 @@ func (b *peerBatch) encrypt() {
 	}
 	b.encrypted = true
 	if b.reserved {
-		b.sealed, b.err = b.sealer(b.raw, b.headers)
+		b.storage, _ = b.peer.sealedPool.Get().(*[][]byte)
+		if b.storage == nil {
+			b.storage = new([][]byte)
+		}
+		b.sealed, b.err = b.sealer(b.raw, b.headers, *b.storage)
 		return
 	}
 	for i, raw := range b.raw {
@@ -188,6 +197,7 @@ func (b *peerBatch) enqueue() error {
 	case p.completed <- b:
 		return nil
 	case <-p.stop:
+		b.releaseStorage()
 		b.releaseSlot()
 		return fmt.Errorf("netstack: peer %s closed", p.ID)
 	}
@@ -243,6 +253,14 @@ func (b *peerBatch) releaseSlot() {
 	}
 }
 
+func (b *peerBatch) releaseStorage() {
+	if b.storage != nil {
+		*b.storage = b.sealed
+		b.peer.sealedPool.Put(b.storage)
+		b.storage, b.sealed = nil, nil
+	}
+}
+
 func (p *Peer) senderLoop() {
 	defer close(p.senderDone)
 	pending := make(map[uint64]*peerBatch, cap(p.completed))
@@ -287,6 +305,7 @@ func (p *Peer) senderLoop() {
 			if b.err == nil {
 				b.err = sendErr
 			}
+			b.releaseStorage()
 			b.releaseSlot()
 			if b.done != nil {
 				b.done <- b.err

@@ -54,7 +54,7 @@ func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T
 		first := nextSequence
 		nextSequence += byte(count)
 		next := first
-		return func(raw [][]byte, _ []byte) ([][]byte, error) {
+		return func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) {
 			sealed := make([][]byte, 0, len(raw))
 			for _, packet := range raw {
 				started <- packet[0]
@@ -138,7 +138,7 @@ func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
 	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
 		sequence := nextSequence
 		nextSequence++
-		return func([][]byte, []byte) ([][]byte, error) { return [][]byte{{sequence}}, nil }, nil
+		return func([][]byte, []byte, [][]byte) ([][]byte, error) { return [][]byte{{sequence}}, nil }, nil
 	}, func(sealed [][]byte) error {
 		if sealed[0][0] == 1 {
 			close(startedSend)

@@ -187,6 +187,15 @@ func (r *SequenceRange) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, err
 // allocation. Besides reducing allocator traffic, the adjacent packet slices
 // let the UDP transport use GSO without first repacking the ciphertext.
 func (r *SequenceRange) SealBatch(innerIPPackets [][]byte, nextHeaders []byte) ([][]byte, error) {
+	return r.SealBatchInto(innerIPPackets, nextHeaders, nil)
+}
+
+// SealBatchInto is SealBatch with reusable output storage. reuse must be nil
+// or the complete result of an earlier SealBatch/SealBatchInto call. The caller
+// must exclusively own that result: its previous consumer must have finished,
+// and the plaintext must not alias it. The returned vector and its backing
+// storage replace reuse, including when a larger batch requires growth.
+func (r *SequenceRange) SealBatchInto(innerIPPackets [][]byte, nextHeaders []byte, reuse [][]byte) ([][]byte, error) {
 	if r == nil || r.sa == nil || len(innerIPPackets) != len(nextHeaders) {
 		return nil, fmt.Errorf("esp: invalid sequence batch")
 	}
@@ -198,14 +207,30 @@ func (r *SequenceRange) SealBatch(innerIPPackets [][]byte, nextHeaders []byte) (
 		total += r.sa.sealedLen(len(packet))
 	}
 	nonceLen := r.sa.aead.NonceSize()
-	storage := make([]byte, nonceLen, nonceLen+total)
-	nonce := storage[:nonceLen]
-	sealed := make([][]byte, 0, len(innerIPPackets))
+	var storage []byte
+	if len(reuse) != 0 {
+		storage = reuse[0][:0]
+	}
+	if cap(storage) < total+nonceLen {
+		storage = make([]byte, 0, total+nonceLen)
+	}
+	// Keep the escaping nonce after the packets, so the first packet retains
+	// the allocation's full capacity when this batch is recycled.
+	nonce := storage[total : total+nonceLen]
+	sealed := reuse
+	if cap(sealed) < len(innerIPPackets) {
+		sealed = make([][]byte, len(innerIPPackets))
+	} else {
+		sealed = sealed[:len(innerIPPackets)]
+	}
+	if len(reuse) > len(sealed) {
+		clear(reuse[len(sealed):])
+	}
 	for i, packet := range innerIPPackets {
 		start := len(storage)
 		storage = r.sa.appendSealed(storage, nonce, packet, nextHeaders[i], r.next)
 		r.next++
-		sealed = append(sealed, storage[start:])
+		sealed[i] = storage[start:]
 	}
 	return sealed, nil
 }

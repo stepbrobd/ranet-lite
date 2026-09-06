@@ -59,7 +59,7 @@ func TestTunnelRekeyPreservesInflightKeys(t *testing.T) {
 		t.Fatal("duplicate SPI installation overwrote its replay state")
 	}
 	// A range reserved before replacement stays bound to the old outbound SA.
-	packets, err := reserved([][]byte{{1}}, []byte{esp.NextHeaderIPv4})
+	packets, err := reserved([][]byte{{1}}, []byte{esp.NextHeaderIPv4}, nil)
 	if err != nil || binary.BigEndian.Uint32(packets[0][:4]) != old.RemoteSPI {
 		t.Fatalf("reserved range lost its original SA: %v", err)
 	}

@@ -79,7 +79,7 @@ func (t *tunnel) reserve(count int) (netstack.BatchSealer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.SealBatch, nil
+	return r.SealBatchInto, nil
 }
 
 var errUnknownSPI = errors.New("no matching inbound ESP SA")

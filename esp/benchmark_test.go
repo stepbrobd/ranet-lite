@@ -50,7 +50,7 @@ func benchmarkESPPlaintext(size int) ([][]byte, []byte) {
 }
 
 // BenchmarkESPEncrypt includes shared-SA sequence reservation, ESP framing,
-// AEAD, and the allocations used by the production batch encryption path.
+// AEAD, and worker-owned reusable output buffers, as in the production path.
 // GOMAXPROCS controls the number of workers encrypting on the same SA.
 func BenchmarkESPEncrypt(b *testing.B) {
 	benchmarkESPSuites(b, func(b *testing.B, child ChildSA, size int) {
@@ -63,13 +63,15 @@ func BenchmarkESPEncrypt(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
+			var sealed [][]byte
 			for pb.Next() {
 				r, err := out.ReserveSequenceRange(len(packets))
 				if err != nil {
 					b.Error(err)
 					return
 				}
-				if _, err := r.SealBatch(packets, headers); err != nil {
+				sealed, err = r.SealBatchInto(packets, headers, sealed)
+				if err != nil {
 					b.Error(err)
 					return
 				}

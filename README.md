@@ -87,6 +87,8 @@ Linux UDP receive reads a full 128-message vector and returns excess GRO
 segments before reusing its buffers. Replay checks and nonce storage are
 amortized across ESP batches, and already-completed send/receive batches are
 combined without waiting for additional traffic.
+Encryption workers reuse packed ciphertext buffers only after the ordered
+sender finishes its UDP call, retaining separate storage for work in flight.
 Replaced inbound SAs remain usable for five seconds after their Delete
 acknowledgement so queued and reordered packets can drain during a rekey.
 
@@ -291,6 +293,11 @@ The kernel profiler runs as root inside the disposable VM. It does not require
 host root or changes to the host's profiling permissions. Profiles are copied
 into the test result.
 
+`nix build .#namespace-profile --no-link -L` runs the namespace harness below
+inside one six-core VM and captures a system-wide kernel profile. This keeps
+the veth topology used by host measurements and avoids the virtual switch
+between integration-test VMs; the guest's CPU and clock still affect results.
+
 For measurements without VM overhead, use the namespace harness:
 
 ```sh
@@ -324,7 +331,7 @@ nix develop -c go test ./esp -run '^$' -bench 'BenchmarkESP' \
 ```
 
 These include ESP framing, AEAD, sequence reservation or replay commits, and
-production batch allocations. Decryption also includes copying the input
+reusable batch buffers. Decryption also includes copying the input
 ciphertext into reusable buffers. They exclude UDP, TUN, and the client queues;
 cipher throughput cannot establish full-duplex tunnel throughput. Namespace
 measurements share CPU resources with the Linux gateway and traffic generators

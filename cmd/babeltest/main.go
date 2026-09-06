@@ -98,7 +98,7 @@ func main() {
 		if err != nil {
 			return nil, err
 		}
-		return sequenceRange.SealBatch, nil
+		return sequenceRange.SealBatchInto, nil
 	}, sess.Mux().SendESPBatch)
 
 	speaker, err := babel.New(babel.Config{HelloInterval: 4 * time.Second}, mesh)

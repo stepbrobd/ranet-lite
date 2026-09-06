@@ -35,6 +35,12 @@
           cores = 4;
           profile = true;
         };
+        namespace-profile = pkgs.testers.runNixOSTest (
+          import ./integration/nixos-performance.nix {
+            inherit pkgs;
+            ranetLite = ranet-lite;
+          }
+        );
       };
 
       devShells.${system}.default = pkgs.mkShell {
