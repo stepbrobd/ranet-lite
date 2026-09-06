@@ -86,26 +86,24 @@ var errUnknownSPI = errors.New("no matching inbound ESP SA")
 
 func (t *tunnel) decryptBatch(packets [][]byte, results []inboundDecrypted) []inboundDecrypted {
 	current := t.sas.Load()
-	for _, raw := range packets {
-		result := inboundDecrypted{err: errUnknownSPI}
+	for len(packets) > 0 {
+		raw := packets[0]
 		if current != nil && len(raw) >= 4 {
-			if sa := current.inbound[binary.BigEndian.Uint32(raw[:4])]; sa != nil {
-				result.authenticated, result.err = sa.AuthenticateInPlace(raw)
+			spi := binary.BigEndian.Uint32(raw[:4])
+			if sa := current.inbound[spi]; sa != nil {
+				end := 1
+				for end < len(packets) && len(packets[end]) >= 4 && binary.BigEndian.Uint32(packets[end][:4]) == spi {
+					end++
+				}
+				results = sa.AuthenticateBatchInPlace(packets[:end], results)
+				packets = packets[end:]
+				continue
 			}
 		}
-		results = append(results, result)
+		results = append(results, inboundDecrypted{Err: errUnknownSPI})
+		packets = packets[1:]
 	}
 	return results
-}
-
-func (r inboundDecrypted) open() ([]byte, byte, error) {
-	if r.err != nil {
-		return nil, 0, r.err
-	}
-	if r.authenticated == nil {
-		return nil, 0, errUnknownSPI
-	}
-	return r.authenticated.Commit()
 }
 
 func validateESPTunnelPayload(plain []byte, nextHeader byte) (bool, error) {

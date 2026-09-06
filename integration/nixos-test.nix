@@ -210,7 +210,8 @@ in
           ]
           ++ lib.optionals profile [
             curl
-            go
+            pprof
+            perf
           ];
 
         systemd.network = {
@@ -353,14 +354,26 @@ in
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
         profile = ${if profile then "True" else "False"}
+        if profile:
+            # NixOS tests force acpi_pm for deterministic timekeeping. Its
+            # virtual I/O reads dominate CPU profiles, so use the KVM clock
+            # in this performance-only variant on both sides of the tunnel.
+            for machine in [client, gateway]:
+                machine.succeed("echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource")
+                assert machine.succeed("cat /sys/devices/system/clocksource/clocksource0/current_clocksource").strip() == "kvm-clock"
         duration = 25 if profile else 5
-        for direction, flags in [("outbound", ""), ("inbound", "--reverse")]:
+        for direction, flags in [("outbound", ""), ("inbound", "--reverse"), ("bidir", "--bidir")]:
             if profile:
                 client.succeed(f"systemd-run --unit=ranet-{direction}-profile --collect curl --silent --show-error 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' --output /tmp/{direction}.pprof")
+                pid = client.succeed("systemctl show -p MainPID --value ranet-lite.service").strip()
+                client.succeed(f"systemd-run --unit=ranet-{direction}-kernel-profile --collect perf record -e cpu-clock:k -F 199 -g -p {pid} -o /tmp/{direction}.perf -- sleep 20")
             print(client.succeed(f"iperf3 --client ${gatewayTunnel} --parallel 8 --time {duration} {flags}"))
             if profile:
                 client.wait_until_succeeds(f"test -s /tmp/{direction}.pprof")
-                print(client.succeed(f"CGO_ENABLED=0 go tool pprof -top -nodecount=50 /tmp/{direction}.pprof"))
+                print(client.succeed(f"pprof -top -nodecount=50 /tmp/{direction}.pprof"))
+                print(client.succeed(f"perf report --stdio --no-children --percent-limit 1 -g none -i /tmp/{direction}.perf"))
+                client.copy_from_machine(f"/tmp/{direction}.pprof")
+                client.copy_from_machine(f"/tmp/{direction}.perf")
 
         if not profile:
             # Verify both new IKE keys and subsequent ESP keys are usable.

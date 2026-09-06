@@ -7,10 +7,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
-type inboundDecrypted struct {
-	authenticated *esp.AuthenticatedPacket
-	err           error
-}
+type inboundDecrypted = esp.AuthenticatedPacket
 
 type inboundBatch struct {
 	ticket  uint64
@@ -27,6 +24,18 @@ func emitInboundBatches(completed <-chan *inboundBatch, recycle chan<- *inboundB
 	next := uint64(0)
 	for batch := range completed {
 		pending[batch.ticket] = batch
+	drain:
+		for range cap(completed) {
+			select {
+			case ready, ok := <-completed:
+				if !ok {
+					break drain
+				}
+				pending[ready.ticket] = ready
+			default:
+				break drain
+			}
+		}
 		merged = merged[:0]
 		for {
 			ready := pending[next]

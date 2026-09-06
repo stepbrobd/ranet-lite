@@ -67,7 +67,9 @@ func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T
 			return sealed, nil
 		}, nil
 	}, func(sealed [][]byte) error {
-		transmitted <- sealed[0][0]
+		for _, packet := range sealed {
+			transmitted <- packet[0]
+		}
 		return nil
 	})
 	defer peer.Close()
@@ -142,7 +144,9 @@ func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
 			close(startedSend)
 			<-releaseSend
 		}
-		transmitted <- sealed[0][0]
+		for _, packet := range sealed {
+			transmitted <- packet[0]
+		}
 		return nil
 	})
 	t.Cleanup(func() {
@@ -184,6 +188,61 @@ func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for transmitted sequence %d", want)
 		}
+	}
+}
+
+func TestReservedSenderMergesReadyBatchesAndCompletesEveryTicket(t *testing.T) {
+	sendErr := errors.New("send failed")
+	cryptoErr := errors.New("crypto failed")
+	transmitted := make(chan []byte, 1)
+	p := &Peer{
+		ID: "peer", completed: make(chan *peerBatch, 3), slots: make(chan struct{}, 3),
+		stop: make(chan struct{}), senderDone: make(chan struct{}),
+		transmitBatchFn: func(packets [][]byte) error {
+			var order []byte
+			for _, packet := range packets {
+				order = append(order, packet[0])
+			}
+			transmitted <- order
+			return sendErr
+		},
+	}
+	var done []chan error
+	for i := range 3 {
+		b := &peerBatch{peer: p, ticket: uint64(i), hasSlot: true, done: make(chan error, 1), sealed: [][]byte{{byte(i)}}}
+		if i == 1 {
+			b.sealed, b.err = nil, cryptoErr
+		}
+		p.slots <- struct{}{}
+		p.completed <- b
+		done = append(done, b.done)
+	}
+	go p.senderLoop()
+	defer p.Close()
+	select {
+	case got := <-transmitted:
+		if !bytes.Equal(got, []byte{0, 2}) {
+			t.Fatalf("merged transmission = %v, want [0 2]", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ready packets were not transmitted")
+	}
+	for i, result := range done {
+		want := sendErr
+		if i == 1 {
+			want = cryptoErr
+		}
+		select {
+		case err := <-result:
+			if !errors.Is(err, want) {
+				t.Fatalf("ticket %d error = %v, want %v", i, err, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("ticket %d never completed", i)
+		}
+	}
+	if len(p.slots) != 0 {
+		t.Fatal("merged transmission leaked reservation slots")
 	}
 }
 

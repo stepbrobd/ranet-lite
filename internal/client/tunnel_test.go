@@ -66,17 +66,17 @@ func TestTunnelRekeyPreservesInflightKeys(t *testing.T) {
 	if err := tunnel.retire(old.LocalSPI); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := authenticated.open(); err != nil {
+	if _, _, err := authenticated.Commit(); err != nil {
 		t.Fatalf("in-flight authenticated packet lost retired keys: %v", err)
 	}
 	for _, raw := range [][]byte{nil, {0, 1}, sealTestPacket(t, remote, 2)} {
 		result := tunnel.decryptBatch([][]byte{raw}, nil)[0]
-		if _, _, err := result.open(); err == nil {
+		if _, _, err := result.Commit(); err == nil {
 			t.Fatal("accepted truncated data or a retired SPI")
 		}
 	}
 	result := tunnel.decryptBatch([][]byte{sealTestPacket(t, remoteSA(t, next), 3)}, nil)[0]
-	if _, _, err := result.open(); err != nil {
+	if _, _, err := result.Commit(); err != nil {
 		t.Fatalf("retiring old SA disturbed the replacement: %v", err)
 	}
 	if err := tunnel.retire(next.LocalSPI); err != nil {
@@ -130,8 +130,9 @@ func TestReceiveESPOrderAndShutdown(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				done <- receiveESP(mux, workers, decrypt, func(results []inboundDecrypted) {
+					esp.CommitBatch(results)
 					for _, result := range results {
-						plain, _, err := result.open()
+						plain, _, err := result.Plaintext()
 						if err != nil {
 							t.Error(err)
 							continue

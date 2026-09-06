@@ -246,25 +246,56 @@ func (b *peerBatch) releaseSlot() {
 func (p *Peer) senderLoop() {
 	defer close(p.senderDone)
 	pending := make(map[uint64]*peerBatch, cap(p.completed))
+	ready := make([]*peerBatch, 0, cap(p.completed))
+	packets := make([][]byte, 0, 128)
 	next := uint64(0)
 	for {
-		if b := pending[next]; b != nil {
+		if pending[next] == nil {
+			select {
+			case b := <-p.completed:
+				pending[b.ticket] = b
+			case <-p.stop:
+				return
+			}
+		}
+		// Small packets such as TCP ACKs arrive as individual TUN reads. Merge
+		// completed work without waiting for another packet or changing order.
+	drain:
+		for range cap(p.completed) {
+			select {
+			case b := <-p.completed:
+				pending[b.ticket] = b
+			default:
+				break drain
+			}
+		}
+		for len(packets) < 128 {
+			b := pending[next]
+			if b == nil {
+				break
+			}
 			delete(pending, next)
-			err := b.send()
+			ready = append(ready, b)
+			packets = append(packets, b.sealed...)
+			next++
+		}
+		var sendErr error
+		if len(packets) != 0 {
+			sendErr = p.transmitBatchFn(packets)
+		}
+		for _, b := range ready {
+			if b.err == nil {
+				b.err = sendErr
+			}
 			b.releaseSlot()
 			if b.done != nil {
-				b.done <- err
-			} else if err != nil {
-				log.Printf("netstack: send batch through peer %s: %v", p.ID, err)
+				b.done <- b.err
+			} else if b.err != nil {
+				log.Printf("netstack: send batch through peer %s: %v", p.ID, b.err)
 			}
-			next++
-			continue
 		}
-		select {
-		case b := <-p.completed:
-			pending[b.ticket] = b
-		case <-p.stop:
-			return
-		}
+		clear(packets)
+		clear(ready)
+		packets, ready = packets[:0], ready[:0]
 	}
 }

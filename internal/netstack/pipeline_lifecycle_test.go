@@ -15,7 +15,12 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 	secondReserved := make(chan struct{}, 2)
 	transmitted := make(chan struct{}, 4)
 	sealer := func(raw [][]byte, _ []byte) ([][]byte, error) { return raw, nil }
-	send := func([][]byte) error { transmitted <- struct{}{}; return nil }
+	send := func(packets [][]byte) error {
+		for range packets {
+			transmitted <- struct{}{}
+		}
+		return nil
+	}
 	a := NewPeerReserved("a", func(int) (BatchSealer, error) {
 		firstOnce.Do(func() { close(firstReserved); <-releaseFirst })
 		return sealer, nil

@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -153,11 +154,12 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 
 	plain := make([][]byte, 0, 128)
 	emit := func(results []inboundDecrypted) {
+		esp.CommitBatch(results)
 		plain = plain[:0]
 		var dropped int
 		var lastError error
 		for _, result := range results {
-			raw, nextHeader, err := result.open()
+			raw, nextHeader, err := result.Plaintext()
 			if err != nil {
 				dropped, lastError = dropped+1, err
 				continue

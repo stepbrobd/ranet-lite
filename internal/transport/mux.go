@@ -11,8 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.zx2c4.com/wireguard/conn"
 )
 
 const (
@@ -28,7 +26,7 @@ const (
 
 // Hub owns one local UDP port and routes incoming packets to registered Muxes.
 type Hub struct {
-	bind conn.Bind
+	bind packetBind
 	port uint16
 
 	mu        sync.Mutex
@@ -41,7 +39,16 @@ type Hub struct {
 
 // Endpoint is the authenticated datagram source retained by IKE so replies
 // can follow a peer whose NAT mapping changed.
-type Endpoint = conn.Endpoint
+type Endpoint interface{ transportEndpoint() }
+
+type packetBind interface {
+	ParseEndpoint(string) (Endpoint, error)
+	Send([][]byte, Endpoint) error
+	Close() error
+}
+
+// A receiver owns its buffers; their views remain valid until its next call.
+type receiveFunc func([][]byte, []int, []Endpoint) (int, error)
 
 type ikeDatagram struct {
 	raw      []byte
@@ -53,8 +60,7 @@ type espDatagramBatch struct {
 	packets [][]byte
 }
 
-// NewHub binds localAddr. A specific IP is not supported by conn.Bind, so only
-// its port is used.
+// NewHub binds localAddr's port on all local IPv4 and IPv6 interfaces.
 func NewHub(localAddr string) (*Hub, error) {
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
@@ -63,8 +69,7 @@ func NewHub(localAddr string) (*Hub, error) {
 	if laddr.IP != nil && !laddr.IP.IsUnspecified() {
 		log.Printf("transport: binding to a specific local address (%s) isn't supported; binding all interfaces on port %d instead", laddr.IP, laddr.Port)
 	}
-	bind := conn.NewStdNetBind()
-	fns, port, err := bind.Open(uint16(laddr.Port))
+	bind, fns, port, err := openPacketBind(uint16(laddr.Port))
 	if err != nil {
 		return nil, fmt.Errorf("transport: open bind: %w", err)
 	}
@@ -121,12 +126,9 @@ func (h *Hub) fail(cause error) (bindErr error) {
 	return bindErr
 }
 
-func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
-	batch := h.bind.BatchSize()
-	bufs, sizes, eps := make([][]byte, batch), make([]int, batch), make([]conn.Endpoint, batch)
-	for i := range bufs {
-		bufs[i] = make([]byte, readBufferSize)
-	}
+func (h *Hub) receiveLoop(fn receiveFunc) {
+	batch := espSendBatch
+	bufs, sizes, eps := make([][]byte, batch), make([]int, batch), make([]Endpoint, batch)
 	type pendingIKE struct {
 		mux      *Mux
 		datagram ikeDatagram
@@ -215,7 +217,7 @@ func packReceivedBatch(packets [][]byte) [][]byte {
 type Mux struct {
 	hub           *Hub
 	endpointMu    sync.RWMutex
-	endpoint      conn.Endpoint
+	endpoint      Endpoint
 	ikeCh         chan ikeDatagram
 	espRecvMu     sync.Mutex
 	espDispatchMu sync.Mutex

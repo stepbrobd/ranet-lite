@@ -15,27 +15,46 @@
         vendorHash = "sha256-3FRdONnzY53jXsC7j6Ig6BwjCF09Qn2PZxnqXzAYoBY=";
         subPackages = [ "cmd/ranet-lite" ];
       };
+      integration =
+        args:
+        pkgs.testers.runNixOSTest (
+          import ./integration/nixos-test.nix (
+            {
+              inherit pkgs;
+              ranetLite = ranet-lite;
+            }
+            // args
+          )
+        );
     in
     {
       packages.${system} = {
         inherit ranet-lite;
         default = ranet-lite;
+        integration-profile = integration {
+          cores = 4;
+          profile = true;
+        };
+      };
+
+      devShells.${system}.default = pkgs.mkShell {
+        packages = with pkgs; [
+          go
+          python3
+          iproute2
+          util-linux
+          iputils
+          strongswan
+          bird3
+          iperf3
+          ethtool
+          pprof
+        ];
       };
 
       checks.${system} = {
-        integration = pkgs.testers.runNixOSTest (
-          import ./integration/nixos-test.nix {
-            inherit pkgs;
-            ranetLite = ranet-lite;
-          }
-        );
-        integration-multicore = pkgs.testers.runNixOSTest (
-          import ./integration/nixos-test.nix {
-            inherit pkgs;
-            ranetLite = ranet-lite;
-            cores = 4;
-          }
-        );
+        integration = integration { };
+        integration-multicore = integration { cores = 4; };
       };
     };
 }

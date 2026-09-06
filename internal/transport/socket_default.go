@@ -1,0 +1,45 @@
+//go:build !linux
+
+package transport
+
+import "golang.zx2c4.com/wireguard/conn"
+
+type portableBind struct{ conn.Bind }
+type portableEndpoint struct{ conn.Endpoint }
+
+func (*portableEndpoint) transportEndpoint() {}
+
+func (b *portableBind) ParseEndpoint(s string) (Endpoint, error) {
+	ep, err := b.Bind.ParseEndpoint(s)
+	return &portableEndpoint{ep}, err
+}
+
+func (b *portableBind) Send(packets [][]byte, endpoint Endpoint) error {
+	return b.Bind.Send(packets, endpoint.(*portableEndpoint).Endpoint)
+}
+
+func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
+	b := &portableBind{conn.NewStdNetBind()}
+	fns, port, err := b.Open(port)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	var receivers []receiveFunc
+	for _, fn := range fns {
+		size := b.BatchSize()
+		eps := make([]conn.Endpoint, size)
+		receivers = append(receivers, func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+			for i := range size {
+				if bufs[i] == nil {
+					bufs[i] = make([]byte, readBufferSize)
+				}
+			}
+			n, err := fn(bufs[:size], sizes[:size], eps)
+			for i := range n {
+				endpoints[i] = &portableEndpoint{eps[i]}
+			}
+			return n, err
+		})
+	}
+	return b, receivers, port, nil
+}

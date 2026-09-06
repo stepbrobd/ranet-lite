@@ -83,6 +83,10 @@ the same snapshot. ESP batches similarly capture an immutable set of installed
 SAs, retaining keys for work already in flight during a rekey. One-core receive
 processing runs inline; multicore receive workers authenticate concurrently and
 commit replay state in intake order before delivering TUN batches.
+Linux UDP receive reads a full 128-message vector and returns excess GRO
+segments before reusing its buffers. Replay checks and nonce storage are
+amortized across ESP batches, and already-completed send/receive batches are
+combined without waiting for additional traffic.
 Replaced inbound SAs remain usable for five seconds after their Delete
 acknowledgement so queued and reordered packets can drain during a rekey.
 
@@ -276,8 +280,55 @@ nix build .#checks.x86_64-linux.integration-multicore -L
 These checks exercise one-core and four-core clients, IPv4 and IPv6 routes,
 locally scheduled and peer-initiated rekeys, BIRD withdrawal/recovery, and a clean
 stop/restart with an idle TUN read. The integration test also accepts
-`profile = true` when imported from Nix to capture CPU profiles during longer
-throughput runs.
+`profile = true` when imported from Nix to capture Go and kernel CPU profiles
+during longer throughput runs, including simultaneous traffic in both directions:
+
+```sh
+nix build .#integration-profile --no-link -L
+```
+
+The kernel profiler runs as root inside the disposable VM. It does not require
+host root or changes to the host's profiling permissions. Profiles are copied
+into the test result.
+
+For measurements without VM overhead, use the namespace harness:
+
+```sh
+nix develop -c go build -o /tmp/ranet-bench ./cmd/ranet-lite
+nix develop -c unshare --user --map-root-user --mount --net \
+  python3 integration/performance.py --client /tmp/ranet-bench \
+  --output /tmp/ranet-perf-6 --cores 6 --affinity 0-5 \
+  --directions outbound,inbound,bidir
+```
+
+Run as an ordinary user with unprivileged user namespaces available. The
+harness creates private client/gateway network namespaces, a private `/run`,
+strongSwan, BIRD, and a real TUN/XFRM tunnel using the synthetic test keys. It
+records binary identity, CPU affinity, iperf3 JSON, CPU profiles, socket drops,
+and key-free XFRM counters in a new output directory. All processes and
+interfaces are removed when the namespaces exit.
+
+`--cores` sets GOMAXPROCS; `--affinity` restricts the client to actual CPUs.
+Use `--cores 1 --affinity 0` for a pinned single-core comparison. Keep flow
+ports, stream counts, affinity, MTU, and replay windows identical between
+versions. The default gateway replay window is strongSwan's 32 packets;
+`--replay-window 4096` can distinguish replay drops from processing limits.
+`--protocol udp --rate 10` offers an aggregate 10 Gbit/s per direction with
+UDP GSO/GRO; inspect received throughput and loss, not just the offered rate.
+
+Raw ESP encryption and decryption have separate benchmarks:
+
+```sh
+nix develop -c go test ./esp -run '^$' -bench 'BenchmarkESP' \
+  -benchmem -cpu=1,2,4,8 -count=5
+```
+
+These include ESP framing, AEAD, sequence reservation or replay commits, and
+production batch allocations. Decryption also includes copying the input
+ciphertext into reusable buffers. They exclude UDP, TUN, and the client queues;
+cipher throughput cannot establish full-duplex tunnel throughput. Namespace
+measurements share CPU resources with the Linux gateway and traffic generators
+and do not establish performance on a physical NIC.
 
 To compare routing and packet classification across CPU counts:
 

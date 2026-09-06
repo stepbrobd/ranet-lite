@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/esp"
@@ -16,8 +17,8 @@ import (
 func TestInboundBatchOrderMergesConsecutiveCompletedBatches(t *testing.T) {
 	const first, second = 0, 1
 
-	firstResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}
-	secondResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}
+	firstResult := inboundDecrypted{Err: errors.New("first")}
+	secondResult := inboundDecrypted{Err: errors.New("second")}
 	completed := make(chan *inboundBatch, 2)
 	recycled := make(chan *inboundBatch, 2)
 	delivered := make(chan byte, 2)
@@ -27,7 +28,7 @@ func TestInboundBatchOrderMergesConsecutiveCompletedBatches(t *testing.T) {
 		emitInboundBatches(completed, recycled, func(results []inboundDecrypted) {
 			calls++
 			for _, result := range results {
-				if result.authenticated == firstResult.authenticated {
+				if result.Err == firstResult.Err {
 					delivered <- 1
 				} else {
 					delivered <- 2
