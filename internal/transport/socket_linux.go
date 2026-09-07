@@ -31,6 +31,7 @@ type udpBatchConn interface {
 
 type udpSocket struct {
 	conn *net.UDPConn
+	raw  syscall.RawConn
 	pc   udpBatchConn
 	ipv6 bool
 	gso  atomic.Bool
@@ -109,6 +110,11 @@ func listenPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
 			_ = b.Close()
 			return nil, nil, 0, err
 		}
+		socket.raw, err = socket.conn.SyscallConn()
+		if err != nil {
+			_ = b.Close()
+			return nil, nil, 0, err
+		}
 		port = uint16(pc.LocalAddr().(*net.UDPAddr).Port)
 		receivers = append(receivers, socket.receiver())
 	}
@@ -128,11 +134,20 @@ func (s *udpSocket) receiver() receiveFunc {
 		messages[i].Buffers = [][]byte{make([]byte, readBufferSize)}
 		messages[i].OOB = make([]byte, 128)
 	}
+	read := func() (int, error) { return s.pc.ReadBatch(messages, 0) }
+	if s.raw != nil {
+		read = newUDPReader(s.raw, messages).read
+	}
 	var count, index, offset, segment int
 	return func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
 		if index == count {
 			var err error
-			count, err = s.pc.ReadBatch(messages, 0)
+			count, err = read()
+			if errors.Is(err, unix.ENOSYS) {
+				// Older 32-bit kernels expose recvmmsg only via socketcall.
+				read = func() (int, error) { return s.pc.ReadBatch(messages, 0) }
+				count, err = read()
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -178,7 +193,17 @@ func (s *udpSocket) receiver() receiveFunc {
 }
 
 func (s *udpSocket) replyEndpoint(m *ipv4.Message) (*udpEndpoint, error) {
-	ep := &udpEndpoint{addr: m.Addr.(*net.UDPAddr)}
+	var addr *net.UDPAddr
+	if source, ok := m.Addr.(*udpSource); ok {
+		var err error
+		addr, err = source.endpoint()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		addr = m.Addr.(*net.UDPAddr)
+	}
+	ep := &udpEndpoint{addr: addr}
 	if s.ipv6 {
 		var cm ipv6.ControlMessage
 		if err := cm.Parse(m.OOB[:m.NN]); err != nil {
