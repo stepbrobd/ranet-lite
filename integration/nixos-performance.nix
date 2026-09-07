@@ -1,4 +1,8 @@
-{ pkgs, ranetLite }:
+{
+  pkgs,
+  ranetLite,
+  benchmarkIperf ? import ./iperf3.nix { inherit pkgs; },
+}:
 
 {
   name = "ranet-lite-namespace-profile";
@@ -18,7 +22,7 @@
       iputils
       strongswan
       bird3
-      iperf3
+      benchmarkIperf
       ethtool
       perf
     ];

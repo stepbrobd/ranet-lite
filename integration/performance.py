@@ -102,6 +102,15 @@ with args.client.open("rb") as binary:
             "arguments": vars(args),
             "kernel": os.uname().release,
             "client_sha256": client_hash,
+            "iperf3": {
+                "executable": commands["iperf3"],
+                "version": subprocess.run(
+                    [commands["iperf3"], "--version"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+            },
             "cpu_model": next(
                 (
                     line.split(":", 1)[1].strip()
@@ -182,6 +191,10 @@ def sample_state(direction):
     (args.output / (direction + "-udp.txt")).write_text(
         run(["cat", "/proc/net/snmp"]).stdout
     )
+    for side, gateway in [("client", False), ("gateway", True)]:
+        (args.output / f"{direction}-{side}-packet-sockets.txt").write_text(
+            run(["cat", "/proc/net/packet"], gateway=gateway).stdout
+        )
 
 
 def traffic(label, address, flags, collect_profile=False):
@@ -196,6 +209,8 @@ def traffic(label, address, flags, collect_profile=False):
             flags = flags + [
                 "--udp",
                 "--gsro",
+                "-w",
+                "4M",
                 "-l",
                 "1300",
                 "-b",

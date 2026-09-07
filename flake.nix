@@ -8,6 +8,7 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      benchmarkIperf = import ./integration/iperf3.nix { inherit pkgs; };
       ranet-lite = pkgs.buildGoModule {
         pname = "ranet-lite";
         version = "0.1.0";
@@ -30,6 +31,7 @@
     {
       packages.${system} = {
         inherit ranet-lite;
+        iperf3-benchmark = benchmarkIperf;
         default = ranet-lite;
         integration-profile = integration {
           cores = 4;
@@ -37,7 +39,7 @@
         };
         namespace-profile = pkgs.testers.runNixOSTest (
           import ./integration/nixos-performance.nix {
-            inherit pkgs;
+            inherit pkgs benchmarkIperf;
             ranetLite = ranet-lite;
           }
         );
@@ -52,7 +54,7 @@
           iputils
           strongswan
           bird3
-          iperf3
+          benchmarkIperf
           ethtool
           pprof
         ];
