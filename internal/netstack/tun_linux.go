@@ -12,6 +12,9 @@ import (
 
 const cloneDevicePath = "/dev/net/tun"
 
+// defaultTUNName lets the kernel number the interface.
+const defaultTUNName = "ranet%d"
+
 func bringTUNUp(name string) error {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {

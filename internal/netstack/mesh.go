@@ -103,7 +103,7 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		mtu = DefaultMTU
 	}
 	if name == "" {
-		name = "ranet%d"
+		name = defaultTUNName
 	}
 	queueCount := max(1, runtime.GOMAXPROCS(0))
 	devs, actualName, err := createTUNQueues(name, mtu, queueCount)
