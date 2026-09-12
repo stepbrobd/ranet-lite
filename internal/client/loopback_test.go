@@ -12,6 +12,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
+
+var meshCounter atomic.Uint64
 
 // loopbackNode is one end of a two-node mesh standing on 127.0.0.1.
 type loopbackNode struct {
@@ -60,9 +64,14 @@ func newLoopbackMesh(t *testing.T) (*loopbackNode, *loopbackNode) {
 	}
 	publicPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
 
+	// Names are unique per mesh, not per role. A port the kernel handed back
+	// can be handed out again once a hub closes, and a node another test left
+	// retransmitting would otherwise authenticate against its replacement:
+	// same organization key, same common name, same port.
+	mesh := meshCounter.Add(1)
 	nodes := []*loopbackNode{
-		{name: "alpha", port: freeUDPPort(t), prefix: netip.MustParsePrefix("fd00:a::/64")},
-		{name: "bravo", port: freeUDPPort(t), prefix: netip.MustParsePrefix("fd00:b::/64")},
+		{name: fmt.Sprintf("alpha-%d", mesh), port: freeUDPPort(t), prefix: netip.MustParsePrefix("fd00:a::/64")},
+		{name: fmt.Sprintf("bravo-%d", mesh), port: freeUDPPort(t), prefix: netip.MustParsePrefix("fd00:b::/64")},
 	}
 	loopback := "127.0.0.1"
 	org := registry.Organization{PublicKey: publicPEM, Organization: "example"}
@@ -151,13 +160,7 @@ originate:
 // against a model of sessionSet with its own close and liveness stubbed out.
 func TestTwoNodesConvergeOverLoopback(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	stopped := make(chan error, 2)
-	for _, node := range []*loopbackNode{alpha, bravo} {
-		go func() { stopped <- node.client.Run(ctx) }()
-	}
+	_, stop := run(t, alpha, bravo)
 
 	// Both ends settle on exactly one session, which is the thing the
 	// preference rule decides and which diverges if the two ends disagree.
@@ -176,21 +179,41 @@ func TestTwoNodesConvergeOverLoopback(t *testing.T) {
 		return reaches(alpha, bravo) && reaches(bravo, alpha)
 	})
 
-	cancel()
-	for range 2 {
-		select {
-		case err := <-stopped:
-			if err != nil && !isCanceled(err) {
-				t.Errorf("a node stopped with %v", err)
-			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("a node did not stop after its context was canceled")
-		}
-	}
+	stop()
 }
 
 func isCanceled(err error) bool {
 	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
+// run starts each node and returns a stop that cancels and waits for every one
+// of them. Waiting matters: a client left unwinding keeps its dialers retrying
+// and its hub bound, and the next test would then be sharing a port with it.
+func run(t *testing.T, nodes ...*loopbackNode) (context.Context, func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, len(nodes))
+	for _, node := range nodes {
+		go func() { stopped <- node.client.Run(ctx) }()
+	}
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			for range nodes {
+				select {
+				case err := <-stopped:
+					if err != nil && !isCanceled(err) {
+						t.Errorf("a node stopped with %v", err)
+					}
+				case <-time.After(30 * time.Second):
+					t.Error("a node did not stop after its context was canceled")
+				}
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return ctx, stop
 }
 
 func waitFor(t *testing.T, limit time.Duration, what string, done func() bool) {
@@ -209,11 +232,7 @@ func waitFor(t *testing.T, limit time.Duration, what string, done func() bool) {
 // counts, so deleting the SetOriginated call passes it.
 func TestReloadAnnouncesANewPrefixToThePeer(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	for _, node := range []*loopbackNode{alpha, bravo} {
-		go func() { _ = node.client.Run(ctx) }()
-	}
+	run(t, alpha, bravo)
 	added := netip.MustParsePrefix("fd00:aa::/64")
 	waitFor(t, 20*time.Second, "the initial route", func() bool {
 		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, alpha.prefix.Addr().Next())
@@ -238,13 +257,8 @@ func TestReloadAnnouncesANewPrefixToThePeer(t *testing.T) {
 // unreachable from anything else in this package.
 func TestShutdownTellsThePeerBeforeGoing(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stopped := make(chan error, 1)
-	go func() { stopped <- alpha.client.Run(ctx) }()
-	bravoCtx, stopBravo := context.WithCancel(context.Background())
-	defer stopBravo()
-	go func() { _ = bravo.client.Run(bravoCtx) }()
+	run(t, bravo)
+	_, stopAlpha := run(t, alpha)
 
 	waitFor(t, 20*time.Second, "both ends established", func() bool {
 		return len(alpha.client.sessions.paths()) == 1 && len(bravo.client.sessions.paths()) == 1
@@ -252,13 +266,18 @@ func TestShutdownTellsThePeerBeforeGoing(t *testing.T) {
 
 	// Only alpha goes. bravo has to notice through the Delete rather than
 	// through its own liveness timer, which is far slower than this.
-	cancel()
-	select {
-	case <-stopped:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the departing node did not stop")
+	stopAlpha()
+	deadline := time.Now().Add(15 * time.Second)
+	for len(bravo.client.sessions.paths()) != 0 {
+		if time.Now().After(deadline) {
+			bravo.client.sessions.mu.Lock()
+			for path, live := range bravo.client.sessions.live {
+				t.Logf("bravo still holds %s: mux closed=%v preferred=%v active=%v",
+					path, live.session.Mux().IsClosed(), live.preferred, live.session.Active())
+			}
+			bravo.client.sessions.mu.Unlock()
+			t.Fatal("the peer kept a session it was told to drop")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	waitFor(t, 15*time.Second, "the peer to drop the session it was told about", func() bool {
-		return len(bravo.client.sessions.paths()) == 0
-	})
 }

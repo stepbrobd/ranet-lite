@@ -119,6 +119,10 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 type sessionSet struct {
 	mu   sync.Mutex
 	live map[string]*liveSession
+	// shut refuses any further session once the node is going. A handshake
+	// still in flight completes after closeAll has swept, and without this it
+	// would install a session nobody is left to tell the peer about.
+	shut bool
 
 	// close is closeSession and active is (*ike.Session).Active in production.
 	// A test drives the resolution rule without standing up two real SAs by
@@ -183,6 +187,14 @@ func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder 
 // the resolution without two identities to derive it from.
 func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bool) (func(), bool) {
 	s.mu.Lock()
+	if s.shut {
+		s.mu.Unlock()
+		// Told rather than dropped: this handshake finished after the node
+		// started going, and its peer would otherwise carry the session until
+		// its own dead peer detection expires, which is over a minute.
+		s.close(sess)
+		return func() {}, false
+	}
 	previous := s.live[path]
 	if previous != nil && previous.session != sess && previous.preferred && !preferred {
 		s.mu.Unlock()
@@ -236,11 +248,13 @@ func (s *sessionSet) holds(path string) bool {
 	return live != nil && s.active(live.session)
 }
 
-// closeAll tells every live peer the session is ending and drops it. Each is
-// closed in parallel, so one unreachable peer costs deleteGrace rather than
-// deleteGrace per peer.
+// closeAll tells every live peer the session is ending and drops it, and shuts
+// the set so nothing can be adopted behind the sweep. Each is closed in
+// parallel, so one unreachable peer costs deleteGrace rather than deleteGrace
+// per peer.
 func (s *sessionSet) closeAll() {
 	s.mu.Lock()
+	s.shut = true
 	sessions := make([]*ike.Session, 0, len(s.live))
 	for _, live := range s.live {
 		sessions = append(sessions, live.session)

@@ -562,7 +562,19 @@ func TestSyncPeersNoticesAChangedSerialNumber(t *testing.T) {
 			Peers:        []config.Peer{{Organization: "example", CommonName: "a", SerialNumber: serial}},
 		}
 	}
-	reg := registry.Registry{}
+	// The peer is in the registry with no address yet, so each dialer retries
+	// rather than giving up. A dialer that gives up drops its own entry, which
+	// would race this test's read of the map it just filled.
+	reg := registry.Registry{{
+		Organization: "example",
+		Nodes: []registry.Node{{
+			CommonName: "a",
+			Endpoints: []registry.Endpoint{
+				{SerialNumber: "1", AddressFamily: "ip4"},
+				{SerialNumber: "2", AddressFamily: "ip4"},
+			},
+		}},
+	}}
 	c.reg.Store(&reg)
 	c.cfg.Store(base("1"))
 	c.syncPeers()
