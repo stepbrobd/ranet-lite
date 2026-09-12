@@ -421,3 +421,80 @@ func TestHubRoutesBySPIAndMuxCloseDoesNotCloseHub(t *testing.T) {
 		t.Fatalf("RecvESP = %x, %v", got, err)
 	}
 }
+
+func TestListenDeliversUnclaimedIKEAndNewMuxToAnswers(t *testing.T) {
+	h, err := NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	unclaimed := h.Listen()
+
+	peer := listenPeer(t, "udp4", "127.0.0.1")
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: h.LocalAddr().(*net.UDPAddr).Port}
+	const spiI = uint64(0x1122334455667788)
+	request := make([]byte, 28)
+	binary.BigEndian.PutUint64(request[:8], spiI)
+	if _, err := peer.WriteToUDP(withMarker(request), dst); err != nil {
+		t.Fatal(err)
+	}
+
+	var first Unclaimed
+	select {
+	case first = <-unclaimed:
+	case <-time.After(time.Second):
+		t.Fatal("unclaimed IKE datagram was not delivered")
+	}
+	if binary.BigEndian.Uint64(first.Raw[:8]) != spiI {
+		t.Fatalf("unclaimed SPI = %x", first.Raw[:8])
+	}
+
+	// A responder learns the peer's address only from this datagram, so the
+	// mux it answers on is created from the endpoint rather than from config.
+	m, err := h.NewMuxTo(first.Endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SendIKE([]byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := peer.ReadFromUDP(buf)
+	if err != nil || string(buf[nonESPMarkerLen:n]) != "response" {
+		t.Fatalf("response = %q, %v", buf[:n], err)
+	}
+
+	// Once registered, the same SPI reaches the mux instead of the listener.
+	if _, err := peer.WriteToUDP(withMarker(request), dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.RecvIKEFromUntil(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("registered SPI did not reach the mux: %v", err)
+	}
+	select {
+	case <-unclaimed:
+		t.Fatal("a claimed SPI was still delivered to the listener")
+	default:
+	}
+}
+
+func TestHubDoneIsClosedOnFailure(t *testing.T) {
+	h, err := NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Listen()
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-h.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done was not closed")
+	}
+}

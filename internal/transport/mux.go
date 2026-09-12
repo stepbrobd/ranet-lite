@@ -33,8 +33,19 @@ type Hub struct {
 	ike       map[uint64]*Mux
 	esp       map[uint32]*Mux
 	muxes     map[*Mux]struct{}
+	listen    chan Unclaimed
+	done      chan struct{}
 	closed    atomic.Bool
 	closeOnce sync.Once
+}
+
+// Unclaimed is one IKE datagram whose SPI belongs to no registered Mux, which
+// is how an IKE_SA_INIT from a peer that has never dialed us arrives. Raw is
+// the message with the non-ESP marker already stripped, and Endpoint is the
+// source to answer, which is also the endpoint a new Mux is created for.
+type Unclaimed struct {
+	Raw      []byte
+	Endpoint Endpoint
 }
 
 // Endpoint is the authenticated datagram source retained by IKE so replies
@@ -73,7 +84,7 @@ func NewHub(localAddr string) (*Hub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: open bind: %w", err)
 	}
-	h := &Hub{bind: bind, port: port, ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux), muxes: make(map[*Mux]struct{})}
+	h := &Hub{bind: bind, port: port, ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux), muxes: make(map[*Mux]struct{}), done: make(chan struct{})}
 	for _, fn := range fns {
 		go h.receiveLoop(fn)
 	}
@@ -97,6 +108,46 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	return m, nil
 }
 
+// NewMuxTo creates a logical peer channel for an endpoint a datagram arrived
+// from, rather than for a configured address. A responder learns where its
+// peer is only from that datagram, and the endpoint carries the reply source
+// address and interface the datagram was received on.
+func (h *Hub) NewMuxTo(endpoint Endpoint) (*Mux, error) {
+	if endpoint == nil {
+		return nil, fmt.Errorf("transport: nil remote endpoint")
+	}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
+	h.mu.Lock()
+	if h.closed.Load() {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("transport: hub closed")
+	}
+	h.muxes[m] = struct{}{}
+	h.mu.Unlock()
+	return m, nil
+}
+
+// Listen turns on delivery of unclaimed IKE datagrams and returns the channel
+// they arrive on. Until it is called nothing accumulates: an initiator-only
+// node keeps dropping them exactly as before. Calling it again returns the
+// same channel, and the channel is never closed; use Done to stop.
+//
+// The queue is bounded and a full queue drops the datagram rather than
+// blocking the receive loop, because an unauthenticated peer must not be able
+// to stall the dataplane. IKE retransmits, so a dropped IKE_SA_INIT costs a
+// retransmission interval and nothing else.
+func (h *Hub) Listen() <-chan Unclaimed {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.listen == nil {
+		h.listen = make(chan Unclaimed, 64)
+	}
+	return h.listen
+}
+
+// Done is closed when the hub's socket is gone, so an accept loop can stop.
+func (h *Hub) Done() <-chan struct{} { return h.done }
+
 // LocalAddr returns the hub's wildcard local address; only its port is useful.
 func (h *Hub) LocalAddr() net.Addr { return &net.UDPAddr{Port: int(h.port)} }
 
@@ -109,6 +160,7 @@ func (h *Hub) fail(cause error) (bindErr error) {
 	h.closeOnce.Do(func() {
 		h.closed.Store(true)
 		bindErr = h.bind.Close()
+		close(h.done)
 		h.mu.Lock()
 		muxes := make([]*Mux, 0, len(h.muxes))
 		for m := range h.muxes {
@@ -135,6 +187,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 	}
 	espBatches := make(map[*Mux][][]byte)
 	ikeDatagrams := make([]pendingIKE, 0, batch)
+	unclaimed := make([]Unclaimed, 0, batch)
 	for {
 		n, err := fn(bufs, sizes, eps)
 		if err != nil {
@@ -147,6 +200,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 		}
 		clear(espBatches)
 		ikeDatagrams = ikeDatagrams[:0]
+		unclaimed = unclaimed[:0]
 		h.mu.Lock()
 		for i := 0; i < n; i++ {
 			raw := bufs[i][:sizes[i]]
@@ -163,6 +217,13 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 								raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
 								endpoint: eps[i],
 							},
+						})
+					} else if h.listen != nil && eps[i] != nil {
+						// An SA no Mux owns yet. Only a listening hub keeps
+						// these; otherwise they stay dropped as before.
+						unclaimed = append(unclaimed, Unclaimed{
+							Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
+							Endpoint: eps[i],
 						})
 					}
 				}
@@ -183,6 +244,13 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			case pending.mux.ikeCh <- pending.datagram:
 			default:
 				log.Printf("transport: ikeCh full, dropping IKE message")
+			}
+		}
+		for _, datagram := range unclaimed {
+			select {
+			case h.listen <- datagram:
+			default:
+				log.Printf("transport: listen queue full, dropping unclaimed IKE message")
 			}
 		}
 		for m, packets := range espBatches {
