@@ -47,8 +47,8 @@ func (f *meshFabric) node(cfg Config, name string) *Speaker {
 	if s, ok := f.speakers[name]; ok {
 		return s
 	}
-	// A router-id derived from the name keeps failures readable and, more
-	// importantly, keeps the origin of a route distinguishable from its relay.
+	// A router-id derived from the name keeps failures readable and keeps the
+	// origin of a route distinguishable from its relay.
 	copy(cfg.RouterID[:], name)
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
 	s, err := New(cfg, mesh)

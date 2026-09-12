@@ -263,7 +263,7 @@ func newRouteMonitor(index int) (*routeMonitor, error) {
 	}
 	// a routing socket that overflows drops the excess without telling the
 	// reader, unlike netlink's ENOBUFS, so a large receive buffer is the only
-	// defence against a route flood and the periodic sweep the only backstop.
+	// defense against a route flood and the periodic sweep the only backstop.
 	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<19)
 	// the socket is nonblocking, so os.NewFile registers it with the runtime
 	// poller and Close unblocks the reader without racing on the descriptor.
@@ -293,7 +293,7 @@ func (m *routeMonitor) run() {
 			// and the monitor stops; the periodic sweep in Run remains as the
 			// backstop.
 			m.wake()
-			slog.Warn("kernel route monitor stopped; falling back to the periodic sweep", "err", err)
+			slog.Warn("kernel route monitor stopped, falling back to the periodic sweep", "err", err)
 			return
 		}
 		if m.interesting(buf[:n]) {

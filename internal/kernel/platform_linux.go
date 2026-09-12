@@ -420,10 +420,10 @@ func (m *routeMonitor) run() {
 			// periodic sweep in Run remains as the backstop.
 			m.wake()
 			if errors.Is(err, unix.ENOBUFS) {
-				slog.Debug("kernel route notifications dropped; resyncing")
+				slog.Debug("kernel route notifications dropped, resyncing")
 				continue
 			}
-			slog.Warn("kernel route monitor stopped; falling back to the periodic sweep", "err", err)
+			slog.Warn("kernel route monitor stopped, falling back to the periodic sweep", "err", err)
 			return
 		}
 		messages, err := parseMessages(buf[:n])

@@ -119,16 +119,16 @@ func main() {
 				log.Printf("kernel: %v", err)
 			}
 		})
-		log.Printf("tun device %s ready with %d queues; reconciling its routes into table %d",
+		log.Printf("tun device %s ready with %d queues, reconciling its routes into table %d",
 			mesh.Name, mesh.QueueCount(), kernelCfg.Table)
 	} else {
-		log.Printf("tun device %s ready with %d queues; configure its addresses and kernel routes externally",
+		log.Printf("tun device %s ready with %d queues, configure its addresses and kernel routes externally",
 			mesh.Name, mesh.QueueCount())
 	}
 
 	// The reconciler has to finish withdrawing while the TUN still exists,
 	// and client.Run destroys it as soon as its own context is done. So the
-	// mesh runs on a context cancelled only once the reconciler has returned;
+	// mesh runs on a context canceled only once the reconciler has returned;
 	// the signal context still stops both, just in that order.
 	meshCtx, stopMesh := context.WithCancel(context.Background())
 	defer stopMesh()

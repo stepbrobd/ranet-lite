@@ -296,7 +296,7 @@ func (s *Speaker) SetOriginated(routes []OriginatedRoute) {
 		s.mu.Unlock()
 		return
 	}
-	// A prefix that has gone away is simply dropped here. Neighbors learn of
+	// A prefix that has gone away is dropped here. Neighbors learn of
 	// it through the retraction the next advertisement carries, since
 	// advertiseTo reports an unknown route as infinity.
 	for key := range s.originate {

@@ -154,7 +154,7 @@ func (r Route) String() string {
 
 // auditor is implemented by a platform that can report other writers in the
 // space this reconciler is about to take over. A platform that cannot answer
-// simply does not implement it.
+// does not implement it.
 type auditor interface {
 	// foreignWriters returns each protocol already writing into the space,
 	// labeled for an operator rather than numbered, since the numbering is
@@ -262,7 +262,7 @@ func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 	}
 }
 
-// Run reconciles until ctx is cancelled, then withdraws everything this
+// Run reconciles until ctx is canceled, then withdraws everything this
 // reconciler installed and closes its netlink sockets. It is called once.
 //
 // Withdrawal is best effort by construction: the caller usually cancels the
@@ -283,7 +283,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		"table", r.cfg.Table, "protocol", r.cfg.Protocol)
 
 	// Installing takes over a same-key route rather than failing, so sharing a
-	// table with another daemon loses its routes quietly. Say so once at
+	// table with another daemon loses its routes with no error. Say so once at
 	// startup: on a fleet node mid-migration the other writer is BIRD in table
 	// 200, which is the intended overlap and still worth seeing.
 	if audit, ok := r.plat.(auditor); ok {
@@ -300,7 +300,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	for ctx.Err() == nil {
 		if err := r.reconcile(); err != nil {
 			backoff = min(max(2*backoff, minRetryInterval), r.cfg.ReconcileInterval)
-			slog.Warn("kernel reconcile failed; retrying", "err", err, "retry_in", backoff)
+			slog.Warn("kernel reconcile failed, retrying", "err", err, "retry_in", backoff)
 			stopTimer(retry)
 			retry.Reset(backoff)
 		} else if backoff != 0 {

@@ -22,7 +22,7 @@ func (c *Client) Metrics(w io.Writer) {
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_babel_neighbor_up{peer=%q} %d\n", neighbor.Peer, boolValue(neighbor.Alive))
 	}
-	fmt.Fprint(w, "# HELP ranet_lite_babel_neighbor_cost Link cost to a babel neighbor; 65535 is infinity.\n")
+	fmt.Fprint(w, "# HELP ranet_lite_babel_neighbor_cost Link cost to a babel neighbor, 65535 is infinity\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_neighbor_cost gauge\n")
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_babel_neighbor_cost{peer=%q} %d\n", neighbor.Peer, neighbor.Cost)

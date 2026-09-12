@@ -220,10 +220,10 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 // skipRouteFlags names every route out of our interface that this reconciler
 // did not and could not have installed. RTF_LOCAL, RTF_BROADCAST and
 // RTF_MULTICAST are the kernel's own entries for an address, which is how
-// darwin records the per-interface broadcast and multicast plumbing;
-// RTF_WASCLONED is a copy the kernel made of some other route and RTF_LLINFO a
-// neighbour cache
-// entry; RTF_BLACKHOLE and RTF_REJECT discard rather than forward. RTF_GATEWAY
+// darwin records the per-interface broadcast and multicast plumbing.
+// RTF_WASCLONED is a copy the kernel made of some other route, RTF_LLINFO a
+// neighbor cache entry, and RTF_BLACKHOLE and RTF_REJECT discard rather than
+// forward. RTF_GATEWAY
 // says the route has a next hop, which the mesh never expresses. Removing any
 // of them would break something this reconciler did not create.
 const skipRouteFlags = unix.RTF_IFSCOPE | unix.RTF_MULTICAST | unix.RTF_BROADCAST |

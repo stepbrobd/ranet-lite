@@ -789,7 +789,7 @@ babel:
             report[counter] = sample(final, metric) - sample(converged[name], metric)
         print(json.dumps(report), flush=True)
         # Each instance decrypts what the other sent, so a direction whose
-        # Child SA quietly failed shows up as one side delivering nothing
+        # Child SA failed with no error shows up as one side delivering nothing
         # rather than only as a smaller number.
         if (
             report["sessions"] != 1

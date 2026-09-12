@@ -8,5 +8,5 @@ package kernel
 // fail at runtime. On ios the tunnel's routes come from the network extension's
 // settings rather than from PF_ROUTE at all. Each platform gets its own backend
 // when it gets one; until then New reports it rather than starting a reconciler
-// that quietly installs nothing.
+// that installs nothing and reports no error.
 func newPlatform(Config) (platform, error) { return nil, ErrUnsupported }

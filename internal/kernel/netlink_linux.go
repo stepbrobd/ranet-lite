@@ -63,7 +63,7 @@ type nlMessage struct {
 // execute sends one request and collects every reply the kernel sends for it.
 // A dump ends at NLMSG_DONE and a modify request at its NLMSG_ERROR ack, so
 // every modify request must carry NLM_F_ACK or this blocks forever. A nonzero
-// ack comes back as the errno it carries; nothing is discarded quietly.
+// ack comes back as the errno it carries; nothing is discarded without an error.
 func (c *nlConn) execute(kind, flags uint16, body []byte) ([]nlMessage, error) {
 	c.seq++
 	seq := c.seq

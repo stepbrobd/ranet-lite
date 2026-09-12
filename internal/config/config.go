@@ -251,7 +251,7 @@ func (o *OriginatePrefix) UnmarshalYAML(value *yaml.Node) error {
 		// babel_read_source_prefix drops the whole Update unless the channel
 		// is NET_IP6_SADR, and it has no IPv4 SADR channel; the Linux IPv4 FIB
 		// has no source-address-dependent lookup either, so internal/kernel
-		// refuses to install one. Announcing it would be a prefix that quietly
+		// refuses to install one. Announcing it would be a prefix that
 		// reaches nobody.
 		return fmt.Errorf("config: originate %s from %s: source-specific routes are IPv6 only", o.Prefix, o.From)
 	}

@@ -155,7 +155,7 @@ func NewResponder(cfg ResponderConfig) (*Responder, error) {
 // calling onSession for each SA that reaches IKE_AUTH. Handshakes run
 // concurrently: a peer that stalls halfway must not delay any other peer.
 //
-// It returns when ctx is cancelled or the hub's socket is gone, after every
+// It returns when ctx is canceled or the hub's socket is gone, after every
 // in-flight handshake has finished.
 func (r *Responder) Serve(ctx context.Context, onSession func(*Session, Accepted)) error {
 	unclaimed := r.cfg.Hub.Listen()

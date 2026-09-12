@@ -110,7 +110,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 func (c *Client) Run(ctx context.Context) error {
 	// Tell every peer before the sessions go, rather than leaving each of them
 	// sending ESP into an SPI we no longer accept until its own dead peer
-	// detection expires. It runs before c.cancel because a cancelled session
+	// detection expires. It runs before c.cancel because a canceled session
 	// has no loop left to carry the Delete.
 	stop := context.AfterFunc(ctx, func() {
 		c.sessions.closeAll()
