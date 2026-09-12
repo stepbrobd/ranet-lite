@@ -2,6 +2,7 @@
   lib,
   writeShellScriptBin,
   deno,
+  git,
   go,
   go-tools,
   gomod2nix,
@@ -13,23 +14,21 @@ writeShellScriptBin "formatter" ''
   set -eoux pipefail
   shopt -s globstar
 
-  root="$PWD"
-  while [[ ! -f "$root/.git/index" ]]; do
-    if [[ "$root" == "/" ]]; then
-      exit 1
-    fi
-    root="$(dirname "$root")"
-  done
+  # in a linked worktree .git is a file, so walking up for .git/index escapes
+  # the worktree and formats whatever checkout is above it
+  root="$(${lib.getExe git} rev-parse --show-toplevel)"
   pushd "$root" > /dev/null
 
   ${lib.getExe deno} fmt **/*.md
   ${lib.getExe nixfmt-tree} .
-  ${lib.getExe taplo} format **/*.toml
 
   ${lib.getExe go} fmt ./...
   ${lib.getExe go} vet ./...
   ${lib.getExe' go-tools "staticcheck"} ./...
+  # before taplo, because gomod2nix rewrites gomod2nix.toml in its own layout
+  # and formatting it first would leave the tree unformatted again
   ${lib.getExe' gomod2nix "gomod2nix"}
+  ${lib.getExe taplo} format **/*.toml
 
   popd
 ''
