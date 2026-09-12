@@ -4,6 +4,7 @@ package kernel
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"slices"
 	"strings"
@@ -72,7 +73,12 @@ func testPlatform(t *testing.T, cfg Config) (*routePlatform, *fakeRouteSocket) {
 		control4: -1, control6: -1,
 		warned:   make(map[Route]bool),
 		pending:  make(map[Route]bool),
+		scoped:   make(map[netip.Prefix]netip.Prefix),
 		occupied: make(map[netip.Prefix]bool),
+		// No address belongs to this interface unless a test says so, which
+		// makes "the source is not ours" the default rather than an accident
+		// of whatever the host running the suite happens to have configured.
+		addrs: func() ([]netip.Prefix, error) { return nil, nil },
 	}, sock
 }
 
@@ -148,7 +154,7 @@ func TestDarwinRouteMessageNamesTheInterfaceAsItsGateway(t *testing.T) {
 		if message.Index != testIndex {
 			t.Errorf("rtm_index is %d, want %d", message.Index, testIndex)
 		}
-		// the gateway is the whole ownership story on darwin: it has to be the
+		// the gateway is what decides ownership on darwin: it has to be the
 		// interface itself, never an address.
 		gateway, ok := message.Addrs[unix.RTAX_GATEWAY].(*route.LinkAddr)
 		if !ok {
@@ -490,5 +496,161 @@ func TestDarwinPrefixMaskRoundTrip(t *testing.T) {
 	// a mask whose ones are not contiguous denotes no prefix at all.
 	if bits, ok := maskBits(addr("255.0.255.0")); ok {
 		t.Fatalf("255.0.255.0 was read as /%d", bits)
+	}
+}
+
+// The scoped install is what lets a Mac hold an address an exit announces, and
+// until the address seam existed no fast test could reach it: sourceIsOurs
+// asked the host about an interface index that names nothing, so every
+// source-specific route took the refusal path.
+func TestDarwinScopesASourceOfOurs(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	local := prefix("198.51.100.0/24")
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
+
+	announced := Route{Destination: prefix("203.0.113.0/24"), Source: local}
+	if err := plat.AddRoute(announced); err != nil {
+		t.Fatalf("install %s: %v", announced, err)
+	}
+	written := sock.messages(t)
+	if len(written) != 1 {
+		t.Fatalf("the install wrote %d messages, want 1", len(written))
+	}
+	if written[0].Flags&unix.RTF_IFSCOPE == 0 {
+		t.Error("a source-specific route for one of our own addresses was installed unscoped, " +
+			"which would capture every socket rather than only ours")
+	}
+	if got, ok := plat.scoped[announced.Destination]; !ok || got != local {
+		t.Errorf("the scoped route was recorded as %v (present %v), want %s", got, ok, local)
+	}
+
+	// The withdrawal has to carry the flag too, or it removes the unscoped
+	// route to the same destination instead.
+	sock.sent = nil
+	if err := plat.DelRoute(announced); err != nil {
+		t.Fatalf("withdraw %s: %v", announced, err)
+	}
+	if withdrawn := sock.messages(t); len(withdrawn) != 1 || withdrawn[0].Flags&unix.RTF_IFSCOPE == 0 {
+		t.Error("the withdrawal did not carry RTF_IFSCOPE")
+	}
+	if _, ok := plat.scoped[announced.Destination]; ok {
+		t.Error("the scoped entry survived the withdrawal")
+	}
+}
+
+// An address that goes away between install and withdraw must not strand the
+// route. Deciding ownership from a live query rather than from what was
+// recorded made DelRoute report success without deleting, and every later pass
+// then listed the same route for deletion and deleted nothing.
+func TestDarwinWithdrawsAScopedRouteAfterItsAddressIsGone(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	local := prefix("198.51.100.0/24")
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
+	announced := Route{Destination: prefix("203.0.113.0/24"), Source: local}
+	if err := plat.AddRoute(announced); err != nil {
+		t.Fatal(err)
+	}
+
+	plat.addrs = func() ([]netip.Prefix, error) { return nil, nil }
+	sock.sent = nil
+	if err := plat.DelRoute(announced); err != nil {
+		t.Fatalf("withdraw %s: %v", announced, err)
+	}
+	if written := sock.messages(t); len(written) != 1 {
+		t.Fatalf("the withdrawal wrote %d messages, want 1: the route is stranded", len(written))
+	}
+}
+
+// A dump failure is not an answer. Reporting it as "the source is not ours"
+// skipped the route, reported success, and never retried something a retry
+// would have fixed.
+func TestDarwinPropagatesAnAddressDumpFailure(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	wanted := errors.New("dump failed")
+	plat.addrs = func() ([]netip.Prefix, error) { return nil, wanted }
+
+	err := plat.AddRoute(Route{Destination: prefix("203.0.113.0/24"), Source: prefix("198.51.100.0/24")})
+	if !errors.Is(err, wanted) {
+		t.Fatalf("AddRoute reported %v, want the dump failure", err)
+	}
+	if len(sock.sent) != 0 {
+		t.Error("a route was written despite the dump failing")
+	}
+}
+
+// A write that fails must leave no trace in the scoped map. An entry for a
+// route that was never installed makes the next dump report the unscoped route
+// to the same destination as carrying a source it does not have, and the diff
+// is then satisfied by a route that captures the whole machine.
+func TestDarwinDoesNotRecordAScopedRouteThatFailedToInstall(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
+	sock.err = unix.EPERM
+
+	announced := Route{Destination: prefix("::/0"), Source: prefix("198.51.100.0/24")}
+	if err := plat.AddRoute(announced); err == nil {
+		t.Fatal("a refused write was reported as success")
+	}
+	if _, recorded := plat.scoped[announced.Destination]; recorded {
+		t.Error("a route that was never installed is recorded as scoped")
+	}
+}
+
+// darwin keys a scoped route separately from the unscoped route to the same
+// destination, so both can be present. Reporting the source on both collapses
+// them into one entry, and the unscoped one, which for a default route is the
+// whole machine, is then never withdrawn.
+func TestDarwinDoesNotAttributeASourceToAnUnscopedRoute(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	dest := prefix("::/0")
+	plat.scoped[dest] = prefix("2001:db8::/48")
+
+	rib := dumpRIB(t,
+		dumpEntry{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC,
+			dst: dest, gateway: ourGateway()},
+		dumpEntry{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+			dst: dest, gateway: ourGateway()},
+	)
+	routes, err := plat.ownedRoutes(rib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 2 {
+		t.Fatalf("the two routes to %s decoded as %v, want both", dest, routes)
+	}
+	var withSource, withoutSource int
+	for _, r := range routes {
+		if r.Source.IsValid() {
+			withSource++
+		} else {
+			withoutSource++
+		}
+	}
+	if withSource != 1 || withoutSource != 1 {
+		t.Errorf("decoded %d with a source and %d without, want one of each: %v",
+			withSource, withoutSource, routes)
+	}
+}
+
+// A second source prefix for the same destination has nowhere to go: interface
+// scope is one route per destination per interface.
+func TestDarwinRefusesASecondSourceForOneDestination(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	plat.addrs = func() ([]netip.Prefix, error) {
+		return []netip.Prefix{prefix("198.51.100.1/24"), prefix("203.0.113.1/24")}, nil
+	}
+	dest := prefix("::/0")
+	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("198.51.100.0/24")}); err != nil {
+		t.Fatal(err)
+	}
+	written := len(sock.sent)
+	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("203.0.113.0/24")}); err != nil {
+		t.Fatalf("the second source was reported as an error rather than skipped: %v", err)
+	}
+	if len(sock.sent) != written {
+		t.Error("a second source prefix for one destination was written to the kernel")
+	}
+	if got := plat.scoped[dest]; got != prefix("198.51.100.0/24") {
+		t.Errorf("the recorded source changed to %s, so the two would take turns", got)
 	}
 }

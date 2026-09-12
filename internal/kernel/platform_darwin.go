@@ -20,41 +20,32 @@ import (
 // # Ownership
 //
 // darwin has neither routing tables nor rt_proto, so the three-part marker the
-// linux backend stamps on a route does not exist here. What is left is the
-// output interface: a route belongs to this reconciler when it leaves
-// Config.Interface and has the shape this reconciler installs, an ordinary
-// unicast prefix route whose gateway is the interface itself rather than a
-// next-hop address. A route out of our own utun that this process did not
-// install is therefore adopted and withdrawn with the rest. That is a
-// deliberate difference from linux, where a foreign rt_proto is left alone:
-// nothing else writes to a utun ranet-lite created, and adopting is what lets
-// the routes of a crashed instance be cleaned up rather than leak. The
-// interface here plays the part Config.Table plays there, so give the
-// reconciler a device no other daemon writes, which for a utun netstack
-// created means every device but the one it names.
+// linux backend stamps on a route does not exist. The output interface takes
+// its place: a route belongs to this reconciler when it leaves Config.Interface
+// with the shape this reconciler installs, a unicast prefix route whose gateway
+// is the interface itself and not a next hop. A route out of our own utun that
+// this process did not install is adopted and withdrawn with the rest, which is
+// how a crashed instance's routes get cleaned up. That rests on one condition:
+// nothing else writes routes out of a utun ranet-lite created. Give it a device
+// no other daemon writes.
 //
-// The kernel's own entries for the interface are not routes in that sense and
-// are never touched. The host route an address creates carries the address
-// itself as its gateway, and the per-interface broadcast and multicast entries
-// carry RTF_IFSCOPE or RTF_MULTICAST; removing any of them would break an
-// address this reconciler did not assign. Nothing outside Config.Interface is
-// ever read, written or deleted, the default route of another interface
-// included, and the only addresses removed are the ones the reconciler above
-// recorded as its own.
+// The kernel's own entries for the interface are excluded by shape. An address
+// creates a host route whose gateway is the address, and the per-interface
+// broadcast and multicast entries carry RTF_BROADCAST or RTF_MULTICAST.
+// Nothing outside Config.Interface is read, written or deleted.
 //
 // # What the darwin FIB cannot hold
 //
-// It has no source-address-dependent lookup, so a source-specific route is
-// reported once and skipped rather than installed. Flattening one would be
-// actively wrong: an exit announcing "::/0 from <prefix>" would become a plain
-// default route out of the tun.
+// There is no source-address-dependent lookup. A source prefix covering one of
+// this interface's own addresses is installed as an interface-scoped route, see
+// AddRoute; any other source prefix is reported once and skipped, because
+// flattening it would turn an exit's "::/0 from <prefix>" into a plain default
+// route out of the tun.
 //
-// It has no per-route metric and no preferred source either, so Route.Metric
+// There is no per-route metric and no preferred source either, so Route.Metric
 // and Route.PrefSrc are mirrored from the configuration into every dump. Both
-// are diff key fields the reconciler computes from that same configuration,
-// and reporting anything else would make every pass add and delete the same
-// route forever. Config.Metric therefore changes nothing on darwin, and source
-// selection comes from the interface address rather than from Config.PrefSrc4.
+// are diff key fields computed from that same configuration, and reporting
+// anything else would make every pass add and delete the same route forever.
 type routePlatform struct {
 	cfg   Config
 	index int
@@ -63,6 +54,13 @@ type routePlatform struct {
 	control4 int
 	control6 int
 	monitor  *routeMonitor
+
+	// scoped remembers the source prefix behind each route installed with
+	// RTF_IFSCOPE, because the kernel stores no source and a dump would
+	// otherwise read our own scoped route as an ordinary one and replace it
+	// every pass. A route left by an earlier process is not in here, so it
+	// reads as ordinary, gets deleted and is reinstalled correctly once.
+	scoped map[netip.Prefix]netip.Prefix
 
 	// warned holds the source-specific routes already reported and pending
 	// the ones reported under the current dump. Routes starts every reconcile
@@ -73,6 +71,12 @@ type routePlatform struct {
 	// occupied remembers destinations another program already holds, so a
 	// route that can never install is reported once rather than every pass.
 	occupied map[netip.Prefix]bool
+
+	// addrs replaces the interface dump when set. The write side already goes
+	// through the rtSocket seam; without the read side a test cannot reach the
+	// scoped install at all, because sourceIsOurs would ask the host about an
+	// interface index that names nothing.
+	addrs func() ([]netip.Prefix, error)
 
 	pending map[Route]bool
 }
@@ -103,6 +107,7 @@ func newPlatform(cfg Config) (platform, error) {
 	plat := &routePlatform{
 		cfg: cfg, index: device.Index,
 		control4: -1, control6: -1,
+		scoped:   make(map[netip.Prefix]netip.Prefix),
 		warned:   make(map[Route]bool),
 		occupied: make(map[netip.Prefix]bool),
 		pending:  make(map[Route]bool),
@@ -214,10 +219,10 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 
 // skipRouteFlags names every route out of our interface that this reconciler
 // did not and could not have installed. RTF_LOCAL, RTF_BROADCAST and
-// RTF_MULTICAST are the kernel's own entries for an address; RTF_IFSCOPE is a
-// route only a socket bound to the interface ever sees, which is how darwin
-// records the per-interface broadcast and multicast plumbing; RTF_WASCLONED is
-// a copy the kernel made of some other route and RTF_LLINFO a neighbour cache
+// RTF_MULTICAST are the kernel's own entries for an address, which is how
+// darwin records the per-interface broadcast and multicast plumbing;
+// RTF_WASCLONED is a copy the kernel made of some other route and RTF_LLINFO a
+// neighbour cache
 // entry; RTF_BLACKHOLE and RTF_REJECT discard rather than forward. RTF_GATEWAY
 // says the route has a next hop, which the mesh never expresses. Removing any
 // of them would break something this reconciler did not create.
@@ -235,7 +240,16 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if !ok || rm.Type != unix.RTM_GET || rm.Index != p.index {
 		return Route{}, false
 	}
-	if rm.Flags&unix.RTF_UP == 0 || rm.Flags&skipRouteFlags != 0 {
+	// RTF_IFSCOPE is handled after the destination is known: this reconciler
+	// sets it on its own source-specific routes, but the kernel and other
+	// daemons also set it on routes of theirs that are otherwise
+	// indistinguishable from ours. utun7 on a machine running Tailscale
+	// carries a scoped 255.255.255.255 entry with a link gateway and
+	// RTF_STATIC, which is exactly the shape this reconciler installs. So a
+	// scoped route counts as ours only if this process scoped that
+	// destination, and one orphaned by a crash is left alone rather than
+	// deleted on the strength of a guess.
+	if rm.Flags&unix.RTF_UP == 0 || rm.Flags&(skipRouteFlags&^unix.RTF_IFSCOPE) != 0 {
 		return Route{}, false
 	}
 	if len(rm.Addrs) <= unix.RTAX_NETMASK {
@@ -268,11 +282,44 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if !ok {
 		return Route{}, false
 	}
+	source, tracked := p.scoped[prefix]
+	if rm.Flags&unix.RTF_IFSCOPE == 0 {
+		// The kernel keys a scoped route separately from the unscoped route to
+		// the same destination, so both can exist at once. Only the scoped one
+		// carries a source; reporting the source on both would collapse them
+		// into one entry in the diff and leave the unscoped route, which for
+		// "::/0" is the whole machine's default, installed forever.
+		source = netip.Prefix{}
+	} else if !tracked {
+		return Route{}, false
+	}
 	return Route{
 		Destination: prefix,
-		PrefSrc:     p.prefSrc(prefix),
-		Metric:      p.metric(prefix),
+		// The kernel keeps no source, so a scoped route's source comes back
+		// from what this process installed for that destination.
+		Source:  source,
+		PrefSrc: p.prefSrc(prefix),
+		Metric:  p.metric(prefix),
 	}, true
+}
+
+// sourceIsOurs reports whether a source prefix covers an address on this
+// interface, which is what interface scope can stand in for. Anything else is
+// a prefix belonging to some other node and cannot be expressed here.
+func (p *routePlatform) sourceIsOurs(source netip.Prefix) (bool, error) {
+	assigned, err := p.Addrs()
+	if err != nil {
+		// Distinguished from "not ours" on purpose. Reporting a dump failure
+		// as a source we cannot express would skip the route, report success,
+		// and never retry something a retry would fix.
+		return false, err
+	}
+	for _, address := range assigned {
+		if source.Contains(address.Addr()) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // routeMessage encodes one RTM_ADD or RTM_DELETE. The gateway is the interface
@@ -281,9 +328,11 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 // picks the peer after the kernel hands over the packet, so there is no next
 // hop to name.
 //
-// RTF_IFSCOPE is deliberately not set. A scoped route on darwin is consulted
-// only by a socket bound to that interface, so it would be invisible to
-// ordinary forwarding, which is the opposite of what the mesh wants.
+// RTF_IFSCOPE is set by the caller and only for a source-specific route. A
+// scoped route is invisible to an ordinary lookup and visible to a socket bound
+// to an address on this interface, which is exactly the distinction a source
+// prefix draws, so an ordinary mesh route must stay unscoped and a
+// source-specific one must not.
 //
 // RTF_HOST is not set either, even for a full-length prefix; the netmask says
 // the same thing. With RTF_HOST the kernel resolves the output interface
@@ -314,13 +363,42 @@ func routeAddr(address netip.Addr) route.Addr {
 }
 
 func (p *routePlatform) AddRoute(r Route) error {
+	scoped := false
 	if r.Source.IsValid() {
-		p.skipSourceSpecific(r)
-		return nil
+		ours, err := p.sourceIsOurs(r.Source)
+		if err != nil {
+			return err
+		}
+		if !ours {
+			// A source prefix that is not one of this interface's own
+			// addresses cannot be expressed: interface scope selects on the
+			// socket's bound address, so it can only stand in for "from an
+			// address of ours".
+			p.skipSourceSpecific(r)
+			return nil
+		}
+		if held, ok := p.scoped[r.Destination]; ok && held != r.Source {
+			// Interface scope is one route per destination per interface, so a
+			// second source prefix for the same destination has nowhere to go.
+			// Skipping says so once; installing would collide, and recording it
+			// would make the two take turns being reported as installed.
+			p.skipSourceSpecific(r)
+			return nil
+		}
+		scoped = true
 	}
 	message, err := p.routeMessage(unix.RTM_ADD, r)
 	if err != nil {
 		return err
+	}
+	if scoped {
+		// RTF_IFSCOPE makes the route invisible to an ordinary lookup and
+		// visible to a socket bound to an address on this interface, which is
+		// measurably how darwin selects it, see TestDarwinScopedRouteSelection.
+		// That is the closest this platform gets to the fleet's
+		// "ip rule from <prefix> lookup 200", and it is what lets a Mac hold an
+		// address an exit announces without taking the whole default route.
+		message.Flags |= unix.RTF_IFSCOPE
 	}
 	// darwin has no replace, so a route another program holds under the same
 	// key stays and this add is retried on every pass. That is the same
@@ -340,24 +418,47 @@ func (p *routePlatform) AddRoute(r Route) error {
 		return nil
 	}
 	delete(p.occupied, r.Destination)
+	if scoped {
+		// Recorded only after the write lands. An entry for a route that was
+		// never installed would make decodeRoute report an unscoped route as
+		// carrying a source it does not have, and the diff would then leave a
+		// plain default out of the tun in place forever.
+		p.scoped[r.Destination] = r.Source
+	}
 	return nil
 }
 
 func (p *routePlatform) DelRoute(r Route) error {
-	if r.Source.IsValid() {
-		// nothing was installed for a source-specific route, and deleting what
-		// is left after dropping the source would take out the ordinary route
-		// to the same destination. For an exit's "::/0 from <prefix>" that is
-		// the box's default route.
+	_, scoped := p.scoped[r.Destination]
+	if r.Source.IsValid() && !scoped {
+		// Nothing was installed for a source we cannot express, and deleting
+		// what is left after dropping the source would take out the ordinary
+		// route to the same destination. For an exit's "::/0 from <prefix>"
+		// that is the box's default route.
+		//
+		// The answer comes from what this process recorded at install rather
+		// than from asking the kernel which addresses are on the interface
+		// now. An address removed between install and withdraw would otherwise
+		// make this report success without deleting, and the route would then
+		// be undeletable for the life of the process.
 		return nil
 	}
 	message, err := p.routeMessage(unix.RTM_DELETE, r)
 	if err != nil {
 		return err
 	}
+	if scoped {
+		// The kernel keys a scoped route separately from the unscoped route to
+		// the same destination, so the delete has to carry the flag or it
+		// removes the wrong one.
+		message.Flags |= unix.RTF_IFSCOPE
+	}
 	if err := p.sock.WriteRoute(message); err != nil && !gone(err) {
 		return err
 	}
+	// Dropped only once the route is gone, so a failed delete leaves the entry
+	// and the next pass decodes the route and tries again.
+	delete(p.scoped, r.Destination)
 	delete(p.occupied, r.Destination)
 	return nil
 }
@@ -376,6 +477,9 @@ func (p *routePlatform) skipSourceSpecific(r Route) {
 }
 
 func (p *routePlatform) Addrs() ([]netip.Prefix, error) {
+	if p.addrs != nil {
+		return p.addrs()
+	}
 	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeInterface, p.index)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the addresses of %s: %w", p.cfg.Interface, err)
