@@ -42,10 +42,18 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 	err = responder.Serve(ctx, func(sess *ike.Session, accepted ike.Accepted) {
 		serving.Go(func() {
 			peer := accepted.Peer
-			name := fmt.Sprintf("%s/%s", peer.Organization, peer.CommonName)
-			sessionName := fmt.Sprintf("%s/%s/%s", peer.Organization, peer.CommonName, peer.SerialNumber)
-			release := c.sessions.adopt(name, sess.Mux())
+			name := fmt.Sprintf("%s/%s@%s", peer.Organization, peer.CommonName, accepted.Local.SerialNumber)
+			// The same shape a dialed session uses, so one path through the
+			// mesh has one name whichever end opened it and the replace rule
+			// in sessionSet applies across both directions.
+			sessionName := fmt.Sprintf("%s/%s/%s@%s", peer.Organization, peer.CommonName, peer.SerialNumber, accepted.Local.SerialNumber)
+			// We answered, so this session is the one both ends keep exactly
+			// when the peer is the end that should be dialing.
+			release, adopted := c.sessions.adopt(sessionName, sess, preferInitiator(peer, accepted.Local))
 			defer release()
+			if !adopted {
+				return
+			}
 			if err := c.serveSession(ctx, sess, name, sessionName); err != nil && ctx.Err() == nil {
 				log.Printf("peer %s: %v", name, err)
 			}

@@ -63,6 +63,12 @@ type ikeContext struct {
 	responder bool // local endpoint is the responder for this IKE SA
 	sendIV    atomic.Uint64
 
+	// localMIDMu guards nextLocalMID across the whole allocate-send-consume
+	// step. Run allocates there on its own goroutine while a caller tearing
+	// the session down can be sending a Delete directly, and requestMu does
+	// not serialize the two: it orders callers queueing work for Run, not Run
+	// itself.
+	localMIDMu         sync.Mutex
 	nextLocalMID       uint32 // next Message ID we allocate for a local request
 	nextPeerMID        uint32 // next Message ID expected from a peer request
 	lastPeerResponseID uint32
@@ -103,6 +109,11 @@ type Session struct {
 	// serving is true while Run is draining the request queue. Nothing else
 	// drains it, so a local exchange started when this is false would wait out
 	// its caller's patience and send nothing.
+	serving atomic.Bool
+	// lastActive is when the peer last proved it is still there, as unix
+	// nanoseconds: the moment the SA was established, then every piece of
+	// authenticated traffic and every successful liveness check after it.
+	lastActive atomic.Int64
 
 	childRekeyInterval time.Duration
 	ikeRekeyInterval   time.Duration
@@ -520,6 +531,7 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 		mux.Close()
 		return nil, err
 	}
+	sess.noteEstablished()
 	return sess, nil
 }
 
@@ -789,3 +801,21 @@ func usefulInitNotify(m *Message, cookieUsed, groupUsed bool) (Notify, bool) {
 	}
 	return Notify{}, false
 }
+
+// Active reports whether this session has recently proved the peer is still
+// there. A session that is merely installed proves nothing: after a peer
+// reboots, the SA on this side stays in place, looking established, until dead
+// peer detection reaps it a minute or more later.
+//
+// A freshly established SA counts as active without having carried anything
+// yet, because a handshake that just completed is the same proof. Deciding
+// from Run instead would make a session read as dead for as long as it takes
+// its own control loop to start, and two nodes resolving a simultaneous open
+// in that window could keep different sessions.
+func (s *Session) Active() bool {
+	last := s.lastActive.Load()
+	return last != 0 && time.Since(time.Unix(0, last)) < 2*dpdInterval
+}
+
+// noteEstablished starts the liveness clock at the end of the handshake.
+func (s *Session) noteEstablished() { s.lastActive.Store(time.Now().UnixNano()) }

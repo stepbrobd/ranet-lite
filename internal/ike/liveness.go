@@ -159,7 +159,10 @@ func (s *Session) Run(ctx context.Context) error {
 	}()
 	stop := context.AfterFunc(ctx, func() { _ = s.mux.Close() })
 	defer stop()
+	s.serving.Store(true)
+	defer s.serving.Store(false)
 	lastAuthenticated := time.Now()
+	s.lastActive.Store(lastAuthenticated.UnixNano())
 	if s.rekeyRetryInitial == 0 && s.rekeyRetryMax == 0 {
 		s.rekeyRetryInitial = 5 * time.Second
 		s.rekeyRetryMax = 5 * time.Minute
@@ -226,6 +229,7 @@ func (s *Session) Run(ctx context.Context) error {
 		startDueRekey()
 		if s.trafficSeen.Swap(false) {
 			lastAuthenticated = time.Now()
+			s.lastActive.Store(lastAuthenticated.UnixNano())
 		}
 		if pending == nil {
 			select {
@@ -344,6 +348,8 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 	if req.exchange == CREATE_CHILD_SA && retired {
 		return nil, fmt.Errorf("ike: IKE SA changed before Child SA exchange started")
 	}
+	context.localMIDMu.Lock()
+	defer context.localMIDMu.Unlock()
 	// Leave the final 32-bit value unused so incrementing the next local ID
 	// can never wrap. RFC 7296 §2.2 requires rekeying or closing first.
 	if context.nextLocalMID == maxMessageID {
@@ -634,4 +640,52 @@ func (s *Session) responseNotifyData(ctx *ikeContext, msgID uint32, exchange Exc
 
 func (s *Session) responseNotifySA(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType, protocol ProtocolID, spi []byte) ([]byte, error) {
 	return s.response(ctx, msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: protocol, SPI: spi, Type: notifyType})}})
+}
+
+// DeleteIKE tells the peer this IKE SA and every Child SA under it are gone,
+// which is the Delete of RFC 7296 section 1.4. Without it the far end keeps
+// its half, keeps sending ESP into an SPI we no longer accept, and only
+// notices when its own dead peer detection expires, which is over a minute.
+//
+// It is best effort by construction: the caller is tearing the session down
+// either way, so a peer that has already vanished costs only the exchange's
+// own retransmission budget, and the caller bounds that.
+func (s *Session) DeleteIKE() error {
+	payloads := []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}
+	if s.serving.Load() {
+		_, err := s.request(INFORMATIONAL, payloads)
+		return err
+	}
+	// Nothing is draining the request queue, so the exchange has to go out
+	// directly. This is the common case for a session resolved away the moment
+	// it was established: it is closed before it is ever served, and routing
+	// the Delete through a loop that will never run would send nothing at all.
+	return s.sendUnansweredRequest(payloads)
+}
+
+// sendUnansweredRequest transmits one encrypted request and does not wait for
+// the response.
+func (s *Session) sendUnansweredRequest(inner []RawPayload) error {
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+	ctx := s.currentContext()
+	ctx.localMIDMu.Lock()
+	defer ctx.localMIDMu.Unlock()
+	flags := uint8(0)
+	if !ctx.responder {
+		flags = FlagInitiator
+	}
+	header := Header{
+		SPIInitiator: ctx.spiI,
+		SPIResponder: ctx.spiR,
+		ExchangeType: INFORMATIONAL,
+		Flags:        flags,
+		MessageID:    ctx.nextLocalMID,
+	}
+	request, err := ctx.encrypt(ctx.localEncryptionKey(), header, nil, inner)
+	if err != nil {
+		return fmt.Errorf("ike: build IKE Delete: %w", err)
+	}
+	ctx.nextLocalMID++
+	return s.mux.SendIKE(request)
 }

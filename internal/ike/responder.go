@@ -350,6 +350,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	if err := session.SetRekeyRetry(retryInitial, retryMax); err != nil {
 		return nil, Accepted{}, err
 	}
+	session.noteEstablished()
 	return session, accepted, nil
 }
 

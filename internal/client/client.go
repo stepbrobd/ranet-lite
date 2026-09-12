@@ -87,7 +87,14 @@ func New(cfg *config.Config) (_ *Client, err error) {
 // Run is called once. It returns only after peer handshakes, IKE sessions, ESP
 // workers and Babel timers have stopped, including cancellation during dialing.
 func (c *Client) Run(ctx context.Context) error {
-	stop := context.AfterFunc(ctx, c.cancel)
+	// Tell every peer before the sessions go, rather than leaving each of them
+	// sending ESP into an SPI we no longer accept until its own dead peer
+	// detection expires. It runs before c.cancel because a cancelled session
+	// has no loop left to carry the Delete.
+	stop := context.AfterFunc(ctx, func() {
+		c.sessions.closeAll()
+		c.cancel()
+	})
 	defer stop()
 	defer c.Close()
 	if ctx.Err() != nil {

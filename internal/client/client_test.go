@@ -11,6 +11,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
 
@@ -129,5 +130,125 @@ func TestValidateESPTunnelPayload(t *testing.T) {
 				t.Fatalf("got deliver=%v err=%v; want deliver=%v err=%v", deliver, err, test.deliver, test.wantErr)
 			}
 		})
+	}
+}
+
+// Two nodes that dial each other at once land both sessions on the same path
+// name at both ends. They have to pick the same survivor whichever order the
+// two handshakes finish in locally, or each keeps the SA the other tore down
+// and nothing crosses until dead peer detection notices.
+func TestSimultaneousOpenConvergesOnTheSameSession(t *testing.T) {
+	a := ike.Identity{Organization: "example", CommonName: "alpha", SerialNumber: "1"}
+	b := ike.Identity{Organization: "example", CommonName: "bravo", SerialNumber: "1"}
+	if preferInitiator(a, b) == preferInitiator(b, a) {
+		t.Fatal("both ends think the same one should dial, so there is no tie-break at all")
+	}
+
+	// One session per direction, named by who opened it. Both nodes see both.
+	const dialedByA, dialedByB = "dialed-by-a", "dialed-by-b"
+	// resolve replays one node's arrival order and reports which session it
+	// keeps. local is that node's own identity.
+	resolve := func(local, remote ike.Identity, order []string) string {
+		set := newSessionSet()
+		set.close = func(*ike.Session) {}
+		set.active = func(*ike.Session) bool { return true }
+		sessions := map[string]*ike.Session{dialedByA: {}, dialedByB: {}}
+		weDial := local == a
+		for _, which := range order {
+			// A session is preferred when it runs in the direction both ends
+			// agree should be dialed.
+			dialedByUs := (which == dialedByA) == weDial
+			preferred := dialedByUs == preferInitiator(local, remote)
+			set.adopt("path", sessions[which], preferred)
+		}
+		for name, sess := range sessions {
+			if live := set.live["path"]; live != nil && live.session == sess {
+				return name
+			}
+		}
+		return ""
+	}
+
+	orders := [][]string{{dialedByA, dialedByB}, {dialedByB, dialedByA}}
+	for _, orderA := range orders {
+		for _, orderB := range orders {
+			keptByA := resolve(a, b, orderA)
+			keptByB := resolve(b, a, orderB)
+			if keptByA == "" || keptByB == "" {
+				t.Fatalf("a node kept no session at all (a=%v b=%v)", orderA, orderB)
+			}
+			if keptByA != keptByB {
+				t.Errorf("alpha (order %v) kept %s while bravo (order %v) kept %s, which is a blackhole in both directions",
+					orderA, keptByA, orderB, keptByB)
+			}
+		}
+	}
+}
+
+// Losing the resolution must not send the dialer straight back in. Without a
+// stand-down the two ends take turns replacing each other's session every
+// reconnect delay for as long as the process runs, and every replacement
+// withdraws the routes learned through that peer.
+func TestAnEstablishedSessionStopsTheDialer(t *testing.T) {
+	set := newSessionSet()
+	set.close = func(*ike.Session) {}
+	set.active = func(*ike.Session) bool { return true }
+	if set.holds("path") {
+		t.Fatal("an empty set reports a session, so neither end would ever dial")
+	}
+	sess := &ike.Session{}
+	release, adopted := set.adopt("path", sess, true)
+	if !adopted {
+		t.Fatal("the first session was not adopted")
+	}
+	if !set.holds("path") {
+		t.Error("a live session is not reported, so the peer's dialer keeps opening more")
+	}
+	release()
+	if set.holds("path") {
+		t.Error("the path is still held after the session ended, so nothing would redial")
+	}
+}
+
+// A peer that reboots leaves an SA on this side that looks established until
+// dead peer detection reaps it, a minute or more later. Declining its fresh
+// handshake in favor of that one locks it out for the whole of that minute,
+// and because the stale entry also stops our own dialer, neither end opens
+// anything at all.
+func TestAStaleSessionDoesNotLockOutTheReconnectingPeer(t *testing.T) {
+	set := newSessionSet()
+	set.close = func(*ike.Session) {}
+	stale, fresh := &ike.Session{}, &ike.Session{}
+	// The incumbent is the one both ends prefer, and it is no longer carrying
+	// traffic. The peer dialing us is the proof of that.
+	set.active = func(sess *ike.Session) bool { return sess != stale }
+
+	if _, adopted := set.adopt("path", stale, true); !adopted {
+		t.Fatal("the first session was not adopted")
+	}
+	if set.holds("path") {
+		t.Error("a session that has stopped proving the peer is there still stops our dialer")
+	}
+	if _, adopted := set.adopt("path", fresh, false); !adopted {
+		t.Fatal("a fresh handshake was declined in favor of a session that is not carrying traffic")
+	}
+	if live := set.live["path"]; live == nil || live.session != fresh {
+		t.Error("the stale session is still the live one")
+	}
+}
+
+// The preference rule still has to hold when the incumbent really is alive, or
+// two nodes dialing each other at once keep different sessions.
+func TestAnActivePreferredSessionStillWins(t *testing.T) {
+	set := newSessionSet()
+	set.close = func(*ike.Session) {}
+	set.active = func(*ike.Session) bool { return true }
+	winner, loser := &ike.Session{}, &ike.Session{}
+	set.adopt("path", winner, true)
+	if _, adopted := set.adopt("path", loser, false); adopted {
+		t.Error("the session neither end prefers replaced the one both do")
+	}
+	if live := set.live["path"]; live == nil || live.session != winner {
+		t.Error("the preferred session was not kept")
 	}
 }

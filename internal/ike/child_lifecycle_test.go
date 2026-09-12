@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -277,5 +278,46 @@ func TestChildNotFoundRecoveryCreatesNewChild(t *testing.T) {
 	}
 	if got := s.currentChild(); got.LocalSPI != newLocalSPI || got.RemoteSPI != newRemoteSPI {
 		t.Fatalf("current Child SA = %#v", got)
+	}
+}
+
+// requestMu orders callers queueing work for Run; it does not order Run
+// itself, which allocates Message IDs on its own goroutine. A session closed
+// the instant it is established runs both at once, which is what adopt's
+// replace path produces on a simultaneous open.
+func TestLocalMessageIDIsNotAllocatedTwiceAtOnce(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	s := &Session{
+		mux: mux,
+		current: &ikeContext{
+			suite:        SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256},
+			skei:         make([]byte, 20),
+			sker:         make([]byte, 20),
+			nextLocalMID: 2,
+		},
+		requests: make(chan *localRequest),
+	}
+
+	payloads := []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}
+	seen := make(chan uint32, 64)
+	var senders sync.WaitGroup
+	for range 8 {
+		senders.Go(func() { _ = s.sendUnansweredRequest(payloads) })
+		senders.Go(func() {
+			pending, err := s.startRequest(&localRequest{exchange: INFORMATIONAL, inner: payloads, result: make(chan requestResult, 1)})
+			if err == nil {
+				seen <- pending.msgID
+			}
+		})
+	}
+	senders.Wait()
+	close(seen)
+
+	taken := make(map[uint32]bool)
+	for msgID := range seen {
+		if taken[msgID] {
+			t.Fatalf("Message ID %d was handed to two exchanges", msgID)
+		}
+		taken[msgID] = true
 	}
 }

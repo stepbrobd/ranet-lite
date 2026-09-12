@@ -522,3 +522,47 @@ func encodeTestSAInit(t *testing.T, spiI uint64, ni []byte, proposal Proposal, a
 	header := Header{SPIInitiator: spiI, ExchangeType: IKE_SA_INIT, Flags: FlagInitiator, MessageID: 0}
 	return (&Message{Header: header, Payloads: payloads}).Encode()
 }
+
+// A session that is resolved away the moment it is established is closed
+// before anything ever serves it, so its Run loop never starts. Routing the
+// Delete through that loop's request queue sends nothing at all, and the peer
+// is left holding an SA it keeps transmitting into until its own dead peer
+// detection expires.
+func TestDeleteIKEReachesThePeerWithoutARunLoop(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	initiator, err := h.dial(t)
+	if err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	defer initiator.Mux().Close()
+	var responder *Session
+	select {
+	case responder = <-h.sessions:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the responder produced no session")
+	}
+	defer responder.Mux().Close()
+	<-h.identities
+
+	// Deliberately no Run on either side, which is the state adopt closes a
+	// session in.
+	start := time.Now()
+	if err := initiator.DeleteIKE(); err != nil {
+		t.Fatalf("DeleteIKE: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("DeleteIKE took %s with nothing to wait for", elapsed)
+	}
+
+	raw, err := responder.Mux().RecvIKEUntil(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("the peer never received the Delete: %v", err)
+	}
+	header, err := decodeHeader(raw)
+	if err != nil {
+		t.Fatalf("decode what arrived: %v", err)
+	}
+	if header.ExchangeType != INFORMATIONAL {
+		t.Errorf("the peer received exchange type %d, want INFORMATIONAL", header.ExchangeType)
+	}
+}

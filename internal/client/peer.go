@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -38,8 +39,14 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 		if ctx.Err() != nil {
 			return
 		}
-		if err := c.connectPeer(ctx, local, p, name); err != nil {
-			log.Printf("peer %s: %v; reconnecting in %s", name, err, reconnectDelay)
+		switch err := c.connectPeer(ctx, local, p, name); {
+		case err == nil:
+		case errors.Is(err, errSessionEstablished):
+			// Not a failure and not worth a log line every reconnect delay.
+			// The loop keeps running so this dialer takes over the moment the
+			// peer's session ends.
+		default:
+			log.Printf("peer %s: %v, reconnecting in %s", name, err, reconnectDelay)
 		}
 		select {
 		case <-ctx.Done():
@@ -97,6 +104,13 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 		return err
 	}
 	sessionName := fmt.Sprintf("%s/%s/%s@%s", p.Organization, p.CommonName, ep.SerialNumber, local.SerialNumber)
+	if c.sessions.holds(sessionName) {
+		// The peer already reached us over this same pair of endpoints. Dialing
+		// anyway opens a second SA that one end or the other has to resolve
+		// away, and doing that on every reconnect delay is how two nodes spend
+		// a full mesh replacing each other's sessions.
+		return errSessionEstablished
+	}
 	log.Printf("peer %s: dialing %s:%d", sessionName, remoteIP, ep.Port)
 
 	ikeCfg := ike.PeerConfig{
@@ -122,7 +136,16 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	if err != nil {
 		return fmt.Errorf("handshake: %w", err)
 	}
-	release := c.sessions.adopt(name, sess.Mux())
+	localIdentity := ike.Identity{Organization: cfg.Organization, CommonName: cfg.CommonName, SerialNumber: local.SerialNumber}
+	remoteIdentity := ike.Identity{Organization: p.Organization, CommonName: node.CommonName, SerialNumber: ep.SerialNumber}
+	release, adopted := c.sessions.adopt(sessionName, sess, preferInitiator(localIdentity, remoteIdentity))
 	defer release()
+	if !adopted {
+		return errSessionEstablished
+	}
 	return c.serveSession(ctx, sess, name, sessionName)
 }
+
+// errSessionEstablished means this peer is already reachable over a session
+// the other end opened, so there is nothing to dial and nothing wrong.
+var errSessionEstablished = errors.New("a session for this endpoint pair is already established")
