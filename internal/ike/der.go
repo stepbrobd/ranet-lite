@@ -106,37 +106,46 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 }
 
 // derAttribute reads one single-valued RDN, SET{SEQUENCE{OID, value}}, and
-// returns the value's string content if the OID is the one expected.
-func derAttribute(rdn []byte, oid []byte, tag byte) (string, error) {
+// returns the attribute's OID and its string content.
+//
+// Both UTF8String and PrintableString are accepted for any attribute. ranet
+// writes O and CN as UTF8String and the serial number as PrintableString,
+// while strongSwan picks the type from the characters in the value, so the
+// same name reaches the wire in either form. The name is not what
+// authenticates a peer: AUTH signs the bytes actually received, so a
+// re-encoded name still needs that peer's key to be accepted.
+func derAttribute(rdn []byte) (oid []byte, value string, err error) {
 	setTag, set, rest, err := derElement(rdn)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	if setTag != 0x31 || len(rest) != 0 {
-		return "", fmt.Errorf("ike: identity RDN is not a single SET")
+		return nil, "", fmt.Errorf("ike: identity RDN is not a single SET")
 	}
 	seqTag, seq, rest, err := derElement(set)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	if seqTag != 0x30 || len(rest) != 0 {
-		return "", fmt.Errorf("ike: identity RDN holds %d attributes, want 1", 1+len(rest))
+		return nil, "", fmt.Errorf("ike: identity RDN does not hold exactly one attribute")
 	}
-	gotOID, _, seq, err := derElementRaw(seq)
+	oid, _, seq, err = derElementRaw(seq)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	if !bytesEqual(gotOID, oid) {
-		return "", fmt.Errorf("ike: unexpected identity attribute type")
-	}
-	valueTag, value, rest, err := derElement(seq)
+	valueTag, content, rest, err := derElement(seq)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	if valueTag != tag || len(rest) != 0 {
-		return "", fmt.Errorf("ike: identity attribute has tag %#x, want %#x", valueTag, tag)
+	if len(rest) != 0 {
+		return nil, "", fmt.Errorf("ike: identity attribute has trailing data")
 	}
-	return string(value), nil
+	switch valueTag {
+	case 0x0c, 0x13:
+		return oid, string(content), nil
+	default:
+		return nil, "", fmt.Errorf("ike: identity attribute has string type %#x", valueTag)
+	}
 }
 
 // derElementRaw is derElement, additionally returning the whole element
@@ -149,11 +158,11 @@ func derElementRaw(b []byte) (raw, content, rest []byte, err error) {
 	return b[:len(b)-len(rest)], content, rest, nil
 }
 
-// DecodeIdentityDN parses exactly what EncodeIdentityDN produces: three
-// single-valued RDNs in the order O, CN, serialNumber. Anything else is
-// rejected rather than interpreted. The identity is the only thing binding an
-// authenticated key to a named peer, so a caller re-encodes the result and
-// compares it to the bytes on the wire before trusting it.
+// DecodeIdentityDN reads the RDNSequence ranet and strongSwan use as a raw
+// public key identity: exactly the three single-valued RDNs O, CN and
+// serialNumber, in any order, each appearing once. A sequence with anything
+// else in it is rejected rather than interpreted, because the name decides
+// which key is allowed to verify AUTH.
 func DecodeIdentityDN(b []byte) (organization, commonName, serialNumber string, err error) {
 	tag, seq, rest, err := derElement(b)
 	if err != nil {
@@ -162,28 +171,44 @@ func DecodeIdentityDN(b []byte) (organization, commonName, serialNumber string, 
 	if tag != 0x30 || len(rest) != 0 {
 		return "", "", "", fmt.Errorf("ike: identity is not a single RDNSequence")
 	}
-	fields := []struct {
+	targets := []struct {
 		oid   []byte
-		tag   byte
 		value *string
+		seen  bool
 	}{
-		{oidOrganizationName, 0x0c, &organization},
-		{oidCommonName, 0x0c, &commonName},
-		{oidSerialNumber, 0x13, &serialNumber},
+		{oid: oidOrganizationName, value: &organization},
+		{oid: oidCommonName, value: &commonName},
+		{oid: oidSerialNumber, value: &serialNumber},
 	}
-	for _, field := range fields {
+	count := 0
+	for len(seq) != 0 {
 		_, _, next, err := derElement(seq)
 		if err != nil {
 			return "", "", "", err
 		}
-		*field.value, err = derAttribute(seq[:len(seq)-len(next)], field.oid, field.tag)
+		oid, value, err := derAttribute(seq[:len(seq)-len(next)])
 		if err != nil {
 			return "", "", "", err
 		}
+		matched := false
+		for i := range targets {
+			if !bytesEqual(oid, targets[i].oid) {
+				continue
+			}
+			if targets[i].seen {
+				return "", "", "", fmt.Errorf("ike: identity repeats an attribute")
+			}
+			targets[i].seen, matched = true, true
+			*targets[i].value = value
+		}
+		if !matched {
+			return "", "", "", fmt.Errorf("ike: identity carries an attribute type this profile does not use")
+		}
+		count++
 		seq = next
 	}
-	if len(seq) != 0 {
-		return "", "", "", fmt.Errorf("ike: identity has more than three RDNs")
+	if count != len(targets) {
+		return "", "", "", fmt.Errorf("ike: identity has %d attributes, want %d", count, len(targets))
 	}
 	return organization, commonName, serialNumber, nil
 }

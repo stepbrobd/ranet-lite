@@ -189,18 +189,52 @@ func TestIdentityRoundTripsThroughItsEncoding(t *testing.T) {
 	}
 }
 
-func TestIdentityRejectsNonCanonicalEncoding(t *testing.T) {
+func TestIdentityAcceptsEitherDERStringType(t *testing.T) {
 	id := Identity{Organization: "testorg", CommonName: "server", SerialNumber: "1"}
 	body := id.encodeID()
-	// The serial number is a PrintableString; the same characters as a
-	// UTF8String name the same peer to a lenient parser and must not here,
-	// or one AUTH signature would cover two distinct byte strings.
-	swapped := bytes.Replace(body, []byte{0x13, 0x01, '1'}, []byte{0x0c, 0x01, '1'}, 1)
-	if bytes.Equal(swapped, body) {
+	// strongSwan picks the ASN.1 string type from the characters in the value
+	// rather than per attribute, so it puts a printable organization in a
+	// PrintableString where ranet writes a UTF8String. The two name one peer.
+	printable := bytes.Replace(body, []byte{0x0c, 0x07, 't', 'e', 's', 't', 'o', 'r', 'g'}, []byte{0x13, 0x07, 't', 'e', 's', 't', 'o', 'r', 'g'}, 1)
+	if bytes.Equal(printable, body) {
 		t.Fatal("test did not alter the encoding")
 	}
-	if _, err := identityFromID(swapped); err == nil {
-		t.Fatal("a re-tagged attribute was accepted")
+	decoded, err := identityFromID(printable)
+	if err != nil {
+		t.Fatalf("a PrintableString organization was rejected: %v", err)
+	}
+	if decoded != id {
+		t.Fatalf("decoded %s, want %s", decoded, id)
+	}
+}
+
+func TestIdentityRejectsAttributesThisProfileDoesNotUse(t *testing.T) {
+	// An RDNSequence carrying a country or an extra common name names a peer
+	// this profile cannot reason about, so it is refused rather than reduced
+	// to the attributes it happens to recognize.
+	extra := derSequence(
+		derSet(derSequence(oidOrganizationName, derUTF8String("testorg"))),
+		derSet(derSequence(oidCommonName, derUTF8String("server"))),
+		derSet(derSequence(oidSerialNumber, derPrintableString("1"))),
+		derSet(derSequence([]byte{0x06, 0x03, 0x55, 0x04, 0x06}, derPrintableString("FR"))),
+	)
+	if _, err := identityFromID(EncodeID(ID_DER_ASN1_DN, extra)); err == nil {
+		t.Fatal("an identity with a fourth attribute was accepted")
+	}
+}
+
+func TestIdentityAcceptsAttributesInAnyOrder(t *testing.T) {
+	reordered := derSequence(
+		derSet(derSequence(oidCommonName, derUTF8String("server"))),
+		derSet(derSequence(oidSerialNumber, derPrintableString("1"))),
+		derSet(derSequence(oidOrganizationName, derUTF8String("testorg"))),
+	)
+	decoded, err := identityFromID(EncodeID(ID_DER_ASN1_DN, reordered))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded != (Identity{Organization: "testorg", CommonName: "server", SerialNumber: "1"}) {
+		t.Fatalf("decoded %s", decoded)
 	}
 }
 

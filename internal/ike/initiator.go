@@ -701,8 +701,17 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	if err := VerifyAuth(cfg.RemotePublicKey, responderSigned, authRecv.Body); err != nil {
 		return false, err
 	}
-	if string(idrRecv.Body) != string(idrBody) {
-		return false, fmt.Errorf("ike: responder identity does not match configured IDr")
+	// Compare the name rather than the bytes: ranet writes O and CN as
+	// UTF8String while strongSwan picks the string type from the value, so
+	// one identity legitimately reaches the wire in two encodings. AUTH above
+	// already signed the bytes as received, so the name is all that is left
+	// to check.
+	got, err := identityFromID(idrRecv.Body)
+	if err != nil {
+		return false, err
+	}
+	if got != (Identity{Organization: remoteOrganization, CommonName: cfg.RemoteCommonName, SerialNumber: cfg.RemoteSerial}) {
+		return false, fmt.Errorf("ike: responder identity %s does not match configured IDr", got)
 	}
 
 	// Only after verifying AUTH may Child-SA failures be authoritative. Per

@@ -36,10 +36,10 @@ func (id Identity) encodeID() []byte {
 	return EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(id.Organization, id.CommonName, id.SerialNumber))
 }
 
-// identityFromID parses an ID payload body and re-encodes the result. A peer
-// that reaches the same name through different DER is rejected rather than
-// accepted, so exactly one byte string denotes any given identity and the
-// AUTH signature over that byte string cannot be replayed under another name.
+// identityFromID parses an ID payload body into the name it asserts. The name
+// only selects which key must verify AUTH; AUTH itself signs the bytes as
+// received, so two encodings of one name are the same peer and neither can be
+// accepted without that peer's key.
 func identityFromID(body []byte) (Identity, error) {
 	idType, data, err := DecodeID(body)
 	if err != nil {
@@ -52,11 +52,7 @@ func identityFromID(body []byte) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	id := Identity{Organization: organization, CommonName: commonName, SerialNumber: serialNumber}
-	if !bytesEqual(id.encodeID(), body) {
-		return Identity{}, fmt.Errorf("ike: identity %s is not in its canonical encoding", id)
-	}
-	return id, nil
+	return Identity{Organization: organization, CommonName: commonName, SerialNumber: serialNumber}, nil
 }
 
 // ResponderConfig is what answering an unsolicited peer needs, as against
@@ -113,7 +109,7 @@ const (
 // authenticated, because until then there is no peer, only a datagram.
 type Responder struct {
 	cfg   ResponderConfig
-	local map[string]Identity // keyed by the encoded IDr body
+	local map[Identity]struct{}
 
 	mu            sync.Mutex
 	halfOpen      int
@@ -135,9 +131,9 @@ func NewResponder(cfg ResponderConfig) (*Responder, error) {
 	if cfg.Lookup == nil {
 		return nil, fmt.Errorf("ike: responder needs a peer lookup")
 	}
-	r := &Responder{cfg: cfg, local: make(map[string]Identity, len(cfg.Local))}
+	r := &Responder{cfg: cfg, local: make(map[Identity]struct{}, len(cfg.Local))}
 	for _, id := range cfg.Local {
-		r.local[string(id.encodeID())] = id
+		r.local[id] = struct{}{}
 	}
 	if _, err := rand.Read(r.cookieSecret[:]); err != nil {
 		return nil, err
@@ -207,6 +203,13 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	ni := DecodeNonce(noncePayload.Body)
 	if !validNonce(ni) {
 		return nil, Identity{}, fmt.Errorf("ike: initiator nonce length %d is outside 16..256", len(ni))
+	}
+	// RFC 7296 section 2.5: a critical payload we do not implement has to be
+	// refused by type rather than ignored, because the peer marked it as
+	// changing what the message means.
+	if unsupported, found := firstUnsupportedCritical(request.Payloads); found {
+		r.sendStatelessNotify(datagram, spiI, N_UNSUPPORTED_CRITICAL_PAYLOAD, []byte{byte(unsupported)})
+		return nil, Identity{}, fmt.Errorf("ike: IKE_SA_INIT request marks payload type %d critical", unsupported)
 	}
 
 	// RFC 7296 section 2.6: under load, prove the initiator can receive at the
@@ -391,6 +394,11 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 	// Only an authenticated message may move where replies go (RFC 7296
 	// section 2.23); decryption above is that proof.
 	s.mux.AdoptEndpoint(source)
+
+	if unsupported, found := firstUnsupportedCritical(inner); found {
+		return Identity{}, s.rejectAuth(N_UNSUPPORTED_CRITICAL_PAYLOAD,
+			fmt.Errorf("ike: IKE_AUTH request marks payload type %d critical", unsupported))
+	}
 
 	request := &Message{Header: outer.Header, Payloads: inner}
 	idiPayload, authPayload := request.find(PayloadIDi), request.find(PayloadAUTH)
@@ -593,9 +601,13 @@ func (s *Session) selectResponderChild(request *Message, ni, nr []byte) (respond
 	}, nil
 }
 
-// localIdentity resolves the IDr the initiator asked for. A request without
-// IDr is answered under our only identity; with more than one configured
-// there is nothing to guess from, so it is rejected.
+// localIdentity resolves the IDr the initiator asked for, by name rather than
+// by its bytes, and returns our own encoding of it. Our AUTH signs the IDr we
+// send, and the initiator verifies against the IDr it receives, so answering
+// in our own encoding is what the signature covers either way.
+//
+// A request without IDr is answered under our only identity; with more than
+// one configured there is nothing to guess from, so it is rejected.
 func (r *Responder) localIdentity(idr *RawPayload) (Identity, error) {
 	if idr == nil {
 		if len(r.cfg.Local) != 1 {
@@ -603,11 +615,26 @@ func (r *Responder) localIdentity(idr *RawPayload) (Identity, error) {
 		}
 		return r.cfg.Local[0], nil
 	}
-	id, ok := r.local[string(idr.Body)]
-	if !ok {
-		return Identity{}, fmt.Errorf("ike: IKE_AUTH request names an identity we do not answer to")
+	id, err := identityFromID(idr.Body)
+	if err != nil {
+		return Identity{}, err
+	}
+	if _, ok := r.local[id]; !ok {
+		return Identity{}, fmt.Errorf("ike: IKE_AUTH request names %s, which we do not answer to", id)
 	}
 	return id, nil
+}
+
+// firstUnsupportedCritical reports the first payload this profile does not
+// implement whose critical bit is set. An unrecognized payload without the bit
+// is skipped, which is what the flag is for.
+func firstUnsupportedCritical(payloads []RawPayload) (PayloadType, bool) {
+	for _, payload := range payloads {
+		if payload.Critical && !supportedPayloadType(payload.Type) {
+			return payload.Type, true
+		}
+	}
+	return 0, false
 }
 
 func (r *Responder) enterHalfOpen() bool {
