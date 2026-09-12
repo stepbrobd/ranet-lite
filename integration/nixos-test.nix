@@ -222,11 +222,11 @@ in
         environment.systemPackages =
           with pkgs;
           [
+            curl
             iperf3
             iproute2
           ]
           ++ lib.optionals profile [
-            curl
             pprof
             perf
           ];
@@ -344,7 +344,7 @@ in
           after = [ "network-online.target" ];
           serviceConfig = {
             ExecStart =
-              "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug"
+              "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug -metrics 127.0.0.1:9669"
               + pkgs.lib.optionalString profile " -pprof 127.0.0.1:6060";
             TimeoutStopSec = "15s";
             Restart = "on-failure";
@@ -457,6 +457,16 @@ in
             # The main table is not this reconciler's to write.
             leaked = client.succeed(f"ip -4 route show proto {kernel_protocol}")
             assert "10.99.0.0/24" not in leaked, leaked
+        # The endpoint that replaces prometheus-bird-exporter has to report a
+        # live neighbor and a selected route, not just answer.
+        client.wait_until_succeeds("curl -sf http://127.0.0.1:9669/metrics | grep -q '^ranet_lite_babel_neighbor_up{.*} 1$'", timeout=timeout)
+        metrics = client.succeed("curl -sf http://127.0.0.1:9669/metrics")
+        print(metrics)
+        assert "ranet_lite_sessions 1" in metrics, metrics
+        assert "ranet_lite_babel_routes_originated 2" in metrics, metrics
+        selected = [line for line in metrics.splitlines() if line.startswith("ranet_lite_babel_routes_selected ")]
+        assert selected and int(selected[0].split()[1]) > 0, metrics
+
         assert client.succeed("journalctl -u ranet-lite.service --no-pager | grep -c ': connected (SPI'").strip() == "1"
         client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
         gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
