@@ -18,7 +18,7 @@ const reconnectDelay = 10 * time.Second
 // reconnecting on any failure (network blip, peer restart, etc.) rather
 // than requiring a manual restart.
 func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Peer) {
-	reg := c.registry
+	reg := c.registry()
 	name := fmt.Sprintf("%s/%s@%s", p.Organization, p.CommonName, local.SerialNumber)
 	if p.SerialNumber != "" {
 		_, node, ok := reg.FindNode(p.Organization, p.CommonName)
@@ -86,7 +86,7 @@ func resolveEndpoint(node registry.Node, serial, family string) (registry.Endpoi
 // it dies (network failure, peer restart, DPD timeout). Returning means
 // the connection is gone; runPeer decides whether/when to retry.
 func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p config.Peer, name string) error {
-	cfg, reg := c.cfg, c.registry
+	cfg, reg := c.config(), c.registry()
 	org, node, ok := reg.FindNode(p.Organization, p.CommonName)
 	if !ok {
 		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)

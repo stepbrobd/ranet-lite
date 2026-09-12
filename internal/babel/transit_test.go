@@ -143,6 +143,17 @@ func (f *meshFabric) nextHop(node string, key routeKey) string {
 	return ""
 }
 
+// forwards resolves an address through the node's forwarding table the way a
+// routed packet does, so a prefix held unreachable and a prefix missing
+// altogether can be told apart: the second falls through to a covering route.
+func (f *meshFabric) forwards(node string, address netip.Addr) string {
+	peer, ok := f.meshes[node].Routes.Lookup(netip.Addr{}, address)
+	if !ok {
+		return ""
+	}
+	return peer.ID
+}
+
 func routerID(name string) [8]byte {
 	var id [8]byte
 	copy(id[:], name)
@@ -226,7 +237,7 @@ func TestThreeNodeChainRedistributesAndCannotLoop(t *testing.T) {
 		t.Fatalf("a kept a route via %q after the origin went away", got)
 	}
 
-	// The omission above is an optimisation, not the safety property. Hand b
+	// The omission above is an optimization rather than the safety property. Hand b
 	// the advertisement a would have made and it must still refuse it: a's
 	// metric is not better than the distance b has already advertised.
 	fabric.inject("b", "a",
@@ -661,10 +672,11 @@ func TestSeqnoRequestIsRepeatedWhileStarved(t *testing.T) {
 	for _, retry := range speaker.starveRetries {
 		retry.nextAt = time.Now().Add(-time.Second)
 	}
-	// The suppression table is what stops a redundant request inside its
-	// window; the retry is deliberately outside it, so clear it rather than
-	// sleeping through it.
-	speaker.pendingSeqno = make(map[sourceKey]pendingSeqno)
+	// The retry backoff is longer than the suppression window, so in production
+	// the retry falls outside it. Backdate rather than sleep through it.
+	for index := range speaker.askedSeqno {
+		speaker.askedSeqno[index] = time.Now().Add(-seqnoRequestSuppress - time.Second)
+	}
 	retries := speaker.retryStarvedLocked(time.Now())
 	speaker.mu.Unlock()
 	if pending == 0 {
@@ -672,5 +684,202 @@ func TestSeqnoRequestIsRepeatedWhileStarved(t *testing.T) {
 	}
 	if len(retries) == 0 {
 		t.Error("a never repeated the seqno request, so the prefix stays starved indefinitely")
+	}
+}
+
+// A prefix removed from the originated set has to be retracted. Dropping it
+// from the set alone leaves every neighbor holding it until it expires, and if
+// it was withdrawn because the address moved, that is a black hole for three
+// and a half update intervals.
+func TestWithdrawnOriginationIsRetracted(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b")
+	dest := netip.MustParsePrefix("fd00:a::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["a"].Originate(dest)
+	fabric.flush("a")
+	if got := fabric.nextHop("b", key); got != "a" {
+		t.Fatalf("b reaches %s via %q, want \"a\"", dest, got)
+	}
+
+	fabric.reset()
+	fabric.speakers["a"].SetOriginated(nil)
+	fabric.flush("a")
+
+	updates := updatesFor(t, fabric.tlvs("a", "b"), dest)
+	if len(updates) != 1 || updates[0].Metric != MetricInfinity {
+		t.Errorf("a sent %v for a prefix it stopped originating, want a single retraction", updates)
+	}
+	if got := fabric.nextHop("b", key); got != "" {
+		t.Errorf("b still forwards %s via %q after the origin withdrew it", dest, got)
+	}
+}
+
+// Starting to originate a prefix this node already learned from a neighbor
+// must drop what it learned. Otherwise the learned route stays selected, split
+// horizon compares its next hop against nil and never fires, and the node
+// advertises the prefix at metric 0 straight back to the neighbor it is still
+// forwarding to, which is a loop until the entry expires.
+func TestOriginatingALearnedPrefixDoesNotLoop(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
+	dest := netip.MustParsePrefix("fd00:a::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["a"].Originate(dest)
+	fabric.flush("a", "b", "c")
+	if got := fabric.nextHop("c", key); got != "b" {
+		t.Fatalf("c reaches %s via %q, want \"b\"", dest, got)
+	}
+
+	// c now originates the same prefix, which is what a reload adding it to
+	// babel.originate does.
+	fabric.reset()
+	fabric.speakers["c"].SetOriginated([]OriginatedRoute{{Destination: dest}})
+	fabric.flush("c", "b")
+
+	if got := fabric.nextHop("c", key); got != "" {
+		t.Errorf("c still forwards its own prefix to %q", got)
+	}
+	if got := fabric.nextHop("b", key); got == "c" {
+		t.Error("b now forwards to c for a prefix c reaches through b, which is the loop")
+	}
+}
+
+// Originate reaches the same purge through its own entry point, which is the
+// one a plain originate: list in the config uses.
+func TestOriginateAlsoDropsWhatThisNodeLearned(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
+	dest := netip.MustParsePrefix("fd00:a::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["a"].Originate(dest)
+	fabric.flush("a", "b", "c")
+	if got := fabric.nextHop("c", key); got != "b" {
+		t.Fatalf("c reaches %s via %q, want \"b\"", dest, got)
+	}
+
+	fabric.reset()
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b")
+
+	if got := fabric.nextHop("c", key); got != "" {
+		t.Errorf("c still forwards its own prefix to %q", got)
+	}
+	if got := fabric.nextHop("b", key); got == "c" {
+		t.Error("b now forwards to c for a prefix c reaches through b, which is the loop")
+	}
+}
+
+// The origin of a prefix is not a promise that every address in it is
+// reachable. Dropping the forwarding entry outright lets a packet for an
+// unassigned address fall through to a covering route, which on a transit node
+// means back out to a neighbor that learned the prefix from this node at
+// metric 0 and forwards it straight here again.
+func TestAnOriginatedPrefixDoesNotFallThroughToACoveringRoute(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b")
+	covering := netip.MustParsePrefix("fd00::/16")
+	own := netip.MustParsePrefix("fd00:a::/64")
+	inside := netip.MustParseAddr("fd00:a::1")
+
+	// a is a transit node: it holds a default-ish covering route through b and
+	// originates a more specific prefix of its own.
+	fabric.speakers["b"].Originate(covering)
+	fabric.speakers["a"].Originate(own)
+	fabric.flush("b", "a")
+	if got := fabric.forwards("a", inside); got != "" {
+		t.Fatalf("a forwards %s to %q, want it dropped", inside, got)
+	}
+
+	// Learning the prefix from b and then originating it has to end the same
+	// way, which is the path the purge takes.
+	fabric.reset()
+	fabric.speakers["a"].SetOriginated(nil)
+	fabric.speakers["b"].Originate(own)
+	fabric.flush("b", "a")
+	if got := fabric.forwards("a", inside); got != "b" {
+		t.Fatalf("a reaches %s via %q before originating it, want \"b\"", inside, got)
+	}
+	fabric.speakers["a"].Originate(own)
+	if got := fabric.forwards("a", inside); got != "" {
+		t.Errorf("a forwards %s to %q after taking over the prefix, want it dropped", inside, got)
+	}
+}
+
+// RFC 8966 section 3.8.2.1: a starved node "MUST send the request to at least
+// one of the next-hop neighbours that advertised these routes, and SHOULD send
+// it to all of them". The forwarding suppression table is indexed without the
+// neighbor, so consulting it here let the first neighbor in map order consume
+// the allowance and silently drop every other.
+func TestStarvationAsksEveryNeighborHoldingTheRoute(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "a-d", "b-e", "c-e")
+	dest := netip.MustParsePrefix("fd00:e::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["e"].Originate(dest)
+	fabric.flush("e", "b", "c", "a")
+	if fabric.nextHop("a", key) == "" {
+		t.Fatal("a never learned the route")
+	}
+	fabric.reset()
+
+	// Both relays worsen past the distance a has already advertised, so both
+	// of a's routes become unfeasible at once.
+	for _, relay := range []string{"b", "c"} {
+		fabric.inject("a", relay,
+			EncodeRouterID(routerID("e")),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: 900}))
+	}
+	for _, relay := range []string{"b", "c"} {
+		if got := len(seqnoRequestsFor(t, fabric.tlvs("a", relay), dest)); got != 1 {
+			t.Errorf("a sent %d seqno requests to %s, want exactly 1", got, relay)
+		}
+	}
+}
+
+// askedSeqno is keyed by a router id the peer chooses and by neighbor pointer,
+// so entries left behind both grow without bound and pin retired neighbors.
+func TestSeqnoSuppressionEntriesAreSweptAndDroppedWithTheirNeighbor(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "b-e", "c-e")
+	dest := netip.MustParsePrefix("fd00:e::/64")
+	speaker := fabric.speakers["a"]
+	fabric.speakers["e"].Originate(dest)
+	fabric.flush("e", "b", "c", "a")
+
+	// Both relays worsen at once, which starves a and makes it ask each of
+	// them, recording one suppression entry per neighbor.
+	for _, relay := range []string{"b", "c"} {
+		fabric.inject("a", relay,
+			EncodeRouterID(routerID("e")),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: 900}))
+	}
+	speaker.mu.Lock()
+	asked := len(speaker.askedSeqno)
+	speaker.mu.Unlock()
+	if asked == 0 {
+		t.Fatal("no seqno requests were suppressed, so this proves nothing")
+	}
+
+	// A neighbor that goes away takes its own entries with it, so a retired
+	// neighborState and everything it advertised can be collected.
+	retired := fabric.neighbor("a", "b")
+	fabric.handles["a-b"].Close()
+	speaker.mu.Lock()
+	for index := range speaker.askedSeqno {
+		if index.neighbor == retired {
+			speaker.mu.Unlock()
+			t.Fatal("a removed neighbor is still pinned by its suppression entries")
+		}
+	}
+	left := len(speaker.askedSeqno)
+	speaker.mu.Unlock()
+	if left == 0 {
+		t.Fatal("every entry went with one neighbor, so the sweep below proves nothing")
+	}
+
+	// The suppression window is the lifetime, the same one pendingSeqno uses.
+	speaker.mu.Lock()
+	speaker.sweepRequestsLocked(time.Now().Add(seqnoRequestSuppress + time.Second))
+	swept := len(speaker.askedSeqno)
+	speaker.mu.Unlock()
+	if swept != 0 {
+		t.Errorf("%d of %d suppression entries survived their window", swept, left)
 	}
 }

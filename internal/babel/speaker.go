@@ -22,9 +22,8 @@
 //     request for a prefix whose selected next hop is the requester is
 //     answered with a retraction, and a seqno request in that position is
 //     forwarded onwards instead of answered at all.
-//   - 3.8.2.1 and 3.8.2.3: seqno requests are suppressed for a short window
-//     instead of being resent on a timer, and a selected route is not
-//     refreshed with a route request shortly before it expires.
+//   - 3.8.2.3: a selected route is not refreshed with a route request shortly
+//     before it expires.
 //   - Appendix A.3: the smoothed metric follows an increase immediately and
 //     only damps improvements, so that a selected route which has genuinely
 //     gone bad is left at once. See routeInfo.smooth.
@@ -83,6 +82,12 @@ const (
 	seqnoRetryInitial   = 3 * time.Second
 )
 
+// askedKey indexes a seqno request this node sent on its own behalf.
+type askedKey struct {
+	source   sourceKey
+	neighbor *neighborState
+}
+
 // starveRetry is one prefix waiting for a seqno that has not arrived.
 type starveRetry struct {
 	key      routeKey
@@ -99,11 +104,17 @@ type Speaker struct {
 	cfg  Config
 	mesh *netstack.Mesh
 
-	mu            sync.Mutex
-	neighbors     map[string]*neighborState
-	originate     map[routeKey]struct{}
-	routes        *routeTable
-	pendingSeqno  map[sourceKey]pendingSeqno
+	mu           sync.Mutex
+	neighbors    map[string]*neighborState
+	originate    map[routeKey]struct{}
+	routes       *routeTable
+	pendingSeqno map[sourceKey]pendingSeqno
+	// askedSeqno is the same suppression for requests this node originates,
+	// but indexed by neighbor as well. RFC 8966 section 3.8.2.1 wants every
+	// neighbor holding an unfeasible route asked, and pendingSeqno's index has
+	// no neighbor in it, so it cannot tell "already asked this one" from
+	// "already asked somebody".
+	askedSeqno    map[askedKey]time.Time
 	starveRetries map[sourceKey]*starveRetry
 	originSeqno   uint16
 	updatePending bool
@@ -140,6 +151,7 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 		neighbors:     make(map[string]*neighborState),
 		originate:     make(map[routeKey]struct{}),
 		pendingSeqno:  make(map[sourceKey]pendingSeqno),
+		askedSeqno:    make(map[askedKey]time.Time),
 		starveRetries: make(map[sourceKey]*starveRetry),
 		originSeqno:   1,
 		changed:       make(chan struct{}, 1),
@@ -174,6 +186,15 @@ func (s *Speaker) removePeer(n *neighborState) {
 		return
 	}
 	delete(s.neighbors, n.peer.ID)
+	// Dropping this neighbor's suppression entries with it keeps a retired
+	// neighborState from being pinned until the next sweep, and lets the next
+	// session for the same peer ask immediately rather than inheriting a
+	// window it never opened.
+	for index := range s.askedSeqno {
+		if index.neighbor == n {
+			delete(s.askedSeqno, index)
+		}
+	}
 	s.routes.expireNeighbor(n, time.Now())
 	s.wake()
 }
@@ -212,8 +233,96 @@ func (s *Speaker) Originate(prefix netip.Prefix) {
 // `route <dest> from <source>`. A zero-length source prefix announces an
 // ordinary route, which is what RFC 9079 section 5 says such an entry means.
 func (s *Speaker) OriginateFrom(dest, source netip.Prefix) {
-	if !dest.IsValid() {
+	key, ok := originatedKey(dest, source)
+	if !ok {
 		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.originate[key] = struct{}{}
+	s.adoptOriginatedLocked(key)
+	s.updatePending = true
+	s.wake()
+}
+
+// adoptOriginatedLocked takes over a prefix this node now originates itself.
+// Whatever it had learned has to go: a learned route left selected keeps
+// advertiseTo's split horizon comparing its next hop against nil, so it never
+// fires and the node advertises the prefix at metric 0 back to the neighbor it
+// is still forwarding to, which is a loop until the entry expires.
+//
+// The forwarding entry is held unreachable rather than removed, and the hold
+// goes in whether or not anything was learned. Originating a prefix is a claim
+// to be its origin, not a promise that every address in it is reachable. With
+// no entry at all, a packet for an address in the prefix that is not assigned
+// locally falls through to a covering route, and on a node holding one that is
+// straight back out to a neighbor which learned this prefix from here at
+// metric 0 and returns it.
+func (s *Speaker) adoptOriginatedLocked(key routeKey) {
+	delete(s.routes.entries, key)
+	s.mesh.Routes.Set(key.source, key.dest, netstack.Unreachable)
+}
+
+// releaseOriginatedLocked gives a prefix back after it stops being originated,
+// so a route to it can be learned from a neighbor again rather than staying
+// held against the hold adoptOriginatedLocked installed.
+func (s *Speaker) releaseOriginatedLocked(key routeKey) {
+	s.mesh.Routes.Remove(key.source, key.dest)
+}
+
+// SetOriginated replaces the whole originated set, which is what a
+// configuration reload needs: a prefix that is no longer configured has to be
+// retracted rather than announced forever, and adding one at a time cannot
+// express a removal. Each element is a destination and an optional source
+// prefix, the same pair OriginateFrom takes.
+func (s *Speaker) SetOriginated(routes []OriginatedRoute) {
+	wanted := make(map[routeKey]struct{}, len(routes))
+	for _, route := range routes {
+		key, ok := originatedKey(route.Destination, route.Source)
+		if !ok {
+			continue
+		}
+		wanted[key] = struct{}{}
+	}
+	s.mu.Lock()
+	changed := len(wanted) != len(s.originate)
+	for key := range s.originate {
+		if _, keep := wanted[key]; !keep {
+			changed = true
+		}
+	}
+	if !changed {
+		s.mu.Unlock()
+		return
+	}
+	// A prefix that has gone away is simply dropped here. Neighbors learn of
+	// it through the retraction the next advertisement carries, since
+	// advertiseTo reports an unknown route as infinity.
+	for key := range s.originate {
+		if _, keep := wanted[key]; !keep {
+			s.releaseOriginatedLocked(key)
+		}
+	}
+	s.originate = wanted
+	for key := range wanted {
+		s.adoptOriginatedLocked(key)
+	}
+	s.updatePending = true
+	s.wake()
+	s.mu.Unlock()
+}
+
+// OriginatedRoute is one configured announcement, an ordinary prefix when
+// Source is zero.
+type OriginatedRoute struct {
+	Destination netip.Prefix
+	Source      netip.Prefix
+}
+
+// originatedKey is the forwarding key one configured announcement takes.
+func originatedKey(dest, source netip.Prefix) (routeKey, bool) {
+	if !dest.IsValid() {
+		return routeKey{}, false
 	}
 	key := routeKey{dest: dest.Masked()}
 	if source.IsValid() && source.Bits() > 0 {
@@ -222,21 +331,11 @@ func (s *Speaker) OriginateFrom(dest, source netip.Prefix) {
 			// encoding, so the pair cannot even be expressed on the wire.
 			slog.Warn("babel ignoring source-specific origination across address families",
 				"route", dest, "from", source)
-			return
+			return routeKey{}, false
 		}
 		key.source = source.Masked()
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.originate[key] = struct{}{}
-	if entry := s.routes.entries[key]; entry != nil {
-		if entry.selected.neighbor != nil {
-			s.installRoute(key, routeSelection{})
-		}
-		delete(s.routes.entries, key)
-	}
-	s.updatePending = true
-	s.wake()
+	return key, true
 }
 
 func (s *Speaker) wake() {
@@ -362,6 +461,14 @@ func (s *Speaker) sweepRequestsLocked(now time.Time) {
 	for index, pending := range s.pendingSeqno {
 		if !now.Before(pending.sentAt.Add(seqnoRequestSuppress)) {
 			delete(s.pendingSeqno, index)
+		}
+	}
+	// askedSeqno expires on the same window. It is keyed by router id, which
+	// the peer chooses, and by neighbor pointer, so an entry left behind pins
+	// a retired neighborState and everything it advertised.
+	for index, at := range s.askedSeqno {
+		if !now.Before(at.Add(seqnoRequestSuppress)) {
+			delete(s.askedSeqno, index)
 		}
 	}
 }

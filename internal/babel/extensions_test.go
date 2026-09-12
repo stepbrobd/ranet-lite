@@ -114,3 +114,27 @@ func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 		})
 	}
 }
+
+// RFC 8966 section 4.6.9: an Update's interval "MUST NOT be 0". Honoring one
+// would expire the route in the pass that learned it, which collapses the
+// section 3.5.4 hold that keeps a retracted prefix from following a covering
+// route.
+func TestUpdateWithZeroIntervalIsIgnored(t *testing.T) {
+	dec := &PrefixDecoder{}
+	body := EncodeUpdate(Update{AE: AEIPv6, Plen: 64, Interval: 0, Seqno: 1, Metric: 64,
+		Prefix: net.ParseIP("fd00:1::")}).Body
+	update, err := dec.Decode(body)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !update.Ignore {
+		t.Error("an Update asking for a zero interval was accepted")
+	}
+
+	// A retraction carries no interval that matters, so it is still honored.
+	retraction := EncodeUpdate(Update{AE: AEIPv6, Plen: 64, Interval: 0, Seqno: 1,
+		Metric: MetricInfinity, Prefix: net.ParseIP("fd00:1::")}).Body
+	if update, err := dec.Decode(retraction); err != nil || update.Ignore {
+		t.Errorf("a retraction was ignored (err %v)", err)
+	}
+}

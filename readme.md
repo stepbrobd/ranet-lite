@@ -284,6 +284,20 @@ and authenticate a real node in a real mesh. Never commit real copies of
 either; only synthetic fixtures belong in version control (see
 `.gitignore`).
 
+## Reloading
+
+`SIGHUP` re-reads the config file and the registry and reconciles rather than
+restarting. It applies the registry itself, the peers dialed, and the prefixes
+originated, so a node joining or leaving the mesh costs one dialer instead of
+dropping every SA this node is carrying. ranet's own `ExecReload` works the
+same way, and it matters because the registry is rewritten every time any node
+joins.
+
+Identity, port, TUN device and local endpoints are refused rather than applied:
+each changes what peers have already authenticated or what the dataplane is
+attached to, so a restart is the honest way to change them. A reload that fails
+validation changes nothing.
+
 ## Repository layout
 
 - `internal/ike` — the IKEv2 initiator and responder.

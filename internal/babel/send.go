@@ -268,20 +268,40 @@ func (s *Speaker) triggeredActions(now time.Time) []sendAction {
 
 // starvedActions turns the route table's pending seqno requests into unicast
 // packets, RFC 8966 sections 3.8.2.1 and 3.8.2.2.
+//
+// Every neighbor holding an unfeasible route for the prefix is asked, which is
+// what section 3.8.2.1 means by "SHOULD send it to all of them". The
+// suppression table is not consulted here: it exists to stop a forwarded
+// request being relayed twice (section 3.8.1.2), and it is indexed without the
+// neighbor, so honoring it would let the first neighbor in map order consume
+// the allowance and silently drop the rest.
 func (s *Speaker) starvedActions(now time.Time) []sendAction {
 	var actions []sendAction
 	for _, request := range s.routes.takeStarved() {
 		if s.neighbors[request.neighbor.peer.ID] != request.neighbor {
 			continue // the peer was replaced or removed while we held the lock
 		}
-		action, ok := s.seqnoRequestAction(request.neighbor, request.key,
-			request.routerID, request.seqno, seqnoRequestHopCount, now)
-		if ok {
-			actions = append(actions, action)
-			s.rememberStarved(request.key, request.routerID, request.seqno, now)
+		if !s.allowAsk(request.neighbor, request.key, request.routerID, now) {
+			continue
 		}
+		actions = append(actions, s.seqnoRequestTo(request.neighbor, request.key,
+			request.routerID, request.seqno, now))
+		// Recorded whether or not this particular packet went out, so a prefix
+		// starved inside the window of a request we forwarded moments earlier
+		// still gets a retry rather than never being asked about again.
+		s.rememberStarved(request.key, request.routerID, request.seqno, now)
 	}
 	return actions
+}
+
+// seqnoRequestTo builds one unicast seqno request, bypassing the forwarding
+// suppression table.
+func (s *Speaker) seqnoRequestTo(n *neighborState, key routeKey, routerID [8]byte, seqno uint16, now time.Time) sendAction {
+	s.pendingSeqno[sourceKey{route: key, routerID: routerID}] = pendingSeqno{seqno: seqno, sentAt: now}
+	return sendAction{n, n.destination(), []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
+		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
+		Seqno: seqno, HopCount: seqnoRequestHopCount, RouterID: routerID,
+	})}}
 }
 
 func (s *Speaker) seqnoRequestAction(n *neighborState, key routeKey, routerID [8]byte, seqno uint16, hops uint8, now time.Time) (sendAction, bool) {
@@ -351,10 +371,25 @@ func (s *Speaker) retryStarvedLocked(now time.Time) []sendAction {
 			if s.routes.route(n, retry.key) == nil {
 				continue
 			}
-			if action, ok := s.seqnoRequestAction(n, retry.key, retry.routerID, retry.seqno, seqnoRequestHopCount, now); ok {
-				actions = append(actions, action)
+			if !s.allowAsk(n, retry.key, retry.routerID, now) {
+				continue
 			}
+			actions = append(actions, s.seqnoRequestTo(n, retry.key, retry.routerID, retry.seqno, now))
 		}
 	}
 	return actions
+}
+
+// allowAsk rate-limits the seqno requests this node originates, per neighbor
+// and per prefix. The route table can queue the same starve twice, once from
+// the update that made the route unfeasible and once from the selection that
+// followed it, and two neighbors worsening in quick succession re-starve each
+// other's prefixes.
+func (s *Speaker) allowAsk(n *neighborState, key routeKey, routerID [8]byte, now time.Time) bool {
+	index := askedKey{sourceKey{route: key, routerID: routerID}, n}
+	if at, ok := s.askedSeqno[index]; ok && now.Before(at.Add(seqnoRequestSuppress)) {
+		return false
+	}
+	s.askedSeqno[index] = now
+	return true
 }

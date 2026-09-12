@@ -22,7 +22,7 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	defer sess.Mux().Close()
 	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
 
-	tunnel := &tunnel{replayWindow: c.cfg.ReplayWindowSize()}
+	tunnel := &tunnel{replayWindow: c.config().ReplayWindowSize()}
 	tunnel.rekey = func() {
 		go func() {
 			if err := sess.RekeyChildProactively(); err != nil && !sess.Mux().IsClosed() {

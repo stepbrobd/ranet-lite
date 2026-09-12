@@ -14,11 +14,12 @@ import (
 // what a node behind no reachable address cannot do without. It returns when
 // ctx ends or the hub's socket is gone.
 func (c *Client) acceptPeers(ctx context.Context) error {
-	local := make([]ike.Identity, 0, len(c.cfg.Endpoints))
-	for _, endpoint := range c.cfg.Endpoints {
+	cfg := c.config()
+	local := make([]ike.Identity, 0, len(cfg.Endpoints))
+	for _, endpoint := range cfg.Endpoints {
 		local = append(local, ike.Identity{
-			Organization: c.cfg.Organization,
-			CommonName:   c.cfg.CommonName,
+			Organization: cfg.Organization,
+			CommonName:   cfg.CommonName,
 			SerialNumber: endpoint.SerialNumber,
 		})
 	}
@@ -27,12 +28,12 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 		Local:              local,
 		LocalPrivateKey:    c.privateKey,
 		Lookup:             c.lookupPeerKey,
-		ChildRekeyInterval: c.cfg.ChildRekeyIntervalValue(),
-		IKERekeyInterval:   c.cfg.IKERekeyIntervalValue(),
-		RekeyMargin:        c.cfg.RekeyMarginValue(),
-		RekeyJitter:        c.cfg.RekeyJitterValue(),
-		RekeyRetryInitial:  c.cfg.RekeyRetryInitialValue(),
-		RekeyRetryMax:      c.cfg.RekeyRetryMaxValue(),
+		ChildRekeyInterval: cfg.ChildRekeyIntervalValue(),
+		IKERekeyInterval:   cfg.IKERekeyIntervalValue(),
+		RekeyMargin:        cfg.RekeyMarginValue(),
+		RekeyJitter:        cfg.RekeyJitterValue(),
+		RekeyRetryInitial:  cfg.RekeyRetryInitialValue(),
+		RekeyRetryMax:      cfg.RekeyRetryMaxValue(),
 	})
 	if err != nil {
 		return err
@@ -75,11 +76,12 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 // from, so a value the registry does not know means the registry and the peer
 // disagree about what exists.
 func (c *Client) lookupPeerKey(peer ike.Identity) (ed25519.PublicKey, bool) {
-	organization, node, ok := c.registry.FindNode(peer.Organization, peer.CommonName)
+	cfg := c.config()
+	organization, node, ok := c.registry().FindNode(peer.Organization, peer.CommonName)
 	if !ok {
 		return nil, false
 	}
-	if peer.Organization == c.cfg.Organization && peer.CommonName == c.cfg.CommonName {
+	if peer.Organization == cfg.Organization && peer.CommonName == cfg.CommonName {
 		// Our own name in another node's IDi is either a misconfiguration or
 		// an attempt to reuse the organization key under our identity.
 		return nil, false

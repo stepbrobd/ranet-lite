@@ -65,6 +65,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// SIGHUP reconciles rather than restarts. The registry is rewritten every
+	// time any node joins the mesh, and a restart to pick that up would drop
+	// every SA this node is carrying.
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	defer signal.Stop(reload)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reload:
+				if err := node.Reload(*configPath); err != nil {
+					log.Printf("reload: %v", err)
+				}
+			}
+		}
+	}()
+
 	// The reconciler is opt-in, so an existing deployment keeps configuring
 	// the device externally.
 	var reconciler sync.WaitGroup

@@ -7,9 +7,9 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"log"
-	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
@@ -21,16 +21,31 @@ import (
 type Client struct {
 	Mesh *netstack.Mesh
 
-	cfg        *config.Config
+	// cfg and reg are replaced wholesale by a reload, never mutated, so every
+	// reader sees one consistent pair even while one is being installed.
+	cfg        atomic.Pointer[config.Config]
+	reg        atomic.Pointer[registry.Registry]
 	privateKey ed25519.PrivateKey
-	registry   registry.Registry
 	speaker    *babel.Speaker
 	hub        *transport.Hub
 	sessions   *sessionSet
 	workers    int
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	// dialers is one cancel per running peer loop, keyed by the same path name
+	// sessions uses, so a reload can start and stop them individually.
+	dialersMu sync.Mutex
+	dialers   map[string]*dialer
+	// stopped closes the door on new dialers. Run sets it under dialersMu
+	// before waiting, so a reload arriving at the same moment cannot add to
+	// the WaitGroup after the wait has begun, which panics.
+	stopped bool
+	peers   sync.WaitGroup
 }
+
+func (c *Client) config() *config.Config      { return c.cfg.Load() }
+func (c *Client) registry() registry.Registry { return *c.reg.Load() }
 
 func New(cfg *config.Config) (_ *Client, err error) {
 	privateKey, err := registry.LoadPrivateKey(cfg.PrivateKey)
@@ -66,25 +81,25 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, raw := range cfg.Originate {
-		prefix, err := netip.ParsePrefix(raw)
-		if err != nil {
-			return nil, fmt.Errorf("config: originate %q: %w", raw, err)
-		}
-		speaker.Originate(prefix)
+	// The plain list and babel.originate together. The latter carries the
+	// source-specific announcements the former cannot express, which is how an
+	// exit announces a default from a prefix.
+	originated, err := originatedRoutes(cfg)
+	if err != nil {
+		return nil, err
 	}
-	// babel.originate carries the source-specific announcements the plain list
-	// cannot express, which is how an exit announces a default from a prefix.
-	for _, entry := range cfg.Babel.Originate {
-		speaker.OriginateFrom(entry.Prefix, entry.From)
-	}
+	speaker.SetOriginated(originated)
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Client{
-		Mesh: mesh, cfg: cfg, privateKey: privateKey, registry: reg,
+	c := &Client{
+		Mesh: mesh, privateKey: privateKey,
 		speaker: speaker, hub: hub, sessions: newSessionSet(),
 		workers: max(1, runtime.GOMAXPROCS(0)),
 		ctx:     ctx, cancel: cancel,
-	}, nil
+		dialers: make(map[string]*dialer),
+	}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+	return c, nil
 }
 
 // Run is called once. It returns only after peer handshakes, IKE sessions, ESP
@@ -103,14 +118,9 @@ func (c *Client) Run(ctx context.Context) error {
 	if ctx.Err() != nil {
 		c.cancel()
 	}
-	var peers sync.WaitGroup
-	for _, local := range c.cfg.Endpoints {
-		for _, peer := range c.cfg.Peers {
-			peers.Go(func() { c.runPeer(c.ctx, local, peer) })
-		}
-	}
-	if c.cfg.Responder {
-		peers.Go(func() {
+	c.syncPeers()
+	if c.config().Responder {
+		c.peers.Go(func() {
 			if err := c.acceptPeers(c.ctx); err != nil && c.ctx.Err() == nil {
 				log.Printf("responder: %v", err)
 			}
@@ -118,7 +128,8 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	err := c.speaker.Run(c.ctx)
 	_ = c.hub.Close()
-	peers.Wait()
+	c.stopDialers()
+	c.peers.Wait()
 	return err
 }
 
@@ -127,4 +138,19 @@ func (c *Client) Close() {
 	c.cancel()
 	_ = c.hub.Close()
 	c.Mesh.Close()
+}
+
+// dialer is one running peer loop. It is a pointer so an entry has an identity
+// a later goroutine can compare against, which a func value cannot provide.
+type dialer struct{ cancel context.CancelFunc }
+
+// stopDialers refuses any further dialer before the wait below begins. It is
+// the write half of the check syncPeers makes under the same lock: without it
+// a SIGHUP that reaches syncPeers as Run is shutting down can call Go on a
+// WaitGroup whose counter has already reached zero and whose Wait has already
+// started, which is a panic rather than a race the scheduler smooths over.
+func (c *Client) stopDialers() {
+	c.dialersMu.Lock()
+	defer c.dialersMu.Unlock()
+	c.stopped = true
 }
