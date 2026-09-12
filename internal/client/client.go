@@ -62,9 +62,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 			_ = hub.Close()
 		}
 	}()
-	speaker, err := babel.New(babel.Config{
-		HelloInterval: cfg.Babel.HelloInterval, UpdateInterval: cfg.Babel.UpdateInterval,
-	}, mesh)
+	speaker, err := babel.New(cfg.Babel.SpeakerConfig(), mesh)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +72,11 @@ func New(cfg *config.Config) (_ *Client, err error) {
 			return nil, fmt.Errorf("config: originate %q: %w", raw, err)
 		}
 		speaker.Originate(prefix)
+	}
+	// babel.originate carries the source-specific announcements the plain list
+	// cannot express, which is how an exit announces a default from a prefix.
+	for _, entry := range cfg.Babel.Originate {
+		speaker.OriginateFrom(entry.Prefix, entry.From)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{

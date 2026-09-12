@@ -191,7 +191,7 @@ in
               randomize router id;
               interface "swan0" {
                 type tunnel;
-                rxcost 32;
+                rxcost 96;
                 hello interval 500 ms;
                 update interval 1 s;
                 rtt cost 1024;
@@ -502,10 +502,13 @@ in
         gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
 
         # Losing the answered SA has to be recoverable without ranet-lite ever
-        # dialing: strongSwan notices through DPD and initiates again, and the
-        # responder accepts a second SA for a peer it already knew.
+        # dialing, so the responder accepts a second SA for a peer it already
+        # knew. Drive the peer rather than waiting out its DPD timers: what is
+        # under test is the responder, not how long charon takes to notice.
         client.succeed("systemctl restart ranet-lite.service")
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=dt.timedelta(seconds=120))
+        gateway.execute("swanctl --terminate --ike ranet")
+        gateway.wait_until_succeeds("swanctl --initiate --child default", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
         client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
     finally:
         for command in [

@@ -78,3 +78,16 @@ babel:
 #   assign_originated: false
 #   vrf: gravity
 #   reconcile_interval: 30s
+
+# The babel block also carries link costs, named after the BIRD interface
+# options they mirror, and source-specific announcements the plain originate
+# list above cannot express.
+# babel:
+#   hello_interval: 20s
+#   update_interval: 80s
+#   rxcost: 96
+#   rtt_cost: 1024
+#   rtt_max: 1024ms
+#   originate:
+#     - 2001:db8:1::/48                      # a plain prefix, same as originate
+#     - { prefix: "::/0", from: "2001:db8:1::/48" }  # an exit's default

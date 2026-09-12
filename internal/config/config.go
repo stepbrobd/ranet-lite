@@ -345,7 +345,9 @@ func (c *Config) validate() error {
 	case !validRekeyTiming(c.IKERekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
 		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than ike_rekey_interval")
 	}
-	if err := (babel.Config{HelloInterval: c.Babel.HelloInterval, UpdateInterval: c.Babel.UpdateInterval}).Validate(); err != nil {
+	// Validate the whole speaker configuration, link costs included, so a bad
+	// rxcost fails at load rather than at speaker construction.
+	if err := c.Babel.SpeakerConfig().Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 	endpointSerials := make(map[string]struct{}, len(c.Endpoints))

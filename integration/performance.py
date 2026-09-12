@@ -403,7 +403,7 @@ protocol babel {
   ipv6 sadr { export all; import all; };
   interface "swan0" {
     type tunnel;
-    rxcost 32;
+    rxcost 96;
     hello interval 500 ms;
     update interval 1 s;
     rx buffer 1500;

@@ -38,11 +38,14 @@ nodes rather than participating in ranet's full N-to-N reconciliation.
 
 ## What it deliberately doesn't do
 
-**ranet-lite is always a stub/leaf node, never transit.** It never
-re-advertises routes learned from one peer to another — the embedded
-Babel speaker only announces prefixes it originates itself. Nothing in
-this binary enables IP forwarding, so claiming transit capability in the
-routing protocol would just mean announced paths blackhole.
+**ranet-lite carries transit in this fork.** Upstream is an RFC 8966
+Appendix E stub that never re-advertises a learned route, which is what made
+it loop-free by construction. The speaker here implements the source table and
+the feasibility condition instead, and redistributes its selected routes, so
+loop freedom comes from the mechanism the RFC provides rather than from an
+inability to relay. A node that advertises transit still has to forward it:
+nothing in this binary enables IP forwarding, and the routes have to reach the
+kernel, which is what the `kernel` block below is for.
 
 It implements genuine source-specific routing
 ([SADR, RFC 9079](https://www.rfc-editor.org/rfc/rfc9079)):
