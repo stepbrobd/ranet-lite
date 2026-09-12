@@ -10,19 +10,19 @@ const HeaderLen = 28
 
 // Header is the fixed IKEv2 message header.
 type Header struct {
-	SPIInitiator  uint64
-	SPIResponder  uint64
-	NextPayload   PayloadType
-	MajorVersion  uint8
-	MinorVersion  uint8
-	ExchangeType  ExchangeType
-	Flags         uint8
-	MessageID     uint32
-	Length        uint32 // total message length including header; filled on encode
+	SPIInitiator uint64
+	SPIResponder uint64
+	NextPayload  PayloadType
+	MajorVersion uint8
+	MinorVersion uint8
+	ExchangeType ExchangeType
+	Flags        uint8
+	MessageID    uint32
+	Length       uint32 // total message length including header; filled on encode
 }
 
-func (h *Header) IsResponse() bool   { return h.Flags&FlagResponse != 0 }
-func (h *Header) IsInitiator() bool  { return h.Flags&FlagInitiator != 0 }
+func (h *Header) IsResponse() bool  { return h.Flags&FlagResponse != 0 }
+func (h *Header) IsInitiator() bool { return h.Flags&FlagInitiator != 0 }
 
 func (h *Header) encode() []byte {
 	b := make([]byte, HeaderLen)

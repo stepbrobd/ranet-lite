@@ -15,6 +15,13 @@ import (
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
+// muxLoopback is the mux's own address with an explicit loopback host. The
+// hub binds the wildcard and reports only a port, and sending to an address
+// with no host reaches the local machine on Linux but is unroutable on darwin.
+func muxLoopback(mux *transport.Mux) *net.UDPAddr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: mux.LocalAddr().(*net.UDPAddr).Port}
+}
+
 // listenPeer opens a plain UDP socket standing in for the IKE responder, so
 // sendRecv's behavior can be tested without a real handshake.
 func listenPeer(t *testing.T) *net.UDPConn {
@@ -556,7 +563,7 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), muxLoopback(mux)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -618,7 +625,7 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), muxLoopback(mux)); err != nil {
 		t.Fatal(err)
 	}
 	n, _, err = peer.ReadFromUDP(buf)
@@ -638,7 +645,7 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), muxLoopback(mux)); err != nil {
 		t.Fatal(err)
 	}
 	n, _, err = peer.ReadFromUDP(buf)
@@ -1386,7 +1393,7 @@ func TestSessionRunUsesOldIKEContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), muxLoopback(mux)); err != nil {
 		t.Fatal(err)
 	}
 
