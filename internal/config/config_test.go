@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/NickCao/ranet-lite/internal/babel"
 )
 
 const testConfig = `
@@ -156,6 +158,32 @@ func TestExampleConfigParses(t *testing.T) {
 	}
 }
 
+// An IPv4 source-specific announcement is accepted by nothing: BIRD drops the
+// Update whole because it has no IPv4 SADR channel, and the IPv4 FIB has no
+// source-specific lookup for internal/kernel to install into. Refusing it at
+// load is the only place it can be said out loud.
+func TestOriginateRefusesIPv4SourceSpecific(t *testing.T) {
+	load := func(t *testing.T, addition string) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(testConfig+addition), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		return err
+	}
+	err := load(t, "babel:\n  originate:\n    - {prefix: 0.0.0.0/0, from: 198.51.100.0/24}\n")
+	if err == nil {
+		t.Fatal("an IPv4 source-specific origination was accepted, and it reaches nobody")
+	}
+	if !strings.Contains(err.Error(), "IPv6 only") {
+		t.Errorf("error %q does not say why it was refused", err)
+	}
+	if err := load(t, "babel:\n  originate:\n    - {prefix: \"::/0\", from: \"2001:db8::/48\"}\n"); err != nil {
+		t.Errorf("the IPv6 form was refused: %v", err)
+	}
+}
+
 // Every IKE datagram here carries the non-ESP marker, and RFC 7296 section
 // 2.23 forbids UDP encapsulation on port 500, so a config naming it would
 // build a node no conformant peer can talk to.
@@ -170,5 +198,51 @@ func TestConfigRejectsPort500(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Error("port 500 was accepted")
+	}
+}
+
+// The link cost surface is what a node uses to look as expensive as the BIRD
+// speaker it replaces. Nothing else reads these four fields, so without this
+// they could all be dropped from SpeakerConfig with every check still green,
+// and a node configured to match its peers would silently run on defaults.
+func TestBabelCostFieldsReachTheSpeaker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := testConfig + `babel:
+  rxcost: 42
+  rtt_cost: 4242
+  rtt_min: 7ms
+  rtt_max: 77ms
+  hello_interval: 3s
+  update_interval: 9s
+`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	speaker := cfg.Babel.SpeakerConfig()
+	if speaker.Cost.RxCost != 42 {
+		t.Errorf("rxcost reached the speaker as %d, want 42", speaker.Cost.RxCost)
+	}
+	if speaker.Cost.RTTCost != 4242 {
+		t.Errorf("rtt_cost reached the speaker as %d, want 4242", speaker.Cost.RTTCost)
+	}
+	if speaker.Cost.RTTMin != 7*time.Millisecond {
+		t.Errorf("rtt_min reached the speaker as %s, want 7ms", speaker.Cost.RTTMin)
+	}
+	if speaker.Cost.RTTMax != 77*time.Millisecond {
+		t.Errorf("rtt_max reached the speaker as %s, want 77ms", speaker.Cost.RTTMax)
+	}
+	if speaker.HelloInterval != 3*time.Second || speaker.UpdateInterval != 9*time.Second {
+		t.Errorf("intervals reached the speaker as %s/%s, want 3s/9s",
+			speaker.HelloInterval, speaker.UpdateInterval)
+	}
+
+	// Omitted, the speaker's own defaults stand, which is what matches BIRD.
+	bare := Babel{}.SpeakerConfig()
+	if bare.Cost != babel.DefaultCostParams() {
+		t.Errorf("an empty block changed the defaults to %+v", bare.Cost)
 	}
 }

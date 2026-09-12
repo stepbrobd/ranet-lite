@@ -24,7 +24,12 @@ const maxInterval = 65535 * 10 * time.Millisecond
 
 func (c *Config) setDefaults() {
 	if c.HelloInterval == 0 {
-		c.HelloInterval = 20 * time.Second
+		// The RFC 8966 Appendix B default, which is also BIRD's and what the
+		// fleet configures. At 20 seconds a peer that is up but silent is
+		// declared dead after 70 rather than 14, which is a different network
+		// from the one this is replacing. A node that would rather wake less
+		// often sets babel.hello_interval.
+		c.HelloInterval = 4 * time.Second
 	}
 	if c.UpdateInterval == 0 {
 		// Cap before multiplying, including for invalid very large inputs.

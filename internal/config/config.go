@@ -183,6 +183,98 @@ type Peer struct {
 type Babel struct {
 	HelloInterval  time.Duration `yaml:"hello_interval"`
 	UpdateInterval time.Duration `yaml:"update_interval"`
+	// Link cost, named after the BIRD babel interface options it mirrors: a
+	// fixed rxcost plus up to rtt_cost scaled linearly between rtt_min and
+	// rtt_max. An unset field keeps the speaker's default.
+	RxCost  *uint16   `yaml:"rxcost"`
+	RTTCost *uint16   `yaml:"rtt_cost"`
+	RTTMin  *Duration `yaml:"rtt_min"`
+	RTTMax  *Duration `yaml:"rtt_max"`
+	// Originate announces source-specific prefixes, which the plain top-level
+	// originate list cannot express.
+	Originate []OriginatePrefix `yaml:"originate"`
+}
+
+// OriginatePrefix is either a bare CIDR prefix or a mapping carrying a source
+// prefix, so both entries below are valid:
+//
+//	babel:
+//	  originate:
+//	    - 2001:db8::/48
+//	    - prefix: ::/0
+//	      from: 2602:f590::/36
+type OriginatePrefix struct {
+	Prefix netip.Prefix
+	From   netip.Prefix
+}
+
+func (o *OriginatePrefix) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		prefix, err := netip.ParsePrefix(value.Value)
+		if err != nil {
+			return fmt.Errorf("config: originate %q: %w", value.Value, err)
+		}
+		o.Prefix = prefix
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("config: originate entry must be a prefix or a prefix and from mapping")
+	}
+	// Walked by hand rather than decoded into a helper struct: a nested
+	// decoder would not inherit the top-level decoder's rejection of unknown
+	// fields.
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key, item := value.Content[i], value.Content[i+1]
+		target := &o.Prefix
+		switch key.Value {
+		case "prefix":
+		case "from":
+			target = &o.From
+		default:
+			return fmt.Errorf("config: originate: unknown field %q", key.Value)
+		}
+		prefix, err := netip.ParsePrefix(item.Value)
+		if err != nil {
+			return fmt.Errorf("config: originate %q: %w", item.Value, err)
+		}
+		*target = prefix
+	}
+	switch {
+	case !o.Prefix.IsValid():
+		return fmt.Errorf("config: originate: prefix is required")
+	case o.From.IsValid() && o.From.Addr().Is4() != o.Prefix.Addr().Is4():
+		// The source prefix is encoded under the destination's address
+		// encoding, so the pair has no representation on the wire.
+		return fmt.Errorf("config: originate %s from %s: mismatched address families", o.Prefix, o.From)
+	case o.From.IsValid() && o.Prefix.Addr().Is4():
+		// Nothing consumes an IPv4 source-specific route. BIRD's
+		// babel_read_source_prefix drops the whole Update unless the channel
+		// is NET_IP6_SADR, and it has no IPv4 SADR channel; the Linux IPv4 FIB
+		// has no source-address-dependent lookup either, so internal/kernel
+		// refuses to install one. Announcing it would be a prefix that quietly
+		// reaches nobody.
+		return fmt.Errorf("config: originate %s from %s: source-specific routes are IPv6 only", o.Prefix, o.From)
+	}
+	return nil
+}
+
+// SpeakerConfig is the babel configuration this block describes. Cost fields
+// left unset keep the speaker's own defaults.
+func (b Babel) SpeakerConfig() babel.Config {
+	cost := babel.DefaultCostParams()
+	if b.RxCost != nil {
+		cost.RxCost = *b.RxCost
+	}
+	if b.RTTCost != nil {
+		cost.RTTCost = *b.RTTCost
+	}
+	if b.RTTMin != nil {
+		cost.RTTMin = time.Duration(*b.RTTMin)
+	}
+	if b.RTTMax != nil {
+		cost.RTTMax = time.Duration(*b.RTTMax)
+	}
+	return babel.Config{HelloInterval: b.HelloInterval, UpdateInterval: b.UpdateInterval, Cost: cost}
 }
 
 func Load(path string) (*Config, error) {
