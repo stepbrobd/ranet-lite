@@ -48,7 +48,7 @@ func benchmarkPeerEnqueue(b *testing.B, workers, batch int) {
 	// sealer never reads it, so no payload byte is touched; reporting MB/s over
 	// them prints a figure four orders of magnitude above what the pipeline
 	// really moves. ns/packet below is the honest axis.
-	b.ReportMetric(0, "ns/op")
+	b.ReportAllocs()
 	b.ResetTimer()
 
 	var group sync.WaitGroup
@@ -92,6 +92,7 @@ func BenchmarkPeerEnqueueParallelBatched(b *testing.B) {
 func BenchmarkPeerTransmitSerial(b *testing.B) {
 	peer, _ := benchPeer(b)
 	payload := make([]byte, 1400)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		pb := peer.reserveBatch(1)
