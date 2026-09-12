@@ -138,7 +138,7 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	}
 	localIdentity := ike.Identity{Organization: cfg.Organization, CommonName: cfg.CommonName, SerialNumber: local.SerialNumber}
 	remoteIdentity := ike.Identity{Organization: p.Organization, CommonName: node.CommonName, SerialNumber: ep.SerialNumber}
-	release, adopted := c.sessions.adopt(sessionName, sess, preferInitiator(localIdentity, remoteIdentity))
+	release, adopted := c.sessions.adopt(sessionName, sess, localIdentity, remoteIdentity)
 	defer release()
 	if !adopted {
 		return errSessionEstablished

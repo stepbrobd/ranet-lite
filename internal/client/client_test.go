@@ -375,20 +375,26 @@ func TestSimultaneousOpenConvergesOnTheSameSession(t *testing.T) {
 
 	// One session per direction, named by who opened it. Both nodes see both.
 	const dialedByA, dialedByB = "dialed-by-a", "dialed-by-b"
+	allAlive := func(*ike.Session) bool { return true }
+	noneAlive := func(*ike.Session) bool { return false }
 	// resolve replays one node's arrival order and reports which session it
 	// keeps. local is that node's own identity.
-	resolve := func(local, remote ike.Identity, order []string) string {
+	// alive is what this node believes about each session. The two ends read
+	// their own clocks, so they are not obliged to agree, and the rule has to
+	// converge anyway.
+	resolve := func(local, remote ike.Identity, order []string, alive func(*ike.Session) bool) string {
 		set := newSessionSet()
 		set.close = func(*ike.Session) {}
-		set.active = func(*ike.Session) bool { return true }
+		set.active = alive
 		sessions := map[string]*ike.Session{dialedByA: {}, dialedByB: {}}
-		weDial := local == a
 		for _, which := range order {
-			// A session is preferred when it runs in the direction both ends
-			// agree should be dialed.
-			dialedByUs := (which == dialedByA) == weDial
-			preferred := dialedByUs == preferInitiator(local, remote)
-			set.adopt("path", sessions[which], preferred)
+			// The roles of the SA itself, not this node's point of view: who
+			// opened it and who answered. Both ends pass the same pair.
+			initiator, responder := a, b
+			if which == dialedByB {
+				initiator, responder = b, a
+			}
+			set.adopt("path", sessions[which], initiator, responder)
 		}
 		for name, sess := range sessions {
 			if live := set.live["path"]; live != nil && live.session == sess {
@@ -401,14 +407,24 @@ func TestSimultaneousOpenConvergesOnTheSameSession(t *testing.T) {
 	orders := [][]string{{dialedByA, dialedByB}, {dialedByB, dialedByA}}
 	for _, orderA := range orders {
 		for _, orderB := range orders {
-			keptByA := resolve(a, b, orderA)
-			keptByB := resolve(b, a, orderB)
-			if keptByA == "" || keptByB == "" {
-				t.Fatalf("a node kept no session at all (a=%v b=%v)", orderA, orderB)
-			}
-			if keptByA != keptByB {
-				t.Errorf("alpha (order %v) kept %s while bravo (order %v) kept %s, which is a blackhole in both directions",
-					orderA, keptByA, orderB, keptByB)
+			for _, liveness := range []struct {
+				name string
+				a, b func(*ike.Session) bool
+			}{
+				{"both alive", allAlive, allAlive},
+				{"alpha sees its incumbent as dead", noneAlive, allAlive},
+				{"bravo sees its incumbent as dead", allAlive, noneAlive},
+				{"both see theirs as dead", noneAlive, noneAlive},
+			} {
+				keptByA := resolve(a, b, orderA, liveness.a)
+				keptByB := resolve(b, a, orderB, liveness.b)
+				if keptByA == "" || keptByB == "" {
+					t.Fatalf("a node kept no session at all (%s, a=%v b=%v)", liveness.name, orderA, orderB)
+				}
+				if keptByA != keptByB {
+					t.Fatalf("%s: alpha kept %s and bravo kept %s (a=%v b=%v), so each closes the one the other kept",
+						liveness.name, keptByA, keptByB, orderA, orderB)
+				}
 			}
 		}
 	}
@@ -426,7 +442,7 @@ func TestSessionSetReportsAnEstablishedPath(t *testing.T) {
 		t.Fatal("an empty set reports a session, so neither end would ever dial")
 	}
 	sess := &ike.Session{}
-	release, adopted := set.adopt("path", sess, true)
+	release, adopted := set.adoptPreferred("path", sess, true)
 	if !adopted {
 		t.Fatal("the first session was not adopted")
 	}
@@ -444,25 +460,32 @@ func TestSessionSetReportsAnEstablishedPath(t *testing.T) {
 // handshake in favor of that one locks it out for the whole of that minute,
 // and because the stale entry also stops our own dialer, neither end opens
 // anything at all.
-func TestSessionSetReplacesAStaleIncumbent(t *testing.T) {
+// A peer that rebooted leaves an SA on this side that looks established until
+// dead peer detection reaps it a minute later. That entry must not stand this
+// node's dialer down, or neither end opens anything for the whole of that
+// minute: the peer has no session, and we are waiting behind one that is gone.
+func TestAStaleIncumbentDoesNotStandTheDialerDown(t *testing.T) {
 	set := newSessionSet()
 	set.close = func(*ike.Session) {}
 	stale, fresh := &ike.Session{}, &ike.Session{}
-	// The incumbent is the one both ends prefer, and it is no longer carrying
-	// traffic. The peer dialing us is the proof of that.
 	set.active = func(sess *ike.Session) bool { return sess != stale }
 
-	if _, adopted := set.adopt("path", stale, true); !adopted {
+	if _, adopted := set.adoptPreferred("path", stale, true); !adopted {
 		t.Fatal("the first session was not adopted")
 	}
 	if set.holds("path") {
-		t.Error("a session that has stopped proving the peer is there still stops our dialer")
+		t.Fatal("a session that has stopped proving the peer is there still stops our dialer")
 	}
-	if _, adopted := set.adopt("path", fresh, false); !adopted {
-		t.Fatal("a fresh handshake was declined in favor of a session that is not carrying traffic")
+	// The dialer then opens one, and this end prefers it because it is the one
+	// both ends agree should be dialed, so it takes over from the stale entry.
+	if _, adopted := set.adoptPreferred("path", fresh, true); !adopted {
+		t.Fatal("the dialer's own session was declined")
 	}
 	if live := set.live["path"]; live == nil || live.session != fresh {
 		t.Error("the stale session is still the live one")
+	}
+	if !set.holds("path") {
+		t.Error("the replacement does not stand the dialer down")
 	}
 }
 
@@ -473,8 +496,8 @@ func TestSessionSetKeepsAnActivePreferredSession(t *testing.T) {
 	set.close = func(*ike.Session) {}
 	set.active = func(*ike.Session) bool { return true }
 	winner, loser := &ike.Session{}, &ike.Session{}
-	set.adopt("path", winner, true)
-	if _, adopted := set.adopt("path", loser, false); adopted {
+	set.adoptPreferred("path", winner, true)
+	if _, adopted := set.adoptPreferred("path", loser, false); adopted {
 		t.Error("the session neither end prefers replaced the one both do")
 	}
 	if live := set.live["path"]; live == nil || live.session != winner {

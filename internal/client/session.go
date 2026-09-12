@@ -141,39 +141,51 @@ func newSessionSet() *sessionSet {
 	}
 }
 
-// preferInitiator reports whether, of the two nodes, this one is the end that
+// preferInitiator reports whether, of the two nodes, the first is the end that
 // should be the initiator. Both ends compute it from the same pair of names
-// and reach opposite answers, which is what makes the choice agree.
-func preferInitiator(local, remote ike.Identity) bool {
-	return identityOrder(local) < identityOrder(remote)
+// and reach the same answer, which is what makes the choice agree.
+func preferInitiator(initiator, responder ike.Identity) bool {
+	return identityOrder(initiator) < identityOrder(responder)
 }
 
 func identityOrder(id ike.Identity) string {
 	return id.Organization + "/" + id.CommonName + "/" + id.SerialNumber
 }
 
-// adopt makes mux the live session for one path unless an equally named
-// session both ends prefer, and is still carrying traffic, already holds it.
-//
-// The liveness half matters as much as the preference. A peer that has just
-// completed a handshake is telling us it has no session, and a peer that has
-// rebooted leaves an SA on this side that looks established until dead peer
-// detection reaps it a minute later. Declining a fresh session in favor of
-// that one locks the peer out for the whole of that minute, and because the
-// stale entry also stops our own dialer, neither end would open anything. The name is the remote and local
+// adopt makes sess the live session for one path unless an equally named
+// session both ends prefer already holds it. The name is the remote and local
 // endpoint pair, not just the peer, so a node reaching one peer over both
 // address families keeps both sessions while a duplicate of either resolves
 // against its twin.
+//
+// The rule reads only the two sessions' preference, which both ends compute
+// from the same pair of names and so always agree on. Nothing local enters it.
+// Gating it on whether the incumbent still looks alive made the outcome depend
+// on a clock the two ends are not obliged to agree about: each would keep the
+// session the other closed, both SAs would die, both ends would redial, and
+// every route through that peer would be withdrawn on each flap. A stale
+// incumbent is handled where it belongs instead, in holds, which is what lets
+// this node's own dialer take over rather than wait behind a dead session.
 //
 // It reports whether the session was adopted. A caller told false has lost and
 // must stop: its mux is already closed. The returned release drops the entry
 // again, and only if it is still ours, so a session that has already been
 // replaced cannot evict its replacement.
-func (s *sessionSet) adopt(path string, sess *ike.Session, preferred bool) (func(), bool) {
+//
+// The two identities are this SA's roles, not this node's point of view: the
+// end that opened it and the end that answered. Naming them that way is what
+// keeps a dialer and a responder from deriving opposite answers for one SA,
+// which is invisible from either end alone.
+func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder ike.Identity) (func(), bool) {
+	return s.adoptPreferred(path, sess, preferInitiator(initiator, responder))
+}
+
+// adoptPreferred is adopt with the rule already applied, for a test that drives
+// the resolution without two identities to derive it from.
+func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bool) (func(), bool) {
 	s.mu.Lock()
 	previous := s.live[path]
-	if previous != nil && previous.session != sess && previous.preferred && !preferred &&
-		s.active(previous.session) {
+	if previous != nil && previous.session != sess && previous.preferred && !preferred {
 		s.mu.Unlock()
 		log.Printf("peer %s: keeping the session the other end also prefers", path)
 		s.close(sess)

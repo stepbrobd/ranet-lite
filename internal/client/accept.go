@@ -48,9 +48,9 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 			// mesh has one name whichever end opened it and the replace rule
 			// in sessionSet applies across both directions.
 			sessionName := fmt.Sprintf("%s/%s/%s@%s", peer.Organization, peer.CommonName, peer.SerialNumber, accepted.Local.SerialNumber)
-			// We answered, so this session is the one both ends keep exactly
-			// when the peer is the end that should be dialing.
-			release, adopted := c.sessions.adopt(sessionName, sess, preferInitiator(peer, accepted.Local))
+			// We answered, so the peer is this SA's initiator and we are its
+			// responder.
+			release, adopted := c.sessions.adopt(sessionName, sess, peer, accepted.Local)
 			defer release()
 			if !adopted {
 				return
