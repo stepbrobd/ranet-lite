@@ -101,8 +101,7 @@ in
               local_addrs = [ "0.0.0.0/0" ];
               # A wildcard remote can only answer. Naming the client is what
               # lets swanctl --initiate dial it.
-              remote_addrs =
-                if responder then [ nodes.client.networking.primaryIPAddress ] else [ "0.0.0.0/0" ];
+              remote_addrs = if responder then [ nodes.client.networking.primaryIPAddress ] else [ "0.0.0.0/0" ];
               local_port = 13000;
               remote_port = 14000;
               encap = true;
@@ -358,184 +357,184 @@ in
   testScript =
     let
       preamble = ''
-    import datetime as dt
+        import datetime as dt
 
-    timeout = dt.timedelta(seconds=30)
+        timeout = dt.timedelta(seconds=30)
 
-    kernel_enabled = ${if kernel then "True" else "False"}
-    kernel_table = "${toString kernelTable}"
-    kernel_protocol = "${toString kernelProtocol}"
-    client_tunnel_v4 = "${clientTunnelV4}"
+        kernel_enabled = ${if kernel then "True" else "False"}
+        kernel_table = "${toString kernelTable}"
+        kernel_protocol = "${toString kernelProtocol}"
+        client_tunnel_v4 = "${clientTunnelV4}"
 
-    def journal_after(machine, unit):
-        output = machine.succeed(f"journalctl -u {unit} -n 1 --show-cursor --no-pager")
-        cursor = output.rsplit("-- cursor: ", 1)[1].strip()
-        return f"journalctl -u {unit} --after-cursor='{cursor}' --no-pager"
+        def journal_after(machine, unit):
+            output = machine.succeed(f"journalctl -u {unit} -n 1 --show-cursor --no-pager")
+            cursor = output.rsplit("-- cursor: ", 1)[1].strip()
+            return f"journalctl -u {unit} --after-cursor='{cursor}' --no-pager"
 
-    start_all()
+        start_all()
 
       '';
 
       # strongSwan answers, ranet-lite dials: upstream's original exchange.
       initiator = ''
-    try:
-        gateway.wait_for_unit("systemd-networkd-wait-online.service")
-        gateway.wait_for_unit("strongswan-swanctl.service")
-        gateway.wait_for_unit("bird.service")
-        gateway.wait_for_unit("iperf3.service")
-        client.wait_for_unit("ranet-lite.service")
+        try:
+            gateway.wait_for_unit("systemd-networkd-wait-online.service")
+            gateway.wait_for_unit("strongswan-swanctl.service")
+            gateway.wait_for_unit("bird.service")
+            gateway.wait_for_unit("iperf3.service")
+            client.wait_for_unit("ranet-lite.service")
 
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
-        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
-        print(gateway.succeed("swanctl --rekey --child default"))
-        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'parsed CREATE_CHILD_SA response.*SA No KE TSi TSr'", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
-        print(gateway.succeed("swanctl --rekey --ike ranet"))
-        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'IKE_SA ranet.* rekeyed between'", timeout=timeout)
-        local_rekeys = journal_after(client, "ranet-lite.service")
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-
-        profile = ${if profile then "True" else "False"}
-        if profile:
-            # NixOS tests force acpi_pm for deterministic timekeeping. Its
-            # virtual I/O reads dominate CPU profiles, so use the KVM clock
-            # in this performance-only variant on both sides of the tunnel.
-            for machine in [client, gateway]:
-                machine.succeed("echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource")
-                assert machine.succeed("cat /sys/devices/system/clocksource/clocksource0/current_clocksource").strip() == "kvm-clock"
-        duration = 25 if profile else 5
-        for direction, flags in [("outbound", ""), ("inbound", "--reverse"), ("bidir", "--bidir")]:
-            if profile:
-                client.succeed(f"systemd-run --unit=ranet-{direction}-profile --collect curl --silent --show-error 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' --output /tmp/{direction}.pprof")
-                pid = client.succeed("systemctl show -p MainPID --value ranet-lite.service").strip()
-                client.succeed(f"systemd-run --unit=ranet-{direction}-kernel-profile --collect perf record -e cpu-clock:k -F 199 -g -p {pid} -o /tmp/{direction}.perf -- sleep 20")
-            # iperf3's server closes and reopens its listening socket between
-            # tests, so a client that connects in that window is refused.
-            # Retrying keeps a harness race out of the result, while a peer
-            # that is genuinely unreachable still fails once they run out.
-            print(client.wait_until_succeeds(
-                f"iperf3 --client ${gatewayTunnel} --parallel 8 --time {duration} {flags}",
-                timeout=120,
-            ))
-            if profile:
-                client.wait_until_succeeds(f"test -s /tmp/{direction}.pprof")
-                print(client.succeed(f"pprof -top -nodecount=50 /tmp/{direction}.pprof"))
-                print(client.succeed(f"perf report --stdio --no-children --percent-limit 1 -g none -i /tmp/{direction}.perf"))
-                client.copy_from_machine(f"/tmp/{direction}.pprof")
-                client.copy_from_machine(f"/tmp/{direction}.perf")
-
-        if not profile:
-            # Verify both new IKE keys and subsequent ESP keys are usable.
-            # swanctl's exit status alone does not prove a rekey succeeded.
-            for sa in ["Child SA", "IKE SA"]:
-                client.wait_until_succeeds(f"{local_rekeys} | grep -F 'ike scheduled rekey completed' | grep -F 'sa=\"{sa}\"'", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
+            peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+            print(gateway.succeed("swanctl --rekey --child default"))
+            gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'parsed CREATE_CHILD_SA response.*SA No KE TSi TSr'", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+            print(gateway.succeed("swanctl --rekey --ike ranet"))
+            gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'IKE_SA ranet.* rekeyed between'", timeout=timeout)
+            local_rekeys = journal_after(client, "ranet-lite.service")
             client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
-        # A graceful BIRD stop retracts routes, then fresh announcements restore
-        # them without reconnecting IKE. Check the client publication as well as IP.
-        withdrawal = journal_after(client, "ranet-lite.service")
-        gateway.succeed("systemctl stop bird.service")
-        client.wait_until_succeeds(f"{withdrawal} | grep -F 'babel route retracted'", timeout=timeout)
-        gateway.succeed("systemctl start bird.service")
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
-        if kernel_enabled:
-            # What replaces kbabel4 and kbabel6 on a fleet node: a route babel
-            # learned has to be in the kernel table the policy rules look up,
-            # carrying this reconciler's protocol and the configured prefsrc.
-            client.wait_until_succeeds(f"ip -4 route show table {kernel_table} | grep -q '10.99.0.0/24'", timeout=timeout)
-            client.wait_until_succeeds(f"ip -6 route show table {kernel_table} | grep -q 'fd00:99::/64'", timeout=timeout)
-            v4 = client.succeed(f"ip -4 route show table {kernel_table}")
-            v6 = client.succeed(f"ip -6 route show table {kernel_table}")
-            print(v4)
-            print(v6)
-            assert f"proto {kernel_protocol}" in v4, v4
-            assert f"src {client_tunnel_v4}" in v4, v4
-            assert "dev ranet0" in v4, v4
-            # The main table is not this reconciler's to write.
-            leaked = client.succeed(f"ip -4 route show proto {kernel_protocol}")
-            assert "10.99.0.0/24" not in leaked, leaked
-        # The endpoint that replaces prometheus-bird-exporter has to report a
-        # live neighbor and a selected route, not just answer.
-        client.wait_until_succeeds("curl -sf http://127.0.0.1:9669/metrics | grep -q '^ranet_lite_babel_neighbor_up{.*} 1$'", timeout=timeout)
-        metrics = client.succeed("curl -sf http://127.0.0.1:9669/metrics")
-        print(metrics)
-        assert "ranet_lite_sessions 1" in metrics, metrics
-        assert "ranet_lite_babel_routes_originated 2" in metrics, metrics
-        selected = [line for line in metrics.splitlines() if line.startswith("ranet_lite_babel_routes_selected ")]
-        assert selected and int(selected[0].split()[1]) > 0, metrics
+            profile = ${if profile then "True" else "False"}
+            if profile:
+                # NixOS tests force acpi_pm for deterministic timekeeping. Its
+                # virtual I/O reads dominate CPU profiles, so use the KVM clock
+                # in this performance-only variant on both sides of the tunnel.
+                for machine in [client, gateway]:
+                    machine.succeed("echo kvm-clock > /sys/devices/system/clocksource/clocksource0/current_clocksource")
+                    assert machine.succeed("cat /sys/devices/system/clocksource/clocksource0/current_clocksource").strip() == "kvm-clock"
+            duration = 25 if profile else 5
+            for direction, flags in [("outbound", ""), ("inbound", "--reverse"), ("bidir", "--bidir")]:
+                if profile:
+                    client.succeed(f"systemd-run --unit=ranet-{direction}-profile --collect curl --silent --show-error 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' --output /tmp/{direction}.pprof")
+                    pid = client.succeed("systemctl show -p MainPID --value ranet-lite.service").strip()
+                    client.succeed(f"systemd-run --unit=ranet-{direction}-kernel-profile --collect perf record -e cpu-clock:k -F 199 -g -p {pid} -o /tmp/{direction}.perf -- sleep 20")
+                # iperf3's server closes and reopens its listening socket between
+                # tests, so a client that connects in that window is refused.
+                # Retrying keeps a harness race out of the result, while a peer
+                # that is genuinely unreachable still fails once they run out.
+                print(client.wait_until_succeeds(
+                    f"iperf3 --client ${gatewayTunnel} --parallel 8 --time {duration} {flags}",
+                    timeout=120,
+                ))
+                if profile:
+                    client.wait_until_succeeds(f"test -s /tmp/{direction}.pprof")
+                    print(client.succeed(f"pprof -top -nodecount=50 /tmp/{direction}.pprof"))
+                    print(client.succeed(f"perf report --stdio --no-children --percent-limit 1 -g none -i /tmp/{direction}.perf"))
+                    client.copy_from_machine(f"/tmp/{direction}.pprof")
+                    client.copy_from_machine(f"/tmp/{direction}.perf")
 
-        assert client.succeed("journalctl -u ranet-lite.service --no-pager | grep -c ': connected (SPI'").strip() == "1"
-        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
-        gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
+            if not profile:
+                # Verify both new IKE keys and subsequent ESP keys are usable.
+                # swanctl's exit status alone does not prove a rekey succeeded.
+                for sa in ["Child SA", "IKE SA"]:
+                    client.wait_until_succeeds(f"{local_rekeys} | grep -F 'ike scheduled rekey completed' | grep -F 'sa=\"{sa}\"'", timeout=timeout)
+                client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
-        # Closing an idle TUN read must stop promptly without SIGKILL.
-        client.succeed("systemctl stop ranet-lite.service")
-        assert client.succeed("systemctl show -p Result --value ranet-lite.service").strip() == "success"
-        if kernel_enabled:
-            # Shutdown withdraws what it installed rather than leaving it behind.
-            assert client.succeed(f"ip -4 route show table {kernel_table}").strip() == "", "ipv4 routes survived shutdown"
-            assert client.succeed(f"ip -6 route show table {kernel_table}").strip() == "", "ipv6 routes survived shutdown"
-        client.succeed("systemctl start ranet-lite.service")
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-    finally:
-        for command in ["swanctl --list-sas", "birdc show babel neighbors", "birdc show babel routes"]:
-            print(gateway.execute(command)[1])
+            # A graceful BIRD stop retracts routes, then fresh announcements restore
+            # them without reconnecting IKE. Check the client publication as well as IP.
+            withdrawal = journal_after(client, "ranet-lite.service")
+            gateway.succeed("systemctl stop bird.service")
+            client.wait_until_succeeds(f"{withdrawal} | grep -F 'babel route retracted'", timeout=timeout)
+            gateway.succeed("systemctl start bird.service")
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
+            if kernel_enabled:
+                # What replaces kbabel4 and kbabel6 on a fleet node: a route babel
+                # learned has to be in the kernel table the policy rules look up,
+                # carrying this reconciler's protocol and the configured prefsrc.
+                client.wait_until_succeeds(f"ip -4 route show table {kernel_table} | grep -q '10.99.0.0/24'", timeout=timeout)
+                client.wait_until_succeeds(f"ip -6 route show table {kernel_table} | grep -q 'fd00:99::/64'", timeout=timeout)
+                v4 = client.succeed(f"ip -4 route show table {kernel_table}")
+                v6 = client.succeed(f"ip -6 route show table {kernel_table}")
+                print(v4)
+                print(v6)
+                assert f"proto {kernel_protocol}" in v4, v4
+                assert f"src {client_tunnel_v4}" in v4, v4
+                assert "dev ranet0" in v4, v4
+                # The main table is not this reconciler's to write.
+                leaked = client.succeed(f"ip -4 route show proto {kernel_protocol}")
+                assert "10.99.0.0/24" not in leaked, leaked
+            # The endpoint that replaces prometheus-bird-exporter has to report a
+            # live neighbor and a selected route, not just answer.
+            client.wait_until_succeeds("curl -sf http://127.0.0.1:9669/metrics | grep -q '^ranet_lite_babel_neighbor_up{.*} 1$'", timeout=timeout)
+            metrics = client.succeed("curl -sf http://127.0.0.1:9669/metrics")
+            print(metrics)
+            assert "ranet_lite_sessions 1" in metrics, metrics
+            assert "ranet_lite_babel_routes_originated 2" in metrics, metrics
+            selected = [line for line in metrics.splitlines() if line.startswith("ranet_lite_babel_routes_selected ")]
+            assert selected and int(selected[0].split()[1]) > 0, metrics
+
+            assert client.succeed("journalctl -u ranet-lite.service --no-pager | grep -c ': connected (SPI'").strip() == "1"
+            client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
+            gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
+
+            # Closing an idle TUN read must stop promptly without SIGKILL.
+            client.succeed("systemctl stop ranet-lite.service")
+            assert client.succeed("systemctl show -p Result --value ranet-lite.service").strip() == "success"
+            if kernel_enabled:
+                # Shutdown withdraws what it installed rather than leaving it behind.
+                assert client.succeed(f"ip -4 route show table {kernel_table}").strip() == "", "ipv4 routes survived shutdown"
+                assert client.succeed(f"ip -6 route show table {kernel_table}").strip() == "", "ipv6 routes survived shutdown"
+            client.succeed("systemctl start ranet-lite.service")
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        finally:
+            for command in ["swanctl --list-sas", "birdc show babel neighbors", "birdc show babel routes"]:
+                print(gateway.execute(command)[1])
       '';
 
       # strongSwan dials, ranet-lite answers.
       responderScript = ''
-    try:
-        gateway.wait_for_unit("systemd-networkd-wait-online.service")
-        gateway.wait_for_unit("strongswan-swanctl.service")
-        gateway.wait_for_unit("bird.service")
-        client.wait_for_unit("ranet-lite.service")
+        try:
+            gateway.wait_for_unit("systemd-networkd-wait-online.service")
+            gateway.wait_for_unit("strongswan-swanctl.service")
+            gateway.wait_for_unit("bird.service")
+            client.wait_for_unit("ranet-lite.service")
 
-        # ranet-lite has no peers configured here, so it never dials. A tunnel
-        # exists only if it answered strongSwan's IKE_SA_INIT.
-        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
-        gateway.succeed("swanctl --initiate --child default")
-        client.wait_until_succeeds("journalctl -u ranet-lite.service --no-pager | grep -F ': connected (SPI'", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
+            # ranet-lite has no peers configured here, so it never dials. A tunnel
+            # exists only if it answered strongSwan's IKE_SA_INIT.
+            client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
+            gateway.succeed("swanctl --initiate --child default")
+            client.wait_until_succeeds("journalctl -u ranet-lite.service --no-pager | grep -F ': connected (SPI'", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
 
-        # The peer drives both rekeys. An answered session has to service them
-        # exactly as a dialed one does, from the opposite role.
-        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
-        print(gateway.succeed("swanctl --rekey --child default"))
-        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'parsed CREATE_CHILD_SA response.*SA No KE TSi TSr'", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
-        print(gateway.succeed("swanctl --rekey --ike ranet"))
-        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'IKE_SA ranet.* rekeyed between'", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            # The peer drives both rekeys. An answered session has to service them
+            # exactly as a dialed one does, from the opposite role.
+            peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+            print(gateway.succeed("swanctl --rekey --child default"))
+            gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'parsed CREATE_CHILD_SA response.*SA No KE TSi TSr'", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+            print(gateway.succeed("swanctl --rekey --ike ranet"))
+            gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'IKE_SA ranet.* rekeyed between'", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
-        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
-        gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
+            client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
+            gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
 
-        # Losing the answered SA has to be recoverable without ranet-lite ever
-        # dialing, so the responder accepts a second SA for a peer it already
-        # knew. Drive the peer rather than waiting out its DPD timers: what is
-        # under test is the responder, not how long charon takes to notice.
-        client.succeed("systemctl restart ranet-lite.service")
-        gateway.execute("swanctl --terminate --ike ranet")
-        gateway.wait_until_succeeds("swanctl --initiate --child default", timeout=timeout)
-        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
-        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
-    finally:
-        for command in [
-            "swanctl --list-sas",
-            "birdc show babel neighbors",
-            "birdc show babel routes",
-            "ip xfrm state",
-            "ip xfrm policy",
-            "grep -v ' 0$' /proc/net/xfrm_stat",
-            "ip -s link show swan0",
-        ]:
-            print(gateway.execute(command)[1])
-        print(client.execute("ip -s link show ranet0")[1])
+            # Losing the answered SA has to be recoverable without ranet-lite ever
+            # dialing, so the responder accepts a second SA for a peer it already
+            # knew. Drive the peer rather than waiting out its DPD timers: what is
+            # under test is the responder, not how long charon takes to notice.
+            client.succeed("systemctl restart ranet-lite.service")
+            gateway.execute("swanctl --terminate --ike ranet")
+            gateway.wait_until_succeeds("swanctl --initiate --child default", timeout=timeout)
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+            client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
+        finally:
+            for command in [
+                "swanctl --list-sas",
+                "birdc show babel neighbors",
+                "birdc show babel routes",
+                "ip xfrm state",
+                "ip xfrm policy",
+                "grep -v ' 0$' /proc/net/xfrm_stat",
+                "ip -s link show swan0",
+            ]:
+                print(gateway.execute(command)[1])
+            print(client.execute("ip -s link show ranet0")[1])
       '';
     in
     preamble + (if responder then responderScript else initiator);
