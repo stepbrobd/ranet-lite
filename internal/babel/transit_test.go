@@ -1,10 +1,13 @@
 package babel
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +23,7 @@ type meshFabric struct {
 	speakers map[string]*Speaker
 	meshes   map[string]*netstack.Mesh
 	handles  map[string]*PeerHandle
+	sentMu   sync.Mutex
 	sent     map[string][]RawTLV
 }
 
@@ -80,11 +84,16 @@ func (f *meshFabric) connect(cfg Config, x, y string) {
 	makeNeighborReachable(f.neighbor(y, x))
 }
 
+// record, reset and tlvs take sentMu because a test that runs a real
+// Speaker.Run records from that goroutine while the test body reads.
 func (f *meshFabric) record(from, to string, raw []byte) {
 	tlvs, err := DecodePacket(raw[ipv6HeaderLen+udpHeaderLen:])
 	if err != nil {
-		f.t.Fatalf("%s sent %s an undecodable packet: %v", from, to, err)
+		f.t.Errorf("%s sent %s an undecodable packet: %v", from, to, err)
+		return
 	}
+	f.sentMu.Lock()
+	defer f.sentMu.Unlock()
 	f.sent[from+">"+to] = append(f.sent[from+">"+to], tlvs...)
 }
 
@@ -111,9 +120,17 @@ func (f *meshFabric) flush(nodes ...string) {
 	}
 }
 
-func (f *meshFabric) reset() { clear(f.sent) }
+func (f *meshFabric) reset() {
+	f.sentMu.Lock()
+	defer f.sentMu.Unlock()
+	clear(f.sent)
+}
 
-func (f *meshFabric) tlvs(from, to string) []RawTLV { return f.sent[from+">"+to] }
+func (f *meshFabric) tlvs(from, to string) []RawTLV {
+	f.sentMu.Lock()
+	defer f.sentMu.Unlock()
+	return slices.Clone(f.sent[from+">"+to])
+}
 
 // inject hands node a packet as if peer had sent it, which is how a test
 // reaches a neighbor that split horizon would otherwise keep quiet.
@@ -882,4 +899,71 @@ func TestSeqnoSuppressionEntriesAreSweptAndDroppedWithTheirNeighbor(t *testing.T
 	if swept != 0 {
 		t.Errorf("%d of %d suppression entries survived their window", swept, left)
 	}
+}
+
+// Starvation recovery is what stops a lost seqno becoming a permanent black
+// hole, and the retry is reached only from Run. Deleting that one call left
+// the retry itself covered and unreachable.
+func TestRunRetriesAStarvedSeqnoRequest(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "b-e", "c-e")
+	dest := netip.MustParsePrefix("fd00:e::/64")
+	speaker := fabric.speakers["a"]
+	fabric.speakers["e"].Originate(dest)
+	fabric.flush("e", "b", "c", "a")
+	if fabric.nextHop("a", routeKey{dest: dest}) == "" {
+		t.Fatal("a never learned the route")
+	}
+
+	// Both relays worsen past the distance a has already advertised, so every
+	// route a holds for the prefix becomes unfeasible at once.
+	fabric.reset()
+	for _, relay := range []string{"b", "c"} {
+		fabric.inject("a", relay,
+			EncodeRouterID(routerID("e")),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: 900}))
+	}
+	if got := len(seqnoRequestsFor(t, fabric.tlvs("a", "b"), dest)); got != 1 {
+		t.Fatalf("a sent %d seqno requests when it starved, want 1", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- speaker.Run(ctx) }()
+
+	// Bring the retry forward rather than waiting out its backoff, and clear
+	// the suppression window the first request opened, which is what the
+	// passage of time would have done.
+	fabric.reset()
+	speaker.mu.Lock()
+	if len(speaker.starveRetries) == 0 {
+		speaker.mu.Unlock()
+		cancel()
+		t.Fatal("starving recorded no retry at all, so there is nothing for Run to reach")
+	}
+	past := time.Now().Add(-time.Hour)
+	for _, retry := range speaker.starveRetries {
+		retry.nextAt = past
+	}
+	for index := range speaker.askedSeqno {
+		speaker.askedSeqno[index] = past
+	}
+	speaker.wake()
+	speaker.mu.Unlock()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if len(seqnoRequestsFor(t, fabric.tlvs("a", "b"), dest)) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("Run never repeated the seqno request, so a lost one is a permanent black hole")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
 }
