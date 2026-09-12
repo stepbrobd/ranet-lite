@@ -642,3 +642,32 @@ func TestSetRekeyRetry(t *testing.T) {
 		}
 	}
 }
+
+// Active compares against a window of seconds, so measuring it on the wall
+// clock makes every session on the node flip together on any step larger than
+// that: a laptop waking, an NTP correction at boot, a VM resuming. A wall step
+// cannot be produced in-process, so pin the representation instead. A unix
+// nanosecond timestamp is six orders of magnitude larger than any offset from
+// a session's own start.
+func TestLivenessClockIsAnOffsetRatherThanAWallTimestamp(t *testing.T) {
+	s := &Session{started: time.Now()}
+	s.noteEstablished()
+	if got := s.lastActive.Load(); got <= 0 || got > int64(time.Hour) {
+		t.Fatalf("lastActive = %d, want a small offset from the session start", got)
+	}
+	if !s.Active() {
+		t.Error("a session that has just been established reads as dead")
+	}
+}
+
+func TestActiveExpiresAndComesBack(t *testing.T) {
+	s := &Session{started: time.Now().Add(-time.Hour)}
+	s.lastActive.Store(1) // last proof of life at the session's start
+	if s.Active() {
+		t.Fatal("a session last active an hour ago reads as live")
+	}
+	s.noteActive()
+	if !s.Active() {
+		t.Error("a session that just proved itself still reads as dead")
+	}
+}

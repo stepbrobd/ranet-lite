@@ -177,7 +177,7 @@ func (s *Session) Run(ctx context.Context) error {
 	s.serving.Store(true)
 	defer s.serving.Store(false)
 	lastAuthenticated := time.Now()
-	s.lastActive.Store(lastAuthenticated.UnixNano())
+	s.noteActive()
 	if s.rekeyRetryInitial == 0 && s.rekeyRetryMax == 0 {
 		s.rekeyRetryInitial = 5 * time.Second
 		s.rekeyRetryMax = 5 * time.Minute
@@ -246,7 +246,7 @@ func (s *Session) Run(ctx context.Context) error {
 		startDueRekey()
 		if s.trafficSeen.Swap(false) {
 			lastAuthenticated = time.Now()
-			s.lastActive.Store(lastAuthenticated.UnixNano())
+			s.noteActive()
 		}
 		if pending == nil {
 			select {
@@ -301,6 +301,10 @@ func (s *Session) Run(ctx context.Context) error {
 		case datagram := <-s.mux.IKE():
 			if s.dispatch(datagram.Raw, datagram.Endpoint, &pending) {
 				lastAuthenticated = time.Now()
+				// An answered exchange proves the peer is there just as ESP
+				// does, and on a link carrying nothing else, a session kept up
+				// by DPD alone, it is the only proof there is.
+				s.noteActive()
 			}
 			continue
 		case <-s.mux.Done():
@@ -349,7 +353,7 @@ func (s *Session) Run(ctx context.Context) error {
 			// no cryptographically protected messages have been received".
 			if s.trafficSeen.Swap(false) {
 				lastAuthenticated = time.Now()
-				s.lastActive.Store(lastAuthenticated.UnixNano())
+				s.noteActive()
 			}
 			if pending == nil && !time.Now().Before(lastAuthenticated.Add(dpdInterval)) {
 				started, err := s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})

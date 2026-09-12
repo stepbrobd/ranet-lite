@@ -610,3 +610,62 @@ func TestDeleteIKEReachesThePeerWithoutARunLoop(t *testing.T) {
 		t.Errorf("the peer received exchange type %d, want INFORMATIONAL", header.ExchangeType)
 	}
 }
+
+// A link that carries nothing but babel hellos and DPD has no ESP to refresh
+// the liveness clock, so an answered exchange has to count as proof on its
+// own. Without it Active()'s window silently becomes a function of
+// babel.hello_interval, which nothing validates against it.
+func TestAnAnsweredExchangeRefreshesTheLivenessClock(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	initiator, err := h.dial(t)
+	if err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	defer initiator.Mux().Close()
+	var responder *Session
+	select {
+	case responder = <-h.sessions:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the responder produced no session")
+	}
+	defer responder.Mux().Close()
+	<-h.identities
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = initiator.Run(ctx) }()
+	go func() { _ = responder.Run(ctx) }()
+
+	// Run refreshes the clock once when it starts, so wait for that to settle
+	// before taking the baseline. Nothing else touches it here: no ESP flows,
+	// and the exchange below is the only thing on the wire.
+	deadline := time.Now().Add(10 * time.Second)
+	var before int64
+	for stable := 0; stable < 20; {
+		if time.Now().After(deadline) {
+			t.Fatal("the responder's liveness clock never settled")
+		}
+		time.Sleep(5 * time.Millisecond)
+		if now := responder.lastActive.Load(); now != before || !responder.serving.Load() {
+			before, stable = now, 0
+			continue
+		}
+		stable++
+	}
+	if before == 0 {
+		t.Fatal("the responder's control loop never started")
+	}
+
+	if _, err := initiator.request(INFORMATIONAL, nil); err != nil {
+		t.Fatalf("liveness exchange: %v", err)
+	}
+	answered := time.Now().Add(5 * time.Second)
+	for responder.lastActive.Load() <= before {
+		if time.Now().After(answered) {
+			t.Fatal("an answered exchange left the responder's liveness clock untouched")
+		}
+	}
+	if !responder.Active() {
+		t.Error("the responder reads as dead after answering")
+	}
+}

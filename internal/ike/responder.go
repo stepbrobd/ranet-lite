@@ -320,6 +320,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	}
 
 	session := &Session{
+		started:          time.Now(),
 		childRetireDelay: 5 * time.Second,
 		mux:              mux,
 		current: &ikeContext{

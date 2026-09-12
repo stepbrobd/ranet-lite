@@ -110,9 +110,20 @@ type Session struct {
 	// drains it, so a local exchange started when this is false would wait out
 	// its caller's patience and send nothing.
 	serving atomic.Bool
-	// lastActive is when the peer last proved it is still there, as unix
-	// nanoseconds: the moment the SA was established, then every piece of
-	// authenticated traffic and every successful liveness check after it.
+	// started fixes the origin lastActive is measured from. It is written
+	// once, before the session is handed to anyone.
+	started time.Time
+	// lastActive is how long after started the peer last proved it is still
+	// there, in nanoseconds, plus one so that zero still reads as never: the
+	// moment the SA was established, then every piece of authenticated
+	// traffic and every answered exchange after it.
+	//
+	// An offset rather than a wall timestamp, because Active compares it
+	// against a window of seconds. A wall clock that steps further than that,
+	// which a laptop waking, an NTP correction at boot or a VM resuming all
+	// do, would otherwise flip every session on the node at once: forward, all
+	// of them read dead and tear down together; backward, all of them read
+	// alive until the clock catches up.
 	lastActive atomic.Int64
 
 	childRekeyInterval time.Duration
@@ -504,6 +515,7 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 	}
 
 	sess := &Session{
+		started:          time.Now(),
 		childRetireDelay: 5 * time.Second,
 		mux:              mux,
 		current: &ikeContext{suite: suite,
@@ -814,8 +826,11 @@ func usefulInitNotify(m *Message, cookieUsed, groupUsed bool) (Notify, bool) {
 // in that window could keep different sessions.
 func (s *Session) Active() bool {
 	last := s.lastActive.Load()
-	return last != 0 && time.Since(time.Unix(0, last)) < 2*dpdInterval
+	return last != 0 && time.Since(s.started)-time.Duration(last-1) < 2*dpdInterval
 }
 
+// noteActive records that the peer has just proved it is still there.
+func (s *Session) noteActive() { s.lastActive.Store(int64(time.Since(s.started)) + 1) }
+
 // noteEstablished starts the liveness clock at the end of the handshake.
-func (s *Session) noteEstablished() { s.lastActive.Store(time.Now().UnixNano()) }
+func (s *Session) noteEstablished() { s.noteActive() }
