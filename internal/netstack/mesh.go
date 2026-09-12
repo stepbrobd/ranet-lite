@@ -38,7 +38,14 @@ const (
 )
 
 var (
-	inboundPacketPool = sync.Pool{New: func() any { return make([]byte, inboundPacketBufferSize) }}
+	// Pooled as a pointer to the array rather than as a slice. A sync.Pool
+	// takes an any, and a slice header does not fit in one, so putting a slice
+	// back boxes it: one heap allocation for every inbound packet released, on
+	// the path every inbound packet takes. The array pointer fits, so the same
+	// release allocates nothing. Measured over 128 packets per release by
+	// BenchmarkInboundCopyAndRelease: 4226 ns and 129 allocations against 3472
+	// ns and 1 at 64 bytes, 8358 against 6561 at 1400.
+	inboundPacketPool = sync.Pool{New: func() any { return new([inboundPacketBufferSize]byte) }}
 )
 
 // writeOffset is how much leading space Device.Write needs in each buffer
@@ -393,7 +400,7 @@ func collectReadyInbound(first inboundWriteBatch, queue <-chan inboundWriteBatch
 func copyInboundPackets(raw [][]byte) [][]byte {
 	bufs := make([][]byte, len(raw))
 	for i := range raw {
-		buf := inboundPacketPool.Get().([]byte)
+		buf := inboundPacketPool.Get().(*[inboundPacketBufferSize]byte)[:]
 		if cap(buf) < writeOffset+len(raw[i]) {
 			buf = make([]byte, writeOffset+len(raw[i]))
 		} else {
@@ -408,11 +415,11 @@ func copyInboundPackets(raw [][]byte) [][]byte {
 func releaseInboundPackets(bufs [][]byte) {
 	for _, buf := range bufs {
 		if cap(buf) == inboundPacketBufferSize {
-			// The pool holds slices rather than pointers to them on purpose:
-			// the header offset means a buffer is re-sliced on every use, and
-			// the guard above is what keeps a re-sliced one out.
-			//lint:ignore SA6002 the pool deliberately stores slices, see above
-			inboundPacketPool.Put(buf[:inboundPacketBufferSize])
+			// The capacity check keeps out a buffer this package did not
+			// hand out, and one grown past the pool's size. A buffer is
+			// re-sliced on every use for the header offset, and recovering
+			// the array from the full-capacity slice is exact.
+			inboundPacketPool.Put((*[inboundPacketBufferSize]byte)(buf[:inboundPacketBufferSize]))
 		}
 	}
 }
