@@ -53,8 +53,45 @@ type Config struct {
 	// A full mesh needs it on, since every node both dials and answers.
 	Responder bool `yaml:"responder"`
 
-	Peers []Peer `yaml:"peers"`
-	Babel Babel  `yaml:"babel"`
+	Peers  []Peer `yaml:"peers"`
+	Babel  Babel  `yaml:"babel"`
+	Kernel Kernel `yaml:"kernel"`
+}
+
+// Kernel configures the optional kernel route reconciler in internal/kernel,
+// which mirrors the mesh forwarding table into a Linux routing table. It is
+// off unless enabled, so a deployment that configures routes externally is
+// unaffected. Every field is validated by kernel.New at startup.
+type Kernel struct {
+	Enabled bool `yaml:"enabled"`
+	// Table is the routing table the reconciler owns; the fleet uses 200,
+	// which is what the policy rules and End.DT46 look up.
+	Table uint32 `yaml:"table"`
+	// Protocol is the rt_proto stamped on every installed route, and the
+	// marker that separates this reconciler's routes from everyone else's.
+	Protocol uint8 `yaml:"protocol"`
+	// Metric is RTA_PRIORITY, and omitting it leaves the kernel default, 0 for
+	// IPv4 and 1024 for IPv6. Do not set it to BIRD's 32 while BIRD is still
+	// exporting to the same table: both daemons would then key on the same
+	// prefix and priority, each install would displace the other's route, and
+	// every displacement wakes the other's scan.
+	Metric uint32 `yaml:"metric"`
+	// PrefSrc4 is RTA_PREFSRC on every installed IPv4 route, taking over from
+	// krt_prefsrc on BIRD's kbabel4. IPv6 source-specific routes carry
+	// RTA_SRC from the babel source prefix instead.
+	PrefSrc4 string `yaml:"prefsrc4"`
+	// Addresses are assigned to the TUN and removed again at shutdown; only
+	// addresses the reconciler added itself are ever removed.
+	Addresses []string `yaml:"addresses"`
+	// AssignOriginated assigns every prefix in Originate as well, which is
+	// the locally originated address the operator configures by hand today.
+	AssignOriginated bool `yaml:"assign_originated"`
+	// VRF enslaves the TUN to that master device, but only while the link has
+	// no master, so networkd keeps whatever it already claimed.
+	VRF string `yaml:"vrf"`
+	// ReconcileInterval is the periodic sweep that corrects drift nothing
+	// announced. Omitted uses the package default.
+	ReconcileInterval *Duration `yaml:"reconcile_interval"`
 }
 
 // Duration accepts standard Go duration strings and a bare YAML zero.

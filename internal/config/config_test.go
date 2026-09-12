@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,5 +132,26 @@ registry: registry.json
 	}
 	if err := load(t, base+"responder: true\n"); err != nil {
 		t.Fatalf("a responder with no peers was rejected: %v", err)
+	}
+}
+
+// The example is the first configuration anyone copies, and nothing else reads
+// it, so it drifts silently. Parsing it here at least keeps it loadable and
+// keeps its field names real.
+func TestExampleConfigParses(t *testing.T) {
+	example, err := os.ReadFile(filepath.Join("..", "..", "examples", "config.yaml"))
+	if err != nil {
+		t.Fatalf("read the example: %v", err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, example, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The example points at files it does not ship, so loading stops at the
+	// key. What is under test is the shape, not the key material.
+	if _, err := Load(path); err != nil && !strings.Contains(err.Error(), "private_key") &&
+		!strings.Contains(err.Error(), "registry") && !strings.Contains(err.Error(), "no such file") {
+		t.Errorf("the example no longer parses: %v", err)
 	}
 }
