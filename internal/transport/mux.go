@@ -19,10 +19,21 @@ const (
 	readBufferSize  = 65536
 	espSendBatch    = 128
 	// espChanSize absorbs receive bursts before a peer's workers can drain
-	// them. Some backends return only one or two datagrams per kernel batch,
-	// so this remains sized by observed burst count even though each channel
-	// element now carries a whole batch.
-	espChanSize = 4096
+	// them. It counts socket batches, which is the datagram count only where
+	// the backend returns one datagram per batch, as darwin's does. The
+	// channel is allocated with the mux, so this is also what a half-open SA
+	// costs while its handshake runs: at 4096 it was 164 KiB a piece, and
+	// halfOpenLimit of them is what a flood can pin at once.
+	espChanSize = 1024
+	// espQueueBytes is what actually bounds that queue. A batch holds up to
+	// espSendBatch datagrams of up to readBufferSize each, so the batch count
+	// alone bounds nothing: 4096 of them is 34 GB per peer at the UDP maximum.
+	// An ESP SPI is cleartext on the wire and the queue is filled before
+	// anything is authenticated, so whoever has seen one packet from a peer
+	// can aim that at us. Steady-state occupancy is a handful of batches
+	// either way, since the workers drain continuously; this only has to
+	// absorb a burst.
+	espQueueBytes = 8 << 20
 )
 
 // Hub owns one local UDP port and routes incoming packets to registered Muxes.
@@ -79,6 +90,9 @@ type Datagram struct {
 type espDatagramBatch struct {
 	ticket  uint64
 	packets [][]byte
+	// bytes is what this batch holds against the queue's byte budget, kept
+	// with it so every receive path releases exactly what was reserved.
+	bytes int
 }
 
 // NewHub binds localAddr's port on all local IPv4 and IPv6 interfaces.
@@ -201,13 +215,17 @@ func (h *Hub) fail(cause error) (bindErr error) {
 func (h *Hub) receiveLoop(fn receiveFunc) {
 	batch := espSendBatch
 	bufs, sizes, eps := make([][]byte, batch), make([]int, batch), make([]Endpoint, batch)
+	// Only the index is recorded while h.mu is held. The copy onto the heap
+	// happens after unlocking: h.mu also serializes ESP demultiplexing and
+	// every RegisterESP, and on linux one acquisition can otherwise cover up
+	// to espSendBatch datagrams of copying.
 	type pendingIKE struct {
-		mux      *Mux
-		datagram Datagram
+		mux   *Mux
+		index int
 	}
 	espBatches := make(map[*Mux][][]byte)
 	ikeDatagrams := make([]pendingIKE, 0, batch)
-	unclaimed := make([]Unclaimed, 0, batch)
+	unclaimed := make([]int, 0, batch)
 	for {
 		n, err := fn(bufs, sizes, eps)
 		if err != nil {
@@ -231,20 +249,11 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 				if len(raw) >= nonESPMarkerLen+8 {
 					spi := uint64(raw[4])<<56 | uint64(raw[5])<<48 | uint64(raw[6])<<40 | uint64(raw[7])<<32 | uint64(raw[8])<<24 | uint64(raw[9])<<16 | uint64(raw[10])<<8 | uint64(raw[11])
 					if m := h.ike[spi]; m != nil {
-						ikeDatagrams = append(ikeDatagrams, pendingIKE{
-							mux: m,
-							datagram: Datagram{
-								Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
-								Endpoint: eps[i],
-							},
-						})
+						ikeDatagrams = append(ikeDatagrams, pendingIKE{mux: m, index: i})
 					} else if h.listen != nil && eps[i] != nil {
 						// An SA no Mux owns yet. Only a listening hub keeps
 						// these; otherwise they stay dropped as before.
-						unclaimed = append(unclaimed, Unclaimed{
-							Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
-							Endpoint: eps[i],
-						})
+						unclaimed = append(unclaimed, i)
 					}
 				}
 			} else {
@@ -259,24 +268,41 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			}
 		}
 		h.mu.Unlock()
+		// The queue is tested before the datagram is copied, not after. This
+		// loop is each queue's only producer, so room seen here is still there
+		// at the send, and a flood from an unauthenticated peer is refused
+		// without allocating for it.
 		for _, pending := range ikeDatagrams {
-			select {
-			case pending.mux.ikeCh <- pending.datagram:
-			default:
+			if len(pending.mux.ikeCh) == cap(pending.mux.ikeCh) {
 				log.Printf("transport: ikeCh full, dropping IKE message")
+				continue
+			}
+			raw := bufs[pending.index][:sizes[pending.index]]
+			pending.mux.ikeCh <- Datagram{
+				Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
+				Endpoint: eps[pending.index],
 			}
 		}
-		for _, datagram := range unclaimed {
-			select {
-			case h.listen <- datagram:
-			default:
+		for _, i := range unclaimed {
+			if len(h.listen) == cap(h.listen) {
 				log.Printf("transport: listen queue full, dropping unclaimed IKE message")
+				continue
+			}
+			raw := bufs[i][:sizes[i]]
+			h.listen <- Unclaimed{
+				Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
+				Endpoint: eps[i],
 			}
 		}
 		for m, packets := range espBatches {
-			packets = packReceivedBatch(packets)
-			if !m.dispatchESP(packets) {
-				log.Printf("transport: espCh full, dropping %d ESP packets", len(packets))
+			total := 0
+			for _, packet := range packets {
+				total += len(packet)
+			}
+			// Tested before packReceivedBatch copies, so a flood is refused
+			// without allocating for it.
+			if !m.hasRoomForESP(total) || !m.dispatchESP(packReceivedBatch(packets), total) {
+				log.Printf("transport: esp receive queue full, dropping %d ESP packets", len(packets))
 			}
 		}
 	}
@@ -311,6 +337,7 @@ type Mux struct {
 	espDispatchMu sync.Mutex
 	espTicket     uint64
 	espCh         chan espDatagramBatch
+	espQueued     atomic.Int64
 	espPending    [][]byte
 	done          chan struct{}
 	doneOnce      sync.Once
@@ -324,17 +351,35 @@ type Mux struct {
 // may have separate IPv4 and IPv6 receive loops. A dropped batch does not
 // consume a ticket, so the ordered decrypt emitter can never wait forever on
 // a hole caused by backpressure.
-func (m *Mux) dispatchESP(packets [][]byte) bool {
+// hasRoomForESP is consulted before packReceivedBatch copies a batch onto the
+// heap. dispatchESP still decides; this only keeps the copy from happening for
+// a batch that is about to be dropped anyway.
+func (m *Mux) hasRoomForESP(bytes int) bool {
+	return len(m.espCh) < cap(m.espCh) && m.espQueued.Load()+int64(bytes) <= espQueueBytes
+}
+
+func (m *Mux) dispatchESP(packets [][]byte, bytes int) bool {
 	m.espDispatchMu.Lock()
 	defer m.espDispatchMu.Unlock()
-	batch := espDatagramBatch{ticket: m.espTicket, packets: packets}
+	if m.espQueued.Load()+int64(bytes) > espQueueBytes {
+		return false
+	}
+	batch := espDatagramBatch{ticket: m.espTicket, packets: packets, bytes: bytes}
 	select {
 	case m.espCh <- batch:
+		m.espQueued.Add(int64(bytes))
 		m.espTicket++
 		return true
 	default:
 		return false
 	}
+}
+
+// takeESP releases a batch's share of the queue's byte budget. Every path that
+// reads from espCh goes through it, or the budget only ever shrinks.
+func (m *Mux) takeESP(batch espDatagramBatch) [][]byte {
+	m.espQueued.Add(-int64(batch.bytes))
+	return batch.packets
 }
 
 // Dial preserves the one-peer convenience path. The returned mux owns its
@@ -502,7 +547,7 @@ func (m *Mux) RecvESP() ([]byte, error) {
 	if len(m.espPending) == 0 {
 		select {
 		case batch := <-m.espCh:
-			m.espPending = batch.packets
+			m.espPending = m.takeESP(batch)
 		case <-m.done:
 			return nil, m.doneError()
 		}
@@ -520,7 +565,7 @@ func (m *Mux) RecvESP() ([]byte, error) {
 func (m *Mux) RecvESPBatchConcurrent() (uint64, [][]byte, error) {
 	select {
 	case batch := <-m.espCh:
-		return batch.ticket, batch.packets, nil
+		return batch.ticket, m.takeESP(batch), nil
 	case <-m.done:
 		return 0, nil, m.doneError()
 	}
@@ -543,14 +588,14 @@ func (m *Mux) RecvESPBatch(dst [][]byte) ([][]byte, error) {
 			if len(dst) == 0 {
 				select {
 				case batch := <-m.espCh:
-					m.espPending = batch.packets
+					m.espPending = m.takeESP(batch)
 				case <-m.done:
 					return nil, m.doneError()
 				}
 			} else {
 				select {
 				case batch := <-m.espCh:
-					m.espPending = batch.packets
+					m.espPending = m.takeESP(batch)
 				case <-m.done:
 					return dst, nil
 				default:
@@ -571,7 +616,7 @@ func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 	if len(m.espPending) == 0 {
 		select {
 		case batch := <-m.espCh:
-			m.espPending = batch.packets
+			m.espPending = m.takeESP(batch)
 		case <-m.done:
 			return nil, m.doneError()
 		case <-time.After(time.Until(deadline)):

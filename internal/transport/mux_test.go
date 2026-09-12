@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -132,7 +133,7 @@ func TestRecvESPBatchDrainsToDestinationCapacity(t *testing.T) {
 
 func TestConcurrentESPReceiveCarriesDispatchOrder(t *testing.T) {
 	m := &Mux{espCh: make(chan espDatagramBatch, 2), done: make(chan struct{})}
-	if !m.dispatchESP([][]byte{[]byte("first")}) || !m.dispatchESP([][]byte{[]byte("second")}) {
+	if !m.dispatchESP([][]byte{[]byte("first")}, len("first")) || !m.dispatchESP([][]byte{[]byte("second")}, len("second")) {
 		t.Fatal("dispatch unexpectedly dropped a batch")
 	}
 
@@ -163,16 +164,16 @@ func TestConcurrentESPReceiveCarriesDispatchOrder(t *testing.T) {
 
 func TestDroppedESPBatchDoesNotLeaveTicketGap(t *testing.T) {
 	m := &Mux{espCh: make(chan espDatagramBatch, 1), done: make(chan struct{})}
-	if !m.dispatchESP([][]byte{[]byte("accepted")}) {
+	if !m.dispatchESP([][]byte{[]byte("accepted")}, len("accepted")) {
 		t.Fatal("first dispatch was dropped")
 	}
-	if m.dispatchESP([][]byte{[]byte("dropped")}) {
+	if m.dispatchESP([][]byte{[]byte("dropped")}, len("dropped")) {
 		t.Fatal("dispatch to a full queue succeeded")
 	}
 	if _, _, err := m.RecvESPBatchConcurrent(); err != nil {
 		t.Fatal(err)
 	}
-	if !m.dispatchESP([][]byte{[]byte("next")}) {
+	if !m.dispatchESP([][]byte{[]byte("next")}, len("next")) {
 		t.Fatal("dispatch after draining was dropped")
 	}
 	ticket, _, err := m.RecvESPBatchConcurrent()
@@ -496,5 +497,119 @@ func TestHubDoneIsClosedOnFailure(t *testing.T) {
 	case <-h.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Done was not closed")
+	}
+}
+
+// An ESP SPI is cleartext on the wire and the receive queue is filled before
+// anything is authenticated, so whoever has seen one packet from a peer can
+// aim a flood at it. The batch count bounds nothing on its own: one batch
+// holds up to espSendBatch datagrams of up to readBufferSize each.
+func TestESPReceiveQueueIsBoundedInBytes(t *testing.T) {
+	m := &Mux{espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
+	packet := make([]byte, 1<<16)
+	queued, accepted := 0, 0
+	for range espChanSize {
+		if !m.hasRoomForESP(len(packet)) {
+			break
+		}
+		if !m.dispatchESP([][]byte{packet}, len(packet)) {
+			break
+		}
+		queued += len(packet)
+		accepted++
+	}
+	if accepted == espChanSize {
+		t.Fatal("the queue filled to its batch count, so nothing bounded its bytes")
+	}
+	if queued > espQueueBytes {
+		t.Fatalf("the queue holds %d bytes, want at most %d", queued, espQueueBytes)
+	}
+
+	// Draining has to give the budget back, or the queue shrinks to nothing
+	// over the life of a session.
+	for range accepted {
+		if _, _, err := m.RecvESPBatchConcurrent(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := m.espQueued.Load(); got != 0 {
+		t.Fatalf("%d bytes are still charged after the queue drained", got)
+	}
+	if !m.hasRoomForESP(len(packet)) {
+		t.Fatal("a drained queue still reports itself full")
+	}
+}
+
+// Every receive path has to release the budget, not just the concurrent one.
+func TestEveryESPReceivePathReleasesItsBudget(t *testing.T) {
+	for name, recv := range map[string]func(*Mux) error{
+		"RecvESP":      func(m *Mux) error { _, err := m.RecvESP(); return err },
+		"RecvESPBatch": func(m *Mux) error { _, err := m.RecvESPBatch(nil); return err },
+		"RecvESPUntil": func(m *Mux) error {
+			_, err := m.RecvESPUntil(time.Now().Add(time.Second))
+			return err
+		},
+		"RecvESPBatchConcurrent": func(m *Mux) error { _, _, err := m.RecvESPBatchConcurrent(); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := &Mux{espCh: make(chan espDatagramBatch, 4), done: make(chan struct{})}
+			payload := []byte("one whole datagram")
+			if !m.dispatchESP([][]byte{payload}, len(payload)) {
+				t.Fatal("dispatch was dropped")
+			}
+			if err := recv(m); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.espQueued.Load(); got != 0 {
+				t.Fatalf("%d bytes are still charged after %s drained the batch", got, name)
+			}
+		})
+	}
+}
+
+// Hub.Listen's contract is that a full queue drops the datagram rather than
+// blocking the receive loop, because an unauthenticated peer must not be able
+// to stall the dataplane. The copy onto the heap has to come after that
+// decision, or the flood is paid for in allocation whether it is kept or not.
+func TestAFloodOfUnclaimedIKEDatagramsIsNotCopied(t *testing.T) {
+	hub, err := NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	unclaimed := hub.Listen()
+
+	peer := listenPeer(t, "udp4", "127.0.0.1")
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: hub.LocalAddr().(*net.UDPAddr).Port}
+	// An IKE_SA_INIT-shaped datagram for an SA no mux owns, at the largest
+	// size a single UDP datagram carries on loopback.
+	datagram := withMarker(make([]byte, 8192))
+	binary.BigEndian.PutUint64(datagram[nonESPMarkerLen:], 0x1122334455667788)
+
+	var allocated uint64
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for range 2000 {
+		if _, err := peer.WriteToUDP(datagram, dst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give the receive loop time to drop what it cannot keep.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(unclaimed) < cap(unclaimed) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	runtime.ReadMemStats(&after)
+	allocated = after.TotalAlloc - before.TotalAlloc
+
+	// The queue holds a bounded number; everything past it costs nothing but
+	// the receive buffer it already had. Copying every datagram would be
+	// 2000 * 8192 bytes, so half of that separates the two outcomes by a wide
+	// margin in both directions and leaves room for whatever else a sandbox
+	// allocates while this runs.
+	if budget := uint64(2000*len(datagram)) / 2; allocated > budget {
+		t.Errorf("a flood of %d dropped datagrams allocated %d bytes, want well under %d",
+			2000, allocated, budget)
 	}
 }
