@@ -48,7 +48,7 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 	})
 	dispatch := func(peers []*Peer) {
 		batch := &outboundBatch{
-			n: 2, bufs: [][]byte{{1}, {2}}, sizes: []int{1, 1}, headers: []byte{0, 0}, peers: peers,
+			n: 2, bufs: [][]byte{framed(1), framed(2)}, sizes: []int{1, 1}, headers: []byte{0, 0}, peers: peers,
 			peerOrder: append([]*Peer(nil), peers...), counts: map[*Peer]int{a: 1, b: 1}, batches: make(map[*Peer]*peerBatch),
 		}
 		m.outboundReaderWG.Add(1)
@@ -90,7 +90,7 @@ func TestMeshCloseCancelsReservationsAndDrainsQueuedTickets(t *testing.T) {
 	go func() {
 		defer m.outboundReaderWG.Done()
 		m.dispatchOutbound(&outboundBatch{
-			n: 1, bufs: [][]byte{{1}}, sizes: []int{1}, headers: []byte{0}, peers: []*Peer{peer},
+			n: 1, bufs: [][]byte{framed(1)}, sizes: []int{1}, headers: []byte{0}, peers: []*Peer{peer},
 			peerOrder: []*Peer{peer}, counts: map[*Peer]int{peer: 1}, batches: make(map[*Peer]*peerBatch),
 		})
 	}()

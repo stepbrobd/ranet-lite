@@ -34,7 +34,7 @@ const (
 	// inboundPacketBufferSize leaves enough tail capacity for the TUN
 	// backend to merge adjacent TCP packets into a single GSO frame before
 	// writing it. Exact-capacity packet buffers silently disable that GRO.
-	inboundPacketBufferSize = writeOffset + 65535
+	inboundPacketBufferSize = tunOffset + 65535
 )
 
 var (
@@ -48,14 +48,21 @@ var (
 	inboundPacketPool = sync.Pool{New: func() any { return new([inboundPacketBufferSize]byte) }}
 )
 
-// writeOffset is how much leading space Device.Write needs in each buffer
-// to prepend its virtio-net header (the tun package always requests
-// IFF_VNET_HDR) — the same offset wireguard-go's own device code uses
-// (device.MessageTransportOffsetContent) for exactly this reason. Passing
-// offset 0 doesn't just lose performance, it fails outright: Write()
-// computes offset-virtioNetHdrLen internally and slices from there, so a
-// too-small offset is an out-of-range slice.
-const writeOffset = 16
+// tunOffset is how much leading space every Device.Read and Device.Write
+// needs in each buffer — the same offset wireguard-go's own device code uses
+// (device.MessageTransportOffsetContent), and for the same reasons. A backend
+// slices backwards from it to reach its own framing: linux prepends a
+// virtio-net header (the tun package always requests IFF_VNET_HDR), darwin
+// prepends the four-byte address family header a utun frame carries. Offset 0
+// doesn't just lose performance, it fails outright, and on darwin it fails
+// before the first packet arrives: tun_darwin.go's Read evaluates
+// bufs[0][offset-4:] on entry, so offset 0 panics the reader goroutine and
+// takes the process down with it.
+//
+// The contract on the way back is that a read leaves packet i at
+// bufs[i][tunOffset : tunOffset+sizes[i]], which is where linux puts each
+// packet it splits out of one GRO'd read as well.
+const tunOffset = 16
 
 type Mesh struct {
 	Routes *RouteTable
@@ -142,7 +149,7 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		Routes:             NewRouteTable(),
 		Name:               actualName,
 		devs:               devs,
-		outboundBufferSize: max(mtu, outboundPacketBufferSize),
+		outboundBufferSize: tunOffset + max(mtu, outboundPacketBufferSize),
 		closed:             make(chan struct{}),
 	}
 	m.startInboundWriters()
@@ -202,13 +209,13 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 		case <-m.closed:
 			return
 		}
-		n, err := dev.Read(b.bufs, b.sizes, 0)
+		n, err := dev.Read(b.bufs, b.sizes, tunOffset)
 		if err != nil {
 			return // device closed
 		}
 		b.n = n
 		for i := 0; i < n; i++ {
-			raw := b.bufs[i][:b.sizes[i]]
+			raw := b.bufs[i][tunOffset : tunOffset+b.sizes[i]]
 			if src, dst, nh, ok := addrsOf(raw); ok {
 				if peer, ok := m.Routes.Lookup(src, dst); ok {
 					b.peers[i], b.headers[i] = peer, nh
@@ -248,7 +255,7 @@ func (m *Mesh) outboundWorker() {
 	for b := range m.outboundJobs {
 		for i := 0; i < b.n; i++ {
 			if peer := b.peers[i]; peer != nil {
-				b.batches[peer].append(b.bufs[i][:b.sizes[i]], b.headers[i])
+				b.batches[peer].append(b.bufs[i][tunOffset:tunOffset+b.sizes[i]], b.headers[i])
 			}
 		}
 		for _, peer := range b.peerOrder {
@@ -401,13 +408,13 @@ func copyInboundPackets(raw [][]byte) [][]byte {
 	bufs := make([][]byte, len(raw))
 	for i := range raw {
 		buf := inboundPacketPool.Get().(*[inboundPacketBufferSize]byte)[:]
-		if cap(buf) < writeOffset+len(raw[i]) {
-			buf = make([]byte, writeOffset+len(raw[i]))
+		if cap(buf) < tunOffset+len(raw[i]) {
+			buf = make([]byte, tunOffset+len(raw[i]))
 		} else {
-			buf = buf[:writeOffset+len(raw[i])]
+			buf = buf[:tunOffset+len(raw[i])]
 		}
 		bufs[i] = buf
-		copy(bufs[i][writeOffset:], raw[i])
+		copy(bufs[i][tunOffset:], raw[i])
 	}
 	return bufs
 }
@@ -425,7 +432,7 @@ func releaseInboundPackets(bufs [][]byte) {
 }
 
 func (m *Mesh) writeInbound(lane int, bufs [][]byte) {
-	if _, err := m.devs[lane].Write(bufs, writeOffset); err != nil {
+	if _, err := m.devs[lane].Write(bufs, tunOffset); err != nil {
 		select {
 		case <-m.closed:
 		default:

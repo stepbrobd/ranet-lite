@@ -3,6 +3,7 @@ package netstack
 import (
 	"bytes"
 	"errors"
+	"net/netip"
 	"os"
 	"sync"
 	"testing"
@@ -44,6 +45,14 @@ func (d *recordingDevice) Name() (string, error)    { return "test0", nil }
 func (d *recordingDevice) Events() <-chan tun.Event { return d.events }
 func (d *recordingDevice) Close() error             { return nil }
 func (d *recordingDevice) BatchSize() int           { return 128 }
+
+// framed is a TUN read buffer holding one marker byte where a backend's Read
+// leaves the packet, past the headroom it slices its own framing out of.
+func framed(marker byte) []byte {
+	buf := make([]byte, tunOffset+1)
+	buf[tunOffset] = marker
+	return buf
+}
 
 func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T) {
 	started := make(chan byte, 2)
@@ -91,7 +100,7 @@ func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T
 	for marker := byte(1); marker <= 2; marker++ {
 		b := &outboundBatch{
 			n:         1,
-			bufs:      [][]byte{{marker}},
+			bufs:      [][]byte{framed(marker)},
 			sizes:     []int{1},
 			peers:     []*Peer{peer},
 			headers:   []byte{0},
@@ -261,8 +270,8 @@ func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
 
 	select {
 	case got := <-dev.writes:
-		if got.offset != writeOffset {
-			t.Fatalf("write offset = %d, want %d", got.offset, writeOffset)
+		if got.offset != tunOffset {
+			t.Fatalf("write offset = %d, want %d", got.offset, tunOffset)
 		}
 		if len(got.packets) != len(want) {
 			t.Fatalf("wrote %d packets, want %d", len(got.packets), len(want))
@@ -370,5 +379,77 @@ func TestCollectReadyInboundCoalescesQueuedDeliveries(t *testing.T) {
 		if len(packet) != 1 || packet[0] != byte(i+1) {
 			t.Fatalf("packet %d = %v, want [%d]", i, packet, i+1)
 		}
+	}
+}
+
+// utunDevice frames a read the way wireguard-go's darwin backend does: it
+// slices backwards from the offset to lay down the four-byte address family
+// header a utun frame carries, then reports the packet length without it.
+// Reading from a real utun needs root, but the arithmetic that panics does
+// not, and it runs before the first packet ever arrives.
+type utunDevice struct {
+	recordingDevice
+	reads chan []byte
+}
+
+func (d *utunDevice) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	packet, ok := <-d.reads
+	if !ok {
+		return 0, errors.New("closed")
+	}
+	frame := bufs[0][offset-4:]
+	frame[0], frame[1], frame[2], frame[3] = 0, 0, 0, 2 // AF_INET
+	copy(frame[4:], packet)
+	sizes[0] = len(packet)
+	return 1, nil
+}
+
+func TestOutboundReaderLeavesRoomForThePlatformFrameHeader(t *testing.T) {
+	dev := &utunDevice{
+		recordingDevice: recordingDevice{writes: make(chan recordedWrite, 1), events: make(chan tun.Event)},
+		reads:           make(chan []byte, 1),
+	}
+	routed := make(chan []byte, 1)
+	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
+		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+			routed <- append([]byte(nil), raw[0]...)
+			return out[:0], nil
+		}, nil
+	}, func([][]byte) error { return nil })
+	defer peer.Close()
+
+	m := &Mesh{
+		Routes:             NewRouteTable(),
+		devs:               []tun.Device{dev},
+		closed:             make(chan struct{}),
+		outboundJobs:       make(chan *outboundBatch, 1),
+		outboundFree:       make(chan *outboundBatch, 1),
+		outboundBufferSize: tunOffset + outboundPacketBufferSize,
+	}
+	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("10.4.5.6/32"), peer)
+	m.outboundFree <- m.newOutboundBatch(1)
+	m.startOutboundPipeline()
+	defer func() {
+		close(m.closed)
+		close(dev.reads)
+		close(m.outboundJobs)
+		m.outboundWorkerWG.Wait()
+	}()
+
+	raw := make([]byte, 24)
+	raw[0] = 0x45
+	raw[3] = byte(len(raw))
+	copy(raw[12:16], mustAddr("10.1.2.3").AsSlice())
+	copy(raw[16:20], mustAddr("10.4.5.6").AsSlice())
+	copy(raw[20:], "tail")
+	dev.reads <- raw
+
+	select {
+	case got := <-routed:
+		if !bytes.Equal(got, raw) {
+			t.Fatalf("routed packet = %x, want %x", got, raw)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader never routed the packet")
 	}
 }
