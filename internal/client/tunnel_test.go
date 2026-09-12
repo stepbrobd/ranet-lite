@@ -2,8 +2,10 @@ package client
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -182,5 +184,66 @@ func TestReceiveESPOrderAndShutdown(t *testing.T) {
 				t.Fatal("receiver did not join its workers on shutdown")
 			}
 		})
+	}
+}
+
+// RFC 7296 section 1.4.1 lets a peer delete the Child SA and keep the IKE SA.
+// Sending has to stop and ask for a replacement, not report the kind of error
+// that closes the session: the next babel hello would otherwise tear down the
+// adjacency and withdraw every route through the peer.
+func TestDeletedChildSAAsksForAReplacementInsteadOfFailingHard(t *testing.T) {
+	child := tunnelChild(1)
+	tunnel := &tunnel{}
+	asked := make(chan struct{}, 4)
+	tunnel.rekey = func() { asked <- struct{}{} }
+	if err := tunnel.install(child); err != nil {
+		t.Fatal(err)
+	}
+	if err := tunnel.retire(child.LocalSPI); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := tunnel.reserve(1)
+	if !errors.Is(err, errNoChildSA) {
+		t.Fatalf("reserve after the peer's delete = %v, want errNoChildSA", err)
+	}
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no replacement Child SA was requested")
+	}
+}
+
+// Every packet routed to a peer with no outbound SA reaches reserve, so the
+// request has to collapse into one attempt at a time.
+func TestReplacementChildSARequestsDoNotPileUp(t *testing.T) {
+	tunnel := &tunnel{}
+	entered := make(chan struct{}, 128)
+	release := make(chan struct{})
+	var running, peak atomic.Int32
+	tunnel.rekey = func() {
+		n := running.Add(1)
+		for {
+			if seen := peak.Load(); seen >= n || peak.CompareAndSwap(seen, n) {
+				break
+			}
+		}
+		entered <- struct{}{}
+		<-release
+		running.Add(-1)
+	}
+	for range 100 {
+		if _, err := tunnel.reserve(1); !errors.Is(err, errNoChildSA) {
+			t.Fatalf("reserve = %v, want errNoChildSA", err)
+		}
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no replacement Child SA was requested")
+	}
+	close(release)
+	if got := peak.Load(); got != 1 {
+		t.Fatalf("%d concurrent rekey attempts, want exactly 1", got)
 	}
 }

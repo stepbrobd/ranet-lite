@@ -26,7 +26,26 @@ type tunnel struct {
 	mu           sync.Mutex // writers only
 	sas          atomic.Pointer[tunnelSAs]
 	replayWindow uint32
+	rekeying     atomic.Bool
 	rekey        func()
+}
+
+// errNoChildSA means the peer deleted the Child SA and kept the IKE SA, which
+// RFC 7296 section 1.4.1 allows. Sending resumes once a replacement is
+// negotiated, so it is not a reason to close anything.
+var errNoChildSA = errors.New("peer has no active Child SA")
+
+// requestRekey asks for a replacement Child SA, at most one attempt at a time.
+// Every batch that finds no outbound SA calls this, which on a routed tun is
+// once per packet.
+func (t *tunnel) requestRekey() {
+	if t.rekey == nil || !t.rekeying.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer t.rekeying.Store(false)
+		t.rekey()
+	}()
 }
 
 func (t *tunnel) install(child esp.ChildSA) error {
@@ -38,7 +57,7 @@ func (t *tunnel) install(child esp.ChildSA) error {
 	if err != nil {
 		return err
 	}
-	out.SetRekeyCallback(t.rekey)
+	out.SetRekeyCallback(t.requestRekey)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	inbound := make(map[uint32]*esp.InboundSA)
@@ -73,7 +92,8 @@ func (t *tunnel) retire(spi uint32) error {
 func (t *tunnel) reserve(count int) (netstack.BatchSealer, error) {
 	current := t.sas.Load()
 	if current == nil || current.outbound == nil {
-		return nil, errors.New("peer has no active Child SA")
+		t.requestRekey()
+		return nil, errNoChildSA
 	}
 	r, err := current.outbound.ReserveSequenceRange(count)
 	if err != nil {
