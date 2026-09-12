@@ -68,7 +68,23 @@ func EncodeUpdate(u Update) RawTLV {
 	binary.BigEndian.PutUint16(body[6:8], u.Seqno)
 	binary.BigEndian.PutUint16(body[8:10], u.Metric)
 	copy(body[10:], raw[:total])
+	if u.SourcePrefix.IsValid() {
+		body = append(body, encodeSourcePrefix(u.AE, u.SourcePrefix)...)
+	}
 	return RawTLV{Type: TLVUpdate, Body: body}
+}
+
+// encodeSourcePrefix builds the Source Prefix sub-TLV of RFC 9079 section 7.1.
+// Its contents are read under the enclosing TLV's AE, so a source prefix from
+// another address family cannot be expressed and is a programming error. A
+// zero-length source prefix is never sent (RFC 9079 section 5): a TLV without
+// the sub-TLV already means exactly that.
+func encodeSourcePrefix(ae uint8, source netip.Prefix) []byte {
+	if source.Bits() == 0 || source.Addr().Is4() != (ae == AEIPv4 || ae == AEIPv4ViaIPv6) {
+		panic("babel: source prefix of the wrong address family")
+	}
+	body := append([]byte{byte(source.Bits())}, source.Addr().AsSlice()[:prefixByteLen(source.Bits())]...)
+	return encodeSubTLVs([]SubTLV{{Type: SubTLVSourcePrefix, Body: body}})
 }
 
 // PrefixDecoder holds the per-packet compression state RFC 8966 §4.6.9
@@ -158,6 +174,13 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		}
 		copy(u.RouterID[8-min(8, len(raw)):], raw[max(0, len(raw)-8):])
 		u.HasRouterID = true
+	}
+	if u.Interval == 0 && metric != MetricInfinity {
+		// RFC 8966 section 4.6.9: the interval "MUST NOT be 0". Honoring one
+		// would expire the route in the pass that learned it, which collapses
+		// the section 3.5.4 hold that keeps a retracted prefix from falling
+		// through to a covering route.
+		u.Ignore = true
 	}
 	if ae == AEWildcard && metric != MetricInfinity {
 		u.Ignore = true

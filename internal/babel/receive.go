@@ -115,23 +115,34 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 				continue // compression state still follows the ignored Update
 			}
 			if u.AE == AEWildcard {
-				s.routes.expireNeighbor(n, now)
-				continue
-			}
-			if !haveRouterID && u.Metric != MetricInfinity {
+				s.routes.retractNeighbor(n, now)
 				continue
 			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
 			if !ok {
 				continue
 			}
-			prefix := netip.PrefixFrom(addr.Unmap(), u.Plen).Masked()
-			_, local := s.originate[prefix]
-			if local || (haveRouterID && routerID == s.cfg.RouterID) {
+			key := routeKey{source: u.SourcePrefix, dest: netip.PrefixFrom(addr.Unmap(), u.Plen).Masked()}
+			if _, local := s.originate[key]; local {
+				continue // a directly attached prefix always wins, Appendix E
+			}
+			adv := advertisement{routerID: routerID, seqno: u.Seqno, metric: u.Metric}
+			if !haveRouterID {
+				if u.Metric != MetricInfinity {
+					continue
+				}
+				// A retraction can arrive with no router-id in the packet's
+				// parser state (RFC 8966 section 4.5). It retracts whatever
+				// this neighbor last advertised, so the entry keeps its origin.
+				if route := s.routes.route(n, key); route != nil {
+					adv.routerID, adv.seqno = route.routerID, route.seqno
+				}
+			} else if routerID == s.cfg.RouterID {
+				// Our own router-id only ever reaches us back through the mesh,
+				// and we never re-advertise it, so this is a reflection.
 				continue
 			}
-			key := routeKey{source: u.SourcePrefix, dest: prefix}
-			s.routes.update(n, key, u.Metric, deadTimeout(time.Duration(u.Interval)*10*time.Millisecond), now)
+			s.routes.update(n, key, adv, deadTimeout(time.Duration(u.Interval)*10*time.Millisecond), now)
 
 		case TLVAckReq:
 			if nonce, err := DecodeAckReq(t.Body); err == nil && n.addr.IsValid() {
@@ -139,43 +150,127 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			}
 
 		case TLVRouteRequest:
-			if request, err := DecodeRouteRequest(t.Body); err == nil && n.addr.IsValid() {
-				actions = append(actions, s.routeReply(n, request))
+			if request, err := DecodeRouteRequest(t.Body); err == nil {
+				actions = append(actions, s.routeReply(n, request, now)...)
 			}
 
 		case TLVSeqnoRequest:
-			request, err := DecodeSeqnoRequest(t.Body)
-			if err != nil || request.RouterID != s.cfg.RouterID || !n.addr.IsValid() {
-				continue // no transit request forwarding
-			}
-			if _, local := s.originate[request.Prefix]; local {
-				if seqnoGT(request.Seqno, s.originSeqno) {
-					s.originSeqno++ // at most one increment per request
-				}
-				actions = append(actions, sendAction{n, n.addr, s.originatedUpdate(request.Prefix, 0)})
+			if request, err := DecodeSeqnoRequest(t.Body); err == nil {
+				actions = append(actions, s.seqnoReply(n, request, now)...)
 			}
 		}
 	}
 	if linkChanged {
 		s.routes.recomputeNeighbor(n, now)
 	}
-	return actions
+	// Requests are a direct consequence of what this packet said, so they leave
+	// with its replies; triggered updates are aggregated by Run instead.
+	return append(actions, s.starvedActions(now)...)
 }
 
-func (s *Speaker) routeReply(n *neighborState, request RouteRequest) sendAction {
+// routeReply implements RFC 8966 section 3.8.1.1: a wildcard request gets a
+// full dump, and any other request gets an update or an explicit retraction.
+//
+// The same section says a full dump SHOULD be rate-limited, and on a transit
+// node it has to be. The dump is the whole learned table, so one 1400 byte
+// packet holds 349 four byte wildcard requests and, unlimited, each would draw
+// its own copy: measured at 5000 routes that is 41,880 packets and 58 MB out
+// for one packet in, with the table walked under the lock the whole protocol
+// runs under. One dump per update interval is all a neighbor can use anyway,
+// since the periodic update carries the same thing.
+func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Time) []sendAction {
 	var tlvs []RawTLV
 	if request.AE == AEWildcard {
-		for prefix := range s.originate {
-			tlvs = append(tlvs, s.originatedUpdate(prefix, 0)...)
+		if !n.lastFullDump.IsZero() && now.Sub(n.lastFullDump) < s.cfg.UpdateInterval {
+			return nil
+		}
+		n.lastFullDump = now
+		for _, key := range s.advertisableKeys() {
+			tlvs = append(tlvs, s.advertiseTo(n, key, false, now)...)
 		}
 	} else {
-		metric := MetricInfinity
-		if _, local := s.originate[request.Prefix]; local {
-			metric = 0
-		}
-		tlvs = s.originatedUpdate(request.Prefix, metric)
+		tlvs = s.advertiseTo(n, routeKey{source: request.SourcePrefix, dest: request.Prefix}, true, now)
 	}
-	return sendAction{n, n.addr, tlvs}
+	if len(tlvs) == 0 {
+		return nil
+	}
+	return []sendAction{{n, n.destination(), tlvs}}
+}
+
+// seqnoReply implements RFC 8966 section 3.8.1.2: satisfy the request from a
+// locally originated prefix or from the selected route, and otherwise forward
+// it one hop along a route toward the origin.
+func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Time) []sendAction {
+	key := routeKey{source: request.SourcePrefix, dest: request.Prefix}
+	if _, local := s.originate[key]; local {
+		if request.RouterID == s.cfg.RouterID && seqnoGT(request.Seqno, s.originSeqno) {
+			s.originSeqno++ // at most one increment per request
+			// Everything we originate carries the new sequence number, so the
+			// whole set is due a triggered update, not just this prefix.
+			for origin := range s.originate {
+				s.routes.dirty[origin] = struct{}{}
+			}
+		}
+		return sendTLVs(n, s.advertiseTo(n, key, true, now))
+	}
+	if entry := s.routes.entries[key]; entry != nil {
+		// Split horizon keeps us from answering the neighbor we learned the
+		// route from; forwarding the request onwards is the useful reply.
+		if sel := entry.selected; sel.neighbor != nil && sel.neighbor != n &&
+			(sel.routerID != request.RouterID || !seqnoGT(request.Seqno, sel.seqno)) {
+			return sendTLVs(n, s.advertiseTo(n, key, true, now))
+		}
+	}
+	if request.RouterID == s.cfg.RouterID || request.HopCount < 2 {
+		return nil // no other node can raise this node's sequence number
+	}
+	target := s.forwardTarget(key, n)
+	if target == nil {
+		return nil
+	}
+	action, ok := s.seqnoRequestAction(target, key, request.RouterID, request.Seqno, request.HopCount-1, now)
+	if !ok {
+		return nil // a recent request for the same source is still outstanding
+	}
+	return []sendAction{action}
+}
+
+// forwardTarget picks the single neighbor a seqno request is forwarded to,
+// RFC 8966 section 3.8.1.2: the next hop of a feasible route if there is one,
+// otherwise of an unfeasible one, and never the requester.
+func (s *Speaker) forwardTarget(key routeKey, from *neighborState) *neighborState {
+	entry := s.routes.entries[key]
+	if entry == nil {
+		return nil
+	}
+	if sel := entry.selected.neighbor; sel != nil && sel != from {
+		return sel
+	}
+	var feasible, unfeasible *neighborState
+	for n, route := range entry.routes {
+		if n == from || route.rxMetric == MetricInfinity {
+			continue
+		}
+		// Break ties by peer ID: a request must not follow map iteration order.
+		if s.routes.feasible(key, route.advertised()) {
+			if feasible == nil || n.peer.ID < feasible.peer.ID {
+				feasible = n
+			}
+		} else if unfeasible == nil || n.peer.ID < unfeasible.peer.ID {
+			unfeasible = n
+		}
+	}
+	if feasible != nil {
+		return feasible
+	}
+	return unfeasible
+}
+
+func sendTLVs(n *neighborState, tlvs []RawTLV) []sendAction {
+	if len(tlvs) == 0 {
+		return nil
+	}
+	return []sendAction{{n, n.destination(), tlvs}}
 }
 
 const rttTimestampHorizon = 3 * time.Minute

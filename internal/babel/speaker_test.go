@@ -271,7 +271,7 @@ func TestPeerHandleRemovesExactNeighborAndRoutes(t *testing.T) {
 	dest := netip.MustParsePrefix("10.88.0.0/16")
 	key := routeKey{dest: dest}
 	makeNeighborReachable(n)
-	speaker.routes.update(n, key, 1, time.Minute, time.Now())
+	speaker.routes.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, time.Minute, time.Now())
 
 	handle.Close()
 	handle.Close()
@@ -304,12 +304,16 @@ func TestWildcardUpdateRetractsEveryRouteFromNeighbor(t *testing.T) {
 	makeNeighborReachable(neighbor)
 	for _, dest := range []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("10.2.0.0/16")} {
 		key := routeKey{dest: dest}
-		speaker.routes.update(neighbor, key, 1, time.Minute, time.Now())
+		speaker.routes.update(neighbor, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, time.Minute, time.Now())
 	}
 	body := []byte{AEWildcard, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{{Type: TLVUpdate, Body: body}}))
-	if debug := mesh.Routes.Debug(); len(debug) != 0 {
-		t.Fatalf("wildcard retraction left routes installed: %v", debug)
+	// The entries survive as unreachable holds, RFC 8966 section 3.5.4, but
+	// nothing may forward through them any more.
+	for _, dest := range []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("10.2.0.0/16")} {
+		if forwards(mesh, dest) {
+			t.Fatalf("wildcard retraction left %s forwarding: %v", dest, mesh.Routes.Debug())
+		}
 	}
 }
 
@@ -394,7 +398,7 @@ func TestIHUAddressAndRTTOrder(t *testing.T) {
 
 func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 	routerID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	speaker, neighbor, packets := captureSpeaker(t, Config{RouterID: routerID, PacketSize: 48})
+	speaker, neighbor, packets := captureSpeaker(t, Config{RouterID: routerID, PacketSize: 64})
 	first := netip.MustParsePrefix("10.0.0.1/32")
 	second := netip.MustParsePrefix("2001:db8::1/128")
 	speaker.Originate(first)

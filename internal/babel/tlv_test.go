@@ -55,7 +55,7 @@ func TestUpdateRoundTripNoCompression(t *testing.T) {
 }
 
 func TestUpdateRouterIDFlagDerivesAndUpdatesState(t *testing.T) {
-	body := EncodeUpdate(Update{AE: AEIPv6, Plen: 128, Prefix: net.ParseIP("2001:db8::0102:0304:0506:0708")}).Body
+	body := EncodeUpdate(Update{AE: AEIPv6, Plen: 128, Interval: 400, Prefix: net.ParseIP("2001:db8::0102:0304:0506:0708")}).Body
 	body[1] |= updateFlagRouterID | 0x01 // unknown flag bits are ignored
 	got, err := (&PrefixDecoder{}).Decode(body)
 	if err != nil {
@@ -65,7 +65,7 @@ func TestUpdateRouterIDFlagDerivesAndUpdatesState(t *testing.T) {
 	if got.Ignore || !got.HasRouterID || got.RouterID != want {
 		t.Fatalf("R-flag Update = %+v, want router-id %x", got, want)
 	}
-	v4 := EncodeUpdate(Update{AE: AEIPv4, Plen: 25, Prefix: net.IPv4(192, 0, 2, 255)}).Body
+	v4 := EncodeUpdate(Update{AE: AEIPv4, Plen: 25, Interval: 400, Prefix: net.IPv4(192, 0, 2, 255)}).Body
 	v4[1] |= updateFlagRouterID
 	got, err = (&PrefixDecoder{}).Decode(v4)
 	if err != nil {
@@ -95,7 +95,7 @@ func TestUpdatePrefixCompression(t *testing.T) {
 	// IPv4 /32 updates sharing the first 3 bytes, second one omits them.
 	dec := &PrefixDecoder{}
 
-	first := EncodeUpdate(Update{AE: AEIPv4, Plen: 32, Metric: 128, Prefix: net.IPv4(10, 99, 1, 1)})
+	first := EncodeUpdate(Update{AE: AEIPv4, Plen: 32, Interval: 400, Metric: 128, Prefix: net.IPv4(10, 99, 1, 1)})
 	got1, err := dec.Decode(first.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestUpdatePrefixCompression(t *testing.T) {
 
 func TestUpdateCompressionRequiresPrefixFlag(t *testing.T) {
 	decoder := &PrefixDecoder{}
-	first := EncodeUpdate(Update{AE: AEIPv4, Plen: 32, Prefix: net.IPv4(10, 0, 0, 1)})
+	first := EncodeUpdate(Update{AE: AEIPv4, Plen: 32, Interval: 400, Prefix: net.IPv4(10, 0, 0, 1)})
 	if _, err := decoder.Decode(first.Body); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestUpdateWithSourcePrefix(t *testing.T) {
 	// (type 128, SourcePlen=16, source prefix 10.1.0.0/16).
 	body := []byte{
 		AEIPv4, updateFlagPrefix, 32, 0, // AE, Flags, Plen, Omitted
-		0, 0, // Interval
+		1, 144, // Interval, 400 centiseconds
 		0, 0, // Seqno
 		0, 128, // Metric
 		10, 99, 2, 5, // Prefix

@@ -49,9 +49,19 @@ func (c Config) Validate() error {
 	if c.LinkLocalAddr.IsValid() && (!c.LinkLocalAddr.Is6() || !c.LinkLocalAddr.IsLinkLocalUnicast() || c.LinkLocalAddr.Zone() != "") {
 		return fmt.Errorf("babel: local address must be an unzoned IPv6 link-local address")
 	}
-	// A full IPv6 Update with its Router-Id must fit in one packet.
-	if c.PacketSize < 44 || c.PacketSize > 65535-udpHeaderLen {
-		return fmt.Errorf("babel: packet size must be between 44 and %d", 65535-udpHeaderLen)
+	if c.Cost.RTTMin < 0 || c.Cost.RTTMax < c.Cost.RTTMin {
+		return fmt.Errorf("babel: rtt min must be nonnegative and no larger than rtt max")
+	}
+	// A link whose cost saturates is a link a neighbor cannot use at all, so a
+	// configuration that reaches infinity at RTTMax is rejected rather than
+	// silently making the peer unreachable.
+	if c.Cost.RxCost == 0 || saturatingAdd(c.Cost.RxCost, c.Cost.RTTCost) == MetricInfinity {
+		return fmt.Errorf("babel: rxcost plus rtt cost must be between 1 and %d", MetricInfinity-1)
+	}
+	// A full IPv6 Update with its Router-Id and a source prefix must fit in one
+	// packet: 4 header, 12 Router-Id, 28 Update, 19 Source Prefix sub-TLV.
+	if c.PacketSize < 63 || c.PacketSize > 65535-udpHeaderLen {
+		return fmt.Errorf("babel: packet size must be between 63 and %d", 65535-udpHeaderLen)
 	}
 	return nil
 }

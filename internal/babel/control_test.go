@@ -93,13 +93,24 @@ func TestExpiryUsesRemoteDeadlines(t *testing.T) {
 			done := make(chan struct{})
 			go func() { defer close(done); _ = s.Run(ctx) }()
 			defer func() { cancel(); <-done }()
+			// The prefix stops forwarding at expiry. Its entry is held a while
+			// longer as unreachable, RFC 8966 section 3.5.4, so what is under
+			// test here is the lookup rather than the size of the table.
 			deadline := time.Now().Add(500 * time.Millisecond)
-			for len(s.mesh.Routes.Debug()) != 0 && time.Now().Before(deadline) {
+			for forwards(s.mesh, dest) && time.Now().Before(deadline) {
 				time.Sleep(time.Millisecond)
 			}
-			if len(s.mesh.Routes.Debug()) != 0 {
+			if forwards(s.mesh, dest) {
 				t.Fatal("route expiry waited for the much slower local timers")
 			}
 		})
 	}
+}
+
+// forwards reports whether the mesh would send a packet for this prefix to a
+// peer. A prefix held as unreachable answers false, which is the point of the
+// hold: it does not forward and it does not fall through to a covering route.
+func forwards(mesh *netstack.Mesh, dest netip.Prefix) bool {
+	_, ok := mesh.Routes.Lookup(dest.Addr(), dest.Addr())
+	return ok
 }
