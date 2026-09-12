@@ -110,6 +110,15 @@ type inboundWriteBatch struct {
 // New creates an automatically named TUN device.
 func New(mtu int) (*Mesh, error) { return NewNamed(mtu, "") }
 
+// NewRoutesOnly is a mesh with a forwarding table and no device, for a test
+// that exercises routing and sessions rather than the dataplane. Creating a
+// TUN needs root on every platform, and babel intercepts its own traffic
+// before delivery, so a mesh that never carries a data packet does not need
+// one. Delivering one to it is a no-op.
+func NewRoutesOnly() *Mesh {
+	return &Mesh{Routes: NewRouteTable(), closed: make(chan struct{})}
+}
+
 // NewNamed attaches to or creates name through wireguard-go's TUN backend.
 // An empty name retains the project's automatically assigned ranet%d name.
 func NewNamed(mtu int, name string) (*Mesh, error) {
@@ -311,7 +320,9 @@ func (m *Mesh) DeliverInbound(raw []byte) {
 // the headroom and tail capacity required by the TUN backend's virtio/GRO
 // implementation.
 func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
-	if len(raw) == 0 {
+	// A mesh with no device only exists in a test, where nothing should reach
+	// here: babel's own traffic is intercepted before delivery.
+	if len(raw) == 0 || len(m.devs) == 0 {
 		return
 	}
 	m.deliveryMu.Lock()
