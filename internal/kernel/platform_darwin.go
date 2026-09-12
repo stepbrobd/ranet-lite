@@ -441,13 +441,15 @@ func (p *routePlatform) AddAddr(prefix netip.Prefix) error {
 // DelAddr removes one address, and is reached only for an address the
 // reconciler added itself in this process lifetime.
 func (p *routePlatform) DelAddr(prefix netip.Prefix) error {
+	// The builder is selected and then called, never called before the family
+	// is known: deleteRequest4 reads the address as four bytes and panics on a
+	// v6 prefix. AddAddr above has the same shape for the same reason.
 	name, fd, number := "SIOCDIFADDR", p.control4, uintptr(unix.SIOCDIFADDR)
-	request := deleteRequest4(p.cfg.Interface, prefix)
+	build := deleteRequest4
 	if !prefix.Addr().Is4() {
-		name, fd, number = "SIOCDIFADDR_IN6", p.control6, siocDIfAddrIn6
-		request = deleteRequest6(p.cfg.Interface, prefix)
+		name, fd, number, build = "SIOCDIFADDR_IN6", p.control6, siocDIfAddrIn6, deleteRequest6
 	}
-	if err := ioctlRequest(fd, number, request); err != nil && !gone(err) {
+	if err := ioctlRequest(fd, number, build(p.cfg.Interface, prefix)); err != nil && !gone(err) {
 		return fmt.Errorf("%s on %s: %w", name, p.cfg.Interface, err)
 	}
 	return nil
