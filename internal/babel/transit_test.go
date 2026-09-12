@@ -625,3 +625,52 @@ func TestSourceTableRefusesAnUnknownOriginWhenFull(t *testing.T) {
 		t.Error("a full source table refused a retraction")
 	}
 }
+
+// One seqno request is not enough. If it or its reply is lost, the prefix
+// stays starved: nothing asks again, and the unfeasible route that caused the
+// starvation keeps the feasibility distance alive so it never expires either.
+// RFC 8966 section 3.8.2.1 says to repeat the request a small number of times.
+func TestSeqnoRequestIsRepeatedWhileStarved(t *testing.T) {
+	// d is a leaf with no path of its own to the origin. It exists so that a
+	// has somewhere to advertise, which is what records the feasibility
+	// distance the worsened update below has to fall foul of, without giving a
+	// a second route that would make the prefix not starved at all.
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c", "a-d")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+	if got := fabric.nextHop("a", key); got != "b" {
+		t.Fatalf("a reaches the origin via %q, want \"b\"", got)
+	}
+	fabric.reset()
+
+	fabric.inject("a", "b",
+		EncodeRouterID(routerID("c")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 900}))
+	if len(seqnoRequestsFor(t, fabric.tlvs("a", "b"), dest)) != 1 {
+		t.Fatal("a did not ask for a new seqno when its route became unfeasible")
+	}
+
+	// Nothing answers. The request has to come again rather than leaving the
+	// prefix black-holed for as long as b keeps refreshing the bad route.
+	speaker := fabric.speakers["a"]
+	speaker.mu.Lock()
+	pending := len(speaker.starveRetries)
+	for _, retry := range speaker.starveRetries {
+		retry.nextAt = time.Now().Add(-time.Second)
+	}
+	// The suppression table is what stops a redundant request inside its
+	// window; the retry is deliberately outside it, so clear it rather than
+	// sleeping through it.
+	speaker.pendingSeqno = make(map[sourceKey]pendingSeqno)
+	retries := speaker.retryStarvedLocked(time.Now())
+	speaker.mu.Unlock()
+	if pending == 0 {
+		t.Fatal("a kept no record of the starved prefix, so it can never ask again")
+	}
+	if len(retries) == 0 {
+		t.Error("a never repeated the seqno request, so the prefix stays starved indefinitely")
+	}
+}

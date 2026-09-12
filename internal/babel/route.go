@@ -216,19 +216,22 @@ func (rt *routeTable) selectRoute(key routeKey, entry *keyEntry, now time.Time) 
 		selected = entry.selectionFor(incumbent, incumbentCost)
 	}
 
-	if selected.neighbor != entry.selected.neighbor || selected.cost != entry.selected.cost {
+	previous := entry.selected
+	if selected.neighbor != previous.neighbor || selected.cost != previous.cost {
 		rt.install(key, selected)
 	}
-	if rt.significant(entry.selected, selected) {
+	if rt.significant(previous, selected) {
 		rt.dirty[key] = struct{}{}
 	}
 	if selected.neighbor != nil {
 		entry.retractID, entry.retractSeqno = selected.routerID, selected.seqno
 	}
 	entry.selected = selected
-	// Section 3.8.2.1: every feasible route is gone while unfeasible ones
-	// remain, so ask their origins for a new sequence number.
-	if selected.neighbor == nil {
+	// Section 3.8.2.1: the last feasible route is gone while unfeasible ones
+	// remain, so ask their origins for a new sequence number. Only the
+	// transition asks: a prefix that stays starved would otherwise repeat the
+	// request on every pass for as long as the unfeasible routes are retained.
+	if selected.neighbor == nil && previous.neighbor != nil {
 		for _, n := range unfeasible {
 			rt.starve(key, n, entry.routes[n].advertised())
 		}

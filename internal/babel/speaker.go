@@ -18,9 +18,10 @@
 //     the prefix, not only while it is advertising one. The case that most
 //     needs forwarding is exactly the one where every route has become
 //     unfeasible and nothing is being advertised.
-//   - 3.8.1.2: a request for a prefix whose selected next hop is the requester
-//     is forwarded onwards rather than answered, since split horizon would
-//     make the answer a retraction.
+//   - 3.8.1.1 and 3.8.1.2: split horizon applies to replies as well, so a
+//     request for a prefix whose selected next hop is the requester is
+//     answered with a retraction, and a seqno request in that position is
+//     forwarded onwards instead of answered at all.
 //   - 3.8.2.1 and 3.8.2.3: seqno requests are suppressed for a short window
 //     instead of being resent on a timer, and a selected route is not
 //     refreshed with a route request shortly before it expires.
@@ -70,6 +71,27 @@ const maxPendingSeqno = 1 << 12
 // value", RFC 8966 section 3.8.2.1.
 const seqnoRequestHopCount = 64
 
+// The same section says a node "SHOULD repeat such a request a small number of
+// times if no route becomes feasible within a short time". One request is not
+// enough: losing it, or its reply, leaves the prefix starved for as long as the
+// unfeasible route keeps being refreshed, and the unfeasible route pins the
+// feasibility distance so that never expires either. BIRD repeats four times,
+// doubling the delay. The first delay is longer than seqnoRequestSuppress so a
+// retry is not dropped as redundant by our own suppression table.
+const (
+	seqnoRequestRetries = 4
+	seqnoRetryInitial   = 3 * time.Second
+)
+
+// starveRetry is one prefix waiting for a seqno that has not arrived.
+type starveRetry struct {
+	key      routeKey
+	routerID [8]byte
+	seqno    uint16
+	attempts int
+	nextAt   time.Time
+}
+
 // Speaker.mu serializes all protocol state and forwarding-table changes.
 // Packet transmission always happens after unlocking: a slow peer cannot
 // prevent a route retraction, and in-memory transports may re-enter Receive.
@@ -82,6 +104,7 @@ type Speaker struct {
 	originate     map[routeKey]struct{}
 	routes        *routeTable
 	pendingSeqno  map[sourceKey]pendingSeqno
+	starveRetries map[sourceKey]*starveRetry
 	originSeqno   uint16
 	updatePending bool
 	changed       chan struct{}
@@ -114,11 +137,12 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 	}
 	s := &Speaker{
 		cfg: cfg, mesh: mesh,
-		neighbors:    make(map[string]*neighborState),
-		originate:    make(map[routeKey]struct{}),
-		pendingSeqno: make(map[sourceKey]pendingSeqno),
-		originSeqno:  1,
-		changed:      make(chan struct{}, 1),
+		neighbors:     make(map[string]*neighborState),
+		originate:     make(map[routeKey]struct{}),
+		pendingSeqno:  make(map[sourceKey]pendingSeqno),
+		starveRetries: make(map[sourceKey]*starveRetry),
+		originSeqno:   1,
+		changed:       make(chan struct{}, 1),
 	}
 	s.routes = newRouteTable(s.installRoute)
 	s.routes.forget = func(key routeKey) { s.mesh.Routes.Remove(key.source, key.dest) }
@@ -257,7 +281,11 @@ func (s *Speaker) Run(ctx context.Context) error {
 			actions = append(actions, s.triggeredActions(now)...)
 		}
 		actions = append(actions, s.starvedActions(now)...)
+		actions = append(actions, s.retryStarvedLocked(now)...)
 		deadline := earlier(earlier(nextHello, nextUpdate), s.routes.nextExpiry())
+		for _, retry := range s.starveRetries {
+			deadline = earlier(deadline, retry.nextAt)
+		}
 		for _, n := range s.neighbors {
 			if n.alive {
 				deadline = earlier(deadline, n.helloExpiry())

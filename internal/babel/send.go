@@ -278,6 +278,7 @@ func (s *Speaker) starvedActions(now time.Time) []sendAction {
 			request.routerID, request.seqno, seqnoRequestHopCount, now)
 		if ok {
 			actions = append(actions, action)
+			s.rememberStarved(request.key, request.routerID, request.seqno, now)
 		}
 	}
 	return actions
@@ -306,4 +307,54 @@ func aeFor(p netip.Prefix) uint8 {
 		return AEIPv4
 	}
 	return AEIPv6
+}
+
+// rememberStarved records a prefix whose seqno request has just gone out, so
+// it can be repeated if no feasible route appears. RFC 8966 section 3.8.2.1.
+func (s *Speaker) rememberStarved(key routeKey, routerID [8]byte, seqno uint16, now time.Time) {
+	id := sourceKey{route: key, routerID: routerID}
+	if retry, ok := s.starveRetries[id]; ok {
+		retry.seqno, retry.nextAt = seqno, now.Add(seqnoRetryInitial)
+		return
+	}
+	s.starveRetries[id] = &starveRetry{
+		key: key, routerID: routerID, seqno: seqno, nextAt: now.Add(seqnoRetryInitial),
+	}
+}
+
+// retryStarvedLocked repeats the seqno requests for prefixes that are still
+// starved. A prefix that has a feasible route again, or that has run out of
+// attempts, is forgotten rather than asked about forever.
+func (s *Speaker) retryStarvedLocked(now time.Time) []sendAction {
+	var actions []sendAction
+	for id, retry := range s.starveRetries {
+		if entry := s.routes.entries[retry.key]; entry != nil && entry.selected.neighbor != nil {
+			delete(s.starveRetries, id)
+			continue
+		}
+		if now.Before(retry.nextAt) {
+			continue
+		}
+		if retry.attempts >= seqnoRequestRetries {
+			delete(s.starveRetries, id)
+			continue
+		}
+		retry.attempts++
+		retry.nextAt = now.Add(seqnoRetryInitial << (retry.attempts - 1))
+		// Ask everyone holding a route for this prefix, not only whoever the
+		// starved one came from: the neighbor that can reach the origin may be
+		// a different one, and BIRD rebroadcasts for the same reason.
+		for _, n := range s.neighbors {
+			if !n.alive {
+				continue
+			}
+			if s.routes.route(n, retry.key) == nil {
+				continue
+			}
+			if action, ok := s.seqnoRequestAction(n, retry.key, retry.routerID, retry.seqno, seqnoRequestHopCount, now); ok {
+				actions = append(actions, action)
+			}
+		}
+	}
+	return actions
 }
