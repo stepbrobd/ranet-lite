@@ -23,6 +23,7 @@ type udpEndpoint struct {
 }
 
 func (*udpEndpoint) transportEndpoint() {}
+func (e *udpEndpoint) String() string   { return e.addr.String() }
 
 type udpBatchConn interface {
 	ReadBatch([]ipv4.Message, int) (int, error)

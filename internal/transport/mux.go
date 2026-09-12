@@ -49,8 +49,13 @@ type Unclaimed struct {
 }
 
 // Endpoint is the authenticated datagram source retained by IKE so replies
-// can follow a peer whose NAT mapping changed.
-type Endpoint interface{ transportEndpoint() }
+// can follow a peer whose NAT mapping changed. It prints as an address, which
+// a responder needs both to log an unauthenticated peer and to bind a cookie
+// to the address it was issued to.
+type Endpoint interface {
+	transportEndpoint()
+	String() string
+}
 
 type packetBind interface {
 	ParseEndpoint(string) (Endpoint, error)
@@ -143,6 +148,16 @@ func (h *Hub) Listen() <-chan Unclaimed {
 		h.listen = make(chan Unclaimed, 64)
 	}
 	return h.listen
+}
+
+// SendIKETo writes one IKE message to an endpoint without a Mux. A responder
+// under load answers an unauthenticated IKE_SA_INIT with a COOKIE or an
+// INVALID_KE_PAYLOAD notify and keeps no state for it, which is the whole
+// point of those exchanges, so there is nothing for a Mux to own.
+func (h *Hub) SendIKETo(b []byte, endpoint Endpoint) error {
+	out := make([]byte, nonESPMarkerLen+len(b))
+	copy(out[nonESPMarkerLen:], b)
+	return h.bind.Send([][]byte{out}, endpoint)
 }
 
 // Done is closed when the hub's socket is gone, so an accept loop can stop.

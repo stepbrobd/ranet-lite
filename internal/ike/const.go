@@ -4,8 +4,10 @@
 // Digital Signature, ASN1_DN identity), X25519/AES-GCM or ChaCha20-Poly1305,
 // forced UDP encapsulation, and 0.0.0.0/0::/0 tunnel-mode traffic selectors.
 //
-// Out of scope by design: responder role, certificates, EAP, MOBIKE,
-// legacy transforms (CBC ciphers, MODP DH groups, SHA-1/MD5).
+// The responder role is in scope in this fork, because two ranet-lite nodes
+// have to be able to reach each other; see responder.go. Still out of scope
+// by design: certificates, EAP, MOBIKE, legacy transforms (CBC ciphers, MODP
+// DH groups, SHA-1/MD5).
 package ike
 
 // Exchange types, RFC 7296 §3.1.
@@ -112,7 +114,8 @@ const (
 	N_CHILD_SA_NOT_FOUND           NotifyType = 44
 	N_REKEY_SA                     NotifyType = 16393
 	N_INITIAL_CONTACT              NotifyType = 16384
-	N_SET_WINDOW_SIZE              NotifyType = 16390
+	N_SET_WINDOW_SIZE              NotifyType = 16385
+	N_COOKIE                       NotifyType = 16390
 
 	// N_SIGNATURE_HASH_ALGORITHMS, RFC 7427 §4: without this in IKE_SA_INIT,
 	// strongSwan assumes the peer only understands the classic RSA/ECDSA

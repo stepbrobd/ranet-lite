@@ -91,7 +91,7 @@ type Session struct {
 	Child    ChildSA
 	retiring ChildSA
 	// Run expires replaced inbound SAs after an overlap period, allowing
-	// queued and reordered ESP to finish after the Delete acknowledgement.
+	// queued and reordered ESP to finish after the Delete acknowledgment.
 	retired          []childRetirement
 	childRetireDelay time.Duration
 
@@ -100,6 +100,9 @@ type Session struct {
 	onRetire      func(uint32) error
 	trafficSeen   atomic.Bool
 	childRekeying atomic.Bool
+	// serving is true while Run is draining the request queue. Nothing else
+	// drains it, so a local exchange started when this is false would wait out
+	// its caller's patience and send nothing.
 
 	childRekeyInterval time.Duration
 	ikeRekeyInterval   time.Duration
@@ -207,6 +210,8 @@ func (s *Session) NoteTraffic() { s.trafficSeen.Store(true) }
 const (
 	requestTimeout = 2 * time.Second
 	maxRetransmits = 5
+	// RFC 7296 section 2.6 bounds a cookie to 1..64 octets.
+	maxCookieLength = 64
 )
 
 func randUint64Nonzero() uint64 {
@@ -319,16 +324,38 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 		ni      []byte
 	)
 
-	// The responder may reject our preferred DH group with
-	// N(INVALID_KE_PAYLOAD, desired-group); retry once with that group.
-	for attempt := 0; attempt < 2; attempt++ {
-		dh, err = GenerateDH(group)
-		if err != nil {
-			mux.Close()
-			return nil, err
+	// Two unauthenticated responses can send us round again. The responder may
+	// reject our preferred DH group with N(INVALID_KE_PAYLOAD, desired-group),
+	// and under load it may answer N(COOKIE) instead of allocating state
+	// (RFC 7296 §2.6). Each is allowed once, so the loop is bounded whatever
+	// the far end does.
+	var (
+		cookie        []byte
+		cookieRetried bool
+		groupRetried  bool
+	)
+	// Hashed once, outside the loop. RFC 7296 section 2.6 requires a cookie
+	// retry to carry "all other payloads unchanged", and a responder that
+	// folds the request into its cookie rejects a retry that moved this,
+	// handing out a fresh challenge every time.
+	var fakeAddr [4]byte
+	rand.Read(fakeAddr[:])
+	srcHash := natDetectionHash(spiI, 0, net.IP(fakeAddr[:]), 0)
+	for {
+		if dh == nil {
+			dh, err = GenerateDH(group)
+			if err != nil {
+				mux.Close()
+				return nil, err
+			}
 		}
-		ni = make([]byte, 32)
-		rand.Read(ni)
+		if ni == nil {
+			// The nonce stays fixed for the whole exchange. A cookie is a
+			// keyed hash of it together with our SPI and address, so a retry
+			// that regenerated it would be handed a fresh challenge forever.
+			ni = make([]byte, 32)
+			rand.Read(ni)
+		}
 
 		hdr := Header{SPIInitiator: spiI, ExchangeType: IKE_SA_INIT, Flags: FlagInitiator, MessageID: 0}
 		hashAlgos := make([]byte, 2)
@@ -355,12 +382,16 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 		// guaranteeing a mismatch so NAT is always assumed — do the same
 		// here rather than relying on whatever this socket's wildcard
 		// bind address happens to be.
-		var fakeAddr [4]byte
-		rand.Read(fakeAddr[:])
-		srcHash := natDetectionHash(spiI, 0, net.IP(fakeAddr[:]), 0)
 		payloads = append(payloads, RawPayload{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NAT_DETECTION_SOURCE_IP, Data: srcHash})})
 		dstHash := natDetectionHash(spiI, 0, cfg.RemoteAddr, uint16(cfg.RemotePort))
 		payloads = append(payloads, RawPayload{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NAT_DETECTION_DESTINATION_IP, Data: dstHash})})
+
+		if cookie != nil {
+			// RFC 7296 §2.6: "include the COOKIE notification containing the
+			// received data as the first payload, and all other payloads
+			// unchanged".
+			payloads = append([]RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_COOKIE, Data: cookie})}}, payloads...)
+		}
 
 		m := &Message{Header: hdr, Payloads: payloads}
 		req = m.Encode()
@@ -372,7 +403,7 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 		// is rejected here, which makes sendRecv keep retransmitting/
 		// waiting for the real response instead of surfacing a possibly
 		// forged error.
-		acceptAttempt := attempt
+		haveCookie, haveGroup := cookieRetried, groupRetried
 		respRaw, err = sendRecv(mux, req, func(raw []byte) bool {
 			m, err := DecodeMessage(raw)
 			if err != nil {
@@ -381,13 +412,8 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 			if m.find(PayloadSA) != nil {
 				return true
 			}
-			if n := m.find(PayloadN); n != nil && acceptAttempt == 0 {
-				nt, err := DecodeNotify(n.Body)
-				if err == nil && nt.Type == N_INVALID_KE_PAYLOAD && len(nt.Data) >= 2 {
-					return true
-				}
-			}
-			return false
+			_, ok := usefulInitNotify(m, haveCookie, haveGroup)
+			return ok
 		})
 		if err != nil {
 			mux.Close()
@@ -398,15 +424,19 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 			mux.Close()
 			return nil, fmt.Errorf("ike: decode IKE_SA_INIT response: %w", err)
 		}
-		if resp.find(PayloadSA) == nil {
-			// Only reachable for the N_INVALID_KE_PAYLOAD case accept()
-			// just validated -- switch group and retry with a fresh request.
-			n := resp.find(PayloadN)
-			nt, _ := DecodeNotify(n.Body)
-			group = binary.BigEndian.Uint16(nt.Data[:2])
-			continue
+		if resp.find(PayloadSA) != nil {
+			break
 		}
-		break
+		// Only reachable for the notify accept() just validated.
+		notify, _ := usefulInitNotify(resp, haveCookie, haveGroup)
+		switch notify.Type {
+		case N_COOKIE:
+			// Everything else about the request stays as it was, so dh and ni
+			// are deliberately not regenerated here.
+			cookie, cookieRetried = notify.Data, true
+		case N_INVALID_KE_PAYLOAD:
+			group, groupRetried, dh = binary.BigEndian.Uint16(notify.Data[:2]), true, nil
+		}
 	}
 	if err := validateResponseCriticalFlags(resp.Payloads); err != nil {
 		mux.Close()
@@ -711,4 +741,42 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		return true, err
 	}
 	return true, nil
+}
+
+// usefulInitNotify finds the one unauthenticated IKE_SA_INIT notify worth
+// acting on. Only two let the exchange make progress, each once: N(COOKIE)
+// asks us to prove return routability (RFC 7296 §2.6) and
+// N(INVALID_KE_PAYLOAD) names a Diffie-Hellman group the responder will take
+// (§1.3). Everything else unauthenticated is ignored, so sendRecv keeps
+// waiting for the real response rather than letting anyone who can spoof our
+// SPI abort the handshake.
+func usefulInitNotify(m *Message, cookieUsed, groupUsed bool) (Notify, bool) {
+	for _, payload := range m.Payloads {
+		if payload.Type != PayloadN {
+			continue
+		}
+		notify, err := DecodeNotify(payload.Body)
+		if err != nil {
+			continue
+		}
+		switch {
+		case notify.Type == N_COOKIE && !cookieUsed:
+			// RFC 7296 section 2.6: "The data associated with this
+			// notification MUST be between 1 and 64 octets in length". Echoing
+			// whatever arrives would let anyone who can see our SPI turn one
+			// spoofed datagram into five oversized ones aimed at our peer.
+			if len(notify.Data) == 0 || len(notify.Data) > maxCookieLength {
+				continue
+			}
+			return notify, true
+		case notify.Type == N_INVALID_KE_PAYLOAD && !groupUsed && len(notify.Data) >= 2:
+			// A group we cannot generate aborts the dial with no retry, so an
+			// unauthenticated notify naming one would end the handshake.
+			if !supportedIKEGroup(binary.BigEndian.Uint16(notify.Data[:2])) {
+				continue
+			}
+			return notify, true
+		}
+	}
+	return Notify{}, false
 }

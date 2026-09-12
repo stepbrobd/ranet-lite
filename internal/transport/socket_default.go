@@ -8,6 +8,7 @@ type portableBind struct{ conn.Bind }
 type portableEndpoint struct{ conn.Endpoint }
 
 func (*portableEndpoint) transportEndpoint() {}
+func (e *portableEndpoint) String() string   { return e.DstToString() }
 
 func (b *portableBind) ParseEndpoint(s string) (Endpoint, error) {
 	ep, err := b.Bind.ParseEndpoint(s)
