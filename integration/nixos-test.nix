@@ -362,6 +362,11 @@ in
 
     timeout = dt.timedelta(seconds=30)
 
+    kernel_enabled = ${if kernel then "True" else "False"}
+    kernel_table = "${toString kernelTable}"
+    kernel_protocol = "${toString kernelProtocol}"
+    client_tunnel_v4 = "${clientTunnelV4}"
+
     def journal_after(machine, unit):
         output = machine.succeed(f"journalctl -u {unit} -n 1 --show-cursor --no-pager")
         cursor = output.rsplit("-- cursor: ", 1)[1].strip()
@@ -436,22 +441,22 @@ in
         gateway.succeed("systemctl start bird.service")
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
-        ${pkgs.lib.optionalString kernel ''
-          # What replaces kbabel4 and kbabel6 on a fleet node: a route babel
-          # learned has to be in the kernel table the policy rules look up,
-          # carrying this reconciler's protocol and the configured prefsrc.
-          client.wait_until_succeeds("ip -4 route show table ${toString kernelTable} | grep -q '10.99.0.0/24'", timeout=timeout)
-          client.wait_until_succeeds("ip -6 route show table ${toString kernelTable} | grep -q 'fd00:99::/64'", timeout=timeout)
-          v4 = client.succeed("ip -4 route show table ${toString kernelTable}")
-          v6 = client.succeed("ip -6 route show table ${toString kernelTable}")
-          print(v4)
-          print(v6)
-          assert "proto ${toString kernelProtocol}" in v4, v4
-          assert "src ${clientTunnelV4}" in v4, v4
-          assert "dev ranet0" in v4, v4
-          # The main table is not this reconciler's to write.
-          assert "10.99.0.0/24" not in client.succeed("ip -4 route show proto ${toString kernelProtocol}"), "routes leaked into the main table"
-        ''}
+        if kernel_enabled:
+            # What replaces kbabel4 and kbabel6 on a fleet node: a route babel
+            # learned has to be in the kernel table the policy rules look up,
+            # carrying this reconciler's protocol and the configured prefsrc.
+            client.wait_until_succeeds(f"ip -4 route show table {kernel_table} | grep -q '10.99.0.0/24'", timeout=timeout)
+            client.wait_until_succeeds(f"ip -6 route show table {kernel_table} | grep -q 'fd00:99::/64'", timeout=timeout)
+            v4 = client.succeed(f"ip -4 route show table {kernel_table}")
+            v6 = client.succeed(f"ip -6 route show table {kernel_table}")
+            print(v4)
+            print(v6)
+            assert f"proto {kernel_protocol}" in v4, v4
+            assert f"src {client_tunnel_v4}" in v4, v4
+            assert "dev ranet0" in v4, v4
+            # The main table is not this reconciler's to write.
+            leaked = client.succeed(f"ip -4 route show proto {kernel_protocol}")
+            assert "10.99.0.0/24" not in leaked, leaked
         assert client.succeed("journalctl -u ranet-lite.service --no-pager | grep -c ': connected (SPI'").strip() == "1"
         client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
         gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
@@ -459,11 +464,10 @@ in
         # Closing an idle TUN read must stop promptly without SIGKILL.
         client.succeed("systemctl stop ranet-lite.service")
         assert client.succeed("systemctl show -p Result --value ranet-lite.service").strip() == "success"
-        ${pkgs.lib.optionalString kernel ''
-          # Shutdown withdraws what it installed rather than leaving it behind.
-          assert client.succeed("ip -4 route show table ${toString kernelTable}").strip() == "", "ipv4 routes survived shutdown"
-          assert client.succeed("ip -6 route show table ${toString kernelTable}").strip() == "", "ipv6 routes survived shutdown"
-        ''}
+        if kernel_enabled:
+            # Shutdown withdraws what it installed rather than leaving it behind.
+            assert client.succeed(f"ip -4 route show table {kernel_table}").strip() == "", "ipv4 routes survived shutdown"
+            assert client.succeed(f"ip -6 route show table {kernel_table}").strip() == "", "ipv6 routes survived shutdown"
         client.succeed("systemctl start ranet-lite.service")
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
     finally:
