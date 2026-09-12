@@ -1,5 +1,10 @@
 # ranet-lite
 
+Binary Cache:
+
+- Cache: <https://cache.ysun.co>
+- Key: `cache.ysun.co-1:WxPYwT5g3kt9XhUhHPpNLZKI9HIOsVVAuqSHpok8Qt4=`
+
 A slim client for a [ranet](https://github.com/NickCao/ranet) mesh: a minimal
 IKEv2 initiator, userspace ESP, a real Linux TUN device, and an embedded Babel
 routing speaker, all in a single Go binary.
@@ -17,14 +22,15 @@ ranet's full N-to-N reconciliation.
   ChaCha20-Poly1305, SHA-256/384. Authenticates with a raw Ed25519 key via
   [RFC 7427](https://www.rfc-editor.org/rfc/rfc7427) Digital Signature auth
   ([RFC 8420](https://www.rfc-editor.org/rfc/rfc8420) EdDSA), and forces UDP
-  encapsulation unconditionally on the one explicit registry port —
-  interoperates with a real strongSwan responder as provisioned by ranet.
+  encapsulation unconditionally on the one explicit registry port, interoperates
+  with a real strongSwan responder as provisioned by ranet.
 - **ESP** ([RFC 4303](https://www.rfc-editor.org/rfc/rfc4303)) tunnel-mode AEAD
-  encap/decap with anti-replay, entirely in userspace — no kernel XFRM state.
+  encap and decap with anti-replay, entirely in userspace, with no kernel XFRM
+  state.
 - A real **TUN device**, so local applications talk to the mesh over ordinary IP
-  sockets through the kernel's own TCP/IP stack — no SOCKS5 proxy, no userspace
-  network stack. Creating the device needs `CAP_NET_ADMIN`. Address and route
-  configuration also require administrative privileges and are managed
+  sockets through the kernel's own TCP/IP stack, with no SOCKS5 proxy and no
+  userspace network stack. Creating the device needs `CAP_NET_ADMIN`. Address
+  and route configuration also require administrative privileges and are managed
   separately (see [Configuration](#configuration)).
 - An embedded minimal **Babel** speaker
   ([RFC 8966](https://www.rfc-editor.org/rfc/rfc8966)), including the RTT
@@ -52,16 +58,16 @@ It implements genuine source-specific routing
 table is keyed by `(source, destination)` prefix pairs, resolved per RFC
 8966/SADR's rule (longest destination match first, source prefix as a tiebreaker
 among equally-specific destinations) using each packet's real source address as
-it arrives on the TUN device — not an approximation based on a single configured
+it arrives on the TUN device, not an approximation based on a single configured
 "our address".
 
 **ranet-lite does not manage the TUN device's address or routes unless you ask
 it to.** It creates the device and brings it up, or attaches to the configured
 `tun` device, and by default assigning its addresses and kernel routes is
 external. This fork adds an optional reconciler, `internal/kernel`, which
-mirrors the learned routes into one Linux routing table it owns and can assign
-the configured addresses; see the `kernel` block in the configuration below. It
-is off unless enabled.
+mirrors the learned routes into one routing table it owns, or into
+interface-scoped routes on darwin, and can assign the configured addresses. See
+the `kernel` block in the configuration below. It is off unless enabled.
 
 Babel only exchanges control packets inside authenticated ESP tunnels; a local
 routing daemon cannot peer with the embedded speaker over the TUN. Learned
@@ -102,7 +108,7 @@ batches, and already-completed send/receive batches are combined without waiting
 for additional traffic. Encryption workers reuse packed ciphertext buffers only
 after the ordered sender finishes its UDP call, retaining separate storage for
 work in flight. Replaced inbound SAs remain usable for five seconds after their
-Delete acknowledgement so queued and reordered packets can drain during a rekey.
+Delete acknowledgment so queued and reordered packets can drain during a rekey.
 
 ## Deliberate protocol deviations
 
@@ -198,7 +204,7 @@ ranet-lite needs two files:
   `internal/registry/testdata/registry.json` for a fully worked, synthetic
   example spanning multiple organizations, nodes, and endpoint address
   families).
-- A **config.yaml** in ranet-lite's own format — see
+- A **config.yaml** in ranet-lite's own format, see
   [`examples/config.yaml`](examples/config.yaml):
 
 ```yaml
@@ -256,14 +262,15 @@ peers:
     serial_number: "0" # optional, picks a specific endpoint if the node has several
 
 babel:
-  hello_interval: 20s
-  update_interval: 80s
+  hello_interval: 4s
+  update_interval: 16s
 
-# Optional: mirror the routes babel learns into a Linux routing table, taking
-# over from BIRD's kernel protocols. Off unless enabled. The reconciler owns
-# exactly the routes carrying its own protocol, in its own table, out of the
-# TUN, and will never remove anything else. Installs replace a same-key route,
-# so give it a table no other daemon writes.
+# Optional: mirror the routes babel learns into a routing table of its own, taking
+# over from BIRD's kernel protocols. Off unless enabled. The reconciler deletes
+# only routes carrying its own protocol, in its own table, out of the TUN, and
+# an install refuses a key another writer already holds rather than taking it
+# over. Give it a table no other daemon writes, or the routes it refuses are
+# routes the mesh wanted.
 # kernel:
 #   enabled: true
 #   table: 200                     # the table the policy rules look up
@@ -277,11 +284,12 @@ babel:
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
-`endpoints` entry, `private_key`, `registry`, and at least one entry in `peers`.
-Everything else has a default (`peers[].organization` defaults to the top-level
-`organization`, and the babel intervals default to 20s/80s).
+`endpoints` entry, `private_key`, `registry`, and, unless `responder` is set, at
+least one entry in `peers`. Everything else has a default
+(`peers[].organization` defaults to the top-level `organization`, and the babel
+intervals default to 4s/16s).
 
-**Your `registry.json` and private key are sensitive** — they identify and
+**Your `registry.json` and private key are sensitive.** They identify and
 authenticate a real node in a real mesh. Never commit real copies of either;
 only synthetic fixtures belong in version control (see `.gitignore`).
 
@@ -305,21 +313,38 @@ reconciler's ownership rules are what make that true rather than a hope.
 On Linux it reads back only routes whose table, `rt_proto` and output interface
 all match its own, so a delete list can never contain another writer's route,
 and `RTM_DELROUTE` carries `rtm_protocol` as well, so the kernel refuses too. It
-never touches another table, another protocol, another device, or any policy
-rule. Installing does replace a same-key route in its own table, so the table
-should belong to it alone; it now says so at startup if it finds another routing
-protocol already writing there.
+never touches another table, another device, or any policy rule.
+
+Installing is where a router daemon usually takes over from its neighbors, and
+this one does not. It asks for the route exclusively, and a key something else
+already holds is left alone and reported once. That matters most in a VRF table,
+which is what a gravity node hands it: a replace compares neither the protocol
+nor the route type, so it would have displaced the kernel's own local and
+connected entries for an address on an enslaved link, at the same priority an
+IPv4 route with no configured metric uses. The reconciler also names any other
+routing protocol it finds in the table at startup.
 
 On darwin there are no tables and no `rt_proto`, so ownership is by interface
 and by shape: a route out of its own utun whose gateway is a link address naming
-that interface. Interface-scoped routes are the exception, and a narrow one,
-because a scoped route is exactly what this reconciler installs for a
-source-specific announcement and also what other tools install. A macOS host
-running Tailscale carries a scoped `255.255.255.255` entry on `utun7` with a
-link gateway and `RTF_STATIC`, which is otherwise indistinguishable, so a scoped
-route counts as this reconciler's only when this process scoped that
-destination. One left behind by a crash is left alone rather than deleted on a
-guess.
+that interface. That condition is the whole guarantee, so it is worth stating
+plainly: nothing else writes routes out of our utun. Tailscale's `100.64.0.0/10`
+on its own utun has exactly the shape described above, so a reconciler pointed
+at that interface would adopt and withdraw it. Two things keep that from
+happening. The device is created by asking for the next free unit, so it is
+never one another tunnel is already using, and XNU allocates interface indices
+by incrementing a counter with no free list, so a destroyed utun's index is
+never handed out again.
+
+Interface-scoped routes are narrower still, because a scoped route is what this
+reconciler installs for a source-specific announcement and also what other tools
+install. A macOS host running Tailscale carries a scoped `255.255.255.255` entry
+with a link gateway and `RTF_STATIC`, so a scoped route counts as this
+reconciler's only when this process scoped that destination. One left behind by
+a crash is left alone rather than deleted on a guess.
+
+An install that collides with a route another program holds is reported rather
+than retried in silence, since darwin has no replace and the collision does not
+resolve itself.
 
 Addresses are narrower still: only an address this process added is ever
 removed, and one already on the link belongs to whoever put it there. The TUN is
@@ -335,31 +360,40 @@ originated, so a node joining or leaving the mesh costs one dialer instead of
 dropping every SA this node is carrying. ranet's own `ExecReload` works the same
 way, and it matters because the registry is rewritten every time any node joins.
 
-Identity, port, TUN device and local endpoints are refused rather than applied:
-each changes what peers have already authenticated or what the dataplane is
-attached to, so a restart is the honest way to change them. A reload that fails
-validation changes nothing.
+Everything else is refused rather than applied, because a reload cannot reach
+it. Identity, port, TUN device and local endpoints each change what peers have
+already authenticated or what the dataplane is attached to. The `babel` block is
+built into the speaker once, apart from the prefixes it originates, which a
+reload does apply. The `kernel` block, including the addresses
+`assign_originated` expands into, is read once at startup. The rekey and replay
+settings are captured by a session when it is created, so applying them to new
+sessions alone would leave the node running two policies at once. And
+`responder` decides whether the node answers at all, which is wired up before
+the reload path exists. A restart is the honest way to change any of them, and a
+reload that fails validation changes nothing.
 
 ## Repository layout
 
-- `internal/ike` — the IKEv2 initiator and responder.
-- `internal/client` — runtime ownership, peer reconnection, and the ESP
-  pipeline.
-- `esp` — userspace ESP AEAD encap/decap and anti-replay.
-- `internal/transport` — the shared UDP socket mux (IKE vs. ESP framing).
-- `internal/netstack` — the TUN device and the `(source, destination)` route
+- `internal/ike` is the IKEv2 initiator and responder.
+- `internal/client` owns the runtime, peer reconnection, and the ESP pipeline.
+- `esp` is userspace ESP AEAD encap and decap with anti-replay.
+- `internal/transport` is the shared UDP socket mux, separating IKE from ESP
+  framing.
+- `internal/netstack` owns the TUN device and the `(source, destination)` route
   table.
-- `internal/babel` — the embedded Babel speaker.
-- `internal/kernel` — the optional reconciler mirroring learned routes into a
-  Linux routing table it owns, and the TUN's addresses.
-- `internal/packet` — shared validation of TUN and decrypted IP packets.
-- `sadr` — immutable source/destination routing trie and snapshot iteration.
-- `internal/registry` — ranet-compatible `registry.json` and Ed25519 key
+- `internal/babel` is the embedded Babel speaker.
+- `internal/kernel` is the optional reconciler. It mirrors learned routes into a
+  routing table it owns on linux, or into interface-scoped routes on darwin, and
+  assigns the TUN's addresses.
+- `internal/packet` validates TUN and decrypted IP packets.
+- `sadr` is the immutable source and destination routing trie, with snapshot
+  iteration.
+- `internal/registry` reads a ranet-compatible `registry.json` and Ed25519 key
   loading.
-- `internal/config` — ranet-lite's own config format.
-- `cmd/ranet-lite` — the production binary.
-- `cmd/*test` — standalone interop/smoke-test binaries used during development
-  (IKE, ESP, babel tests).
+- `internal/config` is ranet-lite's own config format.
+- `cmd/ranet-lite` is the production binary.
+- `cmd/*test` are standalone interop and smoke-test binaries used during
+  development (IKE, ESP, babel tests).
 
 ## Testing
 
@@ -469,4 +503,4 @@ BIRD neighbors and routes on exit, including after a failed check.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [license.txt](license.txt).

@@ -20,9 +20,10 @@ registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 originate:
   - "10.66.0.5/32"
 
-# Optional anti-replay window. Omit for strongSwan's default of 32 packets;
-# set to 0 to disable replay checking.
-# replay_window: 32
+# Optional anti-replay window, in packets. Omitted it is 4096, which is wider
+# than the interoperable minimum on purpose: a multicore sender reorders bursts
+# by more than 32 before they reach userspace. Set 0 to disable replay checking.
+# replay_window: 4096
 
 # Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
 # Set either to 0 to disable it. Rekeys run interval minus the 5m margin and
@@ -49,8 +50,11 @@ peers:
     serial_number: "0"          # optional, picks a specific endpoint if the node has several
 
 babel:
-  hello_interval: 20s
-  update_interval: 80s
+  # Omitted these default to 4s and 16s, which is what BIRD and RFC 8966
+  # Appendix B use and what the fleet configures. Raise them on a node that
+  # would rather wake less often.
+  hello_interval: 4s
+  update_interval: 16s
 
 # Optional: use this TUN name. WireGuard's TUN backend attaches when the
 # interface already exists, or creates it if it does not. Omit it to create
@@ -63,11 +67,12 @@ babel:
 #   ip addr add 10.66.0.5/32 dev ranet0
 #   ip route add ::/0 dev ranet0
 
-# Optional: mirror the routes babel learns into a Linux routing table, taking
-# over from BIRD's kernel protocols. Off unless enabled. The reconciler owns
-# exactly the routes carrying its own protocol, in its own table, out of the
-# TUN, and will never remove anything else. Installs replace a same-key route,
-# so give it a table no other daemon writes.
+# Optional: mirror the routes babel learns into a routing table of its own,
+# taking over from BIRD's kernel protocols. Off unless enabled. The reconciler
+# deletes only routes carrying its own protocol, in its own table, out of the
+# TUN, and an install refuses a key another writer already holds rather than
+# taking it over. Give it a table no other daemon writes, or the routes it
+# refuses are routes the mesh wanted.
 # kernel:
 #   enabled: true
 #   table: 200
@@ -83,8 +88,8 @@ babel:
 # options they mirror, and source-specific announcements the plain originate
 # list above cannot express.
 # babel:
-#   hello_interval: 20s
-#   update_interval: 80s
+#   hello_interval: 4s
+#   update_interval: 16s
 #   rxcost: 96
 #   rtt_cost: 1024
 #   rtt_max: 1024ms
