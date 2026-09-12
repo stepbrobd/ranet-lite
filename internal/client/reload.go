@@ -7,9 +7,11 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"time"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
 
@@ -165,11 +167,22 @@ func reloadable(old, next *config.Config) error {
 // startup. An omitted list and an empty one mean the same thing, and
 // reflect.DeepEqual does not, so they are normalized first: refusing a reload
 // over "addresses: []" against no key at all would be a refusal over nothing.
+// sameKernelSettings compares the kernel block by what the reconciler was
+// given rather than by how the file was written. An omitted field and one
+// written out as its own default are the same configuration, and comparing
+// them as written refuses a reload that changes nothing: writing
+// "reconcile_interval: 30s" into the file would have been enough.
 func sameKernelSettings(old, next config.Kernel) bool {
 	normalize := func(k *config.Kernel) {
 		if len(k.Addresses) == 0 {
 			k.Addresses = nil
 		}
+		interval := kernel.DefaultReconcileInterval
+		if k.ReconcileInterval != nil {
+			interval = time.Duration(*k.ReconcileInterval)
+		}
+		effective := config.Duration(interval)
+		k.ReconcileInterval = &effective
 	}
 	normalize(&old)
 	normalize(&next)
@@ -200,10 +213,13 @@ func sameKernelAddresses(old, next *config.Config) bool {
 }
 
 // sameBabelSettings compares everything in the babel block that a reload
-// cannot apply, which is everything except the originated prefixes.
+// cannot apply, which is everything except the originated prefixes. The
+// comparison is on the speaker configuration each one produces rather than on
+// the fields as written: an omitted cost and one written out as its own
+// default are the same configuration, and comparing the pointers refuses a
+// reload that changes nothing.
 func sameBabelSettings(old, next config.Babel) bool {
-	old.Originate, next.Originate = nil, nil
-	return reflect.DeepEqual(old, next)
+	return old.SpeakerConfig() == next.SpeakerConfig()
 }
 
 // sameRekeySettings compares the timers and the replay window that a session

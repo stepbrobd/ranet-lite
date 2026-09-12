@@ -20,6 +20,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 	yaml "gopkg.in/yaml.v3"
@@ -689,6 +690,46 @@ func TestReloadRefusesAResponderChange(t *testing.T) {
 	next.Responder = !base.Responder
 	if err := reloadable(base, &next); err == nil {
 		t.Error("a responder change was accepted, and nothing applies it")
+	}
+}
+
+// A field written out as its own default is the same configuration as an
+// omitted one. Comparing them as written refuses a reload that changes
+// nothing, so writing "rxcost: 96" into the file, the value the speaker
+// already uses, would have been enough to make every later SIGHUP fail.
+func TestReloadAcceptsADefaultWrittenOutInFull(t *testing.T) {
+	base := &config.Config{
+		Organization: "example", CommonName: "node", Port: 13000,
+		Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
+	}
+	defaults := base.Babel.SpeakerConfig()
+	rxcost, rttCost := defaults.Cost.RxCost, defaults.Cost.RTTCost
+	rttMin, rttMax := config.Duration(defaults.Cost.RTTMin), config.Duration(defaults.Cost.RTTMax)
+	reconcile := config.Duration(kernel.DefaultReconcileInterval)
+
+	for name, next := range map[string]*config.Config{
+		"babel costs": {
+			Organization: "example", CommonName: "node", Port: 13000, Endpoints: base.Endpoints,
+			Babel: config.Babel{RxCost: &rxcost, RTTCost: &rttCost, RTTMin: &rttMin, RTTMax: &rttMax},
+		},
+		"reconcile interval": {
+			Organization: "example", CommonName: "node", Port: 13000, Endpoints: base.Endpoints,
+			Kernel: config.Kernel{ReconcileInterval: &reconcile},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := reloadable(base, next); err != nil {
+				t.Errorf("writing a default out in full was refused: %v", err)
+			}
+		})
+	}
+
+	// A real change is still refused, or the comparison would be useless.
+	louder := uint16(rxcost + 1)
+	changed := *base
+	changed.Babel = config.Babel{RxCost: &louder}
+	if err := reloadable(base, &changed); err == nil {
+		t.Error("a changed link cost was accepted, which the speaker would never see")
 	}
 }
 
