@@ -88,6 +88,120 @@ func TestSelectedMetricChangeIsPublished(t *testing.T) {
 	}
 }
 
+func TestFeasibilityCondition(t *testing.T) {
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	origin := [8]byte{1}
+	for _, test := range []struct {
+		name       string
+		advertised *advertisement // the distance this node has already sent
+		received   advertisement
+		want       bool
+	}{
+		{"no distance for the source", nil, advertisement{origin, 1, 100}, true},
+		{"retraction", &advertisement{origin, 1, 10}, advertisement{origin, 1, MetricInfinity}, true},
+		{"better metric at the same seqno", &advertisement{origin, 1, 10}, advertisement{origin, 1, 9}, true},
+		{"equal metric at the same seqno", &advertisement{origin, 1, 10}, advertisement{origin, 1, 10}, false},
+		{"worse metric at the same seqno", &advertisement{origin, 1, 10}, advertisement{origin, 1, 11}, false},
+		{"newer seqno with a worse metric", &advertisement{origin, 1, 10}, advertisement{origin, 2, 1000}, true},
+		{"older seqno with a better metric", &advertisement{origin, 1, 10}, advertisement{origin, 0, 1}, false},
+		{"newer seqno across the wrap", &advertisement{origin, 0xffff, 10}, advertisement{origin, 0, 1000}, true},
+		{"another origin for the same prefix", &advertisement{origin, 1, 10}, advertisement{[8]byte{2}, 1, 1000}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rt := newRouteTable(func(routeKey, routeSelection) {})
+			if test.advertised != nil {
+				rt.observe(key, *test.advertised, time.Now())
+			}
+			if got := rt.feasible(key, test.received); got != test.want {
+				t.Fatalf("feasible = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestUnfeasibleUpdateIsNeverSelected(t *testing.T) {
+	now := time.Now()
+	origin := [8]byte{1}
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(n)
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	rt.observe(key, advertisement{routerID: origin, seqno: 1, metric: 40}, now)
+
+	rt.update(n, key, advertisement{routerID: origin, seqno: 1, metric: 40}, time.Minute, now)
+	if len(rt.entries) != 0 {
+		t.Fatal("an unfeasible update created a route")
+	}
+	rt.update(n, key, advertisement{routerID: origin, seqno: 1, metric: 39}, time.Minute, now)
+	if rt.entries[key].selected.neighbor != n {
+		t.Fatal("a feasible update was not selected")
+	}
+	// A metric increase can take the selected route past the distance this
+	// node has already advertised, which is exactly the case the feasibility
+	// condition exists to refuse.
+	rt.update(n, key, advertisement{routerID: origin, seqno: 1, metric: 41}, time.Minute, now)
+	if sel := rt.entries[key].selected; sel.neighbor != nil {
+		t.Fatalf("an unfeasible update stayed selected via %q", sel.neighbor.peer.ID)
+	}
+	if len(rt.starved) == 0 {
+		t.Fatal("losing the only feasible route asked nobody for a new seqno")
+	}
+	if got := rt.starved[0]; got.routerID != origin || got.seqno != 2 {
+		t.Fatalf("starvation request = %+v, want seqno 2 for the origin", got)
+	}
+}
+
+// A stored route can turn unfeasible without any update arriving, because this
+// node advertised a better distance in the meantime. Selection has to notice.
+func TestSelectionRechecksFeasibility(t *testing.T) {
+	now := time.Now()
+	origin := [8]byte{1}
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(n)
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	rt.update(n, key, advertisement{routerID: origin, seqno: 1, metric: 39}, time.Minute, now)
+	if rt.entries[key].selected.neighbor != n {
+		t.Fatal("the only route was not selected")
+	}
+
+	rt.observe(key, advertisement{routerID: origin, seqno: 1, metric: 20}, now)
+	rt.sweepExpired(now)
+	if sel := rt.entries[key].selected; sel.neighbor != nil {
+		t.Fatalf("a route that is no longer feasible stayed selected via %q", sel.neighbor.peer.ID)
+	}
+	if len(rt.starved) == 0 {
+		t.Fatal("no seqno request went out for the route that became unusable")
+	}
+}
+
+func TestHysteresisIgnoresAFlappingChallenger(t *testing.T) {
+	now := time.Now()
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	steady := &neighborState{peer: netstack.NewPeer("steady", nil, nil)}
+	flappy := &neighborState{peer: netstack.NewPeer("flappy", nil, nil)}
+	makeNeighborReachable(steady)
+	makeNeighborReachable(flappy)
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	rt.tau = 4 * time.Second
+
+	rt.update(steady, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 60}, time.Hour, now)
+	rt.update(flappy, key, advertisement{routerID: [8]byte{2}, seqno: 1, metric: 500}, time.Hour, now)
+	if rt.entries[key].selected.neighbor != steady {
+		t.Fatal("the cheaper route was not selected")
+	}
+	rt.update(flappy, key, advertisement{routerID: [8]byte{2}, seqno: 1, metric: 1}, time.Hour, now.Add(time.Second))
+	if got := rt.entries[key].selected.neighbor; got != steady {
+		t.Fatalf("a route that was bad a second ago took over at once, now via %q", got.peer.ID)
+	}
+	// Consistently good for several time constants is the bar Appendix A.3
+	// sets, and it is met here.
+	rt.sweepExpired(now.Add(15 * time.Second))
+	if got := rt.entries[key].selected.neighbor; got != flappy {
+		t.Fatal("a consistently better route never took over")
+	}
+}
+
 // A link that goes down and comes back must be selectable again promptly. The
 // smoothed metric follows an increase immediately, so feeding it infinity when
 // a route is retracted pins ms(R) at 65535, and the cheap path then stays

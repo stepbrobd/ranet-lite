@@ -1,0 +1,627 @@
+package babel
+
+import (
+	"encoding/binary"
+	"fmt"
+	"net/netip"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/NickCao/ranet-lite/internal/netstack"
+)
+
+// meshFabric wires several speakers over in-memory relays, one per link, with
+// the same per-peer dispatch as wireSpeakerPair. Neighbors start reachable and
+// packets are delivered inline, so a test drives the protocol one exchange at a
+// time instead of waiting for timers.
+type meshFabric struct {
+	t        *testing.T
+	speakers map[string]*Speaker
+	meshes   map[string]*netstack.Mesh
+	handles  map[string]*PeerHandle
+	sent     map[string][]RawTLV
+}
+
+// newMeshFabric builds the topology described by links of the form "a-b".
+func newMeshFabric(t *testing.T, cfg Config, links ...string) *meshFabric {
+	t.Helper()
+	f := &meshFabric{
+		t:        t,
+		speakers: make(map[string]*Speaker),
+		meshes:   make(map[string]*netstack.Mesh),
+		handles:  make(map[string]*PeerHandle),
+		sent:     make(map[string][]RawTLV),
+	}
+	for _, link := range links {
+		ends := strings.Split(link, "-")
+		if len(ends) != 2 {
+			t.Fatalf("malformed link %q", link)
+		}
+		f.connect(cfg, ends[0], ends[1])
+	}
+	return f
+}
+
+func (f *meshFabric) node(cfg Config, name string) *Speaker {
+	if s, ok := f.speakers[name]; ok {
+		return s
+	}
+	// A router-id derived from the name keeps failures readable and, more
+	// importantly, keeps the origin of a route distinguishable from its relay.
+	copy(cfg.RouterID[:], name)
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	s, err := New(cfg, mesh)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.speakers[name], f.meshes[name] = s, mesh
+	return s
+}
+
+func (f *meshFabric) connect(cfg Config, x, y string) {
+	speakerX, speakerY := f.node(cfg, x), f.node(cfg, y)
+	noopEncrypt := func(raw []byte, _ byte) ([]byte, error) { return raw, nil }
+	var peerXforY, peerYforX *netstack.Peer
+	deliver := func(from, to string, speaker *Speaker, peer **netstack.Peer, mesh *netstack.Mesh) func([]byte) error {
+		return func(raw []byte) error {
+			f.record(from, to, raw)
+			if !speaker.Receive(*peer, raw) {
+				mesh.DeliverInbound(raw)
+			}
+			return nil
+		}
+	}
+	peerYforX = netstack.NewPeer(y, noopEncrypt, deliver(x, y, speakerY, &peerXforY, f.meshes[y]))
+	peerXforY = netstack.NewPeer(x, noopEncrypt, deliver(y, x, speakerX, &peerYforX, f.meshes[x]))
+	f.handles[x+"-"+y] = speakerX.AddPeer(peerYforX)
+	f.handles[y+"-"+x] = speakerY.AddPeer(peerXforY)
+	makeNeighborReachable(f.neighbor(x, y))
+	makeNeighborReachable(f.neighbor(y, x))
+}
+
+func (f *meshFabric) record(from, to string, raw []byte) {
+	tlvs, err := DecodePacket(raw[ipv6HeaderLen+udpHeaderLen:])
+	if err != nil {
+		f.t.Fatalf("%s sent %s an undecodable packet: %v", from, to, err)
+	}
+	f.sent[from+">"+to] = append(f.sent[from+">"+to], tlvs...)
+}
+
+func (f *meshFabric) neighbor(node, peer string) *neighborState {
+	f.t.Helper()
+	n := f.speakers[node].neighbors[peer]
+	if n == nil {
+		f.t.Fatalf("%s has no neighbor %s", node, peer)
+	}
+	return n
+}
+
+// cost sets the rxcost node reports for peer, which is the link cost peer's
+// routes through node are computed with.
+func (f *meshFabric) cost(node, peer string, cost uint16) {
+	f.neighbor(node, peer).reportedCost = cost
+}
+
+// flush sends a full update dump from each named node, in order. Deliveries are
+// inline, so one call carries a change as far as the named nodes reach.
+func (f *meshFabric) flush(nodes ...string) {
+	for _, node := range nodes {
+		f.speakers[node].flushUpdates()
+	}
+}
+
+func (f *meshFabric) reset() { clear(f.sent) }
+
+func (f *meshFabric) tlvs(from, to string) []RawTLV { return f.sent[from+">"+to] }
+
+// inject hands node a packet as if peer had sent it, which is how a test
+// reaches a neighbor that split horizon would otherwise keep quiet.
+func (f *meshFabric) inject(node, peer string, tlvs ...RawTLV) {
+	f.speakers[node].handlePacket(f.neighbor(node, peer), EncodePacket(tlvs))
+}
+
+// down drops both ends of a link, as a peer whose ESP session is gone does.
+func (f *meshFabric) down(link string) {
+	ends := strings.Split(link, "-")
+	f.handles[link].Close()
+	f.handles[ends[1]+"-"+ends[0]].Close()
+}
+
+// selected reports the route node has chosen for key, if any.
+func (f *meshFabric) selected(node string, key routeKey) routeSelection {
+	if entry := f.speakers[node].routes.entries[key]; entry != nil {
+		return entry.selected
+	}
+	return routeSelection{}
+}
+
+func (f *meshFabric) nextHop(node string, key routeKey) string {
+	if sel := f.selected(node, key); sel.neighbor != nil {
+		return sel.neighbor.peer.ID
+	}
+	return ""
+}
+
+func routerID(name string) [8]byte {
+	var id [8]byte
+	copy(id[:], name)
+	return id
+}
+
+// updatesFor returns every Update TLV for one prefix, oldest first.
+func updatesFor(t *testing.T, tlvs []RawTLV, dest netip.Prefix) []Update {
+	t.Helper()
+	var out []Update
+	for _, tlv := range tlvs {
+		if tlv.Type != TLVUpdate {
+			continue
+		}
+		// Nothing here compresses prefixes, so each Update decodes alone.
+		update, err := (&PrefixDecoder{}).Decode(tlv.Body)
+		if err != nil {
+			t.Fatalf("undecodable Update: %v", err)
+		}
+		addr, ok := netip.AddrFromSlice(update.Prefix)
+		if !ok || netip.PrefixFrom(addr.Unmap(), update.Plen).Masked() != dest {
+			continue
+		}
+		out = append(out, update)
+	}
+	return out
+}
+
+func seqnoRequestsFor(t *testing.T, tlvs []RawTLV, dest netip.Prefix) []SeqnoRequest {
+	t.Helper()
+	var out []SeqnoRequest
+	for _, tlv := range tlvs {
+		if tlv.Type != TLVSeqnoRequest {
+			continue
+		}
+		request, err := DecodeSeqnoRequest(tlv.Body)
+		if err != nil {
+			t.Fatalf("undecodable Seqno Request: %v", err)
+		}
+		if request.Prefix == dest {
+			out = append(out, request)
+		}
+	}
+	return out
+}
+
+// A relayed route is only loop free because of the feasibility condition: a
+// chain converges on transit through the middle node, and when the origin goes
+// away the two survivors must not select each other.
+func TestThreeNodeChainRedistributesAndCannotLoop(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+
+	if got := fabric.nextHop("b", key); got != "c" {
+		t.Fatalf("b reaches the origin via %q, want \"c\"", got)
+	}
+	if got := fabric.nextHop("a", key); got != "b" {
+		t.Fatalf("a did not learn the relayed route, next hop %q", got)
+	}
+	if got := fabric.selected("a", key); got.cost != 64 || got.routerID != routerID("c") {
+		t.Fatalf("relayed route = cost %d from router %v, want 64 from c", got.cost, got.routerID)
+	}
+	if peer, ok := fabric.meshes["a"].Routes.Lookup(netip.MustParseAddr("2001:db8::1"), dest.Addr()); !ok || peer.ID != "b" {
+		t.Fatal("the relayed route was not published to the forwarding table")
+	}
+	// Split horizon keeps a from offering the route back to the node it came
+	// from, so b hears nothing about the prefix from a.
+	if got := updatesFor(t, fabric.tlvs("a", "b"), dest); len(got) != 0 {
+		t.Fatalf("a advertised %d updates for its next hop's own prefix", len(got))
+	}
+
+	fabric.down("b-c")
+	fabric.flush("b", "a")
+	if got := fabric.nextHop("b", key); got != "" {
+		t.Fatalf("b picked up a route via %q after losing the origin", got)
+	}
+	if got := fabric.nextHop("a", key); got != "" {
+		t.Fatalf("a kept a route via %q after the origin went away", got)
+	}
+
+	// The omission above is an optimisation, not the safety property. Hand b
+	// the advertisement a would have made and it must still refuse it: a's
+	// metric is not better than the distance b has already advertised.
+	fabric.inject("b", "a",
+		EncodeRouterID(routerID("c")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 64}))
+	if got := fabric.nextHop("b", key); got != "" {
+		t.Fatalf("b selected an unfeasible route via %q, closing a loop", got)
+	}
+}
+
+// A withdrawal must reach the far side of a relay as an explicit retraction
+// rather than as silence, which would leave the prefix installed until it aged
+// out several update intervals later.
+func TestRetractionPropagatesThroughTransit(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+	if fabric.nextHop("a", key) != "b" {
+		t.Fatal("a never learned the relayed route")
+	}
+	fabric.reset()
+
+	fabric.down("b-c")
+	fabric.flush("b")
+	updates := updatesFor(t, fabric.tlvs("b", "a"), dest)
+	if len(updates) != 1 || updates[0].Metric != MetricInfinity {
+		t.Fatalf("b sent %v for a prefix it lost, want a single retraction", updates)
+	}
+	if peer, ok := fabric.meshes["a"].Routes.Lookup(netip.MustParseAddr("2001:db8::1"), dest.Addr()); ok {
+		t.Fatalf("a kept forwarding to %q after the retraction", peer.ID)
+	}
+
+	// The prefix has been withdrawn from a, so there is nothing left to
+	// retract and a second dump must stay quiet.
+	fabric.reset()
+	fabric.flush("b")
+	if got := updatesFor(t, fabric.tlvs("b", "a"), dest); len(got) != 0 {
+		t.Fatalf("b repeated %d retractions for a prefix a has already dropped", len(got))
+	}
+}
+
+// A seqno request that the relay cannot satisfy has to reach the origin, and a
+// repeat of it must not.
+func TestSeqnoRequestIsForwardedOnceTowardTheOrigin(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+	fabric.reset()
+
+	// Ask for a sequence number far ahead of the origin's, so neither the
+	// relay nor the reply can satisfy the repeat either.
+	request := EncodeSeqnoRequest(SeqnoRequest{AE: AEIPv6, Prefix: dest, Seqno: 5, HopCount: 64, RouterID: routerID("c")})
+	fabric.inject("b", "a", request)
+
+	forwarded := seqnoRequestsFor(t, fabric.tlvs("b", "c"), dest)
+	if len(forwarded) != 1 {
+		t.Fatalf("relay forwarded %d requests, want 1", len(forwarded))
+	}
+	if forwarded[0].HopCount != 63 || forwarded[0].RouterID != routerID("c") || forwarded[0].Seqno != 5 {
+		t.Fatalf("forwarded request = %+v", forwarded[0])
+	}
+	if got := fabric.speakers["c"].originSeqno; got != 2 {
+		t.Fatalf("origin sequence number = %d, want a single increment to 2", got)
+	}
+	if got := fabric.selected("b", key).seqno; got != 2 {
+		t.Fatalf("relay route sequence number = %d, want the answered 2", got)
+	}
+
+	fabric.reset()
+	fabric.inject("b", "a", request)
+	if got := seqnoRequestsFor(t, fabric.tlvs("b", "c"), dest); len(got) != 0 {
+		t.Fatalf("relay forwarded %d duplicate requests", len(got))
+	}
+}
+
+// An unfeasible update for the selected route must produce a request for a
+// sequence number that would make it usable again, or the route stays
+// unselectable until it expires.
+func TestUnfeasibleUpdateAsksTheOriginForANewSeqno(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "b-c")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	key := routeKey{dest: dest}
+	// a's own link to the origin is expensive, so the relayed route through b
+	// is both better and feasible when it arrives.
+	fabric.cost("a", "c", 1000)
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+	if got := fabric.nextHop("a", key); got != "b" {
+		t.Fatalf("a reaches the origin via %q, want the cheaper relay \"b\"", got)
+	}
+	fabric.reset()
+
+	// The relay's route worsens past the distance a has already advertised,
+	// so a must drop it rather than keep forwarding along it.
+	fabric.inject("a", "b",
+		EncodeRouterID(routerID("c")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 900}))
+	if got := fabric.nextHop("a", key); got == "b" {
+		t.Fatal("a kept an unfeasible route selected")
+	}
+	requests := seqnoRequestsFor(t, fabric.tlvs("a", "b"), dest)
+	if len(requests) != 1 {
+		t.Fatalf("a sent %d seqno requests after losing its feasible routes, want 1", len(requests))
+	}
+	if requests[0].RouterID != routerID("c") || !seqnoGT(requests[0].Seqno, 1) {
+		t.Fatalf("starvation request = %+v, want a newer seqno for the origin", requests[0])
+	}
+}
+
+// An exit announces `route ::/0 from <its prefix>`: the source prefix has to
+// survive origination, the wire, and selection at the far end.
+func TestSourceSpecificOriginationAndSelection(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		dest   string
+		source string
+		lookup string
+		match  string
+		miss   string
+	}{
+		{"ipv6 default from an exit prefix", "::/0", "2602:f590::/36", "2001:4860::1", "2602:f590:1::7", "2001:db8::7"},
+		{"ipv4 default from an announced prefix", "0.0.0.0/0", "23.161.104.0/24", "192.0.2.1", "23.161.104.7", "198.51.100.7"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fabric := newMeshFabric(t, Config{}, "a-b")
+			dest, source := netip.MustParsePrefix(test.dest), netip.MustParsePrefix(test.source)
+			fabric.speakers["a"].OriginateFrom(dest, source)
+			fabric.flush("a")
+
+			updates := updatesFor(t, fabric.tlvs("a", "b"), dest)
+			if len(updates) != 1 {
+				t.Fatalf("origination sent %d updates for %s, want 1", len(updates), dest)
+			}
+			if updates[0].SourcePrefix != source || updates[0].Metric != 0 {
+				t.Fatalf("update = %s from %s metric %d", dest, updates[0].SourcePrefix, updates[0].Metric)
+			}
+
+			key := routeKey{source: source, dest: dest}
+			if got := fabric.nextHop("b", key); got != "a" {
+				t.Fatalf("the source-specific route was selected via %q, want \"a\"", got)
+			}
+			routes := fabric.meshes["b"].Routes
+			if peer, ok := routes.Lookup(netip.MustParseAddr(test.match), netip.MustParseAddr(test.lookup)); !ok || peer.ID != "a" {
+				t.Fatal("a source inside the announced prefix does not resolve")
+			}
+			if _, ok := routes.Lookup(netip.MustParseAddr(test.miss), netip.MustParseAddr(test.lookup)); ok {
+				t.Fatal("a source outside the announced prefix resolved anyway")
+			}
+
+			// A source-specific route is an independent entry: retracting it
+			// must not need the ordinary route to the same destination.
+			fabric.down("a-b")
+			if _, ok := routes.Lookup(netip.MustParseAddr(test.match), netip.MustParseAddr(test.lookup)); ok {
+				t.Fatal("the source-specific route outlived its peer")
+			}
+		})
+	}
+}
+
+// Requests carry a source prefix too, so an exit's default route can be asked
+// for by name rather than answered with the ordinary route's state.
+func TestRequestsCarryTheSourcePrefix(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b")
+	dest, source := netip.MustParsePrefix("::/0"), netip.MustParsePrefix("2602:f590::/36")
+	fabric.speakers["a"].OriginateFrom(dest, source)
+	fabric.reset()
+
+	fabric.inject("a", "b", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: dest, SourcePrefix: source}))
+	updates := updatesFor(t, fabric.tlvs("a", "b"), dest)
+	if len(updates) != 1 || updates[0].SourcePrefix != source || updates[0].Metric != 0 {
+		t.Fatalf("source-specific route request answered with %v", updates)
+	}
+
+	// The ordinary route to the same destination is a different entry, and
+	// this node does not have it.
+	fabric.reset()
+	fabric.inject("a", "b", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: dest}))
+	updates = updatesFor(t, fabric.tlvs("a", "b"), dest)
+	if len(updates) != 1 || updates[0].SourcePrefix.IsValid() || updates[0].Metric != MetricInfinity {
+		t.Fatalf("ordinary route request answered with %v, want a retraction", updates)
+	}
+}
+
+// Seqno requests reach the origin only if every hop can be trusted to stop
+// forwarding them, so the hop count has to run out.
+func TestSeqnoRequestStopsAtTheHopCount(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+	fabric.reset()
+
+	for _, hops := range []uint8{0, 1} {
+		fabric.inject("b", "a", EncodeSeqnoRequest(SeqnoRequest{
+			AE: AEIPv6, Prefix: dest, Seqno: 5, HopCount: hops, RouterID: routerID("c"),
+		}))
+		if got := seqnoRequestsFor(t, fabric.tlvs("b", "c"), dest); len(got) != 0 {
+			t.Fatalf("a request with hop count %d was forwarded", hops)
+		}
+		if got := fabric.speakers["c"].originSeqno; got != 1 {
+			t.Fatalf("origin sequence number = %d, want it untouched", got)
+		}
+	}
+}
+
+func TestSourceTableGarbageCollection(t *testing.T) {
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	adv := advertisement{routerID: [8]byte{1}, seqno: 1, metric: 10}
+	now := time.Now()
+	rt.observe(key, adv, now)
+
+	rt.sweepSources(now.Add(sourceGCTime - time.Second))
+	if len(rt.sources) != 1 {
+		t.Fatal("a feasibility distance was dropped before its timer expired")
+	}
+	// A distance backing a route outlives its timer: forgetting it would make
+	// updates feasible that selection has already refused.
+	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(n)
+	rt.update(n, key, advertisement{routerID: adv.routerID, seqno: 2, metric: 1}, time.Hour, now)
+	rt.sweepSources(now.Add(2 * sourceGCTime))
+	if len(rt.sources) != 1 {
+		t.Fatal("a feasibility distance still backing a route was collected")
+	}
+	rt.expireNeighbor(n, now)
+	rt.sweepSources(now.Add(2 * sourceGCTime))
+	if len(rt.sources) != 0 {
+		t.Fatal("an unreferenced feasibility distance survived its timer")
+	}
+}
+
+// A wildcard route request answers with the whole table, and on a transit node
+// that table is the whole mesh. RFC 8966 section 3.8.1.1 says such a dump
+// SHOULD be rate-limited; without a limit one packet of four-byte requests
+// draws one full dump each, which is an amplifier pointed at whoever the
+// requests claim to come from and a long walk under the protocol lock.
+func TestWildcardRouteRequestDumpsAtMostOncePerInterval(t *testing.T) {
+	cfg := Config{}
+	fabric := newMeshFabric(t, cfg, "a-b")
+	for i := range 40 {
+		fabric.speakers["a"].Originate(netip.MustParsePrefix(fmt.Sprintf("fd00:a:%x::/64", i)))
+	}
+	fabric.flush("a")
+	fabric.reset()
+
+	// One packet carrying many wildcard requests, which is what fits in a
+	// single MTU and is the shape that amplifies.
+	const requests = 64
+	wildcards := make([]RawTLV, 0, requests)
+	for range requests {
+		wildcards = append(wildcards, EncodeRouteRequest(RouteRequest{AE: AEWildcard}))
+	}
+	fabric.inject("a", "b", wildcards...)
+
+	updates := 0
+	for _, tlv := range fabric.tlvs("a", "b") {
+		if tlv.Type == TLVUpdate {
+			updates++
+		}
+	}
+	if updates == 0 {
+		t.Fatal("a wildcard request drew no dump at all, so the reply path is broken")
+	}
+	// One dump is 40 prefixes plus whatever compression state each carries.
+	// The limit is what matters: 64 dumps would be 64 times this.
+	if updates > 2*40 {
+		t.Errorf("%d wildcard requests in one packet drew %d updates, which is more than one dump", requests, updates)
+	}
+
+	// The next interval may dump again, or a neighbor that genuinely lost its
+	// table could never recover it.
+	n := fabric.neighbor("a", "b")
+	n.lastFullDump = n.lastFullDump.Add(-2 * fabric.speakers["a"].cfg.UpdateInterval)
+	fabric.reset()
+	fabric.inject("a", "b", EncodeRouteRequest(RouteRequest{AE: AEWildcard}))
+	again := 0
+	for _, tlv := range fabric.tlvs("a", "b") {
+		if tlv.Type == TLVUpdate {
+			again++
+		}
+	}
+	if again == 0 {
+		t.Error("a wildcard request a full interval later drew nothing, so the limit never lifts")
+	}
+}
+
+// RFC 8966 section 3.5.4: while a retracted prefix is still held, "packets
+// destined to an address within P MUST NOT be forwarded by following a route
+// for a shorter prefix". Transit is what makes this reachable: a node carrying
+// both an exit's default and a more specific prefix would otherwise start
+// sending that prefix's traffic down the default the moment it is retracted,
+// and if the exit reaches it back through here the packet bounces until its
+// hop limit runs out.
+func TestRetractedPrefixDoesNotFallThroughToACoveringRoute(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b", "a-c")
+	specific := netip.MustParsePrefix("fd00:b::/64")
+	covering := netip.MustParsePrefix("fd00::/16")
+	fabric.speakers["b"].Originate(specific)
+	fabric.speakers["c"].Originate(covering)
+	fabric.flush("b", "c", "a")
+
+	inside := netip.MustParseAddr("fd00:b::1")
+	if peer, ok := fabric.meshes["a"].Routes.Lookup(inside, inside); !ok || peer.ID != "b" {
+		t.Fatalf("a reaches %s via %v, want b", inside, peer)
+	}
+
+	// b retracts it explicitly, which keeps the entry while it is held rather
+	// than flushing it the way a lost neighbor would. The covering route
+	// through c is still there.
+	fabric.inject("a", "b",
+		EncodeRouterID(routerID("b")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: specific.Bits(), Prefix: specific.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: MetricInfinity}))
+
+	if peer, ok := fabric.meshes["a"].Routes.Lookup(inside, inside); ok {
+		t.Errorf("a followed the covering route to %q for a prefix that was just retracted", peer.ID)
+	}
+	// The covering prefix itself still works, so the hold is scoped to the
+	// prefix that was retracted rather than blanking the table.
+	outside := netip.MustParseAddr("fd00:ffff::1")
+	if _, ok := fabric.meshes["a"].Routes.Lookup(outside, outside); !ok {
+		t.Error("the covering route stopped working too")
+	}
+}
+
+// The forwarding suppression table of RFC 8966 section 3.8.1.2 is indexed by a
+// router id the requester writes into the packet, and the one case that
+// forwards a request rather than answering it is a neighbor asking about a
+// prefix it is itself this node's next hop for, which is the ordinary shape of
+// a mesh. Nothing in the request bounds the router id and eighty of them fit
+// in one packet, so the table needs a cap that is not the suppression window.
+func TestForwardedSeqnoRequestsAreBounded(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "b-a", "b-c")
+	dest := netip.MustParsePrefix("fd00:1::/64")
+	key := routeKey{dest: dest}
+	// b reaches the prefix through a and has a worse path through c. Split
+	// horizon keeps b from answering a, and c is somewhere to forward to.
+	fabric.inject("b", "a", EncodeRouterID(routerID("a")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 64}))
+	fabric.inject("b", "c", EncodeRouterID(routerID("a")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 512}))
+	if got := fabric.nextHop("b", key); got != "a" {
+		t.Fatalf("b selected %q for the prefix, want a", got)
+	}
+
+	speaker := fabric.speakers["b"]
+	for i := range maxPendingSeqno + 64 {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i))
+		fabric.inject("b", "a", EncodeSeqnoRequest(SeqnoRequest{
+			AE: AEIPv6, Prefix: dest, Seqno: 9, HopCount: 8, RouterID: id,
+		}))
+	}
+	switch got := len(speaker.pendingSeqno); {
+	case got > maxPendingSeqno:
+		t.Fatalf("b held %d forwarded seqno requests, past its cap of %d", got, maxPendingSeqno)
+	case got < maxPendingSeqno:
+		t.Fatalf("b held %d forwarded seqno requests, so the flood never reached the table", got)
+	}
+}
+
+// The source table is indexed the same way, and a node records a distance for
+// every finite advertisement it makes. A neighbor that names a new origin for
+// one prefix on every packet therefore adds an entry on every packet, and
+// RFC 8966 Appendix B keeps each one for three minutes after the last time it
+// was advertised.
+func TestSourceTableRefusesAnUnknownOriginWhenFull(t *testing.T) {
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	key := routeKey{dest: netip.MustParsePrefix("fd00:1::/64")}
+	now := time.Now()
+	for i := range maxSources {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i))
+		rt.observe(key, advertisement{routerID: id, seqno: 1, metric: 64}, now)
+	}
+	var fresh [8]byte
+	binary.BigEndian.PutUint64(fresh[:], uint64(maxSources))
+	if rt.feasible(key, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
+		t.Fatal("a full source table still admitted an origin it had never advertised")
+	}
+	// The cap refuses origins it has no room to record, not the ones it holds,
+	// and never a retraction: neither of those can close a loop.
+	if !rt.feasible(key, advertisement{routerID: [8]byte{}, seqno: 2, metric: 64}) {
+		t.Error("a full source table refused a better distance for an origin it holds")
+	}
+	if !rt.feasible(key, advertisement{routerID: fresh, metric: MetricInfinity}) {
+		t.Error("a full source table refused a retraction")
+	}
+}

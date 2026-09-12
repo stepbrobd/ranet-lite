@@ -122,7 +122,14 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			if !ok {
 				continue
 			}
-			key := routeKey{source: u.SourcePrefix, dest: netip.PrefixFrom(addr.Unmap(), u.Plen).Masked()}
+			dest := netip.PrefixFrom(addr.Unmap(), u.Plen).Masked()
+			// A v4-mapped address under AE 2 unmaps to IPv4 while its prefix
+			// length still counts IPv6 bits, so the pair names no route. Such
+			// an entry would be re-advertised as a malformed Update.
+			if !dest.IsValid() || (u.SourcePrefix.IsValid() && u.SourcePrefix.Addr().Is4() != dest.Addr().Is4()) {
+				continue
+			}
+			key := routeKey{source: u.SourcePrefix, dest: dest}
 			if _, local := s.originate[key]; local {
 				continue // a directly attached prefix always wins, Appendix E
 			}

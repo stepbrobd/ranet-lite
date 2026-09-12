@@ -64,6 +64,27 @@ func TestIPv4ViaIPv6RequestsAndAnnouncements(t *testing.T) {
 	}
 }
 
+// A v4-mapped address under AE 2 unmaps to IPv4 while its prefix length still
+// counts IPv6 bits. The result names no route, and once learned routes are
+// re-advertised such an entry would leave as a malformed Update.
+func TestMappedPrefixIsRejected(t *testing.T) {
+	s, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	mapped := netip.MustParseAddr("::ffff:10.0.0.0").As16()
+	body := append([]byte{AEIPv6, updateFlagPrefix, 104, 0, 0, 200, 0, 1, 0, 64}, mapped[:13]...)
+	body = append(body, SubTLVSourcePrefix, 14, 104)
+	body = append(body, mapped[:13]...)
+	s.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeRouterID([8]byte{1}), {Type: TLVUpdate, Body: body}}))
+	if got := len(s.routes.entries); got != 0 {
+		t.Fatalf("a prefix length that does not fit its address created %d routes", got)
+	}
+
+	request := append([]byte{AEIPv6, 104}, mapped[:13]...)
+	if _, err := DecodeRouteRequest(request); err == nil {
+		t.Fatal("accepted a request for a prefix length that does not fit its address")
+	}
+}
+
 func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 	prefix := netip.MustParsePrefix("2001:db8::/64")
 	for _, test := range []struct {

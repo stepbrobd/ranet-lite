@@ -243,10 +243,20 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 }
 
 // updateActions is the periodic full dump of RFC 8966 section 3.7.1. It
-// supersedes any triggered update still queued.
+// supersedes any triggered update still queued, except for prefixes that have
+// been flushed from the route table: those are gone from the dump and would
+// otherwise never be retracted.
 func (s *Speaker) updateActions(now time.Time) []sendAction {
-	s.routes.takeDirty()
-	return s.updateActionsFor(s.advertisableKeys(), now)
+	keys := s.advertisableKeys()
+	for _, key := range s.routes.takeDirty() {
+		if _, known := s.routes.entries[key]; known {
+			continue
+		}
+		if _, local := s.originate[key]; !local {
+			keys = append(keys, key)
+		}
+	}
+	return s.updateActionsFor(keys, now)
 }
 
 // triggeredActions covers RFC 8966 section 3.7.2. Selection changes are

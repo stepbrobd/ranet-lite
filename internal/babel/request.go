@@ -67,7 +67,17 @@ func decodeRequestPrefix(ae uint8, plen int, raw []byte) (prefix, source netip.P
 	buf := make([]byte, bits/8)
 	copy(buf, raw[:prefixByteLen(plen)])
 	addr, _ := netip.AddrFromSlice(net.IP(buf))
-	return netip.PrefixFrom(addr.Unmap(), plen).Masked(), source, nil
+	prefix = netip.PrefixFrom(addr.Unmap(), plen).Masked()
+	// A v4-mapped address under AE 2 unmaps to IPv4 while its prefix length
+	// still counts IPv6 bits, and a source prefix decoded under the same AE
+	// stays sixteen bytes wide. Neither pair names a route.
+	if !prefix.IsValid() {
+		return netip.Prefix{}, netip.Prefix{}, fmt.Errorf("babel: request prefix length %d does not fit its address", plen)
+	}
+	if source.IsValid() && source.Addr().Is4() != prefix.Addr().Is4() {
+		return netip.Prefix{}, netip.Prefix{}, fmt.Errorf("babel: request source prefix is from another address family")
+	}
+	return prefix, source, nil
 }
 
 // decodeRequestSubTLVs returns the source prefix of a source-specific request.
