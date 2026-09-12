@@ -669,3 +669,178 @@ func TestAnAnsweredExchangeRefreshesTheLivenessClock(t *testing.T) {
 		t.Error("the responder reads as dead after answering")
 	}
 }
+
+// observedEndpoint returns the endpoint a hub reports for a datagram from one
+// UDP socket. transport.Endpoint cannot be implemented outside its package, so
+// a test that needs two distinct peer addresses has to observe two.
+func observedEndpoint(t *testing.T, hub *transport.Hub, spi uint64) transport.Endpoint {
+	t.Helper()
+	mux, err := hub.NewMux(net.IPv4(127, 0, 0, 1), 4500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.RegisterIKE(spi); err != nil {
+		t.Fatal(err)
+	}
+	peer := listenPeer(t)
+	request := make([]byte, 28)
+	binary.BigEndian.PutUint64(request[:8], spi)
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: hub.LocalAddr().(*net.UDPAddr).Port}
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
+		t.Fatal(err)
+	}
+	_, endpoint, err := mux.RecvIKEFromUntil(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return endpoint
+}
+
+// Under pressure a request without a currently valid cookie must be answered
+// with one and dropped. RFC 7296 section 2.6 is the whole point of the
+// mechanism: without it an off-path source can make the responder allocate for
+// an address it never has to receive at.
+func TestResponderDemandsACookieUnderPressure(t *testing.T) {
+	hub, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	endpoint := observedEndpoint(t, hub, 0x1111)
+
+	r := &Responder{halfOpen: cookieThreshold}
+	r.cfg.Hub = hub
+	required, err := r.cookieRequired(&Message{}, bytes.Repeat([]byte{7}, 32), 1, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !required {
+		t.Fatal("a request under pressure was carried forward with no cookie at all")
+	}
+
+	// Below the threshold it does nothing at all, which is what keeps the
+	// ordinary case a two-message exchange.
+	quiet := &Responder{}
+	quiet.cfg.Hub = hub
+	required, err = quiet.cookieRequired(&Message{}, bytes.Repeat([]byte{7}, 32), 1, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if required {
+		t.Error("an idle responder demanded a cookie, which costs every handshake a round trip")
+	}
+}
+
+func TestResponderRefusesACookieItDidNotIssue(t *testing.T) {
+	hub, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	endpoint := observedEndpoint(t, hub, 0x2222)
+	elsewhere := observedEndpoint(t, hub, 0x3333)
+
+	r := &Responder{halfOpen: cookieThreshold}
+	r.cfg.Hub = hub
+	if _, err := rand.Read(r.cookieSecret[:]); err != nil {
+		t.Fatal(err)
+	}
+	r.cookieRotated = time.Now()
+	nonce := bytes.Repeat([]byte{7}, 32)
+	valid := cookieValue(r.cookieSecret, r.cookieVersion, nonce, 1, endpoint)
+
+	withCookie := func(data []byte) *Message {
+		return &Message{Payloads: []RawPayload{
+			{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_COOKIE, Data: data})},
+		}}
+	}
+	accepted := func(t *testing.T, request *Message, ni []byte, spi uint64, ep transport.Endpoint) bool {
+		t.Helper()
+		required, err := r.cookieRequired(request, ni, spi, ep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return !required
+	}
+
+	if !accepted(t, withCookie(valid), nonce, 1, endpoint) {
+		t.Fatal("the responder refused a cookie it had just issued")
+	}
+	for name, forged := range map[string][]byte{
+		"empty":            {},
+		"version only":     valid[:1],
+		"wrong version":    append([]byte{valid[0] + 1}, valid[1:]...),
+		"flipped last bit": append(append([]byte{}, valid[:len(valid)-1]...), valid[len(valid)-1]^1),
+		"right length":     bytes.Repeat([]byte{0}, len(valid)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if accepted(t, withCookie(forged), nonce, 1, endpoint) {
+				t.Error("the responder took a cookie it never issued, which is worse than issuing none")
+			}
+		})
+	}
+
+	// Bound to the attempt, so a cookie is useless for another nonce, another
+	// SPI, or another address: that binding is what stops an off-path source
+	// collecting one and spending it on addresses it cannot receive at.
+	for name, replay := range map[string]func() bool{
+		"another nonce":   func() bool { return accepted(t, withCookie(valid), bytes.Repeat([]byte{8}, 32), 1, endpoint) },
+		"another SPI":     func() bool { return accepted(t, withCookie(valid), nonce, 2, endpoint) },
+		"another address": func() bool { return accepted(t, withCookie(valid), nonce, 1, elsewhere) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if replay() {
+				t.Error("a cookie issued for one attempt was accepted for another")
+			}
+		})
+	}
+}
+
+// halfOpenLimit caps what a flood can allocate even with valid cookies, which
+// is the second half of RFC 7296 section 2.6: the cookie makes the source
+// prove an address, the cap bounds what one proven address can hold.
+func TestResponderCapsHalfOpenExchanges(t *testing.T) {
+	r := &Responder{}
+	for i := range halfOpenLimit {
+		if !r.enterHalfOpen() {
+			t.Fatalf("the responder refused half-open exchange %d, below its own limit", i)
+		}
+	}
+	if r.enterHalfOpen() {
+		t.Fatal("the responder allocated past its half-open limit, so a flood is bounded by nothing")
+	}
+	r.leaveHalfOpen()
+	if !r.enterHalfOpen() {
+		t.Error("a completed exchange did not free its slot")
+	}
+}
+
+// RFC 7296 section 3.3.5 forbids the Key Length attribute on a fixed-key
+// transform, and section 3.3.6 requires a selected transform to come back with
+// the attributes it was offered with. ChaCha20-Poly1305 is offered without
+// one, so the answer must carry none either. Getting this wrong is a silent
+// interop break: charon and this fork's own initiator both reject the result,
+// and AES-GCM being first in the proposal is why no handshake ever shows it.
+func TestChaChaChildResponseEchoesNoKeyLength(t *testing.T) {
+	child := responderChild{
+		number:     1,
+		encryption: Transform{Type: TransEncr, ID: ENCR_CHACHA20_POLY1305, KeyLengthBits: 256},
+	}
+	proposal := child.proposal(binary.BigEndian.AppendUint32(nil, 0x11223344))
+	for _, transform := range proposal.Transforms {
+		if transform.Type == TransEncr && transform.KeyLengthBits != 0 {
+			t.Errorf("the IKE_AUTH response offered ChaCha20-Poly1305 with Key Length %d, which RFC 7296 section 3.3.5 forbids",
+				transform.KeyLengthBits)
+		}
+	}
+
+	// An attributed cipher keeps its key length, or the answer would be
+	// proposing something different from what was selected.
+	child.encryption = Transform{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}
+	proposal = child.proposal(binary.BigEndian.AppendUint32(nil, 0x11223344))
+	for _, transform := range proposal.Transforms {
+		if transform.Type == TransEncr && transform.KeyLengthBits != 128 {
+			t.Errorf("AES-GCM came back with Key Length %d, want 128", transform.KeyLengthBits)
+		}
+	}
+}

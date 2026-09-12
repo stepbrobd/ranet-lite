@@ -239,3 +239,54 @@ func TestHandleChildRekeyRefusesASecondRekeyInTheSameInterval(t *testing.T) {
 		t.Fatalf("second rekey answered with notify %v, %v, want TEMPORARY_FAILURE", decoded, err)
 	}
 }
+
+// The same rule on the CREATE_CHILD_SA response path, which has its own copy.
+func TestChaChaChildRekeyResponseEchoesNoKeyLength(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ctx := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: bytes.Repeat([]byte{1}, 32),
+		skei: bytes.Repeat([]byte{2}, 20), sker: bytes.Repeat([]byte{3}, 20)}
+	// A rekey keeps the cipher, so the SA being replaced has to be the one
+	// whose response encoding is under test.
+	old := ChildSA{EncrID: ENCR_CHACHA20_POLY1305, EncrKeyBits: 256, LocalSPI: 21, RemoteSPI: 22}
+	s := &Session{mux: mux, current: ctx, Child: old, started: time.Now()}
+
+	// Offered the way a conformant peer offers a fixed-key cipher: no Key
+	// Length attribute at all.
+	proposal := Proposal{
+		Number: 1, Protocol: ProtoESP, SPI: binary.BigEndian.AppendUint32(nil, 32),
+		Transforms: []Transform{{Type: TransEncr, ID: ENCR_CHACHA20_POLY1305}, {Type: TransESN, ID: ESN_NO}},
+	}
+	raw, err := s.handleChildRekey(ctx, 0, []RawPayload{
+		{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_REKEY_SA, Protocol: ProtoESP, SPI: binary.BigEndian.AppendUint32(nil, old.RemoteSPI)})},
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{proposal})},
+		{Type: PayloadNonce, Body: bytes.Repeat([]byte{4}, 32)},
+		{Type: PayloadTSi, Body: fullRangeSelectors()},
+		{Type: PayloadTSr, Body: fullRangeSelectors()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := DecryptMessage(suite, ctx.localEncryptionKey(), raw, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := decodeChildExchangePayloads(inner)
+	if err != nil {
+		t.Fatalf("the rekey was refused rather than answered: %v, %v", inner, err)
+	}
+	selected, err := DecodeSA(payloads.sa.Body)
+	if err != nil || len(selected) != 1 {
+		t.Fatalf("response proposal = %v, %v", selected, err)
+	}
+	for _, transform := range selected[0].Transforms {
+		if transform.Type == TransEncr && transform.KeyLengthBits != 0 {
+			t.Errorf("the rekey response offered ChaCha20-Poly1305 with Key Length %d, which RFC 7296 section 3.3.5 forbids",
+				transform.KeyLengthBits)
+		}
+	}
+}
