@@ -247,3 +247,45 @@ func TestReplacementChildSARequestsDoNotPileUp(t *testing.T) {
 		t.Fatalf("%d concurrent rekey attempts, want exactly 1", got)
 	}
 }
+
+// A spent sequence space ends the SA, not the session. RFC 4303 section 3.3.3
+// forbids reusing a sequence number, so refusing to send is right; RFC 7296
+// section 1.3.1 says what to do about it -- "A failed attempt to create a
+// Child SA SHOULD NOT tear down the IKE SA" -- and the margin
+// ProactiveRekeySequence leaves exists precisely for the case where a rekey
+// has already failed once. Closing the mux there loses the session at the one
+// moment a replacement matters most.
+func TestASpentSequenceSpaceAsksForAReplacementAndKeepsTheSession(t *testing.T) {
+	child := tunnelChild(1)
+	tunnel := &tunnel{}
+	asked := make(chan struct{}, 4)
+	tunnel.rekey = func() { asked <- struct{}{} }
+	if err := tunnel.install(child); err != nil {
+		t.Fatal(err)
+	}
+	// Spent through the same path production uses. Four reservations of 2^30
+	// carry the 32-bit space past its end, and 1<<30 still fits an int on a
+	// 32-bit build.
+	var err error
+	for range 4 {
+		_, err = tunnel.reserve(1 << 30)
+	}
+	if !errors.Is(err, esp.ErrSequenceExhausted) {
+		t.Fatalf("reserve on a spent SA = %v, want ErrSequenceExhausted", err)
+	}
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a spent sequence space asked for no replacement Child SA")
+	}
+	if fatalReserveError(err) {
+		t.Error("a spent sequence space closes the mux, which withdraws every route through the peer")
+	}
+	// The refusals that are a real transport failure still do.
+	if !fatalReserveError(errors.New("the socket is gone")) {
+		t.Error("a genuine transport failure no longer closes the mux")
+	}
+	if fatalReserveError(errNoChildSA) || fatalReserveError(nil) {
+		t.Error("a refusal a replacement fixes closes the mux")
+	}
+}

@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -23,7 +22,8 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	defer sess.Mux().Close()
 	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
 
-	tunnel := &tunnel{replayWindow: c.config().ReplayWindowSize()}
+	tunnel := &tunnel{replayWindow: c.config().ReplayWindowSize(), started: time.Now()}
+	tunnel.askedAt.Store(-int64(rekeyAskInterval))
 	// requestRekey owns the goroutine and the one-at-a-time guard, so this
 	// runs on its own and may block.
 	tunnel.rekey = func() {
@@ -39,12 +39,11 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	sess.SetChildRetireHandler(tunnel.retire)
 	peer := netstack.NewPeerReserved(sessionName, func(count int) (netstack.BatchSealer, error) {
 		sealer, err := tunnel.reserve(count)
-		// A peer is entitled to delete the Child SA and keep the IKE SA
-		// (RFC 7296 section 1.4.1), and reserve has already asked for a
-		// replacement. Closing the mux here instead would turn the first
-		// babel hello after the Delete, four seconds later, into a full
-		// session teardown that withdraws every route through this peer.
-		if err != nil && !errors.Is(err, errNoChildSA) {
+		// Closing the mux here turns the first babel hello after a refusal,
+		// four seconds later, into a full session teardown that withdraws
+		// every route through this peer. See fatalReserveError for the two
+		// refusals that do not deserve that.
+		if fatalReserveError(err) {
 			_ = sess.Mux().Close()
 		}
 		return sealer, err

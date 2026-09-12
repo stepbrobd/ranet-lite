@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -72,15 +73,46 @@ func TestProactivePacketCountRekey(t *testing.T) {
 	}
 	var called atomic.Int32
 	out.SetRekeyCallback(func() { called.Add(1) })
-	out.seq.Store(ProactiveRekeySequence - 1)
+	out.seq.Store(ProactiveRekeySequence - 2)
+	// One packet short of the mark asks for nothing.
 	if _, err := out.Seal(nil, NextHeaderIPv4); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := out.Seal(nil, NextHeaderIPv4); err != nil {
+	if got := called.Load(); got != 0 {
+		t.Fatalf("rekey callback called %d times before the mark, want none", got)
+	}
+	// And every reservation past it asks again. A single ask for the life of
+	// the SA is the one thing that cannot retry a rekey that failed, which is
+	// the case ProactiveRekeySequence's margin is sized for: the next driver
+	// would be the scheduled rekey, most of an hour away, while at the rates
+	// in that comment the space runs out in minutes. The rate is bounded by
+	// the callback, which carries the one-at-a-time guard and the floor.
+	for range 3 {
+		if _, err := out.Seal(nil, NextHeaderIPv4); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := called.Load(); got != 3 {
+		t.Fatalf("rekey callback called %d times past the mark, want one per reservation", got)
+	}
+}
+
+// Refusing to send is right -- RFC 4303 section 3.3.3 forbids reusing a
+// sequence number -- but the refusal has to be recognizable, because the
+// caller's answer is to replace the SA rather than to tear the session down.
+func TestExhaustionIsReportedAsItsOwnError(t *testing.T) {
+	out, err := NewOutbound(testChild(t))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := called.Load(); got != 1 {
-		t.Fatalf("rekey callback called %d times, want once", got)
+	var called atomic.Int32
+	out.SetRekeyCallback(func() { called.Add(1) })
+	out.seq.Store(0xffffffff)
+	if _, err := out.ReserveSequenceRange(1); !errors.Is(err, ErrSequenceExhausted) {
+		t.Fatalf("a spent sequence space reported %v, want ErrSequenceExhausted", err)
+	}
+	if got := called.Load(); got == 0 {
+		t.Error("a spent sequence space asked for no replacement")
 	}
 }
 

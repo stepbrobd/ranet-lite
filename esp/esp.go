@@ -10,6 +10,7 @@ package esp
 import (
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -21,9 +22,17 @@ const (
 	NextHeaderNone = 59
 
 	headerLen = 8 // SPI + 32-bit Sequence Number
-	// ProactiveRekeySequence leaves a 65536-packet safety margin before a
-	// non-ESN SA's sequence space is exhausted.
-	ProactiveRekeySequence = uint64(0xffffffff - 0xffff)
+	// ProactiveRekeySequence is where a non-ESN SA asks to be replaced, and
+	// the margin it leaves is a time budget rather than a packet count: what
+	// has to happen before the space runs out is two round trips, and it may
+	// have to wait for an exchange already outstanding. 65535 packets was
+	// 58 milliseconds at this implementation's own measured 12.7 Gbit/s, and
+	// under 5 at small packets. 2^28 is about four minutes at a million
+	// packets per second and six percent of the space, which the hourly
+	// scheduled rekey reaches long before in any case: this is the backstop
+	// for a link fast enough to exhaust the space inside one interval, and
+	// the case where it matters is the one where a rekey has already failed.
+	ProactiveRekeySequence = uint64(0xffffffff - 1<<28)
 )
 
 // OutboundSA encrypts packets for the direction this client originates.
@@ -36,10 +45,18 @@ type OutboundSA struct {
 	salt   []byte
 	spi    uint32
 
-	seq       atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
-	rekeyOnce sync.Once
-	onRekey   func()
+	seq     atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
+	onRekey func()
 }
+
+// ErrSequenceExhausted is returned once a non-ESN SA has no sequence numbers
+// left. Refusing to send is what RFC 4303 section 3.3.3 requires -- "the
+// sender MUST NOT send a packet on an SA if doing so would cause the sequence
+// number to cycle" -- but it says nothing about the IKE SA, and RFC 7296
+// section 1.3.1 does: "A failed attempt to create a Child SA SHOULD NOT tear
+// down the IKE SA." It is a sentinel so a caller can tell the one refusal a
+// replacement fixes from a real transport failure.
+var ErrSequenceExhausted = errors.New("esp: sequence number space exhausted, SA must be re-established")
 
 // SequenceRange is an ordered run of sequence numbers reserved from one SA.
 // A range belongs to one worker: successive Seal calls consume its sequence
@@ -156,14 +173,26 @@ func (o *OutboundSA) reserveSequenceNumbers(count int) (uint64, uint64, error) {
 	n := uint64(count)
 	end := o.seq.Add(n)
 	first := end - n + 1
-	if end >= ProactiveRekeySequence && first <= 0xffffffff && o.onRekey != nil {
-		o.rekeyOnce.Do(o.onRekey)
+	// Asked on every reservation past the mark rather than once for the life
+	// of the SA. The margin above is sized for "a rekey has already failed",
+	// and a single-shot ask is exactly what cannot retry one: the next driver
+	// would be the scheduled rekey, most of an hour away, while the space
+	// runs out in minutes. The callback carries its own one-at-a-time guard
+	// and its own floor between attempts, so this costs a compare past the
+	// mark and nothing before it.
+	//
+	// A reservation that is wholly past the end asks too. That SA will never
+	// carry another packet, so it is the moment a replacement matters most,
+	// and it is the moment an ask conditioned on having a usable number left
+	// would fall silent.
+	if end >= ProactiveRekeySequence && o.onRekey != nil {
+		o.onRekey()
 	}
 	if end > 0xffffffff {
 		// No ESN: do not return even the in-range prefix of a reservation that
 		// crosses the boundary. The caller must move the whole batch to a fresh
 		// SA rather than partially transmitting it.
-		return 0, 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
+		return 0, 0, ErrSequenceExhausted
 	}
 	return first, end, nil
 }

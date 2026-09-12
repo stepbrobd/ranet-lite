@@ -167,3 +167,24 @@ func TestReplayCommitCostDoesNotFollowTheJumpDistance(t *testing.T) {
 			"so the cost still follows the distance the peer chose", window-1, worst, inOrder, ratio)
 	}
 }
+
+// The margin between asking for a rekey and refusing to send is a time budget:
+// two round trips have to complete inside it, possibly behind an exchange that
+// is already outstanding. Expressed as a packet count it shrinks with the link
+// rate, and this implementation's own measured rate left it at milliseconds.
+func TestProactiveRekeyLeavesTimeAndNotJustPackets(t *testing.T) {
+	margin := uint64(0xffffffff) - ProactiveRekeySequence
+	// A million packets per second is what 12.7 Gbit/s at path MTU comes to,
+	// and small packets go several times faster.
+	const perSecond = 1_000_000
+	if seconds := margin / perSecond; seconds < 60 {
+		t.Errorf("the rekey margin is %d packets, %d seconds at %d packets per second, "+
+			"which is not enough for two round trips behind a pending exchange",
+			margin, seconds, perSecond)
+	}
+	// It still has to be a small fraction of the space, or the SA spends its
+	// life rekeying.
+	if margin > 0xffffffff/8 {
+		t.Errorf("the rekey margin is %d packets, over an eighth of the sequence space", margin)
+	}
+}

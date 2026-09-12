@@ -7,6 +7,7 @@ import (
 	"maps"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -28,18 +29,52 @@ type tunnel struct {
 	replayWindow uint32
 	rekeying     atomic.Bool
 	rekey        func()
+	// askedAt is nanoseconds since started, read through time.Since so it
+	// comes off the monotonic clock, and primed one interval in the past so
+	// the first ask goes straight through. See requestRekey.
+	askedAt atomic.Int64
+	started time.Time
 }
+
+// rekeyAskInterval is the floor between two attempts to replace the Child SA.
+// The one-at-a-time guard alone does not bound the rate: a rekey that fails
+// without an exchange -- no Child SA to rekey, or one already running -- comes
+// back at once, and both callers ask per batch, which on a routed tun is per
+// packet. It is well under the two round trips ProactiveRekeySequence leaves
+// room for, so a genuine retry still lands inside the margin.
+const rekeyAskInterval = 250 * time.Millisecond
 
 // errNoChildSA means the peer deleted the Child SA and kept the IKE SA, which
 // RFC 7296 section 1.4.1 allows. Sending resumes once a replacement is
 // negotiated, so it is not a reason to close anything.
 var errNoChildSA = errors.New("peer has no active Child SA")
 
+// fatalReserveError reports whether a refusal from reserve is a reason to
+// close the session's mux, which ends Run, drops the babel peer and withdraws
+// every route through it.
+//
+// Two refusals are not. A peer may delete the Child SA and keep the IKE SA
+// (RFC 7296 section 1.4.1), and a non-ESN SA may run out of sequence numbers,
+// which RFC 4303 section 3.3.3 makes a refusal to send rather than a failure
+// of anything else. Both leave the IKE SA intact with a replacement already
+// asked for, and section 1.3.1 is explicit about the answer: "A failed attempt
+// to create a Child SA SHOULD NOT tear down the IKE SA: there is no reason to
+// lose the work done to set up the IKE SA."
+func fatalReserveError(err error) bool {
+	return err != nil && !errors.Is(err, errNoChildSA) && !errors.Is(err, esp.ErrSequenceExhausted)
+}
+
 // requestRekey asks for a replacement Child SA, at most one attempt at a time.
 // Every batch that finds no outbound SA calls this, which on a routed tun is
 // once per packet.
 func (t *tunnel) requestRekey() {
 	if t.rekey == nil || !t.rekeying.CompareAndSwap(false, true) {
+		return
+	}
+	now := int64(time.Since(t.started))
+	if previous := t.askedAt.Load(); now-previous < int64(rekeyAskInterval) ||
+		!t.askedAt.CompareAndSwap(previous, now) {
+		t.rekeying.Store(false)
 		return
 	}
 	go func() {
@@ -97,6 +132,10 @@ func (t *tunnel) reserve(count int) (netstack.BatchSealer, error) {
 	}
 	r, err := current.outbound.ReserveSequenceRange(count)
 	if err != nil {
+		// The SA that ran out is still installed, so nothing else will ask.
+		if errors.Is(err, esp.ErrSequenceExhausted) {
+			t.requestRekey()
+		}
 		return nil, err
 	}
 	return r.SealBatchInto, nil
