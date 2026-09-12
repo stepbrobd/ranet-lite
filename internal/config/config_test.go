@@ -155,3 +155,20 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Errorf("the example no longer parses: %v", err)
 	}
 }
+
+// Every IKE datagram here carries the non-ESP marker, and RFC 7296 section
+// 2.23 forbids UDP encapsulation on port 500, so a config naming it would
+// build a node no conformant peer can talk to.
+func TestConfigRejectsPort500(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := strings.Replace(testConfig, "port: 13000", "port: 500", 1)
+	if body == testConfig {
+		t.Fatal("the fixture no longer names a port, so this test proves nothing")
+	}
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Error("port 500 was accepted")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,9 @@ type Unclaimed struct {
 type Endpoint interface {
 	transportEndpoint()
 	String() string
+	// AddrPort is the peer's address as this socket observed it, which NAT
+	// detection has to hash (RFC 7296 section 2.23).
+	AddrPort() netip.AddrPort
 }
 
 type packetBind interface {

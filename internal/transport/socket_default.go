@@ -2,13 +2,25 @@
 
 package transport
 
-import "golang.zx2c4.com/wireguard/conn"
+import (
+	"net/netip"
+
+	"golang.zx2c4.com/wireguard/conn"
+)
 
 type portableBind struct{ conn.Bind }
 type portableEndpoint struct{ conn.Endpoint }
 
 func (*portableEndpoint) transportEndpoint() {}
 func (e *portableEndpoint) String() string   { return e.DstToString() }
+
+func (e *portableEndpoint) AddrPort() netip.AddrPort {
+	addr, err := netip.ParseAddrPort(e.DstToString())
+	if err != nil {
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
+}
 
 func (b *portableBind) ParseEndpoint(s string) (Endpoint, error) {
 	ep, err := b.Bind.ParseEndpoint(s)

@@ -104,6 +104,15 @@ const (
 	cookieLifetime = 2 * time.Minute
 )
 
+// Accepted names both ends of an SA a peer opened to us. The local identity
+// is the endpoint the initiator addressed in IDr, so the pair identifies one
+// path through the mesh the same way a dialed session does, rather than just
+// naming the peer.
+type Accepted struct {
+	Peer  Identity
+	Local Identity
+}
+
 // Responder accepts IKE SAs that peers initiate to us on a shared hub. One
 // Responder serves every peer; there is no per-peer state until IDi is
 // authenticated, because until then there is no peer, only a datagram.
@@ -148,7 +157,7 @@ func NewResponder(cfg ResponderConfig) (*Responder, error) {
 //
 // It returns when ctx is cancelled or the hub's socket is gone, after every
 // in-flight handshake has finished.
-func (r *Responder) Serve(ctx context.Context, onSession func(*Session, Identity)) error {
+func (r *Responder) Serve(ctx context.Context, onSession func(*Session, Accepted)) error {
 	unclaimed := r.cfg.Hub.Listen()
 	var running sync.WaitGroup
 	defer running.Wait()
@@ -160,12 +169,12 @@ func (r *Responder) Serve(ctx context.Context, onSession func(*Session, Identity
 			return fmt.Errorf("ike: responder hub closed")
 		case datagram := <-unclaimed:
 			running.Go(func() {
-				session, id, err := r.handshake(ctx, datagram)
+				session, accepted, err := r.handshake(ctx, datagram)
 				if err != nil {
 					slog.Debug("ike responder handshake failed", "peer", datagram.Endpoint, "err", err)
 					return
 				}
-				onSession(session, id)
+				onSession(session, accepted)
 			})
 		}
 	}
@@ -175,7 +184,7 @@ func (r *Responder) Serve(ctx context.Context, onSession func(*Session, Identity
 // initiator. Every failure before the mux exists is answered statelessly or
 // silently; every failure after it closes the mux, so nothing survives a
 // rejected exchange.
-func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed) (_ *Session, _ Identity, err error) {
+func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed) (_ *Session, _ Accepted, err error) {
 	timeout := r.cfg.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = handshakeTimeout
@@ -186,39 +195,39 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 
 	request, err := DecodeMessage(datagram.Raw)
 	if err != nil {
-		return nil, Identity{}, fmt.Errorf("ike: decode IKE_SA_INIT request: %w", err)
+		return nil, Accepted{}, fmt.Errorf("ike: decode IKE_SA_INIT request: %w", err)
 	}
 	header := request.Header
 	if header.ExchangeType != IKE_SA_INIT || header.IsResponse() || !header.IsInitiator() ||
 		header.MessageID != 0 || header.SPIResponder != 0 || header.SPIInitiator == 0 ||
 		header.MajorVersion != 2 || header.Length != uint32(len(datagram.Raw)) {
-		return nil, Identity{}, fmt.Errorf("ike: unclaimed datagram is not an IKE_SA_INIT request")
+		return nil, Accepted{}, fmt.Errorf("ike: unclaimed datagram is not an IKE_SA_INIT request")
 	}
 	spiI := header.SPIInitiator
 
 	saPayload, kePayload, noncePayload := request.find(PayloadSA), request.find(PayloadKE), request.find(PayloadNonce)
 	if saPayload == nil || kePayload == nil || noncePayload == nil {
-		return nil, Identity{}, fmt.Errorf("ike: incomplete IKE_SA_INIT request")
+		return nil, Accepted{}, fmt.Errorf("ike: incomplete IKE_SA_INIT request")
 	}
 	ni := DecodeNonce(noncePayload.Body)
 	if !validNonce(ni) {
-		return nil, Identity{}, fmt.Errorf("ike: initiator nonce length %d is outside 16..256", len(ni))
+		return nil, Accepted{}, fmt.Errorf("ike: initiator nonce length %d is outside 16..256", len(ni))
 	}
 	// RFC 7296 section 2.5: a critical payload we do not implement has to be
 	// refused by type rather than ignored, because the peer marked it as
 	// changing what the message means.
 	if unsupported, found := firstUnsupportedCritical(request.Payloads); found {
 		r.sendStatelessNotify(datagram, spiI, N_UNSUPPORTED_CRITICAL_PAYLOAD, []byte{byte(unsupported)})
-		return nil, Identity{}, fmt.Errorf("ike: IKE_SA_INIT request marks payload type %d critical", unsupported)
+		return nil, Accepted{}, fmt.Errorf("ike: IKE_SA_INIT request marks payload type %d critical", unsupported)
 	}
 
 	// RFC 7296 section 2.6: under load, prove the initiator can receive at the
 	// address it claims before allocating anything for it. The cookie is a
 	// keyed hash of its nonce, address and SPI, so we still keep no state.
 	if required, err := r.cookieRequired(request, ni, spiI, datagram.Endpoint); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	} else if required {
-		return nil, Identity{}, fmt.Errorf("ike: cookie challenge sent")
+		return nil, Accepted{}, fmt.Errorf("ike: cookie challenge sent")
 	}
 
 	// The cap comes before the Diffie-Hellman, not after it. Everything above
@@ -230,22 +239,22 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	// key exchange is exactly the pressure the challenge of RFC 7296 section
 	// 2.6 exists to answer.
 	if !r.enterHalfOpen() {
-		return nil, Identity{}, fmt.Errorf("ike: too many half-open SAs")
+		return nil, Accepted{}, fmt.Errorf("ike: too many half-open SAs")
 	}
 	defer r.leaveHalfOpen()
 
 	supportsIdentity, err := supportsSignatureHash(request.Payloads, HashIdentity)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	if !supportsIdentity {
 		r.sendStatelessNotify(datagram, spiI, N_AUTHENTICATION_FAILED, nil)
-		return nil, Identity{}, fmt.Errorf("ike: initiator did not advertise Ed25519 Identity hash support")
+		return nil, Accepted{}, fmt.Errorf("ike: initiator did not advertise Ed25519 Identity hash support")
 	}
 
 	peerGroup, peerPublic, err := DecodeKE(kePayload.Body)
 	if err != nil {
-		return nil, Identity{}, fmt.Errorf("ike: decode KE: %w", err)
+		return nil, Accepted{}, fmt.Errorf("ike: decode KE: %w", err)
 	}
 	proposal, suite, err := selectIKEProposal(saPayload.Body, peerGroup)
 	if err != nil {
@@ -254,35 +263,35 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 			group := make([]byte, 2)
 			binary.BigEndian.PutUint16(group, wrongGroup.group)
 			r.sendStatelessNotify(datagram, spiI, N_INVALID_KE_PAYLOAD, group)
-			return nil, Identity{}, err
+			return nil, Accepted{}, err
 		}
 		r.sendStatelessNotify(datagram, spiI, N_NO_PROPOSAL_CHOSEN, nil)
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 
 	dh, err := GenerateDH(suite.DHGroup)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	shared, err := dh.SharedSecret(peerPublic)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	nr := make([]byte, 32)
 	if _, err := rand.Read(nr); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	spiR := randUint64Nonzero()
 	keys, err := DeriveIKEKeys(suite, shared, ni, nr, spiI, spiR)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 
 	// Per-SA state starts here; the half-open slot above is what bounds how
 	// many of these can exist at once.
 	mux, err := r.cfg.Hub.NewMuxTo(datagram.Endpoint)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	defer func() {
 		if err != nil {
@@ -294,7 +303,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	// Register before the response goes out, so the initiator's IKE_AUTH
 	// cannot race the receive loop back into the unclaimed queue.
 	if err := mux.RegisterIKE(spiI); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	defer func() {
 		if err != nil {
@@ -302,12 +311,12 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 		}
 	}()
 
-	response, err := r.buildSAInitResponse(spiI, spiR, proposal, suite, dh, nr)
+	response, err := r.buildSAInitResponse(spiI, spiR, proposal, suite, dh, nr, datagram.Endpoint)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	if err := mux.SendIKE(response); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 
 	session := &Session{
@@ -324,24 +333,24 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 		requests: make(chan *localRequest, 1),
 	}
 
-	id, err := session.completeResponderAuth(r, datagram.Raw, response, ni, nr, deadline)
+	accepted, err := session.completeResponderAuth(r, datagram.Raw, response, ni, nr, deadline)
 	if err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	if err := session.SetRekeyTiming(r.cfg.RekeyMargin, r.cfg.RekeyJitter); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	if err := session.SetRekeyIntervals(r.cfg.ChildRekeyInterval, r.cfg.IKERekeyInterval); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
 	retryInitial, retryMax := r.cfg.RekeyRetryInitial, r.cfg.RekeyRetryMax
 	if retryInitial == 0 && retryMax == 0 {
 		retryInitial, retryMax = 5*time.Second, 5*time.Minute
 	}
 	if err := session.SetRekeyRetry(retryInitial, retryMax); err != nil {
-		return nil, Identity{}, err
+		return nil, Accepted{}, err
 	}
-	return session, id, nil
+	return session, accepted, nil
 }
 
 // buildSAInitResponse mirrors the initiator's IKE_SA_INIT, including the
@@ -349,13 +358,21 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 // UDP-encapsulated ESP only, so the initiator has to conclude that we are
 // behind a NAT; hashing a random address guarantees the mismatch that makes
 // it, exactly as strongSwan's own force_encap does (ike_natd.c).
-func (r *Responder) buildSAInitResponse(spiI, spiR uint64, proposal Proposal, suite SASuite, dh *DHKeyPair, nr []byte) ([]byte, error) {
+//
+// Both notifies have to be present. strongSwan enables NAT traversal only
+// when it has seen a source and a destination notify, and treats one alone as
+// a peer that does not implement RFC 7296 section 2.23 at all, so sending the
+// mismatching source on its own leaves it building raw ESP that no userspace
+// transport ever sees. The destination hash is the honest one, over the
+// address this datagram actually came from.
+func (r *Responder) buildSAInitResponse(spiI, spiR uint64, proposal Proposal, suite SASuite, dh *DHKeyPair, nr []byte, endpoint transport.Endpoint) ([]byte, error) {
 	hashAlgos := make([]byte, 2)
 	binary.BigEndian.PutUint16(hashAlgos, HashIdentity)
 	var fakeAddr [4]byte
 	if _, err := rand.Read(fakeAddr[:]); err != nil {
 		return nil, err
 	}
+	peer := endpoint.AddrPort()
 	payloads := []RawPayload{
 		{Type: PayloadSA, Body: EncodeSA([]Proposal{proposal})},
 		{Type: PayloadKE, Body: EncodeKE(suite.DHGroup, dh.PublicBytes())},
@@ -365,57 +382,71 @@ func (r *Responder) buildSAInitResponse(spiI, spiR uint64, proposal Proposal, su
 			Type: N_NAT_DETECTION_SOURCE_IP,
 			Data: natDetectionHash(spiI, spiR, net.IP(fakeAddr[:]), 0),
 		})},
+		{Type: PayloadN, Body: EncodeNotify(Notify{
+			Type: N_NAT_DETECTION_DESTINATION_IP,
+			Data: natDetectionHash(spiI, spiR, net.IP(peer.Addr().AsSlice()), peer.Port()),
+		})},
 	}
 	header := Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: IKE_SA_INIT, Flags: FlagResponse, MessageID: 0}
 	return (&Message{Header: header, Payloads: payloads}).Encode(), nil
 }
 
+//
+// It follows from this that the peer must be reachable on the port it already
+// knows. RFC 7296 §2.23 obliges a conformant initiator that sees the mismatch
+// to move everything to UDP 4500, and nothing here binds 4500 separately, so
+// the registry port has to be the port both ends keep using. strongSwan does
+// that when charon.port_nat_t is set to it, which is what the fleet and the
+// integration test both configure; a peer left on the default would float away
+// to a socket that is not listening. Config rejects port 500 outright for the
+// related reason that the non-ESP marker cannot be used there.
+
 // completeResponderAuth waits for IKE_AUTH, authenticates the initiator and
 // answers with our own AUTH and the selected Child SA. A duplicate
 // IKE_SA_INIT while waiting is answered with the identical response.
-func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2, ni, nr []byte, deadline time.Time) (Identity, error) {
+func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2, ni, nr []byte, deadline time.Time) (Accepted, error) {
 	ctx := s.current
 	raw, source, err := s.awaitAuthRequest(realMessage1, realMessage2, deadline)
 	if err != nil {
-		return Identity{}, err
+		return Accepted{}, err
 	}
 	outer, err := DecodeMessage(raw)
 	if err != nil {
-		return Identity{}, fmt.Errorf("ike: decode IKE_AUTH request: %w", err)
+		return Accepted{}, fmt.Errorf("ike: decode IKE_AUTH request: %w", err)
 	}
 	innerFirst, plaintext, err := decryptMessagePlaintext(ctx.suite, ctx.peerEncryptionKey(), raw, outer)
 	if err != nil {
-		return Identity{}, fmt.Errorf("ike: decrypt IKE_AUTH request: %w", err)
+		return Accepted{}, fmt.Errorf("ike: decrypt IKE_AUTH request: %w", err)
 	}
 	inner, err := decodeMessagePlaintext(innerFirst, plaintext)
 	if err != nil {
-		return Identity{}, fmt.Errorf("ike: malformed IKE_AUTH request: %w", err)
+		return Accepted{}, fmt.Errorf("ike: malformed IKE_AUTH request: %w", err)
 	}
 	// Only an authenticated message may move where replies go (RFC 7296
 	// section 2.23); decryption above is that proof.
 	s.mux.AdoptEndpoint(source)
 
 	if unsupported, found := firstUnsupportedCritical(inner); found {
-		return Identity{}, s.rejectAuth(N_UNSUPPORTED_CRITICAL_PAYLOAD,
+		return Accepted{}, s.rejectAuth(N_UNSUPPORTED_CRITICAL_PAYLOAD,
 			fmt.Errorf("ike: IKE_AUTH request marks payload type %d critical", unsupported))
 	}
 
 	request := &Message{Header: outer.Header, Payloads: inner}
 	idiPayload, authPayload := request.find(PayloadIDi), request.find(PayloadAUTH)
 	if idiPayload == nil || authPayload == nil {
-		return Identity{}, s.rejectAuth(N_AUTHENTICATION_FAILED, fmt.Errorf("ike: IKE_AUTH request has no IDi or AUTH"))
+		return Accepted{}, s.rejectAuth(N_AUTHENTICATION_FAILED, fmt.Errorf("ike: IKE_AUTH request has no IDi or AUTH"))
 	}
 	peerID, err := identityFromID(idiPayload.Body)
 	if err != nil {
-		return Identity{}, s.rejectAuth(N_AUTHENTICATION_FAILED, err)
+		return Accepted{}, s.rejectAuth(N_AUTHENTICATION_FAILED, err)
 	}
 	peerKey, known := r.cfg.Lookup(peerID)
 	if !known {
-		return Identity{}, s.rejectAuth(N_AUTHENTICATION_FAILED, fmt.Errorf("ike: no registry entry for %s", peerID))
+		return Accepted{}, s.rejectAuth(N_AUTHENTICATION_FAILED, fmt.Errorf("ike: no registry entry for %s", peerID))
 	}
 	macedIDForI := prf(ctx.suite.PRFID, ctx.skpi, idiPayload.Body)
 	if err := VerifyAuth(peerKey, concat(realMessage1, nr, macedIDForI), authPayload.Body); err != nil {
-		return Identity{}, s.rejectAuth(N_AUTHENTICATION_FAILED, err)
+		return Accepted{}, s.rejectAuth(N_AUTHENTICATION_FAILED, err)
 	}
 
 	// The initiator names us in IDr. Answering under a name it did not ask
@@ -423,7 +454,7 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 	// unknown IDr is a rejection rather than a substitution.
 	localID, err := r.localIdentity(request.find(PayloadIDr))
 	if err != nil {
-		return Identity{}, s.rejectAuth(N_AUTHENTICATION_FAILED, err)
+		return Accepted{}, s.rejectAuth(N_AUTHENTICATION_FAILED, err)
 	}
 	idrBody := localID.encodeID()
 	macedIDForR := prf(ctx.suite.PRFID, ctx.skpr, idrBody)
@@ -447,7 +478,7 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 		if buildErr == nil {
 			_ = s.mux.SendIKE(response)
 		}
-		return Identity{}, err
+		return Accepted{}, err
 	}
 
 	localSPI := make([]byte, 4)
@@ -461,10 +492,10 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 		{Type: PayloadTSr, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
 	})
 	if err != nil {
-		return Identity{}, err
+		return Accepted{}, err
 	}
 	if err := s.replaceChild(child.sa); err != nil {
-		return Identity{}, err
+		return Accepted{}, err
 	}
 	// Retain the response before sending it: Session.Run answers a
 	// retransmitted IKE_AUTH from here, and the initiator may retransmit
@@ -473,9 +504,9 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 	ctx.lastPeerResponseID, ctx.lastPeerResponse = 1, response
 	s.stateMu.Unlock()
 	if err := s.mux.SendIKE(response); err != nil {
-		return Identity{}, err
+		return Accepted{}, err
 	}
-	return peerID, nil
+	return Accepted{Peer: peerID, Local: localID}, nil
 }
 
 // awaitAuthRequest waits for the initiator's IKE_AUTH, answering a repeat of

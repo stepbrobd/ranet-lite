@@ -39,8 +39,9 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 	}
 	var serving sync.WaitGroup
 	defer serving.Wait()
-	err = responder.Serve(ctx, func(sess *ike.Session, peer ike.Identity) {
+	err = responder.Serve(ctx, func(sess *ike.Session, accepted ike.Accepted) {
 		serving.Go(func() {
+			peer := accepted.Peer
 			name := fmt.Sprintf("%s/%s", peer.Organization, peer.CommonName)
 			sessionName := fmt.Sprintf("%s/%s/%s", peer.Organization, peer.CommonName, peer.SerialNumber)
 			release := c.sessions.adopt(name, sess.Mux())

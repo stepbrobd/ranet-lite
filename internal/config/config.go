@@ -216,6 +216,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: common_name is required")
 	case c.Port == 0:
 		return fmt.Errorf("config: port is required")
+	case c.Port == 500:
+		// Every IKE datagram here carries the non-ESP marker so IKE and ESP
+		// can share one socket, and RFC 7296 section 2.23 says "UDP
+		// encapsulation MUST NOT be done on port 500". A peer on 500 would
+		// read the marker as the start of a header.
+		return fmt.Errorf("config: port 500 cannot carry UDP-encapsulated IKE, use 4500 or a private port")
 	case len(c.Endpoints) == 0:
 		return fmt.Errorf("config: at least one endpoint is required")
 	case c.PrivateKey == "":

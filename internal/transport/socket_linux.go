@@ -25,6 +25,14 @@ type udpEndpoint struct {
 func (*udpEndpoint) transportEndpoint() {}
 func (e *udpEndpoint) String() string   { return e.addr.String() }
 
+func (e *udpEndpoint) AddrPort() netip.AddrPort {
+	addr, ok := netip.AddrFromSlice(e.addr.IP)
+	if !ok {
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(addr.Unmap(), uint16(e.addr.Port))
+}
+
 type udpBatchConn interface {
 	ReadBatch([]ipv4.Message, int) (int, error)
 	WriteBatch([]ipv4.Message, int) (int, error)

@@ -22,7 +22,7 @@ type responderHarness struct {
 	public     ed25519.PublicKey
 	private    ed25519.PrivateKey
 	sessions   chan *Session
-	identities chan Identity
+	identities chan Accepted
 }
 
 // newResponderHarness runs a Responder on one hub and hands back everything
@@ -68,13 +68,13 @@ func newResponderHarness(t *testing.T, lookup func(Identity) (ed25519.PublicKey,
 		public:     public,
 		private:    private,
 		sessions:   make(chan *Session, 1),
-		identities: make(chan Identity, 1),
+		identities: make(chan Accepted, 1),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go responder.Serve(ctx, func(s *Session, id Identity) {
+	go responder.Serve(ctx, func(s *Session, accepted Accepted) {
 		h.sessions <- s
-		h.identities <- id
+		h.identities <- accepted
 	})
 	return h
 }
@@ -115,8 +115,12 @@ func TestResponderCompletesHandshakeWithInitiator(t *testing.T) {
 	}
 	defer responder.Mux().Close()
 
-	if id := <-h.identities; id != (Identity{Organization: "testorg", CommonName: "client", SerialNumber: "2"}) {
-		t.Fatalf("authenticated identity = %s", id)
+	accepted := <-h.identities
+	if accepted.Peer != (Identity{Organization: "testorg", CommonName: "client", SerialNumber: "2"}) {
+		t.Fatalf("authenticated identity = %s", accepted.Peer)
+	}
+	if accepted.Local != (Identity{Organization: "testorg", CommonName: "server", SerialNumber: "1"}) {
+		t.Fatalf("local identity = %s", accepted.Local)
 	}
 	// Each side's outbound key must be the other's inbound key, or the first
 	// ESP packet decrypts to nothing on a tunnel both ends believe is up.
@@ -312,8 +316,8 @@ func TestInitiatorAnswersCookieChallenge(t *testing.T) {
 	t.Cleanup(func() { session.Mux().Close() })
 	select {
 	case accepted := <-h.identities:
-		if accepted.CommonName != "client" {
-			t.Fatalf("the responder accepted %q", accepted.CommonName)
+		if accepted.Peer.CommonName != "client" {
+			t.Fatalf("the responder accepted %q", accepted.Peer.CommonName)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the responder never reported the accepted session")
