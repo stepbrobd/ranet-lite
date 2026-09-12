@@ -389,6 +389,14 @@ originated, so a node joining or leaving the mesh costs one dialer instead of
 dropping every SA this node is carrying. ranet's own `ExecReload` works the same
 way, and it matters because the registry is rewritten every time any node joins.
 
+What a reload changes is which peers this node dials, not which sessions it is
+already carrying. On a node with `responder` set, a peer removed from both
+`peers:` and the registry keeps the session it opened until one side goes: the
+dialer for it stops, and nothing evicts a session that is still answering. That
+is deliberate. The registry is rewritten on every join, so evicting on absence
+would mean a node that read it mid-write dropped every peer at once, which is a
+worse failure than carrying one peer too long. Restart the node to be rid of it.
+
 Everything else is refused rather than applied, because a reload cannot reach
 it. Identity, port, TUN device and local endpoints each change what peers have
 already authenticated or what the dataplane is attached to. The `babel` block is
