@@ -15,9 +15,8 @@ import (
 )
 
 const (
-	dpdInterval         = 10 * time.Second
-	requestPollInterval = 100 * time.Millisecond
-	maxMessageID        = ^uint32(0)
+	dpdInterval  = 10 * time.Second
+	maxMessageID = ^uint32(0)
 )
 
 var errMessageIDExhausted = errors.New("ike: Message ID space exhausted")
@@ -197,6 +196,8 @@ func (s *Session) Run(ctx context.Context) error {
 			startRekey(schedule)
 		}
 	}
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
 	for {
 		if err := s.expireRetiredChildren(time.Now()); err != nil {
 			return err
@@ -256,18 +257,56 @@ func (s *Session) Run(ctx context.Context) error {
 				deadline = schedule.deadline
 			}
 		}
-		// Mux has no selectable receive channel. Polling avoids another receiver.
-		if poll := time.Now().Add(requestPollInterval); poll.Before(deadline) {
-			deadline = poll
+		// The retirement sweep at the top of the loop has a deadline of its
+		// own. It used to be reached by the poll below; now it has to be one
+		// of the things the loop actually waits for.
+		if retire, ok := s.nextRetirement(); ok && retire.Before(deadline) {
+			deadline = retire
 		}
-		raw, source, err := s.mux.RecvIKEFromUntil(deadline)
-		if err != nil {
-			if !transport.IsTimeout(err) {
-				if pending != nil {
-					pending.result <- requestResult{err: err}
-				}
-				return err
+
+		// Everything this loop reacts to is selectable, so it sleeps until one
+		// of them happens rather than waking ten times a second to check. That
+		// matters on anything running on a battery: one idle session cost 10
+		// wakeups per second, and a laptop holds one per peer per family.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
 			}
+		}
+		timer.Reset(max(time.Until(deadline), 0))
+		// A local request is only accepted while no exchange is outstanding,
+		// which a nil channel expresses: IKEv2 permits one at a time.
+		var requests <-chan *localRequest
+		if pending == nil {
+			requests = s.requests
+		}
+		select {
+		case datagram := <-s.mux.IKE():
+			if s.dispatch(datagram.Raw, datagram.Endpoint, &pending) {
+				lastAuthenticated = time.Now()
+			}
+			continue
+		case <-s.mux.Done():
+			err := s.mux.Err()
+			if pending != nil {
+				pending.result <- requestResult{err: err}
+			}
+			return err
+		// These two are handled at the top of the loop; the cases exist so it
+		// wakes for them rather than sleeping until the next deadline. Putting
+		// the value back cannot block: both channels hold one element, this is
+		// their only reader, and each has a single producer that cannot have
+		// another value in flight.
+		case result := <-rekeyResult:
+			rekeyResult <- result
+			continue
+		case req := <-requests:
+			s.requests <- req
+			continue
+		case <-timer.C:
+		}
+		{
 			if pending != nil && !time.Now().Before(pending.deadline) {
 				if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
 					s.mux.Close()
@@ -286,17 +325,25 @@ func (s *Session) Run(ctx context.Context) error {
 				}
 				continue
 			}
+			// Re-read the traffic edge here rather than relying on the one at
+			// the top of the loop. ESP arrives without waking this select, so
+			// the timer fires exactly at the deadline with the flag still
+			// unconsumed, and a peer sending continuously would be probed every
+			// interval forever. RFC 7296 section 2.4 asks for a check only "if
+			// no cryptographically protected messages have been received".
+			if s.trafficSeen.Swap(false) {
+				lastAuthenticated = time.Now()
+				s.lastActive.Store(lastAuthenticated.UnixNano())
+			}
 			if pending == nil && !time.Now().Before(lastAuthenticated.Add(dpdInterval)) {
-				pending, err = s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})
+				started, err := s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})
 				if err != nil {
 					s.mux.Close()
 					return fmt.Errorf("ike: DPD failed: %w", err)
 				}
+				pending = started
 			}
 			continue
-		}
-		if s.dispatch(raw, source, &pending) {
-			lastAuthenticated = time.Now()
 		}
 	}
 }

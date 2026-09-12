@@ -106,6 +106,17 @@ func (s *Session) retireInboundLocked(spi uint32, replaced bool) error {
 	return nil
 }
 
+// nextRetirement is when the earliest replaced inbound SA may be dropped, so
+// the control loop can wait for it rather than poll for it.
+func (s *Session) nextRetirement() (time.Time, bool) {
+	s.childMu.Lock()
+	defer s.childMu.Unlock()
+	if len(s.retired) == 0 {
+		return time.Time{}, false
+	}
+	return s.retired[0].expiresAt, true
+}
+
 func (s *Session) expireRetiredChildren(now time.Time) error {
 	s.childMu.Lock()
 	defer s.childMu.Unlock()

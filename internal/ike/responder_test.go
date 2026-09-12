@@ -297,6 +297,50 @@ func TestSelectIKEProposalPrefersOurOrderAndReportsGroup(t *testing.T) {
 	})
 }
 
+// The control loop used to poll its own request queue ten times a second. With
+// the poll gone, a local exchange has to be picked up because the loop selects
+// on the queue, not because a timer happened to fire; if that regressed, this
+// would wait out the DPD interval instead.
+func TestLocalRequestIsPickedUpWithoutPolling(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	initiator, err := h.dial(t)
+	if err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	defer initiator.Mux().Close()
+	var responder *Session
+	select {
+	case responder = <-h.sessions:
+	case <-time.After(10 * time.Second):
+		t.Fatal("responder produced no session")
+	}
+	defer responder.Mux().Close()
+	<-h.identities
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go initiator.Run(ctx)
+	go responder.Run(ctx)
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := initiator.request(INFORMATIONAL, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("informational exchange: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("local request was not picked up within 2s, dpd interval is %s", dpdInterval)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("local request took %s", elapsed)
+	}
+}
+
 // A responder under cookie pressure is useless if the initiator cannot answer
 // the challenge, and a mesh of these nodes then partitions: every dial gets
 // N(COOKIE) on all its retransmissions and fails. RFC 7296 section 2.6 requires the

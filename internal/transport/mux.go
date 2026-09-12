@@ -70,9 +70,10 @@ type packetBind interface {
 // A receiver owns its buffers; their views remain valid until its next call.
 type receiveFunc func([][]byte, []int, []Endpoint) (int, error)
 
-type ikeDatagram struct {
-	raw      []byte
-	endpoint Endpoint
+// Datagram is one received IKE message and the endpoint it arrived from.
+type Datagram struct {
+	Raw      []byte
+	Endpoint Endpoint
 }
 
 type espDatagramBatch struct {
@@ -106,7 +107,7 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: parse remote endpoint: %w", err)
 	}
-	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan Datagram, 16), espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed.Load() {
 		h.mu.Unlock()
@@ -125,7 +126,7 @@ func (h *Hub) NewMuxTo(endpoint Endpoint) (*Mux, error) {
 	if endpoint == nil {
 		return nil, fmt.Errorf("transport: nil remote endpoint")
 	}
-	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan Datagram, 16), espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed.Load() {
 		h.mu.Unlock()
@@ -202,7 +203,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 	bufs, sizes, eps := make([][]byte, batch), make([]int, batch), make([]Endpoint, batch)
 	type pendingIKE struct {
 		mux      *Mux
-		datagram ikeDatagram
+		datagram Datagram
 	}
 	espBatches := make(map[*Mux][][]byte)
 	ikeDatagrams := make([]pendingIKE, 0, batch)
@@ -232,9 +233,9 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 					if m := h.ike[spi]; m != nil {
 						ikeDatagrams = append(ikeDatagrams, pendingIKE{
 							mux: m,
-							datagram: ikeDatagram{
-								raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
-								endpoint: eps[i],
+							datagram: Datagram{
+								Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
+								Endpoint: eps[i],
 							},
 						})
 					} else if h.listen != nil && eps[i] != nil {
@@ -305,7 +306,7 @@ type Mux struct {
 	hub           *Hub
 	endpointMu    sync.RWMutex
 	endpoint      Endpoint
-	ikeCh         chan ikeDatagram
+	ikeCh         chan Datagram
 	espRecvMu     sync.Mutex
 	espDispatchMu sync.Mutex
 	espTicket     uint64
@@ -466,11 +467,21 @@ func (m *Mux) RecvIKE() ([]byte, error) {
 func (m *Mux) RecvIKEFrom() ([]byte, Endpoint, error) {
 	select {
 	case d := <-m.ikeCh:
-		return d.raw, d.endpoint, nil
+		return d.Raw, d.Endpoint, nil
 	case <-m.done:
 		return nil, nil, m.doneError()
 	}
 }
+
+// IKE is the channel this peer's IKE messages arrive on, so a control loop can
+// select over it together with its own work instead of waking on a timer to
+// check both. It is the same queue the Recv methods drain, so only one reader
+// may use either at a time: the handshake uses Recv and hands over to the
+// control loop once the SA is established.
+func (m *Mux) IKE() <-chan Datagram { return m.ikeCh }
+
+// Err is why this mux is done, for a caller that selected on Done itself.
+func (m *Mux) Err() error { return m.doneError() }
 func (m *Mux) RecvIKEUntil(deadline time.Time) ([]byte, error) {
 	b, _, err := m.RecvIKEFromUntil(deadline)
 	return b, err
@@ -478,7 +489,7 @@ func (m *Mux) RecvIKEUntil(deadline time.Time) ([]byte, error) {
 func (m *Mux) RecvIKEFromUntil(deadline time.Time) ([]byte, Endpoint, error) {
 	select {
 	case d := <-m.ikeCh:
-		return d.raw, d.endpoint, nil
+		return d.Raw, d.Endpoint, nil
 	case <-m.done:
 		return nil, nil, m.doneError()
 	case <-time.After(time.Until(deadline)):
