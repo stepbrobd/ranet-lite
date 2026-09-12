@@ -54,6 +54,7 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -149,6 +150,16 @@ func (r Route) String() string {
 		return fmt.Sprintf("%s from %s metric %d", r.Destination, r.Source, r.Metric)
 	}
 	return fmt.Sprintf("%s metric %d", r.Destination, r.Metric)
+}
+
+// auditor is implemented by a platform that can report other writers in the
+// space this reconciler is about to take over. A platform that cannot answer
+// simply does not implement it.
+type auditor interface {
+	// foreignWriters returns each protocol already writing into the space,
+	// labeled for an operator rather than numbered, since the numbering is
+	// the platform's own registry.
+	foreignWriters() ([]string, error)
 }
 
 // platform is the kernel surface the reconciler drives. Everything above it is
@@ -271,6 +282,20 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	slog.Info("kernel reconciler started", "interface", r.cfg.Interface,
 		"table", r.cfg.Table, "protocol", r.cfg.Protocol)
 
+	// Installing takes over a same-key route rather than failing, so sharing a
+	// table with another daemon loses its routes quietly. Say so once at
+	// startup: on a fleet node mid-migration the other writer is BIRD in table
+	// 200, which is the intended overlap and still worth seeing.
+	if audit, ok := r.plat.(auditor); ok {
+		if writers, err := audit.foreignWriters(); err != nil {
+			slog.Warn("kernel could not check the table for other writers", "err", err)
+		} else if len(writers) > 0 {
+			slog.Warn("kernel is sharing its table with another routing protocol",
+				"table", r.cfg.Table, "protocols", strings.Join(writers, ", "),
+				"detail", "an install replaces a same-key route, so give this reconciler a table of its own")
+		}
+	}
+
 	backoff := time.Duration(0)
 	for ctx.Err() == nil {
 		if err := r.reconcile(); err != nil {
@@ -383,7 +408,7 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 				// the IPv4 FIB has no source-specific lookup, and installing
 				// such a route as an ordinary one would steal traffic from
 				// every other source. Report it and leave it to the mesh's
-				// own table, where forwarding still honours it.
+				// own table, where forwarding still honors it.
 				key := Route{Destination: destination, Source: entry.Source}
 				if !r.warned[key] {
 					slog.Warn("kernel cannot install source-specific IPv4 route",

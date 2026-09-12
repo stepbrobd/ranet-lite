@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
+	"slices"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 )
@@ -466,4 +469,106 @@ func notificationTable(message nlMessage) uint32 {
 		}
 	}
 	return table
+}
+
+// foreignWriters names the routing protocols other than this reconciler's that
+// already have unicast routes in the table it is about to take over.
+//
+// It exists because installation uses NLM_F_REPLACE, which takes over a
+// same-key route rather than failing, so a second writer in one table loses
+// routes silently. Everything else on a host keeps to its own table: Tailscale
+// uses 52, and BIRD on a ranet fleet node uses 200, which is exactly the table
+// this reconciler is pointed at during a migration. Reporting it is the
+// difference between a migration that looks fine and one that is visibly
+// sharing a table.
+func (p *netlinkPlatform) foreignWriters() ([]string, error) {
+	seen := map[uint8]bool{}
+	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
+		body := make([]byte, unix.SizeofRtMsg)
+		body[0] = family
+		replies, err := p.conn.execute(unix.RTM_GETROUTE, unix.NLM_F_DUMP, body)
+		if err != nil {
+			return nil, err
+		}
+		for _, reply := range replies {
+			if reply.Kind != unix.RTM_NEWROUTE || len(reply.Data) < unix.SizeofRtMsg {
+				continue
+			}
+			table, protocol, kind := uint32(reply.Data[4]), reply.Data[5], reply.Data[7]
+			if kind != unix.RTN_UNICAST || protocol == p.cfg.Protocol {
+				continue
+			}
+			for attr, value := range reply.attributes(unix.SizeofRtMsg) {
+				if attr == unix.RTA_TABLE && len(value) == 4 {
+					table = binary.NativeEndian.Uint32(value)
+				}
+			}
+			// RTPROT_KERNEL is excluded only in the main table, where it is
+			// the kernel's own plumbing for the machine's addresses. In any
+			// other table, and a VRF table is the case that matters, those
+			// same entries belong to whoever put the interface in the VRF and
+			// are exactly what an install must not take over.
+			if table != p.cfg.Table {
+				continue
+			}
+			if protocol == unix.RTPROT_KERNEL && p.cfg.Table == unix.RT_TABLE_MAIN {
+				continue
+			}
+			seen[protocol] = true
+		}
+	}
+	// Labeled here rather than by the caller, because rt_proto is a linux
+	// registry and kernel.go is the portable half. Returning the numbers bare
+	// also renders them unreadably: slog's text handler quotes a []uint8 as a
+	// byte string, so protocols 2 and 12 reach an operator as "\x02\f".
+	labels := make([]string, 0, len(seen))
+	for _, protocol := range slices.Sorted(maps.Keys(seen)) {
+		labels = append(labels, protocolLabel(protocol))
+	}
+	return labels, nil
+}
+
+// protocolLabel names a routing protocol the way iproute2 prints it, from the
+// rt_protos registry, and falls back to the bare number for one nothing has
+// claimed. The two a fleet node meets in table 200 are bird and the kernel's
+// own entries for the links enslaved to the VRF.
+func protocolLabel(protocol uint8) string {
+	var name string
+	switch protocol {
+	case unix.RTPROT_REDIRECT:
+		name = "redirect"
+	case unix.RTPROT_KERNEL:
+		name = "kernel"
+	case unix.RTPROT_BOOT:
+		name = "boot"
+	case unix.RTPROT_STATIC:
+		name = "static"
+	case unix.RTPROT_RA:
+		name = "ra"
+	case unix.RTPROT_ZEBRA:
+		name = "zebra"
+	case unix.RTPROT_BIRD:
+		name = "bird"
+	case unix.RTPROT_DHCP:
+		name = "dhcp"
+	case unix.RTPROT_KEEPALIVED:
+		name = "keepalived"
+	case unix.RTPROT_BABEL:
+		name = "babel"
+	case unix.RTPROT_OPENR:
+		name = "openr"
+	case unix.RTPROT_BGP:
+		name = "bgp"
+	case unix.RTPROT_ISIS:
+		name = "isis"
+	case unix.RTPROT_OSPF:
+		name = "ospf"
+	case unix.RTPROT_RIP:
+		name = "rip"
+	case unix.RTPROT_EIGRP:
+		name = "eigrp"
+	default:
+		return strconv.Itoa(int(protocol))
+	}
+	return name + " (" + strconv.Itoa(int(protocol)) + ")"
 }

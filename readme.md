@@ -296,6 +296,37 @@ inbound ESP packet and drop counters. Everything is read from live state at
 scrape time, so a scrape reflects the instant it happened rather than a sampled
 snapshot.
 
+## Sharing a host with other networking
+
+ranet-lite is built to run next to Tailscale, NetBird, ZeroTier, an SD-WAN
+agent, or anything else that owns interfaces and routes on the same box, and the
+reconciler's ownership rules are what make that true rather than a hope.
+
+On Linux it reads back only routes whose table, `rt_proto` and output interface
+all match its own, so a delete list can never contain another writer's route,
+and `RTM_DELROUTE` carries `rtm_protocol` as well, so the kernel refuses too. It
+never touches another table, another protocol, another device, or any policy
+rule. Installing does replace a same-key route in its own table, so the table
+should belong to it alone; it now says so at startup if it finds another routing
+protocol already writing there.
+
+On darwin there are no tables and no `rt_proto`, so ownership is by interface
+and by shape: a route out of its own utun whose gateway is a link address naming
+that interface. Interface-scoped routes are the exception, and a narrow one,
+because a scoped route is exactly what this reconciler installs for a
+source-specific announcement and also what other tools install. A macOS host
+running Tailscale carries a scoped `255.255.255.255` entry on `utun7` with a
+link gateway and `RTF_STATIC`, which is otherwise indistinguishable, so a scoped
+route counts as this reconciler's only when this process scoped that
+destination. One left behind by a crash is left alone rather than deleted on a
+guess.
+
+Addresses are narrower still: only an address this process added is ever
+removed, and one already on the link belongs to whoever put it there. The TUN is
+enslaved to a VRF only while it has no master at all, so systemd-networkd keeps
+whatever it already claimed. The device itself is created by asking for the next
+free unit, so it never takes a name another tunnel is using.
+
 ## Reloading
 
 `SIGHUP` re-reads the config file and the registry and reconciles rather than
