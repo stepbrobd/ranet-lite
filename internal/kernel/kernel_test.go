@@ -545,21 +545,42 @@ func TestNewRejectsAReservedProtocol(t *testing.T) {
 	}
 }
 
+// Both lists come out sorted, so one pass produces the same order as the next
+// and a log line or a diff of two passes is comparable. A one-element list is
+// sorted whatever the code does, so this needs several on each side.
 func TestDiffRoutesIsSorted(t *testing.T) {
 	desired := []Route{
 		{Destination: prefix("10.1.0.0/16")},
 		{Destination: prefix("10.0.0.0/8")},
+		{Destination: prefix("2001:db8:1::/48")},
+		{Destination: prefix("2001:db8::/48")},
+		{Destination: prefix("10.2.0.0/16")},
 	}
 	actual := []Route{
 		{Destination: prefix("10.1.0.0/16")},
 		{Destination: prefix("192.0.2.0/24")},
+		{Destination: prefix("203.0.113.0/24")},
+		{Destination: prefix("2001:db8:99::/48")},
+		{Destination: prefix("198.51.100.0/24")},
 	}
 	add, del := diffRoutes(desired, actual)
-	if !slices.Equal(add, []Route{{Destination: prefix("10.0.0.0/8")}}) {
-		t.Fatalf("add is %v", add)
+	if len(add) < 2 || len(del) < 2 {
+		t.Fatalf("add %v and del %v are too short to be a test of ordering", add, del)
 	}
-	if !slices.Equal(del, []Route{{Destination: prefix("192.0.2.0/24")}}) {
-		t.Fatalf("del is %v", del)
+	if !slices.IsSortedFunc(add, compareRoutes) {
+		t.Errorf("the routes to install came out unsorted: %v", add)
+	}
+	if !slices.IsSortedFunc(del, compareRoutes) {
+		t.Errorf("the routes to withdraw came out unsorted: %v", del)
+	}
+	// And the sets themselves are still right.
+	want := []Route{
+		{Destination: prefix("10.0.0.0/8")}, {Destination: prefix("10.2.0.0/16")},
+		{Destination: prefix("2001:db8::/48")}, {Destination: prefix("2001:db8:1::/48")},
+	}
+	slices.SortFunc(want, compareRoutes)
+	if !slices.Equal(add, want) {
+		t.Errorf("add is %v, want %v", add, want)
 	}
 }
 

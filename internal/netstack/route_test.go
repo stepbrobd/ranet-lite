@@ -290,3 +290,61 @@ func TestRouteTableTrieRemovePeerCompactsAcrossFamilies(t *testing.T) {
 		t.Fatalf("b's IPv6 route should be unaffected, got %v, %v", peer, ok)
 	}
 }
+
+// The kernel reconciler mirrors Snapshot and can only encode a unicast route,
+// so a prefix held unreachable must not appear in it. Installing the hold as a
+// real route would point a kernel route at a peer that cannot carry it.
+func TestSnapshotOmitsTheUnreachableHold(t *testing.T) {
+	rt := NewRouteTable()
+	peer := NewPeer("peer", nil, nil)
+	held := netip.MustParsePrefix("2001:db8:1::/48")
+	rt.Set(netip.Prefix{}, netip.MustParsePrefix("2001:db8::/48"), peer)
+	rt.Set(netip.Prefix{}, held, Unreachable)
+
+	for _, route := range rt.Snapshot() {
+		if route.Destination == held {
+			t.Fatalf("the unreachable hold for %s reached the reconciler's snapshot", held)
+		}
+		if route.Value == Unreachable {
+			t.Fatalf("the unreachable sentinel reached the reconciler's snapshot as %v", route)
+		}
+	}
+	if len(rt.Snapshot()) != 1 {
+		t.Fatalf("snapshot has %d routes, want the one real route", len(rt.Snapshot()))
+	}
+	// It is still a hold for forwarding, which is the whole point of keeping
+	// the entry rather than removing it.
+	if _, ok := rt.Lookup(netip.Addr{}, held.Addr().Next()); ok {
+		t.Error("a packet for a held prefix was routed rather than dropped")
+	}
+}
+
+// Changed is how the reconciler learns a route moved without waiting out its
+// periodic sweep, which at the default interval is thirty seconds of the
+// kernel disagreeing with the mesh.
+func TestEveryTableChangeWakesTheReconciler(t *testing.T) {
+	rt := NewRouteTable()
+	peer := NewPeer("peer", nil, nil)
+	drain := func() {
+		select {
+		case <-rt.Changed():
+		default:
+		}
+	}
+	for name, change := range map[string]func(){
+		"set":        func() { rt.Set(netip.Prefix{}, netip.MustParsePrefix("10.0.0.0/8"), peer) },
+		"remove":     func() { rt.Remove(netip.Prefix{}, netip.MustParsePrefix("10.0.0.0/8")) },
+		"removePeer": func() { rt.RemovePeer(peer) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt.Set(netip.Prefix{}, netip.MustParsePrefix("10.0.0.0/8"), peer)
+			drain()
+			change()
+			select {
+			case <-rt.Changed():
+			default:
+				t.Errorf("a %s left the reconciler asleep until its next sweep", name)
+			}
+		})
+	}
+}

@@ -493,32 +493,7 @@ func (p *netlinkPlatform) foreignWriters() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, reply := range replies {
-			if reply.Kind != unix.RTM_NEWROUTE || len(reply.Data) < unix.SizeofRtMsg {
-				continue
-			}
-			table, protocol, kind := uint32(reply.Data[4]), reply.Data[5], reply.Data[7]
-			if kind != unix.RTN_UNICAST || protocol == p.cfg.Protocol {
-				continue
-			}
-			for attr, value := range reply.attributes(unix.SizeofRtMsg) {
-				if attr == unix.RTA_TABLE && len(value) == 4 {
-					table = binary.NativeEndian.Uint32(value)
-				}
-			}
-			// RTPROT_KERNEL is excluded only in the main table, where it is
-			// the kernel's own plumbing for the machine's addresses. In any
-			// other table, and a VRF table is the case that matters, those
-			// same entries belong to whoever put the interface in the VRF and
-			// are exactly what an install must not take over.
-			if table != p.cfg.Table {
-				continue
-			}
-			if protocol == unix.RTPROT_KERNEL && p.cfg.Table == unix.RT_TABLE_MAIN {
-				continue
-			}
-			seen[protocol] = true
-		}
+		collectForeignWriters(replies, p.cfg.Table, p.cfg.Protocol, seen)
 	}
 	// Labeled here rather than by the caller, because rt_proto is a linux
 	// registry and kernel.go is the portable half. Returning the numbers bare
@@ -574,4 +549,35 @@ func protocolLabel(protocol uint8) string {
 		return strconv.Itoa(int(protocol))
 	}
 	return name + " (" + strconv.Itoa(int(protocol)) + ")"
+}
+
+// collectForeignWriters is the filter half of foreignWriters, split out so the
+// rule can be tested without a netlink socket.
+func collectForeignWriters(replies []nlMessage, table uint32, ours uint8, seen map[uint8]bool) {
+	for _, reply := range replies {
+		if reply.Kind != unix.RTM_NEWROUTE || len(reply.Data) < unix.SizeofRtMsg {
+			continue
+		}
+		routeTable, protocol, kind := uint32(reply.Data[4]), reply.Data[5], reply.Data[7]
+		if kind != unix.RTN_UNICAST || protocol == ours {
+			continue
+		}
+		for attr, value := range reply.attributes(unix.SizeofRtMsg) {
+			if attr == unix.RTA_TABLE && len(value) == 4 {
+				routeTable = binary.NativeEndian.Uint32(value)
+			}
+		}
+		// RTPROT_KERNEL is excluded only in the main table, where it is the
+		// kernel's own plumbing for the machine's addresses. In any other
+		// table, and a VRF table is the case that matters, those same entries
+		// belong to whoever put the interface in the VRF and are exactly what
+		// an install must not take over.
+		if routeTable != table {
+			continue
+		}
+		if protocol == unix.RTPROT_KERNEL && table == unix.RT_TABLE_MAIN {
+			continue
+		}
+		seen[protocol] = true
+	}
 }

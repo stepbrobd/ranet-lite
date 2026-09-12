@@ -498,3 +498,54 @@ func TestAStalledNeighborDoesNotHoldTheOthers(t *testing.T) {
 		t.Error("the healthy neighbor received nothing")
 	}
 }
+
+// The speaker's construction wires three things nothing else sets, and each
+// can be nulled out with the rest of the suite green: the route table's
+// forwarding-entry removal, and the two Appendix A.3 hysteresis parameters.
+func TestSpeakerConstructionWiresTheRouteTable(t *testing.T) {
+	cfg := Config{HelloInterval: 4 * time.Second, UpdateInterval: 16 * time.Second}
+	cfg.Cost = DefaultCostParams()
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := New(cfg, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speaker.routes.forget == nil {
+		t.Error("the route table cannot drop a forwarding entry, so every expired route leaks one")
+	} else {
+		key := routeKey{dest: netip.MustParsePrefix("fd00:a::/64")}
+		mesh.Routes.Set(key.source, key.dest, netstack.Unreachable)
+		speaker.routes.forget(key)
+		if _, ok := mesh.Routes.Lookup(netip.Addr{}, key.dest.Addr().Next()); ok {
+			t.Error("forget left the forwarding entry behind")
+		}
+	}
+	// RFC 8966 Appendix A.3 recommends a hysteresis time constant of a small
+	// multiple of the Hello interval. Zero turns the smoothing off entirely.
+	if speaker.routes.tau == 0 {
+		t.Error("hysteresis is disabled, so a flapping link changes the selected route every update")
+	}
+	if speaker.routes.trigger == 0 {
+		t.Error("the triggered-update threshold is zero, so every metric change sends one")
+	}
+}
+
+// The defaults are a fleet interoperability choice, not an arbitrary number.
+func TestBabelDefaultsMatchTheFleet(t *testing.T) {
+	cost := DefaultCostParams()
+	// BABEL_RXCOST_WIRED, which is what BIRD uses and what the fleet sets
+	// explicitly. At 32 a ranet-lite hop looks three times cheaper than a BIRD
+	// hop and a mixed fleet pulls transit onto whichever nodes run this.
+	if cost.RxCost != 96 {
+		t.Errorf("default rxcost is %d, want 96", cost.RxCost)
+	}
+	if cost.RTTCost != 1024 || cost.RTTMax != 1024*time.Millisecond {
+		t.Errorf("default rtt costing is %d over %s, want 1024 over 1024ms", cost.RTTCost, cost.RTTMax)
+	}
+	var cfg Config
+	cfg.setDefaults()
+	if cfg.HelloInterval != 4*time.Second || cfg.UpdateInterval != 16*time.Second {
+		t.Errorf("default intervals are %s and %s, want 4s and 16s, which is what RFC 8966 Appendix B gives",
+			cfg.HelloInterval, cfg.UpdateInterval)
+	}
+}
