@@ -147,8 +147,13 @@ If both peers initiate a rekey of the same Child SA concurrently, ranet-lite
 answers the peer's rekey with `TEMPORARY_FAILURE`. The RFC recommends completing
 both exchanges, temporarily retaining the redundant SAs, and using the four
 nonces to decide which new SA to delete. Returning the error keeps ranet-lite's
-single-Child-SA state machine simple and causes the peer to retry after the
-local rekey finishes.
+single-Child-SA state machine simple. Both ends fail at the same instant and
+reset the same backoff, so the retry is drawn from the upper half of its window
+rather than run at the window's end; without that spread the retry reproduces
+the phase difference that caused the collision and collides again indefinitely,
+which is the jitter
+[RFC 7296 section 2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)
+asks for.
 
 The remaining narrow feature set is not counted as RFC non-compliance.
 Raw-public-key authentication without certificates or EAP and refusal to create

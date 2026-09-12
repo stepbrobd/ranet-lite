@@ -98,16 +98,32 @@ func (s *Session) rekeyDelay(interval time.Duration) (time.Duration, error) {
 	return delay, nil
 }
 
+// rekeyRetryDelay backs off exponentially and then spreads the result over the
+// upper half of that window. The spread is what breaks a simultaneous rekey:
+// both ends of a collision fail at the same instant and reset the same
+// deterministic backoff, so an unjittered retry reproduces the phase
+// difference that caused the collision and collides again, forever. RFC 7296
+// section 2.8 asks for the jitter for that reason.
 func (s *Session) rekeyRetryDelay(failures uint) time.Duration {
 	delay := s.rekeyRetryInitial
 	for failures > 1 {
 		if delay >= s.rekeyRetryMax/2 {
-			return s.rekeyRetryMax
+			delay = s.rekeyRetryMax
+			break
 		}
 		delay *= 2
 		failures--
 	}
-	return delay
+	source := s.rekeyJitterSource
+	if source == nil {
+		source = randomRekeyJitter
+	}
+	// A retry that cannot draw randomness is still better run unjittered.
+	jitter, err := source(delay / 2)
+	if err != nil || jitter < 0 || jitter > delay/2 {
+		return delay
+	}
+	return delay - jitter
 }
 
 func (s *Session) newRekeySchedule(name string, interval time.Duration, run func() error) (*rekeySchedule, error) {

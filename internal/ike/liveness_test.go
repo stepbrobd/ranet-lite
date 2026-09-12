@@ -77,7 +77,11 @@ func TestSupportedPayloadTypeRejectsUnknownCriticalType(t *testing.T) {
 }
 
 func TestRekeyRetryDelay(t *testing.T) {
-	s := &Session{rekeyRetryInitial: 5 * time.Second, rekeyRetryMax: time.Minute}
+	s := &Session{
+		rekeyRetryInitial: 5 * time.Second,
+		rekeyRetryMax:     time.Minute,
+		rekeyJitterSource: func(time.Duration) (time.Duration, error) { return 0, nil },
+	}
 	for _, test := range []struct {
 		failures uint
 		want     time.Duration
@@ -92,6 +96,23 @@ func TestRekeyRetryDelay(t *testing.T) {
 		if got := s.rekeyRetryDelay(test.failures); got != test.want {
 			t.Errorf("retry delay after %d failures = %s, want %s", test.failures, got, test.want)
 		}
+	}
+}
+
+// Two ends of a simultaneous rekey fail at the same instant and reset the same
+// backoff, so an unjittered retry collides again on every attempt.
+func TestRekeyRetryDelayIsSpreadOverTheUpperHalfOfTheWindow(t *testing.T) {
+	s := &Session{rekeyRetryInitial: 5 * time.Second, rekeyRetryMax: time.Minute}
+	seen := make(map[time.Duration]bool)
+	for range 64 {
+		got := s.rekeyRetryDelay(3)
+		if got < 10*time.Second || got > 20*time.Second {
+			t.Fatalf("retry delay = %s, want it within 10s..20s", got)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 32 {
+		t.Fatalf("64 draws produced %d distinct delays, want a spread", len(seen))
 	}
 }
 
