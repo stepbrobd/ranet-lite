@@ -43,9 +43,12 @@ Appendix E stub that never re-advertises a learned route, which is what made
 it loop-free by construction. The speaker here implements the source table and
 the feasibility condition instead, and redistributes its selected routes, so
 loop freedom comes from the mechanism the RFC provides rather than from an
-inability to relay. A node that advertises transit still has to forward it:
-nothing in this binary enables IP forwarding, and the routes have to reach the
-kernel, which is what the `kernel` block below is for.
+inability to relay. A node that advertises transit still has to be able to forward it, which is
+three things this binary does not do for you: `net.ipv4.ip_forward` and
+`net.ipv6.conf.all.forwarding` have to be on, the learned routes have to reach
+a kernel table the node actually consults, which is what the `kernel` block
+below is for, and the TUN has to be allowed to forward back out of itself.
+Advertising transit without them means announced paths blackhole.
 
 It implements genuine source-specific routing
 ([SADR, RFC 9079](https://www.rfc-editor.org/rfc/rfc9079)):
