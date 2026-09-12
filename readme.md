@@ -83,10 +83,13 @@ its `[Tun]` section). Single-core processes can also attach to a legacy
 single-queue TUN. TUN readers hand bounded batches to shared encryption workers;
 sequence reservation and queue submission preserve packet order across workers.
 
-The Babel control state and forwarding publication share one mutex. A stub
-selects the cheapest live candidate without a feasibility/source table, as
-permitted by [RFC 8966 Appendix E](https://www.rfc-editor.org/rfc/rfc8966.html#appendix-E).
-Local prefixes take precedence even after a router-ID change. Remote Hello,
+The Babel control state and forwarding publication share one mutex. Selection
+runs over feasible routes only, against the source table this fork added, since
+a speaker that re-advertises what it learns can no longer rely on the
+structural loop freedom of [RFC 8966 Appendix E](https://www.rfc-editor.org/rfc/rfc8966.html#appendix-E).
+Every finite advertisement leaves through one function, which records the
+feasibility distance before the packet is built. Local prefixes take precedence
+even after a router-ID change. Remote Hello,
 IHU, and Update expiration is scheduled independently of local send intervals.
 
 Packet lookups read an immutable SADR trie snapshot without locking. Route
