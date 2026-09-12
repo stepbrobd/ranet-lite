@@ -40,6 +40,9 @@ type pendingRequest struct {
 	msgID    uint32
 	raw      []byte
 	attempts int
+	// sent counts transmissions. attempts drives the backoff and stops
+	// growing at maxRetransmits, so it cannot also bound the exchange.
+	sent     int
 	deadline time.Time
 }
 
@@ -452,6 +455,7 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 }
 
 func (s *Session) sendPending(pending *pendingRequest) error {
+	pending.sent++
 	nextAttempt := min(pending.attempts+1, maxRetransmits)
 	pending.deadline = time.Now().Add(retransmitDelay(nextAttempt))
 	pending.attempts = nextAttempt
@@ -462,7 +466,23 @@ func (s *Session) sendPending(pending *pendingRequest) error {
 }
 
 func pendingRetransmitsExhausted(pending *pendingRequest, peerAlive bool) bool {
-	return pending.attempts >= maxRetransmits && (pending.dpd || !peerAlive)
+	if pending.attempts < maxRetransmits {
+		return false
+	}
+	if pending.dpd || !peerAlive {
+		return true
+	}
+	// A peer that keeps authenticated traffic flowing gets more room, because
+	// an ordinary exchange can lose out to a busy control loop for a while.
+	// Not unlimited room: this exchange holds the one outstanding local
+	// request IKEv2 allows, so until it ends there is no rekey, no Delete on
+	// teardown and no dead peer detection, and the session reports up the
+	// whole time. A peer that answers ESP and never answers IKE, which it can
+	// do with RFC 4303 section 2.6 dummy packets alone, would otherwise pin it
+	// until the sequence space ran out. RFC 7296 section 2.1 leaves the policy
+	// open, "until it either receives a corresponding response or deems the
+	// IKE SA to have failed"; this is where it is deemed to have failed.
+	return pending.sent >= maxRetransmitsWhileBusy
 }
 
 func retransmitDelay(attempt int) time.Duration {

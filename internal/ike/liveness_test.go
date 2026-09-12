@@ -671,3 +671,35 @@ func TestActiveExpiresAndComesBack(t *testing.T) {
 		t.Error("a session that just proved itself still reads as dead")
 	}
 }
+
+// An exchange holds the one outstanding local request IKEv2 allows, so while
+// it is open there is no rekey, no Delete on teardown and no dead peer
+// detection, and the session reports up. A peer that keeps ESP flowing and
+// never answers IKE, which RFC 4303 section 2.6 dummy packets alone are enough
+// for, must not be able to pin it until the sequence space runs out.
+func TestAnExchangeAPeerNeverAnswersStillEnds(t *testing.T) {
+	ordinary := &pendingRequest{}
+	for range maxRetransmits {
+		ordinary.attempts = min(ordinary.attempts+1, maxRetransmits)
+		ordinary.sent++
+	}
+	if pendingRetransmitsExhausted(ordinary, true) {
+		t.Fatal("an exchange gave up at the ordinary limit while the peer was still proving it is there")
+	}
+	if !pendingRetransmitsExhausted(ordinary, false) {
+		t.Fatal("an exchange to a silent peer did not give up at the ordinary limit")
+	}
+	for ordinary.sent < maxRetransmitsWhileBusy {
+		ordinary.sent++
+	}
+	if !pendingRetransmitsExhausted(ordinary, true) {
+		t.Errorf("an exchange retransmitted %d times against a peer that answers ESP and not IKE, with no end in sight", ordinary.sent)
+	}
+
+	// Dead peer detection keeps its own tighter bound, because that exchange
+	// exists to decide exactly this.
+	dpd := &pendingRequest{localRequest: localRequest{dpd: true}, attempts: maxRetransmits, sent: maxRetransmits}
+	if !pendingRetransmitsExhausted(dpd, true) {
+		t.Error("a liveness check kept retransmitting because other traffic was arriving")
+	}
+}

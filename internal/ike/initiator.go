@@ -262,6 +262,10 @@ func (s *Session) NoteTraffic() { s.trafficSeen.Store(true) }
 const (
 	requestTimeout = 2 * time.Second
 	maxRetransmits = 5
+	// maxRetransmitsWhileBusy bounds an exchange the peer keeps alive without
+	// answering. The backoff is clamped at requestTimeout<<(maxRetransmits-1),
+	// so this is about eight minutes.
+	maxRetransmitsWhileBusy = 20
 	// RFC 7296 section 2.6 bounds a cookie to 1..64 octets.
 	maxCookieLength = 64
 )
