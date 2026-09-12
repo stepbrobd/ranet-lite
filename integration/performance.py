@@ -11,6 +11,7 @@ after processes exit.
 import argparse
 import concurrent.futures
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -46,6 +47,11 @@ parser.add_argument(
 )
 parser.add_argument("--peer-affinity")
 parser.add_argument("--peer-cores", type=int)
+parser.add_argument(
+    "--load-affinity",
+    help="pin both iperf3 processes, which otherwise float over every cpu "
+    "including the ones under test",
+)
 parser.add_argument("--client-port", type=int, default=20000)
 args = parser.parse_args()
 ranet_peer = args.peer == "ranet-lite"
@@ -73,12 +79,19 @@ if not ranet_peer and (args.peer_affinity or args.peer_cores):
     parser.error("--peer-affinity and --peer-cores require --peer ranet-lite")
 if args.peer_cores is not None and args.peer_cores < 1:
     parser.error("peer-cores must be positive")
-pinned = [cpu_list(spec) for spec in [args.affinity, args.peer_affinity] if spec]
-if len(pinned) == 2 and pinned[0] & pinned[1]:
-    # Both instances on one cpu measures how they contend, not the dataplane.
-    parser.error(
-        f"--affinity and --peer-affinity share cpus {sorted(pinned[0] & pinned[1])}"
-    )
+specs = {
+    "--affinity": args.affinity,
+    "--peer-affinity": args.peer_affinity,
+    "--load-affinity": args.load_affinity,
+}
+pinned = {name: cpu_list(spec) for name, spec in specs.items() if spec}
+for left, right in itertools.combinations(sorted(pinned), 2):
+    # Two of these on one cpu measures how they contend, not the dataplane.
+    # iperf3 matters as much as the instances here: at ten gigabits the two
+    # iperf3 processes are a serious consumer, and unpinned they land on the
+    # cpus under test.
+    if overlap := pinned[left] & pinned[right]:
+        parser.error(f"{left} and {right} share cpus {sorted(overlap)}")
 if any(
     direction not in {"bidir", "outbound", "inbound"}
     for direction in args.directions.split(",")
@@ -319,8 +332,10 @@ def traffic(label, address, flags, collect_profile=False):
             + {"plain-bidir": 0, "outbound": 100, "inbound": 200, "bidir": 300}[label]
         )
         flags = flags + ["--cport", str(port)]
+        load = ["taskset", "-c", args.load_affinity] if args.load_affinity else []
         result = run(
-            ["iperf3", "-c", address, "-P", args.streams, "-t", args.duration, "--json"]
+            load
+            + ["iperf3", "-c", address, "-P", args.streams, "-t", args.duration, "--json"]
             + flags,
             check=False,
             timeout=args.duration + 15,
@@ -545,7 +560,12 @@ protocol babel {
             "bird",
             gateway=True,
         )
-    start(["iperf3", "-s"], "iperf-server", gateway=True)
+    start(
+        (["taskset", "-c", args.load_affinity] if args.load_affinity else [])
+        + ["iperf3", "-s"],
+        "iperf-server",
+        gateway=True,
+    )
     public = (args.repo / "integration/org-pub.pem").read_text()
     registry = args.output / "registry.json"
     registry.write_text(
