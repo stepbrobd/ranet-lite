@@ -327,6 +327,14 @@ func (s *Session) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 		{
+			// An exchange whose IKE SA has gone can never be answered, and
+			// leaving it pending blocks every later local request for the life
+			// of the session, since IKEv2 permits one at a time.
+			if pending != nil && s.contextRetired(pending.context) {
+				pending.result <- requestResult{err: fmt.Errorf("ike: the IKE SA carrying this exchange was replaced")}
+				pending = nil
+				continue
+			}
 			if pending != nil && !time.Now().Before(pending.deadline) {
 				if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
 					s.mux.Close()
@@ -613,7 +621,7 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				if err != nil {
 					return nil, err
 				}
-				if s.removeRetainedContext(ctx) {
+				if s.removeRetainedContext(ctx) || s.adoptCollisionOnPeerDelete(ctx) {
 					s.mux.UnregisterIKE(ctx.spiI)
 					return response, nil
 				}

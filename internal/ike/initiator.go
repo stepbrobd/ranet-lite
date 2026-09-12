@@ -176,6 +176,33 @@ func (s *Session) removeRetainedContext(ctx *ikeContext) bool {
 	return false
 }
 
+// adoptCollisionOnPeerDelete is the second half of RFC 7296 section 2.8.2:
+// "If the peer that did notice the simultaneous rekey gets the delete request
+// from the other peer for the old IKE SA, it knows that the other peer did not
+// detect the simultaneous rekey, and the first peer can forget its own rekey
+// attempt." The peer's new SA is the candidate already held as the loser of a
+// collision only this end saw, so it becomes current. Without this the Delete
+// matches no retained context and closes a session the peer believes is fine,
+// and the window is not microseconds: localRekey is set before the request
+// goes out, so any exchange already pending widens it to that exchange's whole
+// lifetime.
+func (s *Session) adoptCollisionOnPeerDelete(ctx *ikeContext) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if ctx != s.current || s.collision == nil || s.localRekey == nil {
+		return false
+	}
+	s.current, s.collision, s.localRekey = s.collision, nil, nil
+	return true
+}
+
+// contextRetired reports an IKE SA this session no longer holds in any role.
+func (s *Session) contextRetired(ctx *ikeContext) bool {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return ctx != s.current && ctx != s.old && ctx != s.collision
+}
+
 // SetRekeyIntervals configures optional periodic Child and IKE SA rekeys.
 // Zero disables an interval. It must be called before Run.
 func (s *Session) SetRekeyIntervals(child, ike time.Duration) error {
