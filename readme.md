@@ -52,12 +52,18 @@ prefix as a tiebreaker among equally-specific destinations) using each
 packet's real source address as it arrives on the TUN device — not an
 approximation based on a single configured "our address".
 
-**ranet-lite never manages the TUN device's address or routes.** It
-creates the device and brings it up, or attaches to the configured `tun`
-device. Assign its addresses and kernel routes externally. Babel only exchanges
-control packets inside authenticated ESP tunnels; a local routing daemon cannot
-peer with the embedded speaker over the TUN. Learned routes select the outgoing
-ESP peer after the kernel has routed a packet to the TUN.
+**ranet-lite does not manage the TUN device's address or routes unless you
+ask it to.** It creates the device and brings it up, or attaches to the
+configured `tun` device, and by default assigning its addresses and kernel
+routes is external. This fork adds an optional reconciler, `internal/kernel`,
+which mirrors the learned routes into one Linux routing table it owns and can
+assign the configured addresses; see the `kernel` block in the configuration
+below. It is off unless enabled.
+
+Babel only exchanges control packets inside authenticated ESP tunnels; a local
+routing daemon cannot peer with the embedded speaker over the TUN. Learned
+routes select the outgoing ESP peer after the kernel has routed a packet to
+the TUN.
 
 IPv4 announcements use the control link's IPv6 link-local next hop (AE 4).
 The BIRD peer needs Babel's `extended next hop` support, enabled by default
@@ -244,6 +250,22 @@ peers:
 babel:
   hello_interval: 20s
   update_interval: 80s
+
+# Optional: mirror the routes babel learns into a Linux routing table, taking
+# over from BIRD's kernel protocols. Off unless enabled. The reconciler owns
+# exactly the routes carrying its own protocol, in its own table, out of the
+# TUN, and will never remove anything else. Installs replace a same-key route,
+# so give it a table no other daemon writes.
+# kernel:
+#   enabled: true
+#   table: 200                     # the table the policy rules look up
+#   protocol: 155                  # rt_proto marking this reconciler's routes
+#   metric: 32
+#   prefsrc4: 10.66.0.5            # RTA_PREFSRC on v4 routes, as krt_prefsrc does
+#   addresses: ["10.66.0.5/32"]    # assigned to the TUN, removed again at exit
+#   assign_originated: false       # also assign every prefix in originate
+#   vrf: gravity                   # joined only while the link has no master
+#   reconcile_interval: 30s
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
@@ -265,6 +287,8 @@ either; only synthetic fixtures belong in version control (see
 - `internal/netstack` — the TUN device and the `(source, destination)`
   route table.
 - `internal/babel` — the embedded Babel speaker.
+- `internal/kernel` — the optional reconciler mirroring learned routes into a
+  Linux routing table it owns, and the TUN's addresses.
 - `internal/packet` — shared validation of TUN and decrypted IP packets.
 - `sadr` — immutable source/destination routing trie and snapshot iteration.
 - `internal/registry` — ranet-compatible `registry.json` and Ed25519 key
