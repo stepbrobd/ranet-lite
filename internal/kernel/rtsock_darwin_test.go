@@ -26,7 +26,11 @@ const darwinNetTestEnv = "RANET_LITE_DARWIN_NETTEST"
 var (
 	netTestRoute4 = prefix("198.51.100.0/24")
 	netTestHost4  = prefix("198.51.100.42/32")
-	netTestRoute6 = prefix("2001:db8::/48")
+	// deliberately not the address's own prefix: assigning an IPv6 address
+	// makes in6_ifinit create the connected route for it, and this reconciler
+	// can only own routes it installed itself. IPv4 has no such collision on a
+	// point to point link, where in_ifinit adds only the host route.
+	netTestRoute6 = prefix("2001:db8:1::/48")
 	netTestAddr4  = prefix("198.51.100.1/24")
 	netTestAddr6  = prefix("2001:db8::1/48")
 )
