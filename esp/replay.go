@@ -52,10 +52,7 @@ func (w *replayWindow) commit(seq uint32) {
 		if diff >= w.window {
 			clear(w.mask)
 		} else {
-			pos := (w.last - 1) % w.window
-			for i := uint32(1); i < diff; i++ {
-				w.clear((pos + i) % w.window)
-			}
+			w.clearRange((w.last-1)%w.window+1, diff-1)
 		}
 		w.last, bit = seq, (seq-1)%w.window
 	} else {
@@ -64,10 +61,44 @@ func (w *replayWindow) commit(seq uint32) {
 	w.mark(bit)
 }
 
+// clearRange clears n bits from start, wrapping at the window. The positions a
+// forward jump skips are one or two contiguous runs, so they come out a word at
+// a time rather than one division and one mask per bit. A peer that chooses its
+// sequence numbers just under a window apart maximizes that loop: on the
+// default 4096-packet window it cost microseconds of the per-session commit
+// emitter, which is single-threaded and holds the inbound SA's lock, for a
+// packet the peer spent about a hundred nanoseconds sealing.
+func (w *replayWindow) clearRange(start, n uint32) {
+	if n == 0 {
+		return
+	}
+	start %= w.window
+	if start+n > w.window {
+		head := w.window - start
+		w.clearSpan(start, head)
+		w.clearSpan(0, n-head)
+		return
+	}
+	w.clearSpan(start, n)
+}
+
+// clearSpan clears n bits from start without wrapping.
+func (w *replayWindow) clearSpan(start, n uint32) {
+	for end := start + n; start < end; {
+		offset := start % 64
+		bits := min(64-offset, end-start)
+		mask := ^uint64(0)
+		if bits < 64 {
+			mask = uint64(1)<<bits - 1
+		}
+		w.mask[start/64] &^= mask << offset
+		start += bits
+	}
+}
+
 func (w *replayWindow) bit(last, diff uint32) uint32 {
 	pos := (last - 1) % w.window
 	return (pos + w.window - diff) % w.window
 }
 func (w *replayWindow) set(bit uint32) bool { return w.mask[bit/64]&(uint64(1)<<(bit%64)) != 0 }
 func (w *replayWindow) mark(bit uint32)     { w.mask[bit/64] |= uint64(1) << (bit % 64) }
-func (w *replayWindow) clear(bit uint32)    { w.mask[bit/64] &^= uint64(1) << (bit % 64) }
