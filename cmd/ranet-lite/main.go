@@ -1,22 +1,29 @@
 // Command ranet-lite connects a real TUN device to a ranet mesh through
-// userspace IKEv2/ESP and an embedded Babel stub. Address and kernel route
-// configuration are external; Babel exchanges control packets inside ESP.
+// userspace IKEv2/ESP and an embedded Babel stub. Babel exchanges control
+// packets inside ESP. Address and kernel route configuration are external
+// unless the kernel block in the config file turns the reconciler on.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/NickCao/ranet-lite/internal/client"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/kernel"
 )
 
 func main() {
@@ -54,10 +61,45 @@ func main() {
 	}
 	defer node.Close()
 	mesh := node.Mesh
-	log.Printf("tun device %s ready with %d queues; configure its addresses and kernel routes externally", mesh.Name, mesh.QueueCount())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// The reconciler is opt-in, so an existing deployment keeps configuring
+	// the device externally.
+	var reconciler sync.WaitGroup
+	if cfg.Kernel.Enabled {
+		kernelCfg, err := kernelConfig(cfg, mesh.Name)
+		if err != nil {
+			log.Fatal(err)
+		}
+		routes, err := kernel.New(kernelCfg, mesh.Routes)
+		if err != nil {
+			log.Fatal(err)
+		}
+		reconciler.Go(func() {
+			if err := routes.Run(ctx); err != nil {
+				log.Printf("kernel: %v", err)
+			}
+		})
+		log.Printf("tun device %s ready with %d queues; reconciling its routes into table %d",
+			mesh.Name, mesh.QueueCount(), kernelCfg.Table)
+	} else {
+		log.Printf("tun device %s ready with %d queues; configure its addresses and kernel routes externally",
+			mesh.Name, mesh.QueueCount())
+	}
+
+	// The reconciler has to finish withdrawing while the TUN still exists,
+	// and client.Run destroys it as soon as its own context is done. So the
+	// mesh runs on a context cancelled only once the reconciler has returned;
+	// the signal context still stops both, just in that order.
+	meshCtx, stopMesh := context.WithCancel(context.Background())
+	defer stopMesh()
+	go func() {
+		<-ctx.Done()
+		reconciler.Wait()
+		stopMesh()
+	}()
 
 	// SIGUSR1 dumps the current mesh route table to the log — the fastest
 	// way to see what babel has actually installed without wiring up a
@@ -85,7 +127,52 @@ func main() {
 		}
 	}()
 
-	if err := node.Run(ctx); err != nil && ctx.Err() == nil {
+	if err := node.Run(meshCtx); err != nil && ctx.Err() == nil {
 		log.Printf("client: %v", err)
 	}
+	// Whichever side stopped first, stop the other, then let the reconciler
+	// finish withdrawing before the process exits.
+	cancel()
+	reconciler.Wait()
+}
+
+// kernelConfig resolves the config file's kernel block against the device the
+// mesh actually got and the prefixes this node originates. The addresses are
+// parsed here rather than in config.Load, so the reconciler's own validation
+// in kernel.New stays the single place that decides what it accepts.
+func kernelConfig(cfg *config.Config, device string) (kernel.Config, error) {
+	out := kernel.Config{
+		Interface: device,
+		Table:     cfg.Kernel.Table,
+		Protocol:  cfg.Kernel.Protocol,
+		Metric:    cfg.Kernel.Metric,
+		VRF:       cfg.Kernel.VRF,
+	}
+	if cfg.Kernel.ReconcileInterval != nil {
+		out.ReconcileInterval = time.Duration(*cfg.Kernel.ReconcileInterval)
+	}
+	if raw := cfg.Kernel.PrefSrc4; raw != "" {
+		address, err := netip.ParseAddr(raw)
+		if err != nil {
+			return kernel.Config{}, fmt.Errorf("config: kernel.prefsrc4 %q: %w", raw, err)
+		}
+		out.PrefSrc4 = address
+	}
+	raw := cfg.Kernel.Addresses
+	if cfg.Kernel.AssignOriginated {
+		raw = append(slices.Clone(raw), cfg.Originate...)
+	}
+	seen := make(map[netip.Prefix]bool, len(raw))
+	for _, entry := range raw {
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return kernel.Config{}, fmt.Errorf("config: kernel.addresses %q: %w", entry, err)
+		}
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		out.Addresses = append(out.Addresses, prefix)
+	}
+	return out, nil
 }
