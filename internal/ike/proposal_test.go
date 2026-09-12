@@ -46,7 +46,7 @@ func TestDecodeSARejectsInconsistentNestedFraming(t *testing.T) {
 		"proposal marker":  func(raw []byte) { raw[0] = 1 },
 		"transform marker": func(raw []byte) { raw[8] = 1 },
 		"transform count":  func(raw []byte) { raw[7] = 2 },
-		"trailing data":    func(raw []byte) { raw[0] = 0; raw = append(raw, 0) },
+		"trailing data":    func(raw []byte) { raw[0] = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			raw := append([]byte(nil), valid...)

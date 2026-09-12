@@ -54,7 +54,6 @@ type ChildSA = esp.ChildSA
 type ikeContext struct {
 	suite     SASuite
 	skD       []byte
-	skai      []byte // unused (AEAD ciphers derive no integrity keys)
 	skei      []byte
 	sker      []byte
 	skpi      []byte

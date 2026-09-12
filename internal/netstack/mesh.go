@@ -408,6 +408,10 @@ func copyInboundPackets(raw [][]byte) [][]byte {
 func releaseInboundPackets(bufs [][]byte) {
 	for _, buf := range bufs {
 		if cap(buf) == inboundPacketBufferSize {
+			// The pool holds slices rather than pointers to them on purpose:
+			// the header offset means a buffer is re-sliced on every use, and
+			// the guard above is what keeps a re-sliced one out.
+			//lint:ignore SA6002 the pool deliberately stores slices, see above
 			inboundPacketPool.Put(buf[:inboundPacketBufferSize])
 		}
 	}

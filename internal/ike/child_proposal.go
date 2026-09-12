@@ -1,9 +1,9 @@
 package ike
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
+	"slices"
 )
 
 func fullRangeSelectors() []byte {
@@ -47,8 +47,12 @@ func isFullRangeSelectors(body []byte) bool {
 		default:
 			return false
 		}
+		// slices.Equal rather than net.IP.Equal: DecodeTS has already fixed the
+		// width to the selector type, and net.IP.Equal would fold a 4-in-6
+		// address onto its IPv4 form, which is a different selector on the
+		// wire and must not compare equal to one.
 		if selector.Protocol != 0 || selector.StartPort != 0 || selector.EndPort != 0xffff ||
-			!bytes.Equal(selector.StartAddr, expected.StartAddr) || !bytes.Equal(selector.EndAddr, expected.EndAddr) {
+			!slices.Equal(selector.StartAddr, expected.StartAddr) || !slices.Equal(selector.EndAddr, expected.EndAddr) {
 			return false
 		}
 	}
