@@ -47,6 +47,12 @@ type Config struct {
 	RekeyRetryInitial *Duration `yaml:"rekey_retry_initial"`
 	RekeyRetryMax     *Duration `yaml:"rekey_retry_max"`
 
+	// Responder answers peers that dial us. It is off by default because a
+	// leaf never needs it: it has no reachable address to be dialed at, and
+	// an open responder is the one surface an unauthenticated peer can reach.
+	// A full mesh needs it on, since every node both dials and answers.
+	Responder bool `yaml:"responder"`
+
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`
 }
@@ -179,8 +185,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: private_key is required")
 	case c.Registry == "":
 		return fmt.Errorf("config: registry is required")
-	case len(c.Peers) == 0:
-		return fmt.Errorf("config: at least one peer is required")
+	case len(c.Peers) == 0 && !c.Responder:
+		// A responder needs no peers: it answers whoever the registry knows.
+		// Without one, a node with neither would do nothing at all.
+		return fmt.Errorf("config: at least one peer is required unless responder is set")
 	case c.ReplayWindow != nil && *c.ReplayWindow > 1<<20:
 		return fmt.Errorf("config: replay_window must not exceed %d", uint32(1<<20))
 	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:

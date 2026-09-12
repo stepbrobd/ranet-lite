@@ -6,10 +6,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/ike"
-	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
 
@@ -124,76 +122,7 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	if err != nil {
 		return fmt.Errorf("handshake: %w", err)
 	}
-	defer sess.Mux().Close()
-	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
-
-	tunnel := &tunnel{replayWindow: cfg.ReplayWindowSize()}
-	tunnel.rekey = func() {
-		go func() {
-			if err := sess.RekeyChildProactively(); err != nil && !sess.Mux().IsClosed() {
-				log.Printf("peer %s: proactive Child SA rekey: %v", name, err)
-				_ = sess.Mux().Close()
-			}
-		}()
-	}
-	if err := tunnel.install(sess.Child); err != nil {
-		return err
-	}
-	sess.SetChildHandler(tunnel.install)
-	sess.SetChildRetireHandler(tunnel.retire)
-	peer := netstack.NewPeerReserved(sessionName, func(count int) (netstack.BatchSealer, error) {
-		sealer, err := tunnel.reserve(count)
-		if err != nil {
-			_ = sess.Mux().Close()
-		}
-		return sealer, err
-	}, sess.Mux().SendESPBatch)
-	defer peer.Close()
-	handle := c.speaker.AddPeer(peer)
-	defer handle.Close()
-
-	plain := make([][]byte, 0, 128)
-	emit := func(results []inboundDecrypted) {
-		esp.CommitBatch(results)
-		plain = plain[:0]
-		var dropped int
-		var lastError error
-		for _, result := range results {
-			raw, nextHeader, err := result.Plaintext()
-			if err != nil {
-				dropped, lastError = dropped+1, err
-				continue
-			}
-			sess.NoteTraffic()
-			deliver, err := validateESPTunnelPayload(raw, nextHeader)
-			if err != nil {
-				dropped, lastError = dropped+1, err
-				continue
-			}
-			if deliver && !c.speaker.Receive(peer, raw) {
-				plain = append(plain, raw)
-			}
-		}
-		if dropped > 0 {
-			log.Printf("peer %s: dropped %d ESP packets in batch; last error: %v", name, dropped, lastError)
-		}
-		c.Mesh.DeliverInboundBatch(plain)
-		clear(plain)
-	}
-	type sessionResult struct {
-		component string
-		err       error
-	}
-	results := make(chan sessionResult, 2)
-	go func() { results <- sessionResult{"IKE control", sess.Run(ctx)} }()
-	go func() {
-		results <- sessionResult{"ESP receive", receiveESP(sess.Mux(), c.workers, tunnel.decryptBatch, emit)}
-	}()
-	first := <-results
-	_ = sess.Mux().Close()
-	<-results
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return fmt.Errorf("%s session ended: %w", first.component, first.err)
+	release := c.sessions.adopt(name, sess.Mux())
+	defer release()
+	return c.serveSession(ctx, sess, name, sessionName)
 }

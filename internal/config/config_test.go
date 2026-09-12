@@ -105,3 +105,31 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestResponderConfigNeedsNoPeers(t *testing.T) {
+	base := `
+organization: example
+common_name: laptop
+port: 13000
+endpoints:
+  - serial_number: "0"
+    address_family: ip4
+private_key: key.pem
+registry: registry.json
+`
+	load := func(t *testing.T, yaml string) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		return err
+	}
+	if err := load(t, base); err == nil {
+		t.Fatal("a config that neither dials nor answers was accepted")
+	}
+	if err := load(t, base+"responder: true\n"); err != nil {
+		t.Fatalf("a responder with no peers was rejected: %v", err)
+	}
+}

@@ -133,10 +133,17 @@ keeps ranet-lite's single-Child-SA state machine simple and causes the peer
 to retry after the local rekey finishes.
 
 The remaining narrow feature set is not counted as RFC non-compliance.
-Initiator-only establishment, raw-public-key authentication without
-certificates or EAP, omission of COOKIE handling, and refusal to create
-additional Child SAs are all within the
+Raw-public-key authentication without certificates or EAP and refusal to
+create additional Child SAs are both within the
 [RFC 7815 minimal-initiator profile](https://www.rfc-editor.org/rfc/rfc7815.html).
+
+This fork adds the responder role, which upstream lists as out of scope,
+because a full mesh needs every node to answer as well as dial. It is off
+unless `responder` is set. Identities are compared by name rather than by
+their DER bytes: ranet writes `O` and `CN` as `UTF8String` while strongSwan
+picks the string type from the value, so one name legitimately reaches the
+wire in two encodings. AUTH signs the bytes as received either way, so the
+name is only what selects which key must verify it.
 
 IKE rekeys retain the negotiated PRF. This avoids differing key expansion
 behavior between [strongSwan](https://github.com/strongswan/strongswan/blob/master/src/libcharon/sa/ikev2/keymat_v2.c)
@@ -217,10 +224,18 @@ originate:
 
 # Optional fixed TUN name. It attaches to an existing compatible device
 # (which must be multiqueue on multicore) or creates it when absent. Omit to
-# create an automatically named ranet%d device.
+# create an automatically named ranet%d device on Linux, or the next free
+# utun on darwin, whose control accepts only "utun" or "utunN".
 # tun: ranet0
 
-# One or more existing mesh nodes to dial as IKEv2/babel peers.
+# Answer peers that dial us, rather than only dialing. Off by default: a leaf
+# has no address to be dialed at, and an open responder is the one surface an
+# unauthenticated peer can reach. Any node in the registry may then dial us;
+# the peers list below says who we dial, not who we answer.
+# responder: true
+
+# One or more existing mesh nodes to dial as IKEv2/babel peers. Not required
+# when responder is set.
 peers:
   - organization: example       # optional, defaults to the top-level organization
     common_name: gateway
@@ -243,7 +258,7 @@ either; only synthetic fixtures belong in version control (see
 
 ## Repository layout
 
-- `internal/ike` — the IKEv2 initiator.
+- `internal/ike` — the IKEv2 initiator and responder.
 - `internal/client` — runtime ownership, peer reconnection, and the ESP pipeline.
 - `esp` — userspace ESP AEAD encap/decap and anti-replay.
 - `internal/transport` — the shared UDP socket mux (IKE vs. ESP framing).

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"log"
 	"net/netip"
 	"runtime"
 	"sync"
@@ -25,6 +26,7 @@ type Client struct {
 	registry   registry.Registry
 	speaker    *babel.Speaker
 	hub        *transport.Hub
+	sessions   *sessionSet
 	workers    int
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -76,8 +78,9 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
 		Mesh: mesh, cfg: cfg, privateKey: privateKey, registry: reg,
-		speaker: speaker, hub: hub, workers: max(1, runtime.GOMAXPROCS(0)),
-		ctx: ctx, cancel: cancel,
+		speaker: speaker, hub: hub, sessions: newSessionSet(),
+		workers: max(1, runtime.GOMAXPROCS(0)),
+		ctx:     ctx, cancel: cancel,
 	}, nil
 }
 
@@ -95,6 +98,13 @@ func (c *Client) Run(ctx context.Context) error {
 		for _, peer := range c.cfg.Peers {
 			peers.Go(func() { c.runPeer(c.ctx, local, peer) })
 		}
+	}
+	if c.cfg.Responder {
+		peers.Go(func() {
+			if err := c.acceptPeers(c.ctx); err != nil && c.ctx.Err() == nil {
+				log.Printf("responder: %v", err)
+			}
+		})
 	}
 	err := c.speaker.Run(c.ctx)
 	_ = c.hub.Close()

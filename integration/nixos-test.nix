@@ -3,6 +3,9 @@
   ranetLite,
   cores ? 1,
   profile ? false,
+  # responder inverts the exchange: strongSwan dials and ranet-lite answers,
+  # which is the direction upstream could not do at all.
+  responder ? false,
 }:
 
 let
@@ -23,11 +26,11 @@ let
   };
 in
 {
-  name = "ranet-lite-integration";
+  name = if responder then "ranet-lite-responder" else "ranet-lite-integration";
 
   nodes = {
     gateway =
-      { config, ... }:
+      { config, nodes, ... }:
       {
         imports = [ common ];
 
@@ -85,7 +88,10 @@ in
             connections.ranet = {
               version = 2;
               local_addrs = [ "0.0.0.0/0" ];
-              remote_addrs = [ "0.0.0.0/0" ];
+              # A wildcard remote can only answer. Naming the client is what
+              # lets swanctl --initiate dial it.
+              remote_addrs =
+                if responder then [ nodes.client.networking.primaryIPAddress ] else [ "0.0.0.0/0" ];
               local_port = 13000;
               remote_port = 14000;
               encap = true;
@@ -295,9 +301,16 @@ in
             ike_rekey_interval: ${if profile then "0" else "15s"}
             rekey_margin: 0
             rekey_jitter: 0
-            peers:
-              - common_name: server
-                serial_number: "1"
+            ${
+              if responder then
+                "responder: true"
+              else
+                ''
+                  peers:
+                    - common_name: server
+                      serial_number: "1"
+                ''
+            }
             babel:
               hello_interval: 500ms
               update_interval: 1s
@@ -322,7 +335,9 @@ in
       };
   };
 
-  testScript = ''
+  testScript =
+    let
+      preamble = ''
     import datetime as dt
 
     timeout = dt.timedelta(seconds=30)
@@ -334,6 +349,10 @@ in
 
     start_all()
 
+      '';
+
+      # strongSwan answers, ranet-lite dials: upstream's original exchange.
+      initiator = ''
     try:
         gateway.wait_for_unit("systemd-networkd-wait-online.service")
         gateway.wait_for_unit("strongswan-swanctl.service")
@@ -402,5 +421,48 @@ in
     finally:
         for command in ["swanctl --list-sas", "birdc show babel neighbors", "birdc show babel routes"]:
             print(gateway.execute(command)[1])
-  '';
+      '';
+
+      # strongSwan dials, ranet-lite answers.
+      responderScript = ''
+    try:
+        gateway.wait_for_unit("systemd-networkd-wait-online.service")
+        gateway.wait_for_unit("strongswan-swanctl.service")
+        gateway.wait_for_unit("bird.service")
+        client.wait_for_unit("ranet-lite.service")
+
+        # ranet-lite has no peers configured here, so it never dials. A tunnel
+        # exists only if it answered strongSwan's IKE_SA_INIT.
+        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
+        gateway.succeed("swanctl --initiate --child default")
+        client.wait_until_succeeds("journalctl -u ranet-lite.service --no-pager | grep -F ': connected (SPI'", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnelV4}", timeout=timeout)
+
+        # The peer drives both rekeys. An answered session has to service them
+        # exactly as a dialed one does, from the opposite role.
+        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+        print(gateway.succeed("swanctl --rekey --child default"))
+        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'parsed CREATE_CHILD_SA response.*SA No KE TSi TSr'", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        peer_rekey = journal_after(gateway, "strongswan-swanctl.service")
+        print(gateway.succeed("swanctl --rekey --ike ranet"))
+        gateway.wait_until_succeeds(f"{peer_rekey} | grep -E 'IKE_SA ranet.* rekeyed between'", timeout=timeout)
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+
+        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F 'no matching inbound ESP SA'")
+        gateway.fail("journalctl -u strongswan-swanctl.service --no-pager | grep -E 'integrity check failed|no CHILD_SA built'")
+
+        # Losing the answered SA has to be recoverable without ranet-lite ever
+        # dialing: strongSwan notices through DPD and initiates again, and the
+        # responder accepts a second SA for a peer it already knew.
+        client.succeed("systemctl restart ranet-lite.service")
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=dt.timedelta(seconds=120))
+        client.fail("journalctl -u ranet-lite.service --no-pager | grep -F ': dialing '")
+    finally:
+        for command in ["swanctl --list-sas", "birdc show babel neighbors", "birdc show babel routes"]:
+            print(gateway.execute(command)[1])
+      '';
+    in
+    preamble + (if responder then responderScript else initiator);
 }

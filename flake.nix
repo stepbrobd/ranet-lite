@@ -110,6 +110,7 @@
             // lib.optionalAttrs linux {
               integration = integration { };
               integration-multicore = integration { cores = 4; };
+              responder = integration { responder = true; };
             };
           };
       }
