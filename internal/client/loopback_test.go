@@ -5,9 +5,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,11 +22,12 @@ import (
 
 // loopbackNode is one end of a two-node mesh standing on 127.0.0.1.
 type loopbackNode struct {
-	name   string
-	port   uint16
-	prefix netip.Prefix
-	client *Client
-	cfg    *config.Config
+	name       string
+	port       uint16
+	prefix     netip.Prefix
+	client     *Client
+	cfg        *config.Config
+	configPath string
 }
 
 // freeUDPPort asks the kernel for a port and gives it straight back, which is
@@ -71,18 +76,30 @@ func newLoopbackMesh(t *testing.T) (*loopbackNode, *loopbackNode) {
 	}
 	reg := registry.Registry{org}
 
+	// Written to disk as well, because Reload reads the file rather than
+	// taking a struct, and that is the path a SIGHUP takes.
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registryPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	for i, node := range nodes {
 		peer := nodes[1-i]
-		node.cfg = &config.Config{
-			Organization: "example", CommonName: node.name, Port: node.port,
-			Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
-			Peers:     []config.Peer{{Organization: "example", CommonName: peer.name, SerialNumber: "0"}},
-			Originate: []string{node.prefix.String()},
-			// Both ends answer as well as dial, which is the full-mesh shape
-			// and the one that produces a simultaneous open.
-			Responder: true,
-			Babel:     config.Babel{HelloInterval: 200 * time.Millisecond, UpdateInterval: 400 * time.Millisecond},
-		}
+		node.configPath = filepath.Join(dir, node.name+".yaml")
+		node.cfg = writeLoopbackConfig(t, node, peer, keyPath, registryPath, []string{node.prefix.String()})
 		client, err := newClient(node.cfg, private, reg, netstack.NewRoutesOnly())
 		if err != nil {
 			t.Fatalf("%s: %v", node.name, err)
@@ -90,6 +107,42 @@ func newLoopbackMesh(t *testing.T) (*loopbackNode, *loopbackNode) {
 		node.client = client
 	}
 	return nodes[0], nodes[1]
+}
+
+// writeLoopbackConfig writes one node's config file and loads it back, so the
+// running client and the file a reload reads can never drift apart.
+func writeLoopbackConfig(t *testing.T, node, peer *loopbackNode, keyPath, registryPath string, originate []string) *config.Config {
+	t.Helper()
+	body := fmt.Sprintf(`organization: example
+common_name: %s
+port: %d
+endpoints:
+  - serial_number: "0"
+    address_family: ip4
+private_key: %s
+registry: %s
+# Both ends answer as well as dial, which is the full-mesh shape and the one
+# that produces a simultaneous open.
+responder: true
+peers:
+  - common_name: %s
+    serial_number: "0"
+babel:
+  hello_interval: 200ms
+  update_interval: 400ms
+originate:
+`, node.name, node.port, keyPath, registryPath, peer.name)
+	for _, prefix := range originate {
+		body += fmt.Sprintf("  - %q\n", prefix)
+	}
+	if err := os.WriteFile(node.configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(node.configPath)
+	if err != nil {
+		t.Fatalf("%s: %v", node.name, err)
+	}
+	return cfg
 }
 
 // Two nodes dialing and answering each other is the shape a full mesh has, and
@@ -149,4 +202,63 @@ func waitFor(t *testing.T, limit time.Duration, what string, done func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// SIGHUP announcing a new prefix has to reach the peer's forwarding table.
+// The existing reload test sets Originate and asserts peer and registry
+// counts, so deleting the SetOriginated call passes it.
+func TestReloadAnnouncesANewPrefixToThePeer(t *testing.T) {
+	alpha, bravo := newLoopbackMesh(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, node := range []*loopbackNode{alpha, bravo} {
+		go func() { _ = node.client.Run(ctx) }()
+	}
+	added := netip.MustParsePrefix("fd00:aa::/64")
+	waitFor(t, 20*time.Second, "the initial route", func() bool {
+		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, alpha.prefix.Addr().Next())
+		return ok && peer != nil
+	})
+
+	writeLoopbackConfig(t, alpha, bravo, alpha.cfg.PrivateKey, alpha.cfg.Registry,
+		[]string{alpha.prefix.String(), added.String()})
+	if err := alpha.client.Reload(alpha.configPath); err != nil {
+		t.Fatalf("adding an originated prefix was refused: %v", err)
+	}
+
+	waitFor(t, 20*time.Second, "the reloaded prefix to reach the peer", func() bool {
+		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, added.Addr().Next())
+		return ok && peer != nil
+	})
+}
+
+// Shutdown tells every peer the SA is gone rather than leaving it sending ESP
+// into an SPI we no longer accept until its own dead peer detection expires,
+// which is over a minute. closeAll and the Delete inside closeSession are both
+// unreachable from anything else in this package.
+func TestShutdownTellsThePeerBeforeGoing(t *testing.T) {
+	alpha, bravo := newLoopbackMesh(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() { stopped <- alpha.client.Run(ctx) }()
+	bravoCtx, stopBravo := context.WithCancel(context.Background())
+	defer stopBravo()
+	go func() { _ = bravo.client.Run(bravoCtx) }()
+
+	waitFor(t, 20*time.Second, "both ends established", func() bool {
+		return len(alpha.client.sessions.paths()) == 1 && len(bravo.client.sessions.paths()) == 1
+	})
+
+	// Only alpha goes. bravo has to notice through the Delete rather than
+	// through its own liveness timer, which is far slower than this.
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the departing node did not stop")
+	}
+	waitFor(t, 15*time.Second, "the peer to drop the session it was told about", func() bool {
+		return len(bravo.client.sessions.paths()) == 0
+	})
 }
