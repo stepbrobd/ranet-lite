@@ -57,7 +57,7 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 		if err := plat.addScopedRoute(remote); err != nil {
 			t.Fatalf("install %s scoped to %s: %v", remote, device, err)
 		}
-		t.Cleanup(func() { _ = plat.DelRoute(Route{Destination: remote}) })
+		t.Cleanup(func() { _ = plat.delScopedRoute(remote) })
 
 		unbound := reaches(t, tun, target, netip.Addr{}, 0)
 		bound := reaches(t, tun, target, local.Addr(), 0)
@@ -144,11 +144,23 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 	})
 }
 
-// addScopedRoute installs the same route the reconciler would, plus
-// RTF_IFSCOPE. It is only used by this test: the reconciler deliberately
-// installs unscoped routes.
+// addScopedRoute and delScopedRoute install and withdraw a scoped route the
+// reconciler would not: a plain destination, which scopeOnDarwin leaves
+// unscoped. The pair exists to isolate what RTF_IFSCOPE does to a lookup from
+// what the reconciler chooses to do with it, so neither touches the
+// bookkeeping. The kernel keys a scoped route separately, so the withdrawal
+// has to carry the flag too, or the route stays and the next subtest's install
+// collides with it.
 func (p *routePlatform) addScopedRoute(destination netip.Prefix) error {
-	message, err := p.routeMessage(unix.RTM_ADD, Route{Destination: destination})
+	return p.writeScopedRoute(unix.RTM_ADD, destination)
+}
+
+func (p *routePlatform) delScopedRoute(destination netip.Prefix) error {
+	return p.writeScopedRoute(unix.RTM_DELETE, destination)
+}
+
+func (p *routePlatform) writeScopedRoute(kind int, destination netip.Prefix) error {
+	message, err := p.routeMessage(kind, Route{Destination: destination})
 	if err != nil {
 		return err
 	}

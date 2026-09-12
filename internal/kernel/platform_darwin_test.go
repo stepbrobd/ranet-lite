@@ -3,12 +3,14 @@
 package kernel
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"net/netip"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
@@ -175,6 +177,117 @@ func TestDarwinRouteMessageNamesTheInterfaceAsItsGateway(t *testing.T) {
 	}
 	if mask6, ok := addressFromRouteAddr(del.Addrs[unix.RTAX_NETMASK]); !ok || mask6 != addr("ffff:ffff:ffff::") {
 		t.Errorf("the IPv6 netmask is %v, want ffff:ffff:ffff::", del.Addrs[unix.RTAX_NETMASK])
+	}
+}
+
+// The half-default pair is included because that is how a default that leaves
+// the host's own in place is written, and it is the shape that captures the
+// machine outright rather than merely colliding: every destination matches it
+// at a longer prefix than the box's /0.
+func TestDarwinScopesPlainDefaults(t *testing.T) {
+	for _, destination := range []string{
+		"0.0.0.0/0", "::/0",
+		"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1",
+	} {
+		t.Run(destination, func(t *testing.T) {
+			plat, sock := testPlatform(t, Config{})
+			announced := Route{Destination: prefix(destination)}
+			announced.Metric = plat.metric(announced.Destination)
+			if err := plat.AddRoute(announced); err != nil {
+				t.Fatal(err)
+			}
+			written := sock.messages(t)
+			if len(written) != 1 {
+				t.Fatalf("install wrote %d messages, want 1", len(written))
+			}
+			if written[0].Flags&unix.RTF_IFSCOPE == 0 || written[0].Index != testIndex {
+				t.Fatalf("default %s was installed without interface scope, so it can capture the ESP underlay", destination)
+			}
+			rib := dumpRIB(t, dumpEntry{
+				index: testIndex, flags: written[0].Flags,
+				dst: announced.Destination, gateway: ourGateway(),
+			})
+			actual, err := plat.ownedRoutes(rib)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if add, del := diffRoutes([]Route{announced}, actual); len(add) != 0 || len(del) != 0 {
+				t.Fatalf("installed plain default did not converge: add %v, delete %v", add, del)
+			}
+			if err := plat.DelRoute(actual[0]); err != nil {
+				t.Fatal(err)
+			}
+			if deleted := sock.messages(t); len(deleted) != 2 || deleted[1].Flags&unix.RTF_IFSCOPE == 0 {
+				t.Fatal("withdrawing the plain default did not select its interface scope")
+			}
+		})
+	}
+}
+
+// An announced default is the one route that can capture this machine: darwin
+// has one FIB, Config.Table is meaningless here, and nothing keeps the peers'
+// own endpoints out of it, so the ESP underlay would route into the tun
+// carrying it.
+func TestDarwinAnnouncedDefaultDoesNotCaptureUnderlay(t *testing.T) {
+	requireNetTest(t)
+	device, tun := createUTUNWithFD(t)
+	setInterfaceUp(t, device)
+	plat, err := newPlatform(Config{
+		Interface: device, Table: DefaultTable, Protocol: DefaultProtocol,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plat.Close() })
+	local := prefix("198.51.100.1/32")
+	if err := plat.AddAddr(local); err != nil {
+		t.Fatal(err)
+	}
+	if err := plat.AddRoute(Route{Destination: prefix("0.0.0.0/0")}); err != nil {
+		t.Fatal(err)
+	}
+	target := addr("203.0.113.9").As4()
+	probe := func(bound bool) bool {
+		t.Helper()
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(fd)
+		if bound {
+			if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: local.Addr().As4()}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		drainTUN(tun)
+		payload := []byte("ranet plain route scope probe")
+		if err := unix.Sendto(fd, payload, 0, &unix.SockaddrInet4{Addr: target, Port: 9}); err != nil {
+			if !bound && (errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH)) {
+				return false
+			}
+			t.Fatal(err)
+		}
+		buf := make([]byte, 2048)
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			n, err := unix.Read(tun, buf)
+			// address assignment can emit unrelated traffic on the same utun
+			if err == nil && n >= 32 && buf[4]>>4 == 4 && buf[13] == unix.IPPROTO_UDP &&
+				bytes.Equal(buf[20:24], target[:]) && bytes.HasSuffix(buf[:n], payload) {
+				return true
+			}
+			if err != nil && !errors.Is(err, unix.EAGAIN) {
+				t.Fatal(err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return false
+	}
+	if probe(false) {
+		t.Error("an unbound underlay socket reached the tun through the announced default, which is how the ESP underlay routes into its own tunnel")
+	}
+	if !probe(true) {
+		t.Error("a socket bound to the mesh address could not reach the announced default")
 	}
 }
 
@@ -652,5 +765,75 @@ func TestDarwinRefusesASecondSourceForOneDestination(t *testing.T) {
 	}
 	if got := plat.scoped[dest]; got != prefix("198.51.100.0/24") {
 		t.Errorf("the recorded source changed to %s, so the two would take turns", got)
+	}
+}
+
+// A route more specific than a default stays unscoped, so the mesh is
+// reachable from the Mac itself without every program binding first. That is
+// the split tailscale makes on the same machine: its exit-node default is
+// scoped to its utun, its 100.64/10 is not.
+func TestDarwinSpecificRouteStaysReachableWithoutBinding(t *testing.T) {
+	requireNetTest(t)
+	device, tun := createUTUNWithFD(t)
+	setInterfaceUp(t, device)
+	plat, err := newPlatform(Config{
+		Interface: device, Table: DefaultTable, Protocol: DefaultProtocol,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plat.Close() })
+	if err := plat.AddAddr(prefix("198.51.100.1/32")); err != nil {
+		t.Fatal(err)
+	}
+	if err := plat.AddRoute(Route{Destination: prefix("203.0.113.0/24")}); err != nil {
+		t.Fatal(err)
+	}
+	target := addr("203.0.113.9").As4()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	drainTUN(tun)
+	payload := []byte("ranet specific route reachability probe")
+	if err := unix.Sendto(fd, payload, 0, &unix.SockaddrInet4{Addr: target, Port: 9}); err != nil {
+		t.Fatalf("an unbound socket could not reach a mesh prefix: %v", err)
+	}
+	buf := make([]byte, 2048)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		n, err := unix.Read(tun, buf)
+		if err == nil && n >= 32 && buf[4]>>4 == 4 && buf[13] == unix.IPPROTO_UDP &&
+			bytes.Equal(buf[20:24], target[:]) && bytes.HasSuffix(buf[:n], payload) {
+			return
+		}
+		if err != nil && !errors.Is(err, unix.EAGAIN) {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Error("an unbound socket did not reach a mesh prefix, so the machine cannot use the mesh it joined")
+}
+
+// The scope on a delete comes from the route, not from a record keyed by
+// destination alone: an unscoped route and a scoped one can share a
+// destination, and withdrawing one must not take out the other.
+func TestDarwinDeleteSelectsTheScopeOfTheRouteItWithdraws(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	specific := Route{Destination: prefix("203.0.113.0/24")}
+	if err := plat.DelRoute(specific); err != nil {
+		t.Fatal(err)
+	}
+	written := sock.messages(t)
+	if len(written) != 1 || written[0].Flags&unix.RTF_IFSCOPE != 0 {
+		t.Fatalf("withdrawing %s carried interface scope, which deletes a different route", specific.Destination)
+	}
+	if err := plat.DelRoute(Route{Destination: prefix("::/0")}); err != nil {
+		t.Fatal(err)
+	}
+	written = sock.messages(t)
+	if len(written) != 2 || written[1].Flags&unix.RTF_IFSCOPE == 0 {
+		t.Fatal("withdrawing an announced default did not select its interface scope")
 	}
 }

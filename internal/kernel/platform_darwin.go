@@ -37,10 +37,12 @@ import (
 // # What the darwin FIB cannot hold
 //
 // There is no source-address-dependent lookup. A source prefix covering one of
-// this interface's own addresses is installed as an interface-scoped route, see
-// AddRoute; any other source prefix is reported once and skipped, because
-// flattening it would turn an exit's "::/0 from <prefix>" into a plain default
-// route out of the tun.
+// this interface's own addresses is installed as an interface-scoped route,
+// see scopeOnDarwin; any other source prefix is reported once and skipped,
+// because flattening it would turn an exit's "::/0 from <prefix>" into a plain
+// default route out of the tun. An announced default is scoped for a different
+// reason, that it would otherwise capture the ESP underlay, and the two share
+// the one scoped slot a destination has.
 //
 // There is no per-route metric and no preferred source either, so Route.Metric
 // and Route.PrefSrc are mirrored from the configuration into every dump. Both
@@ -55,11 +57,13 @@ type routePlatform struct {
 	control6 int
 	monitor  *routeMonitor
 
-	// scoped remembers the source prefix behind each route installed with
-	// RTF_IFSCOPE, because the kernel stores no source and a dump would
-	// otherwise read our own scoped route as an ordinary one and replace it
-	// every pass. A route left by an earlier process is not in here, so it
-	// reads as ordinary, gets deleted and is reinstalled correctly once.
+	// scoped remembers the source behind each route installed with
+	// RTF_IFSCOPE, which the FIB cannot store, and an invalid prefix for a
+	// scoped route that has no source. The kernel keys a scoped route by
+	// destination and interface, so there is at most one per destination.
+	// Only successful installs go in here, so a route left by an earlier
+	// process reads as ordinary, gets deleted and is reinstalled correctly
+	// once, and a foreign scoped route is never adopted from its shape alone.
 	scoped map[netip.Prefix]netip.Prefix
 
 	// warned holds the source-specific routes already reported and pending
@@ -241,9 +245,9 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		return Route{}, false
 	}
 	// RTF_IFSCOPE is handled after the destination is known: this reconciler
-	// sets it on its own source-specific routes, but the kernel and other
-	// daemons also set it on routes of theirs that are otherwise
-	// indistinguishable from ours. utun7 on a machine running Tailscale
+	// sets it on some of its own routes, but the kernel and other daemons also
+	// set it on routes of theirs that are otherwise indistinguishable from
+	// ours. utun7 on a machine running Tailscale
 	// carries a scoped 255.255.255.255 entry with a link gateway and
 	// RTF_STATIC, which is exactly the shape this reconciler installs. So a
 	// scoped route counts as ours only if this process scoped that
@@ -328,11 +332,9 @@ func (p *routePlatform) sourceIsOurs(source netip.Prefix) (bool, error) {
 // picks the peer after the kernel hands over the packet, so there is no next
 // hop to name.
 //
-// RTF_IFSCOPE is set by the caller and only for a source-specific route. A
-// scoped route is invisible to an ordinary lookup and visible to a socket bound
-// to an address on this interface, which is exactly the distinction a source
-// prefix draws, so an ordinary mesh route must stay unscoped and a
-// source-specific one must not.
+// RTF_IFSCOPE is set by the caller, for the routes scopeOnDarwin names. A
+// scoped route is invisible to an ordinary lookup and visible to a socket
+// bound to an address on this interface.
 //
 // RTF_HOST is not set either, even for a full-length prefix; the netmask says
 // the same thing. With RTF_HOST the kernel resolves the output interface
@@ -363,7 +365,6 @@ func routeAddr(address netip.Addr) route.Addr {
 }
 
 func (p *routePlatform) AddRoute(r Route) error {
-	scoped := false
 	if r.Source.IsValid() {
 		ours, err := p.sourceIsOurs(r.Source)
 		if err != nil {
@@ -377,27 +378,24 @@ func (p *routePlatform) AddRoute(r Route) error {
 			p.skipSourceSpecific(r)
 			return nil
 		}
+	}
+	if scopeOnDarwin(r) {
 		if held, ok := p.scoped[r.Destination]; ok && held != r.Source {
 			// Interface scope is one route per destination per interface, so a
-			// second source prefix for the same destination has nowhere to go.
-			// Skipping says so once; installing would collide, and recording it
-			// would make the two take turns being reported as installed.
+			// second scoped route for the same destination has nowhere to go.
+			// That covers a second source prefix and an announced default
+			// competing with a source-specific route to the same destination.
+			// Skipping says so once; installing would collide, and recording
+			// it would make the two take turns being reported as installed.
 			p.skipSourceSpecific(r)
 			return nil
 		}
-		scoped = true
 	}
 	message, err := p.routeMessage(unix.RTM_ADD, r)
 	if err != nil {
 		return err
 	}
-	if scoped {
-		// RTF_IFSCOPE makes the route invisible to an ordinary lookup and
-		// visible to a socket bound to an address on this interface, which is
-		// measurably how darwin selects it, see TestDarwinScopedRouteSelection.
-		// That is the closest this platform gets to the fleet's
-		// "ip rule from <prefix> lookup 200", and it is what lets a Mac hold an
-		// address an exit announces without taking the whole default route.
+	if scopeOnDarwin(r) {
 		message.Flags |= unix.RTF_IFSCOPE
 	}
 	// darwin has no replace, so a route another program holds under the same
@@ -418,19 +416,53 @@ func (p *routePlatform) AddRoute(r Route) error {
 		return nil
 	}
 	delete(p.occupied, r.Destination)
-	if scoped {
-		// Recorded only after the write lands. An entry for a route that was
-		// never installed would make decodeRoute report an unscoped route as
-		// carrying a source it does not have, and the diff would then leave a
-		// plain default out of the tun in place forever.
+	// Recorded only after the write lands, and only for a route that actually
+	// carries the scope. An entry for a route that was never installed would
+	// make decodeRoute report an unscoped route as carrying a source it does
+	// not have, and the diff would then leave a plain route in place forever.
+	if scopeOnDarwin(r) {
 		p.scoped[r.Destination] = r.Source
 	}
 	return nil
 }
 
+// scopeOnDarwin decides whether a route is installed with RTF_IFSCOPE, which
+// hides it from an ordinary lookup and shows it to a socket bound to an
+// address on this interface.
+//
+// A source-specific route is scoped because that is the only thing on this
+// platform that draws the distinction a source prefix draws at all.
+//
+// A default is scoped because otherwise it captures the machine. darwin has
+// one FIB and Config.Table is meaningless here, so there is no equivalent of
+// the fleet's table plus "ipproto udp sport <port> lookup main", and nothing
+// keeps the peers' own endpoints out of an announced default: the ESP underlay
+// would route into the tun carrying it. On IPv4 an unscoped mesh default
+// survives today only because it collides with the box's own, and AddRoute
+// retries every pass, so the first moment the Mac has no v4 default the next
+// pass takes the machine. On IPv6 there is no collision to rely on, since
+// every default row on a Mac is already scoped to its own interface.
+//
+// A half of the address space counts as a default, because that is how a
+// default that does not replace the host's is written: 0.0.0.0/1 with
+// 128.0.0.0/1, or ::/1 with 8000::/1, which is the spelling wg-quick and the
+// tunnels on this platform use. The pair covers every destination at a longer
+// prefix than the box's own /0, so unscoped it wins the lookup outright
+// instead of merely colliding, and it takes the underlay with it. A neighbor
+// can announce one: the Update decoder bounds a prefix length only at 32 and
+// 128.
+//
+// Anything more specific stays unscoped, so the mesh is reachable from the Mac
+// itself without every program having to bind first. That is the same split
+// tailscale makes on the same machine: its exit-node default is scoped to its
+// utun, its 100.64/10 is not.
+func scopeOnDarwin(r Route) bool {
+	return r.Source.IsValid() || r.Destination.Bits() <= 1
+}
+
 func (p *routePlatform) DelRoute(r Route) error {
-	_, scoped := p.scoped[r.Destination]
-	if r.Source.IsValid() && !scoped {
+	_, installed := p.scoped[r.Destination]
+	if r.Source.IsValid() && !installed {
 		// Nothing was installed for a source we cannot express, and deleting
 		// what is left after dropping the source would take out the ordinary
 		// route to the same destination. For an exit's "::/0 from <prefix>"
@@ -447,10 +479,12 @@ func (p *routePlatform) DelRoute(r Route) error {
 	if err != nil {
 		return err
 	}
-	if scoped {
+	if scopeOnDarwin(r) {
 		// The kernel keys a scoped route separately from the unscoped route to
 		// the same destination, so the delete has to carry the flag or it
-		// removes the wrong one.
+		// removes the wrong one. Asking the route rather than the record keeps
+		// withdrawing an unscoped default from taking out the scoped
+		// source-specific route that shares its destination.
 		message.Flags |= unix.RTF_IFSCOPE
 	}
 	if err := p.sock.WriteRoute(message); err != nil && !gone(err) {
@@ -458,7 +492,9 @@ func (p *routePlatform) DelRoute(r Route) error {
 	}
 	// Dropped only once the route is gone, so a failed delete leaves the entry
 	// and the next pass decodes the route and tries again.
-	delete(p.scoped, r.Destination)
+	if scopeOnDarwin(r) {
+		delete(p.scoped, r.Destination)
+	}
 	delete(p.occupied, r.Destination)
 	return nil
 }
