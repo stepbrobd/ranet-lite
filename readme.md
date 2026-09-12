@@ -347,6 +347,30 @@ with a link gateway and `RTF_STATIC`, so a scoped route counts as this
 reconciler's only when this process scoped that destination. One left behind by
 a crash is left alone rather than deleted on a guess.
 
+Two kinds of route are scoped, for two different reasons. A source-specific
+announcement is scoped because interface scope is the only thing on this
+platform that draws the distinction a source prefix draws at all. An announced
+default is scoped because it would otherwise capture the machine: darwin has one
+FIB and no equivalent of the fleet's table plus policy rule, so nothing keeps
+the peers' own endpoints out of it and the ESP underlay would route into the
+tunnel carrying it. Anything more specific is installed unscoped, so the mesh is
+reachable from the Mac without every program binding first. Tailscale makes the
+same split on the same machine: its exit-node default is scoped to its utun, its
+`100.64.0.0/10` is not.
+
+What a scoped route does not give you is automatic use of an exit-announced
+address. Invisibility to an ordinary lookup is the safety property, and it
+applies to every unbound socket, so Safari, curl and ssh keep the address of
+whatever interface the machine was already using. macOS has no `ip rule`:
+selecting a scoped route means `bind()` to an address on the tun or
+`IP_BOUND_IF` to the tun itself, per application, and ranet-lite provides
+neither. There is a second-order effect worth knowing about too. Once the
+outgoing interface has no address of a family, which happens on an IPv4-only
+network where the mesh address is the box's only global IPv6, RFC 6724 rule 5
+makes the mesh address a candidate source for traffic that is not going through
+the mesh at all, and those packets die at the first BCP 38 filter with nothing
+to show for it locally.
+
 An install that collides with a route another program holds is reported rather
 than retried in silence, since darwin has no replace and the collision does not
 resolve itself.
