@@ -38,8 +38,9 @@ parser.add_argument(
     "--replay-window",
     type=int,
     default=4096,
-    help="strongSwan Child SA window, matched to ranet-lite's own default so "
-    "the two arms are compared at the same window rather than 32 against 4096",
+    help="anti-replay window for every instance in the run, strongSwan and "
+    "ranet-lite alike, so a value other than the default still compares the "
+    "two arms at the same window rather than one against the other's default",
 )
 parser.add_argument("--affinity")
 parser.add_argument(
@@ -243,6 +244,17 @@ def suffix(name):
 def scrape(address):
     with urllib.request.urlopen(f"http://{address}/metrics", timeout=5) as response:
         return response.read().decode()
+
+
+def parse_xfrm_stat(text):
+    # /proc/net/xfrm_stat is "Name value" per line. Every counter is an error
+    # counter, inbound and outbound alike.
+    counters = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            counters[fields[0]] = int(fields[1])
+    return counters
 
 
 def sample(text, metric):
@@ -542,6 +554,8 @@ protocol babel {
     rxcost 96;
     hello interval 500 ms;
     update interval 1 s;
+    rtt cost 1024;
+    rtt max 1024 ms;
     rx buffer 1500;
   };
 }
@@ -617,6 +631,7 @@ endpoints:
 private_key: {args.repo / "integration/org-key.pem"}
 registry: {registry}
 originate: ["fd00:99::/64"]
+replay_window: {args.replay_window}
 tun: ranet1
 child_rekey_interval: 0
 ike_rekey_interval: 0
@@ -666,6 +681,7 @@ endpoints:
 private_key: {args.repo / "integration/org-key.pem"}
 registry: {registry}
 originate: ["fd00:88::2/128"]
+replay_window: {args.replay_window}
 tun: ranet0
 child_rekey_interval: 0
 ike_rekey_interval: 0
@@ -729,8 +745,15 @@ babel:
         "ESP/Babel did not converge",
         timeout=30,
     )
-    # The baseline the end-of-run check subtracts from. Taken for both arms,
-    # since the client exports metrics either way.
+    # The baselines the end-of-run checks subtract from. Taken for both arms,
+    # since the client exports metrics either way. The gateway's counters are
+    # cumulative since boot, so comparing the final read against zero would
+    # fail a run over something that happened before it started.
+    gateway_xfrm_before = {}
+    if not ranet_peer:
+        gateway_xfrm_before = parse_xfrm_stat(
+            run(["cat", "/proc/net/xfrm_stat"], gateway=True).stdout
+        )
     converged = {}
     for name, _, metrics in instances:
         converged[name] = scrape(metrics)
@@ -757,22 +780,24 @@ babel:
         ]
         traffic(direction, "fd00:99::1", flags, collect_profile=True)
     if not ranet_peer:
-        xfrm_stat = run(["cat", "/proc/net/xfrm_stat"], gateway=True, check=False).stdout
+        xfrm_stat = run(["cat", "/proc/net/xfrm_stat"], gateway=True).stdout
         (args.output / "xfrm-state.txt").write_text(
             run(["ip", "-s", "xfrm", "state", "list", "nokeys"], gateway=True).stdout
         )
         (args.output / "xfrm-stat.txt").write_text(xfrm_stat)
         # The gateway's own error counters, collected since this harness was
-        # written and never read. A run the peer spent discarding replays is
+        # written and never read. A run the peer spent discarding packets is
         # not a measurement of this dataplane, and it looks exactly like a slow
-        # one.
-        discarded = {}
-        for line in xfrm_stat.splitlines():
-            fields = line.split()
-            if len(fields) == 2 and fields[0].startswith("XfrmIn") and int(fields[1]):
-                discarded[fields[0]] = int(fields[1])
+        # one. Both directions: a transmit-side fault is as disqualifying as a
+        # receive-side one, and the read itself is checked, because a missing
+        # counter file used to pass as a clean gateway.
+        discarded = {
+            name: after - gateway_xfrm_before.get(name, 0)
+            for name, after in parse_xfrm_stat(xfrm_stat).items()
+            if after - gateway_xfrm_before.get(name, 0)
+        }
         if discarded:
-            raise RuntimeError(f"the gateway discarded inbound ESP: {discarded}")
+            raise RuntimeError(f"the gateway discarded ESP during the run: {discarded}")
     else:
         (args.output / "peer-links.txt").write_text(
             run(["ip", "-s", "link"], gateway=True).stdout
