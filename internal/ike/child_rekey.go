@@ -115,6 +115,17 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		return nil
 	}
 	deleted, err := s.requestLocked(INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{oldLocalSPI}})}})
+	// The replacement is installed, so the old SA is finished whatever comes
+	// back. Retire it on every path out of here. A response that names no SPI
+	// at all is the case RFC 7296 section 1.4.1 requires of a peer whose own
+	// Delete for this SA crossed ours ("the responses MUST NOT include Delete
+	// payloads for the deleted SAs"), and a failed exchange leaves nobody to
+	// send one. Leaving s.retiring set locks out every later rekey in both
+	// directions for the life of the session, and the peer chooses when that
+	// happens, so the inbound keys drain on the retirement timer instead.
+	if retireErr := s.retireChild(old.RemoteSPI); retireErr != nil && err == nil {
+		return retireErr
+	}
 	if err != nil {
 		return fmt.Errorf("ike: retire replaced Child SA: %w", err)
 	}
@@ -122,17 +133,11 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		if p.Type != PayloadD {
 			continue
 		}
-		d, err := DecodeDelete(p.Body)
-		if err != nil {
+		if _, err := DecodeDelete(p.Body); err != nil {
 			return fmt.Errorf("ike: invalid Child SA retire response: %w", err)
 		}
-		for _, spi := range d.SPIs {
-			if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == old.RemoteSPI {
-				return s.retireChild(old.RemoteSPI)
-			}
-		}
 	}
-	return fmt.Errorf("ike: Child SA retire response did not delete peer inbound SPI")
+	return nil
 }
 
 type childNegotiationRejectedError struct{ notify Notify }

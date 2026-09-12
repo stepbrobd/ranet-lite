@@ -321,3 +321,111 @@ func TestLocalMessageIDIsNotAllocatedTwiceAtOnce(t *testing.T) {
 		taken[msgID] = true
 	}
 }
+
+// driveChildRekey runs one Child SA rekey to the point where the replacement
+// is installed and the INFORMATIONAL Delete for the old SA is outstanding,
+// and answers that Delete with respond.
+func driveChildRekey(t *testing.T, s *Session, old ChildSA, respond func(*localRequest)) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- s.RekeyChild() }()
+
+	rekey := <-s.requests
+	payloads, err := decodeChildExchangePayloads(rekey.inner)
+	if err != nil {
+		t.Fatalf("invalid rekey request: %v", err)
+	}
+	proposals, err := DecodeSA(payloads.sa.Body)
+	if err != nil || len(proposals) != 1 || len(proposals[0].SPI) != 4 {
+		t.Fatalf("invalid rekey proposal: %#v, %v", proposals, err)
+	}
+	remoteSPI := make([]byte, 4)
+	binary.BigEndian.PutUint32(remoteSPI, old.RemoteSPI+1)
+	rekey.result <- requestResult{inner: []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{
+			Number: 1, Protocol: ProtoESP, SPI: remoteSPI,
+			Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}},
+		}})},
+		{Type: PayloadNonce, Body: EncodeNonce(make([]byte, 32))},
+		{Type: PayloadTSi, Body: fullRangeSelectors()},
+		{Type: PayloadTSr, Body: fullRangeSelectors()},
+	}}
+
+	remove := <-s.requests
+	if remove.exchange != INFORMATIONAL {
+		t.Fatalf("second exchange = %d, want INFORMATIONAL", remove.exchange)
+	}
+	respond(remove)
+	return <-done
+}
+
+func newRekeyableSession(t *testing.T, old ChildSA) *Session {
+	t.Helper()
+	mux, _ := lifecycleMuxes(t)
+	if err := mux.RegisterESP(old.LocalSPI); err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{
+		mux: mux,
+		current: &ikeContext{
+			suite: SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256},
+			skD:   []byte("test child replacement SK_d material"),
+		},
+		Child:    old,
+		requests: make(chan *localRequest),
+	}
+	s.SetChildHandler(func(ChildSA) error { return nil })
+	s.SetChildRetireHandler(func(uint32) error { return nil })
+	return s
+}
+
+// RFC 7296 section 1.4.1 requires a peer whose own Delete crossed ours to
+// answer with no Delete payload at all. Treating that as a failure used to
+// leave the replaced SA latched in s.retiring, which locks out every later
+// rekey in both directions for the life of the session.
+func TestCrossedChildDeleteStillRetiresTheReplacedSA(t *testing.T) {
+	old := ChildSA{
+		EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128,
+		LocalSPI: 0x10203040, RemoteSPI: 0x50607080,
+	}
+	s := newRekeyableSession(t, old)
+	if err := driveChildRekey(t, s, old, func(remove *localRequest) {
+		remove.result <- requestResult{inner: nil}
+	}); err != nil {
+		t.Fatalf("rekey: %v", err)
+	}
+	if got := s.retiringChild(); got.LocalSPI != 0 {
+		t.Fatalf("Child SA %08x is still awaiting retirement", got.LocalSPI)
+	}
+
+	// The session has to stay rekeyable, which is the part a latch broke.
+	next := s.currentChild()
+	if err := driveChildRekey(t, s, next, func(remove *localRequest) {
+		spi := make([]byte, 4)
+		binary.BigEndian.PutUint32(spi, next.RemoteSPI)
+		remove.result <- requestResult{inner: []RawPayload{
+			{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{spi}})},
+		}}
+	}); err != nil {
+		t.Fatalf("second rekey: %v", err)
+	}
+}
+
+// A failed retire exchange has nobody left to send the Delete either, so the
+// replaced SA still has to come out of s.retiring.
+func TestFailedChildRetireExchangeStillClearsTheReplacedSA(t *testing.T) {
+	old := ChildSA{
+		EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128,
+		LocalSPI: 0x11223344, RemoteSPI: 0x55667788,
+	}
+	s := newRekeyableSession(t, old)
+	err := driveChildRekey(t, s, old, func(remove *localRequest) {
+		remove.result <- requestResult{err: errors.New("peer stopped answering")}
+	})
+	if err == nil {
+		t.Fatal("a failed retire exchange should still be reported")
+	}
+	if got := s.retiringChild(); got.LocalSPI != 0 {
+		t.Fatalf("Child SA %08x is still awaiting retirement after a failed exchange", got.LocalSPI)
+	}
+}
