@@ -89,7 +89,7 @@ func (p *netlinkPlatform) decodeRoute(message nlMessage) (Route, bool) {
 	}
 	family, dstLen, srcLen := message.Data[0], message.Data[1], message.Data[2]
 	table, protocol, kind := uint32(message.Data[4]), message.Data[5], message.Data[7]
-	if protocol != p.cfg.Protocol || kind != unix.RTN_UNICAST {
+	if protocol != p.cfg.Protocol || (kind != unix.RTN_UNICAST && kind != unix.RTN_UNREACHABLE) {
 		return Route{}, false
 	}
 	if family != unix.AF_INET && family != unix.AF_INET6 {
@@ -120,7 +120,9 @@ func (p *netlinkPlatform) decodeRoute(message nlMessage) (Route, bool) {
 			}
 		}
 	}
-	if table != p.cfg.Table || oif != p.index {
+	// An unreachable hold names no device, so only the table and the protocol
+	// identify it. Both are this reconciler's own marker.
+	if table != p.cfg.Table || (kind == unix.RTN_UNICAST && oif != p.index) {
 		return Route{}, false
 	}
 	if !destination.IsValid() {
@@ -133,7 +135,10 @@ func (p *netlinkPlatform) decodeRoute(message nlMessage) (Route, bool) {
 	if !ok {
 		return Route{}, false
 	}
-	decoded := Route{Destination: prefix, PrefSrc: prefsrc, Metric: metric}
+	decoded := Route{
+		Destination: prefix, PrefSrc: prefsrc, Metric: metric,
+		Unreachable: kind == unix.RTN_UNREACHABLE,
+	}
 	if srcLen > 0 {
 		if !source.IsValid() {
 			return Route{}, false
@@ -156,6 +161,12 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 		family, scope = unix.AF_INET, unix.RT_SCOPE_LINK
 	}
 	kind := uint8(unix.RTN_UNICAST)
+	if route.Unreachable {
+		// A hold, not a path. It has no output interface and no scope of its
+		// own: fib_check_nh is not consulted for a route that resolves to an
+		// error, and naming a device would make the kernel reject it.
+		kind, scope = unix.RTN_UNREACHABLE, unix.RT_SCOPE_UNIVERSE
+	}
 	if del {
 		// RT_SCOPE_NOWHERE and RTN_UNSPEC are the kernel's wildcards in a
 		// delete match, the way "ip route del" leaves them.
@@ -185,7 +196,9 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 	if srcLen > 0 {
 		body = putAttr(body, unix.RTA_SRC, addressBytes(route.Source.Addr()))
 	}
-	body = putAttrU32(body, unix.RTA_OIF, p.index)
+	if !route.Unreachable {
+		body = putAttrU32(body, unix.RTA_OIF, p.index)
+	}
 	if route.PrefSrc.IsValid() {
 		body = putAttr(body, unix.RTA_PREFSRC, addressBytes(route.PrefSrc))
 	}

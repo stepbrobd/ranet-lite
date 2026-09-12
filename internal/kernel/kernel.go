@@ -152,13 +152,23 @@ type Route struct {
 	// Metric is RTA_PRIORITY as the kernel holds it, never the zero that
 	// means "your default" on the way in.
 	Metric uint32
+	// Unreachable holds a prefix rather than carrying it, which is what
+	// RFC 8966 section 3.5.4 requires of a retracted route until it is
+	// flushed. Without it the entry leaves the table and a packet for that
+	// prefix follows a shorter one instead, which on a node holding a default
+	// is straight back out to the neighbor that just retracted it.
+	Unreachable bool
 }
 
 func (r Route) String() string {
-	if r.Source.IsValid() {
-		return fmt.Sprintf("%s from %s metric %d", r.Destination, r.Source, r.Metric)
+	kind := ""
+	if r.Unreachable {
+		kind = " unreachable"
 	}
-	return fmt.Sprintf("%s metric %d", r.Destination, r.Metric)
+	if r.Source.IsValid() {
+		return fmt.Sprintf("%s from %s metric %d%s", r.Destination, r.Source, r.Metric, kind)
+	}
+	return fmt.Sprintf("%s metric %d%s", r.Destination, r.Metric, kind)
 }
 
 // auditor is implemented by a platform that can report other writers in the
@@ -413,7 +423,11 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 		if !ok {
 			continue
 		}
-		route := Route{Destination: destination, Metric: r.metric(destination)}
+		route := Route{
+			Destination: destination,
+			Metric:      r.metric(destination),
+			Unreachable: entry.Value == netstack.Unreachable,
+		}
 		if entry.Source.IsValid() {
 			source, ok := canonicalPrefix(entry.Source)
 			if !ok || source.Addr().Is4() || destination.Addr().Is4() {
@@ -477,12 +491,20 @@ func diffRoutes(desired, actual []Route) (add, del []Route) {
 	return add, del
 }
 
+func boolOrder(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func compareRoutes(a, b Route) int {
 	return cmp.Or(
 		comparePrefixes(a.Destination, b.Destination),
 		comparePrefixes(a.Source, b.Source),
 		a.PrefSrc.Compare(b.PrefSrc),
 		cmp.Compare(a.Metric, b.Metric),
+		cmp.Compare(boolOrder(a.Unreachable), boolOrder(b.Unreachable)),
 	)
 }
 

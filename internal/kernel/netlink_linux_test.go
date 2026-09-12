@@ -94,8 +94,8 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 	// an exclusive install must report a collision even if the route is ours,
 	// so a race after the dump cannot be counted as a successful addition
 	for _, route := range want {
-		if err := plat.AddRoute(route); !errors.Is(err, unix.EEXIST) {
-			t.Fatalf("reinstall %s: got %v, want EEXIST", route, err)
+		if err := plat.AddRoute(route); !errors.Is(err, errRouteSkipped) {
+			t.Fatalf("reinstall %s: got %v, want the route reported as not installed", route, err)
 		}
 	}
 	if got, _ := plat.Routes(); !slices.Equal(got, want) {
@@ -210,8 +210,8 @@ func TestNetlinkReportsOccupiedRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	for attempt := range 2 {
-		if err := plat.AddRoute(announced); !errors.Is(err, unix.EEXIST) {
-			t.Errorf("attempt %d reported %v, want EEXIST for the foreign route", attempt, err)
+		if err := plat.AddRoute(announced); !errors.Is(err, errRouteSkipped) {
+			t.Errorf("attempt %d reported %v, want the foreign route reported as not installed", attempt, err)
 		}
 	}
 	if got, err := plat.Routes(); err != nil || len(got) != 0 {
@@ -350,5 +350,59 @@ func drain(signal <-chan struct{}) {
 		default:
 			return
 		}
+	}
+}
+
+// The RFC 8966 section 3.5.4 hold has to reach the kernel as a route that
+// answers with an error, naming no output device, and has to come back from a
+// dump the same way or every pass would delete and reinstall it.
+func TestNetlinkHoldsARetractedPrefix(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Getuid() != 0 {
+		t.Skip("the real netlink path needs root on linux")
+	}
+	enterThrowawayNamespace(t)
+	conn, err := dialNetlink()
+	if err != nil {
+		t.Fatalf("dial rtnetlink: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	requireEmptyNamespace(t, conn)
+	const device = "ranethold0"
+	createTUN(t, device)
+	index, _, err := conn.link(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setLinkFlags(t, conn, index, unix.IFF_UP)
+	plat := &netlinkPlatform{
+		cfg:      Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol},
+		index:    index,
+		conn:     conn,
+		occupied: map[string]bool{},
+	}
+
+	// An explicit metric, the way the reconciler always sets one: a zero
+	// RTA_PRIORITY makes the kernel substitute its own default, 1024 for
+	// IPv6, and the dump would then never match what was asked for.
+	held := Route{Destination: prefix("2001:db8:1::/48"), Unreachable: true, Metric: defaultIPv6Metric}
+	if err := plat.AddRoute(held); err != nil {
+		t.Fatalf("install the hold: %v", err)
+	}
+	got, err := plat.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []Route{held}) {
+		t.Fatalf("the table holds %v, want %v", got, []Route{held})
+	}
+	// It converges, so a pass does not delete and reinstall it forever.
+	if add, del := diffRoutes([]Route{held}, got); len(add) != 0 || len(del) != 0 {
+		t.Fatalf("an installed hold did not converge: add %v, delete %v", add, del)
+	}
+	if err := plat.DelRoute(held); err != nil {
+		t.Fatalf("withdraw the hold: %v", err)
+	}
+	if got, err := plat.Routes(); err != nil || len(got) != 0 {
+		t.Fatalf("the hold outlived its withdrawal: %v, error %v", got, err)
 	}
 }

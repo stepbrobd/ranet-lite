@@ -862,3 +862,42 @@ func TestDarwinReportsAnOccupiedRouteAsSkipped(t *testing.T) {
 		t.Fatalf("refused route appeared owned: %v, error %v", actual, err)
 	}
 }
+
+// A hold answers with an error rather than carrying the packet out of the tun,
+// and keeps whatever scope its destination would have had: a held default must
+// no more be visible to an unbound socket than a real one.
+func TestDarwinHoldIsInstalledAsAReject(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	held := Route{Destination: prefix("2001:db8:1::/48"), Unreachable: true, Metric: defaultIPv6Metric}
+	if err := plat.AddRoute(held); err != nil {
+		t.Fatal(err)
+	}
+	written := sock.messages(t)
+	if len(written) != 1 {
+		t.Fatalf("install wrote %d messages, want 1", len(written))
+	}
+	if written[0].Flags&unix.RTF_REJECT == 0 {
+		t.Fatalf("the hold was installed as a path, flags %#x", written[0].Flags)
+	}
+	// It comes back from a dump as a hold too, or every pass would delete and
+	// reinstall it.
+	actual, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: written[0].Flags, dst: held.Destination, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actual) != 1 || !actual[0].Unreachable {
+		t.Fatalf("the dump reported %v, want the hold", actual)
+	}
+	if add, del := diffRoutes([]Route{held}, actual); len(add) != 0 || len(del) != 0 {
+		t.Fatalf("an installed hold did not converge: add %v, delete %v", add, del)
+	}
+	// A real route to the same destination is a different route, so switching
+	// between them is an add and a delete rather than nothing at all.
+	carried := held
+	carried.Unreachable = false
+	if add, del := diffRoutes([]Route{carried}, actual); len(add) != 1 || len(del) != 1 {
+		t.Fatalf("a hold and a path to one prefix compared equal: add %v, delete %v", add, del)
+	}
+}

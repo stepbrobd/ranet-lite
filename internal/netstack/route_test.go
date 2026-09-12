@@ -291,29 +291,32 @@ func TestRouteTableTrieRemovePeerCompactsAcrossFamilies(t *testing.T) {
 	}
 }
 
-// The kernel reconciler mirrors Snapshot and can only encode a unicast route,
-// so a prefix held unreachable must not appear in it. Installing the hold as a
-// real route would point a kernel route at a peer that cannot carry it.
-func TestSnapshotOmitsTheUnreachableHold(t *testing.T) {
+// The hold is what stops a packet for a retracted prefix following a shorter
+// one instead, and a mirror of this table has to hold it for the same reason.
+// Leaving it out of the snapshot deleted it from the kernel table, where
+// longest-prefix match then fell through to the covering route for the whole
+// hold window.
+func TestSnapshotCarriesTheUnreachableHold(t *testing.T) {
 	rt := NewRouteTable()
 	peer := NewPeer("peer", nil, nil)
 	held := netip.MustParsePrefix("2001:db8:1::/48")
 	rt.Set(netip.Prefix{}, netip.MustParsePrefix("2001:db8::/48"), peer)
 	rt.Set(netip.Prefix{}, held, Unreachable)
 
+	var found bool
 	for _, route := range rt.Snapshot() {
 		if route.Destination == held {
-			t.Fatalf("the unreachable hold for %s reached the reconciler's snapshot", held)
-		}
-		if route.Value == Unreachable {
-			t.Fatalf("the unreachable sentinel reached the reconciler's snapshot as %v", route)
+			found = true
+			if route.Value != Unreachable {
+				t.Errorf("the hold for %s came back as a route through %v", held, route.Value)
+			}
 		}
 	}
-	if len(rt.Snapshot()) != 1 {
-		t.Fatalf("snapshot has %d routes, want the one real route", len(rt.Snapshot()))
+	if !found {
+		t.Errorf("the hold for %s was left out of the snapshot, so a mirror deletes it", held)
 	}
-	// It is still a hold for forwarding, which is the whole point of keeping
-	// the entry rather than removing it.
+	// It is still a hold for forwarding here, which is what keeping the entry
+	// rather than removing it is for.
 	if _, ok := rt.Lookup(netip.Addr{}, held.Addr().Next()); ok {
 		t.Error("a packet for a held prefix was routed rather than dropped")
 	}

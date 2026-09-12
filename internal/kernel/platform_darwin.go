@@ -226,13 +226,17 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 // RTF_MULTICAST are the kernel's own entries for an address, which is how
 // darwin records the per-interface broadcast and multicast plumbing.
 // RTF_WASCLONED is a copy the kernel made of some other route, RTF_LLINFO a
-// neighbor cache entry, and RTF_BLACKHOLE and RTF_REJECT discard rather than
-// forward. RTF_GATEWAY
-// says the route has a next hop, which the mesh never expresses. Removing any
-// of them would break something this reconciler did not create.
+// neighbor cache entry, and RTF_BLACKHOLE discards silently, which the mesh
+// never asks for. RTF_GATEWAY says the route has a next hop, which the mesh
+// never expresses. Removing any of them would break something this reconciler
+// did not create.
+//
+// RTF_REJECT is not among them: it is the shape a held prefix is installed
+// with, so a reject route out of our own interface with our own gateway shape
+// is one of ours, by the same argument as every other route out of it.
 const skipRouteFlags = unix.RTF_IFSCOPE | unix.RTF_MULTICAST | unix.RTF_BROADCAST |
 	unix.RTF_LOCAL | unix.RTF_WASCLONED | unix.RTF_LLINFO |
-	unix.RTF_BLACKHOLE | unix.RTF_REJECT | unix.RTF_GATEWAY
+	unix.RTF_BLACKHOLE | unix.RTF_GATEWAY
 
 // decodeRoute keeps only the routes this reconciler owns. Everything else in
 // the dump belongs to somebody else, so it is dropped here and can never reach
@@ -301,9 +305,10 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		Destination: prefix,
 		// The kernel keeps no source, so a scoped route's source comes back
 		// from what this process installed for that destination.
-		Source:  source,
-		PrefSrc: p.prefSrc(prefix),
-		Metric:  p.metric(prefix),
+		Source:      source,
+		PrefSrc:     p.prefSrc(prefix),
+		Metric:      p.metric(prefix),
+		Unreachable: rm.Flags&unix.RTF_REJECT != 0,
 	}, true
 }
 
@@ -395,6 +400,13 @@ func (p *routePlatform) AddRoute(r Route) error {
 	}
 	if scopeOnDarwin(r) {
 		message.Flags |= unix.RTF_IFSCOPE
+	}
+	if r.Unreachable {
+		// A hold rather than a path, so it answers with an error instead of
+		// carrying the packet out of the tun. It keeps the scope decision
+		// above: a held default must no more be visible to an unbound socket
+		// than a real one.
+		message.Flags |= unix.RTF_REJECT
 	}
 	// darwin has no replace, so a route another program holds under the same
 	// key stays and this add is retried on every pass. That is the same

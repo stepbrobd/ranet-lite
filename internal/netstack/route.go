@@ -36,15 +36,13 @@ func (rt *RouteTable) Changed() <-chan struct{} { return rt.changed }
 // Snapshot is one consistent view of the forwarding table. The underlying
 // trie publishes immutable roots, so this is safe to call from any goroutine.
 //
-// The unreachable holds are left out. They exist to stop this node's own
-// forwarding table falling through to a shorter prefix, and the kernel
-// reconciler that mirrors this has no unicast route to install for one.
+// The unreachable holds are included, carrying the Unreachable sentinel as
+// their value. They exist to stop a packet for a retracted prefix following a
+// shorter one instead, and a mirror of this table has to hold them for the
+// same reason rather than letting its own longest-prefix match fall through.
 func (rt *RouteTable) Snapshot() []sadr.Route[*Peer] {
 	var out []sadr.Route[*Peer]
 	for route := range rt.table.All() {
-		if route.Value == Unreachable {
-			continue
-		}
 		out = append(out, route)
 	}
 	return out

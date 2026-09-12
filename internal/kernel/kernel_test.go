@@ -628,3 +628,59 @@ func TestSkippedRoutesAreNotCountedAndDoNotFailThePass(t *testing.T) {
 		t.Fatalf("the kernel took %d routes across two passes, want 1", kernel.adds)
 	}
 }
+
+// RFC 8966 section 3.5.4 holds a retracted prefix until it is flushed, so a
+// packet for it does not follow a shorter prefix instead. The mesh's own table
+// does that; the kernel table this mirrors into has to as well, or longest
+// prefix match falls through to the covering route for the whole window, which
+// on a node holding a default is straight back out to the neighbor that just
+// retracted it.
+func TestRetractedPrefixIsHeldInTheKernelTable(t *testing.T) {
+	r, table, kernel := harness(t, Config{})
+	peer := netstack.NewPeer("peer", nil, nil)
+	covering := prefix("2001:db8::/32")
+	retracted := prefix("2001:db8:1::/48")
+	table.Set(netip.Prefix{}, covering, peer)
+	table.Set(netip.Prefix{}, retracted, peer)
+	if err := r.applyRoutes(); err != nil {
+		t.Fatal(err)
+	}
+
+	table.Set(netip.Prefix{}, retracted, netstack.Unreachable)
+	if err := r.applyRoutes(); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := kernel.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held, carried bool
+	for _, route := range routes {
+		if route.Destination != retracted {
+			continue
+		}
+		held, carried = route.Unreachable, !route.Unreachable
+	}
+	if carried {
+		t.Error("the retracted prefix is still a unicast route, so the mesh and the kernel disagree")
+	}
+	if !held {
+		t.Errorf("the retracted prefix left the kernel table, so a packet for it follows %s instead", covering)
+	}
+
+	// And it goes when the hold is flushed, rather than staying an error route
+	// nothing announces.
+	table.Remove(netip.Prefix{}, retracted)
+	if err := r.applyRoutes(); err != nil {
+		t.Fatal(err)
+	}
+	routes, err = kernel.Routes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range routes {
+		if route.Destination == retracted {
+			t.Errorf("the hold outlived the entry it was holding: %v", route)
+		}
+	}
+}
