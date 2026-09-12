@@ -1,6 +1,10 @@
 # Example ranet-lite config. See internal/config/config.go for the full
 # schema and defaults, and internal/registry/testdata/registry.json for a
 # worked example of the registry.json this points at.
+#
+# Optional YAML lines start with "# " followed by a lowercase key or list
+# item, possibly indented. Enable an option by removing only "# ", keeping
+# the remaining indentation. Enable its parent keys and list items together.
 
 # Identity: must match an entry for this org/node/serial in the registry
 # below, and private_key must be that organization's shared Ed25519 key.
@@ -56,14 +60,25 @@ babel:
   hello_interval: 4s
   update_interval: 16s
 
+  # Optional link costs use the BIRD interface option names.
+  # rxcost: 96
+  # rtt_cost: 1024
+  # rtt_max: 1024ms
+
+  # Optional announcements also support a source prefix, which the top-level
+  # originate list cannot express. Enable the list and its entries together.
+  # originate:
+  #   - 2001:db8:1::/48                      # a plain prefix, same as originate
+  #   - { prefix: "::/0", from: "2001:db8:1::/48" }  # an exit's default
+
 # Optional: use this TUN name. WireGuard's TUN backend attaches when the
 # interface already exists, or creates it if it does not. Omit it to create
 # an automatically named ranet%d interface.
 # tun: ranet0
 
 # ranet-lite creates a TUN device by default (its name is logged on startup) but
-# never touches its address or routes itself — after starting it, assign
-# it an address and add whatever routes you want yourself, e.g.:
+# never touches its address or routes itself unless kernel mode is enabled.
+# Otherwise, after starting it, assign an address and add routes yourself, e.g.:
 #   ip addr add 10.66.0.5/32 dev ranet0
 #   ip route add ::/0 dev ranet0
 
@@ -83,16 +98,3 @@ babel:
 #   assign_originated: false
 #   vrf: gravity
 #   reconcile_interval: 30s
-
-# The babel block also carries link costs, named after the BIRD interface
-# options they mirror, and source-specific announcements the plain originate
-# list above cannot express.
-# babel:
-#   hello_interval: 4s
-#   update_interval: 16s
-#   rxcost: 96
-#   rtt_cost: 1024
-#   rtt_max: 1024ms
-#   originate:
-#     - 2001:db8:1::/48                      # a plain prefix, same as originate
-#     - { prefix: "::/0", from: "2001:db8:1::/48" }  # an exit's default

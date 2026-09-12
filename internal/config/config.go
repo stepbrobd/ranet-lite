@@ -94,6 +94,38 @@ type Kernel struct {
 	ReconcileInterval *Duration `yaml:"reconcile_interval"`
 }
 
+// KernelAddresses keeps startup and reload checking the same assigned-address
+// set. Host bits belong to interface addresses, unlike Babel route keys.
+func (c *Config) KernelAddresses() ([]netip.Prefix, error) {
+	originated := c.Originate
+	if !c.Kernel.AssignOriginated {
+		originated = nil
+	}
+	var addresses []netip.Prefix
+	seen := make(map[netip.Prefix]bool)
+	add := func(prefix netip.Prefix) {
+		if !seen[prefix] {
+			seen[prefix] = true
+			addresses = append(addresses, prefix)
+		}
+	}
+	for _, list := range [][]string{c.Kernel.Addresses, originated} {
+		for _, raw := range list {
+			prefix, err := netip.ParsePrefix(raw)
+			if err != nil {
+				return nil, fmt.Errorf("config: kernel.addresses %q: %w", raw, err)
+			}
+			add(prefix)
+		}
+	}
+	if c.Kernel.AssignOriginated {
+		for _, entry := range c.Babel.Originate {
+			add(entry.Prefix)
+		}
+	}
+	return addresses, nil
+}
+
 // Duration accepts standard Go duration strings and a bare YAML zero.
 // The latter keeps `child_rekey_interval: 0` concise when disabling rekeys.
 type Duration time.Duration

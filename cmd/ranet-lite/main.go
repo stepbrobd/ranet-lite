@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -195,21 +194,10 @@ func kernelConfig(cfg *config.Config, device string) (kernel.Config, error) {
 		}
 		out.PrefSrc4 = address
 	}
-	raw := cfg.Kernel.Addresses
-	if cfg.Kernel.AssignOriginated {
-		raw = append(slices.Clone(raw), cfg.Originate...)
+	addresses, err := cfg.KernelAddresses()
+	if err != nil {
+		return kernel.Config{}, err
 	}
-	seen := make(map[netip.Prefix]bool, len(raw))
-	for _, entry := range raw {
-		prefix, err := netip.ParsePrefix(entry)
-		if err != nil {
-			return kernel.Config{}, fmt.Errorf("config: kernel.addresses %q: %w", entry, err)
-		}
-		if seen[prefix] {
-			continue
-		}
-		seen[prefix] = true
-		out.Addresses = append(out.Addresses, prefix)
-	}
+	out.Addresses = addresses
 	return out, nil
 }

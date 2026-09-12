@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/netip"
 	"reflect"
+	"slices"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
@@ -146,7 +147,7 @@ func reloadable(old, next *config.Config) error {
 		// of reporting a reload that did nothing. Originate is the exception:
 		// SetOriginated applies it, and it is the field an exit changes.
 		return fmt.Errorf("config: babel settings changed, restart to apply")
-	case !sameKernelSettings(old.Kernel, next.Kernel):
+	case !sameKernelSettings(old.Kernel, next.Kernel) || !sameKernelAddresses(old, next):
 		// The reconciler is configured once in main, including the addresses
 		// assign_originated expands into, so none of this block can be applied
 		// here.
@@ -173,6 +174,29 @@ func sameKernelSettings(old, next config.Kernel) bool {
 	normalize(&old)
 	normalize(&next)
 	return reflect.DeepEqual(old, next)
+}
+
+func sameKernelAddresses(old, next *config.Config) bool {
+	if !old.Kernel.Enabled || !old.Kernel.AssignOriginated {
+		return true
+	}
+	before, err := old.KernelAddresses()
+	if err != nil {
+		return false
+	}
+	after, err := next.KernelAddresses()
+	if err != nil {
+		return false
+	}
+	compare := func(a, b netip.Prefix) int {
+		if order := a.Addr().Compare(b.Addr()); order != 0 {
+			return order
+		}
+		return a.Bits() - b.Bits()
+	}
+	slices.SortFunc(before, compare)
+	slices.SortFunc(after, compare)
+	return slices.Equal(before, after)
 }
 
 // sameBabelSettings compares everything in the babel block that a reload

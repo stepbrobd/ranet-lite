@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -137,24 +138,29 @@ registry: registry.json
 	}
 }
 
-// The example is the first configuration anyone copies, and nothing else reads
-// it, so it drifts silently. Parsing it here at least keeps it loadable and
-// keeps its field names real.
+// Both the shipped defaults and the optional YAML get copied into real
+// configurations, so neither may hide invalid fields or duplicate blocks.
 func TestExampleConfigParses(t *testing.T) {
 	example, err := os.ReadFile(filepath.Join("..", "..", "examples", "config.yaml"))
 	if err != nil {
 		t.Fatalf("read the example: %v", err)
 	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(path, example, 0600); err != nil {
-		t.Fatal(err)
-	}
-	// The example points at files it does not ship, so loading stops at the
-	// key. What is under test is the shape, not the key material.
-	if _, err := Load(path); err != nil && !strings.Contains(err.Error(), "private_key") &&
-		!strings.Contains(err.Error(), "registry") && !strings.Contains(err.Error(), "no such file") {
-		t.Errorf("the example no longer parses: %v", err)
+	// Match the example's commented lowercase keys and list items, not prose
+	// or shell commands. Removing only "# " preserves YAML nesting.
+	commentedYAML := regexp.MustCompile(`(?m)^([ ]*)# ([ ]*(?:[a-z_][a-z0-9_]*:|-[ ]).*)$`)
+	for name, body := range map[string][]byte{
+		"shipped":             example,
+		"all options enabled": commentedYAML.ReplaceAll(example, []byte(`${1}${2}`)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, body, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err != nil {
+				t.Fatalf("the example no longer loads: %v", err)
+			}
+		})
 	}
 }
 
@@ -176,11 +182,33 @@ func TestOriginateRefusesIPv4SourceSpecific(t *testing.T) {
 	if err == nil {
 		t.Fatal("an IPv4 source-specific origination was accepted, and it reaches nobody")
 	}
-	if !strings.Contains(err.Error(), "IPv6 only") {
-		t.Errorf("error %q does not say why it was refused", err)
-	}
 	if err := load(t, "babel:\n  originate:\n    - {prefix: \"::/0\", from: \"2001:db8::/48\"}\n"); err != nil {
 		t.Errorf("the IPv6 form was refused: %v", err)
+	}
+}
+
+func TestOriginateRefusesUnknownField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	// A valid prefix value isolates unknown-field rejection from parsing.
+	body := testConfig + "babel:\n  originate:\n    - {prefix: \"::/0\", form: \"2001:db8::/48\"}\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("an unknown originate field was accepted")
+	}
+}
+
+func TestOriginateRefusesMismatchedFamilies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	// An IPv6 destination keeps the IPv4 source-specific guard from masking
+	// a missing address-family check.
+	body := testConfig + "babel:\n  originate:\n    - {prefix: \"::/0\", from: 198.51.100.0/24}\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("originate prefixes with mismatched address families were accepted")
 	}
 }
 

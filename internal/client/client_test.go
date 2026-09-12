@@ -234,6 +234,102 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 	}
 }
 
+func TestReloadRefusesAssignedAddressChanges(t *testing.T) {
+	for name, change := range map[string]func(*config.Config){
+		"top-level addition": func(c *config.Config) {
+			c.Originate = []string{"fd00:1::1/64", "fd00:2::1/64"}
+		},
+		"top-level removal": func(c *config.Config) { c.Originate = nil },
+		"babel addition": func(c *config.Config) {
+			c.Babel.Originate = []config.OriginatePrefix{{
+				Prefix: netip.MustParsePrefix("fd00:2::1/64"), From: netip.MustParsePrefix("fd00:3::/64"),
+			}}
+		},
+		"host address change": func(c *config.Config) { c.Originate = []string{"fd00:1::2/64"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, path := reloadFixture(t)
+			old := c.config()
+			old.Kernel = config.Kernel{Enabled: true, AssignOriginated: true}
+			old.Originate = []string{"fd00:1::1/64"}
+			next := *old
+			change(&next)
+			writeConfig(t, path, &next)
+			if _, err := config.Load(path); err != nil {
+				t.Fatalf("invalid reload fixture: %v", err)
+			}
+			if err := c.Reload(path); err == nil {
+				t.Fatal("reload accepted an assigned address change")
+			}
+			if !slices.Equal(c.config().Originate, old.Originate) ||
+				!slices.Equal(c.config().Babel.Originate, old.Babel.Originate) {
+				t.Error("refused reload changed the active originations")
+			}
+		})
+	}
+}
+
+func TestReloadAllowsUnchangedAssignedAddresses(t *testing.T) {
+	base := &config.Config{
+		Kernel:    config.Kernel{Enabled: true, AssignOriginated: true},
+		Originate: []string{"fd00:1::1/64", "fd00:2::1/64"},
+	}
+	for name, change := range map[string]func(*config.Config){
+		"reorder and duplicate": func(c *config.Config) {
+			c.Originate = []string{"fd00:2::1/64", "fd00:1::1/64", "fd00:2::1/64"}
+		},
+		"move into babel": func(c *config.Config) {
+			c.Originate = []string{"fd00:1::1/64"}
+			c.Babel.Originate = []config.OriginatePrefix{{
+				Prefix: netip.MustParsePrefix("fd00:2::1/64"), From: netip.MustParsePrefix("fd00:3::/64"),
+			}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			next := *base
+			change(&next)
+			if err := reloadable(base, &next); err != nil {
+				t.Fatalf("unchanged assigned addresses were refused: %v", err)
+			}
+		})
+	}
+	for _, kernel := range []config.Kernel{
+		{Enabled: true},
+		{AssignOriginated: true},
+	} {
+		old := &config.Config{Kernel: kernel}
+		next := *old
+		next.Originate = []string{"fd00:4::/64"}
+		if err := reloadable(old, &next); err != nil {
+			t.Fatalf("announcement-only change was refused: %v", err)
+		}
+	}
+}
+
+func reloadFixture(t *testing.T) (*Client, string) {
+	t.Helper()
+	cfg, privateKey, reg := runtimeFixture(t)
+	dir := t.TempDir()
+	cfg.Port = 13000
+	cfg.PrivateKey = filepath.Join(dir, "key.pem")
+	cfg.Registry = filepath.Join(dir, "registry.json")
+	writeKey(t, cfg.PrivateKey, privateKey)
+	writeRegistry(t, cfg.Registry, reg)
+	speaker, err := babel.New(cfg.Babel.SpeakerConfig(), &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{
+		ctx: ctx, cancel: cancel, privateKey: privateKey,
+		speaker: speaker, dialers: make(map[string]*dialer),
+	}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+	t.Cleanup(func() { cancel(); c.peers.Wait() })
+	return c, filepath.Join(dir, "config.yaml")
+}
+
 func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
 	speaker, err := babel.New(babel.Config{}, mesh)
