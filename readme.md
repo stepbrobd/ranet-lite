@@ -284,6 +284,17 @@ and authenticate a real node in a real mesh. Never commit real copies of
 either; only synthetic fixtures belong in version control (see
 `.gitignore`).
 
+## Metrics
+
+`-metrics 127.0.0.1:9669` serves `/metrics` in the Prometheus text format on
+its own listener, separate from `-pprof` so a fleet node can be scraped without
+exposing a profiler. It reports what
+`prometheus-bird-exporter` reported while Babel lived in BIRD: neighbor
+liveness and link cost, routes received per neighbor, routes selected and
+originated, established sessions per path, and inbound ESP packet and drop
+counters. Everything is read from live state at scrape time, so a scrape
+reflects the instant it happened rather than a sampled snapshot.
+
 ## Reloading
 
 `SIGHUP` re-reads the config file and the registry and reconciles rather than

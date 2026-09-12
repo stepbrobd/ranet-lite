@@ -42,6 +42,9 @@ type Client struct {
 	// the WaitGroup after the wait has begun, which panics.
 	stopped bool
 	peers   sync.WaitGroup
+
+	inboundPackets atomic.Uint64
+	inboundDropped atomic.Uint64
 }
 
 func (c *Client) config() *config.Config      { return c.cfg.Load() }

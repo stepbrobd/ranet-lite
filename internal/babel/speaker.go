@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -471,4 +472,51 @@ func (s *Speaker) sweepRequestsLocked(now time.Time) {
 			delete(s.askedSeqno, index)
 		}
 	}
+}
+
+// NeighborStat is one neighbor as an operator sees it, the same three facts
+// `birdc show babel neighbors` reports.
+type NeighborStat struct {
+	Peer   string
+	Alive  bool
+	Cost   uint16
+	Routes int
+}
+
+// Stats is a consistent snapshot of the speaker for a metrics endpoint. It
+// takes the same lock the protocol runs under, so it is a point in time rather
+// than a set of independently sampled counters.
+type Stats struct {
+	Neighbors  []NeighborStat
+	Selected   int
+	Originated int
+}
+
+func (s *Speaker) Stats() Stats {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stats := Stats{
+		Neighbors:  make([]NeighborStat, 0, len(s.neighbors)),
+		Originated: len(s.originate),
+	}
+	received := make(map[*neighborState]int, len(s.neighbors))
+	for _, entry := range s.routes.entries {
+		if entry.selected.neighbor != nil {
+			stats.Selected++
+		}
+		for neighbor := range entry.routes {
+			received[neighbor]++
+		}
+	}
+	for _, neighbor := range s.neighbors {
+		stats.Neighbors = append(stats.Neighbors, NeighborStat{
+			Peer:   neighbor.peer.ID,
+			Alive:  neighbor.isAlive(now),
+			Cost:   neighbor.linkCost(now),
+			Routes: received[neighbor],
+		})
+	}
+	sort.Slice(stats.Neighbors, func(i, j int) bool { return stats.Neighbors[i].Peer < stats.Neighbors[j].Peer })
+	return stats
 }

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -28,8 +29,9 @@ import (
 
 func main() {
 	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
-	pprofAddr := flag.String("pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling — CPU: /debug/pprof/profile, flamegraph: go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
+	pprofAddr := flag.String("pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
 	contentionProfiles := flag.Bool("contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
+	metricsAddr := flag.String("metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
 	logLevel := flag.String("log-level", "info", "minimum log level: debug, info, warn, or error")
 	flag.Parse()
 	var level slog.Level
@@ -61,6 +63,22 @@ func main() {
 	}
 	defer node.Close()
 	mesh := node.Mesh
+
+	// A separate listener from pprof: a fleet node wants metrics scraped
+	// without exposing a profiler, and a profiling run wants the profiler
+	// without rewiring monitoring.
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", node.MetricsHandler())
+		server := &http.Server{Addr: *metricsAddr, Handler: mux}
+		go func() {
+			log.Printf("metrics listening on http://%s/metrics", *metricsAddr)
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("metrics: %v", err)
+			}
+		}()
+		defer server.Close()
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

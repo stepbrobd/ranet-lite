@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/esp"
@@ -229,6 +231,38 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 	unchanged.Peers = []config.Peer{{Organization: "example", CommonName: "a"}}
 	if err := reloadable(base, &unchanged); err != nil {
 		t.Fatalf("adding a peer was refused: %v", err)
+	}
+}
+
+func TestMetricsExposesBabelAndSessionState(t *testing.T) {
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := babel.New(babel.Config{}, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	speaker.Originate(netip.MustParsePrefix("10.66.0.5/32"))
+	c := &Client{speaker: speaker, sessions: newSessionSet()}
+	c.countInbound(7, 2)
+
+	var out bytes.Buffer
+	c.Metrics(&out)
+	text := out.String()
+	for _, want := range []string{
+		"ranet_lite_babel_routes_originated 1",
+		"ranet_lite_babel_routes_selected 0",
+		"ranet_lite_sessions 0",
+		"ranet_lite_esp_inbound_packets_total 7",
+		"ranet_lite_esp_inbound_dropped_total 2",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output is missing %q:\n%s", want, text)
+		}
+	}
+	// Every series needs its HELP and TYPE, or a scrape rejects the sample.
+	for _, name := range []string{"ranet_lite_sessions", "ranet_lite_esp_inbound_packets_total"} {
+		if !strings.Contains(text, "# HELP "+name+" ") || !strings.Contains(text, "# TYPE "+name+" ") {
+			t.Errorf("metric %s has no HELP or TYPE", name)
+		}
 	}
 }
 
