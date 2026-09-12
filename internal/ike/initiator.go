@@ -125,6 +125,9 @@ type Session struct {
 	// of them read dead and tear down together; backward, all of them read
 	// alive until the clock catches up.
 	lastActive atomic.Int64
+	// lastPeerChildRekey is when the last peer-initiated Child SA rekey was
+	// accepted, on the same clock and with the same plus-one as lastActive.
+	lastPeerChildRekey atomic.Int64
 
 	childRekeyInterval time.Duration
 	ikeRekeyInterval   time.Duration
@@ -858,6 +861,26 @@ func (s *Session) Active() bool {
 
 // noteActive records that the peer has just proved it is still there.
 func (s *Session) noteActive() { s.lastActive.Store(int64(time.Since(s.started)) + 1) }
+
+// minPeerChildRekeyInterval is the shortest gap between accepted
+// peer-initiated Child SA rekeys. Each one retains the SA it replaces for the
+// retirement delay, and installing a replacement copies the retained set, so a
+// peer rekeying as fast as it can drives that set to its own rate times the
+// delay and makes every install proportional to it. A legitimate rekey is
+// minutes apart: the packet-count trigger fires once per sequence space and
+// the scheduled one once per interval.
+const minPeerChildRekeyInterval = time.Second
+
+// allowPeerChildRekey reports whether to take on another peer-initiated Child
+// SA rekey, and records it when it does.
+func (s *Session) allowPeerChildRekey() bool {
+	now := int64(time.Since(s.started))
+	if last := s.lastPeerChildRekey.Load(); last != 0 && now-(last-1) < int64(minPeerChildRekeyInterval) {
+		return false
+	}
+	s.lastPeerChildRekey.Store(now + 1)
+	return true
+}
 
 // noteEstablished starts the liveness clock at the end of the handshake.
 func (s *Session) noteEstablished() { s.noteActive() }

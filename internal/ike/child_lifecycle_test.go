@@ -429,3 +429,23 @@ func TestFailedChildRetireExchangeStillClearsTheReplacedSA(t *testing.T) {
 		t.Fatalf("Child SA %08x is still awaiting retirement after a failed exchange", got.LocalSPI)
 	}
 }
+
+// A peer chooses when to rekey. Each accepted one retains the SA it replaces
+// for the retirement delay, and installing a replacement copies the retained
+// set, so an unbounded rate drives that set to the rate times the delay and
+// makes every install proportional to it, on the session's own goroutine.
+func TestPeerChildRekeysAreRateLimited(t *testing.T) {
+	s := &Session{started: time.Now()}
+	if !s.allowPeerChildRekey() {
+		t.Fatal("the first peer rekey was refused")
+	}
+	if s.allowPeerChildRekey() {
+		t.Error("a second peer rekey was accepted immediately after the first")
+	}
+	// Backdating the origin the offset is measured from is the same as time
+	// passing, and does not make the test wait for it.
+	s.started = s.started.Add(-minPeerChildRekeyInterval)
+	if !s.allowPeerChildRekey() {
+		t.Error("a peer rekey was still refused a whole interval later")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestPeerChildRekeyWithPFS(t *testing.T) {
@@ -180,5 +181,61 @@ func TestQueuedChildRequestDoesNotUseRetiredIKE(t *testing.T) {
 	_, err := s.startRequest(&localRequest{exchange: CREATE_CHILD_SA, context: new(ikeContext)})
 	if err == nil {
 		t.Fatal("started CREATE_CHILD_SA on a replaced IKE SA")
+	}
+}
+
+// The rate limit has to sit in handleChildRekey, before the Diffie-Hellman and
+// the keymat, which is what a peer rekeying in a loop is really asking us to
+// spend.
+func TestHandleChildRekeyRefusesASecondRekeyInTheSameInterval(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ctx := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: bytes.Repeat([]byte{1}, 32),
+		skei: bytes.Repeat([]byte{2}, 20), sker: bytes.Repeat([]byte{3}, 20)}
+	old := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 21, RemoteSPI: 22}
+	s := &Session{mux: mux, current: ctx, Child: old, started: time.Now()}
+
+	rekey := func(msgID uint32, remoteSPI uint32) []RawPayload {
+		raw, err := s.handleChildRekey(ctx, msgID, []RawPayload{
+			{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_REKEY_SA, Protocol: ProtoESP, SPI: binary.BigEndian.AppendUint32(nil, remoteSPI)})},
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{espProposal(binary.BigEndian.AppendUint32(nil, 32))})},
+			{Type: PayloadNonce, Body: bytes.Repeat([]byte{4}, 32)},
+			{Type: PayloadTSi, Body: fullRangeSelectors()},
+			{Type: PayloadTSr, Body: fullRangeSelectors()},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		message, err := DecodeMessage(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner, err := DecryptMessage(suite, ctx.localEncryptionKey(), raw, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inner
+	}
+
+	if notify := findType(rekey(0, old.RemoteSPI), PayloadN); notify != nil {
+		decoded, _ := DecodeNotify(notify.Body)
+		t.Fatalf("the first peer rekey was refused with notify type %d", decoded.Type)
+	}
+	// Clear the retirement the first rekey left outstanding, which would
+	// refuse the second on its own and hide what this test is about.
+	s.childMu.Lock()
+	s.retiring = ChildSA{}
+	s.childMu.Unlock()
+
+	// The replacement is now current, so the second names it and is refused
+	// only because it is too soon.
+	next := s.currentChild()
+	notify := findType(rekey(1, next.RemoteSPI), PayloadN)
+	if notify == nil {
+		t.Fatal("a second peer rekey in the same interval was accepted")
+	}
+	decoded, err := DecodeNotify(notify.Body)
+	if err != nil || decoded.Type != N_TEMPORARY_FAILURE {
+		t.Fatalf("second rekey answered with notify %v, %v, want TEMPORARY_FAILURE", decoded, err)
 	}
 }
