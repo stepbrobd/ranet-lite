@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,18 +28,60 @@ import (
 	"github.com/NickCao/ranet-lite/internal/kernel"
 )
 
-func main() {
-	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
-	pprofAddr := flag.String("pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
-	contentionProfiles := flag.Bool("contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
-	metricsAddr := flag.String("metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
-	logLevel := flag.String("log-level", "info", "minimum log level: debug, info, warn, or error")
-	flag.Parse()
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
-		log.Fatalf("invalid -log-level %q: %v", *logLevel, err)
+func main() { os.Exit(run()) }
+
+// options is the command line after parsing.
+type options struct {
+	configPath         string
+	pprofAddr          string
+	metricsAddr        string
+	contentionProfiles bool
+	level              slog.Level
+}
+
+// parseOptions reads the command line and refuses what it cannot act on. It
+// takes the arguments rather than reading them from the process, and returns
+// an error rather than calling log.Fatal, so that both refusals are reachable
+// from a test: log.Fatal is os.Exit, which a test cannot observe.
+func parseOptions(args []string, usage io.Writer) (options, error) {
+	fs := flag.NewFlagSet("ranet-lite", flag.ContinueOnError)
+	fs.SetOutput(usage)
+	var o options
+	fs.StringVar(&o.configPath, "config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
+	fs.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
+	fs.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
+	fs.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
+	logLevel := fs.String("log-level", "info", "minimum log level: debug, info, warn, or error")
+	if err := fs.Parse(args); err != nil {
+		return options{}, err
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if fs.NArg() != 0 {
+		// A missing dash is the way this happens: `ranet-lite config.yaml`
+		// otherwise starts silently against the default path.
+		return options{}, fmt.Errorf("unexpected argument %q: the config path is given with -config", fs.Arg(0))
+	}
+	if err := o.level.UnmarshalText([]byte(*logLevel)); err != nil {
+		return options{}, fmt.Errorf("invalid -log-level %q: %w", *logLevel, err)
+	}
+	return o, nil
+}
+
+// run is main's body so that every deferred close runs before the process
+// exits with a status. A failure reported only in the log and then exited zero
+// tells a supervisor the node stopped cleanly when it did not, and the route
+// withdrawal at shutdown is one of the things that reports this way.
+func run() int {
+	opts, err := parseOptions(os.Args[1:], os.Stderr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	configPath, pprofAddr := &opts.configPath, &opts.pprofAddr
+	metricsAddr, contentionProfiles := &opts.metricsAddr, &opts.contentionProfiles
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: opts.level})))
+
+	// Set by anything that fails after the point where log.Fatal would skip
+	// the deferred cleanup. run returns nonzero if any of them did.
+	var failed atomic.Bool
 
 	if *pprofAddr != "" {
 		if *contentionProfiles {
@@ -48,6 +92,7 @@ func main() {
 			log.Printf("pprof listening on http://%s/debug/pprof/", *pprofAddr)
 			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
 				log.Printf("pprof: %v", err)
+				failed.Store(true)
 			}
 		}()
 	}
@@ -74,13 +119,33 @@ func main() {
 			log.Printf("metrics listening on http://%s/metrics", *metricsAddr)
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("metrics: %v", err)
+				failed.Store(true)
 			}
 		}()
 		defer server.Close()
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// One registration and one reader, rather than signal.NotifyContext plus a
+	// second channel registered after it cancels. Shutdown closes every
+	// session with a grace period, withdraws the installed routes and waits
+	// for every dialer, and while that is slow an operator pressing Ctrl-C
+	// again has nothing to press; the second signal is what answers that.
+	//
+	// Registering the second channel only after the first signal leaves a
+	// window in which a signal reaches nobody: NotifyContext has stopped
+	// reading its own channel and the replacement does not exist yet. Two
+	// signals with no gap lose the second there. Registering it up front
+	// instead delivers the first signal to both, and then the first Ctrl-C
+	// forces an exit rather than shutting down, which is the failure the
+	// window was introduced to fix. Reading both from one channel in order has
+	// neither: the first cancels, the second forces, and a burst of two is
+	// held by the buffer.
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go watchSignals(signals, cancel, func() { os.Exit(1) })
 
 	// SIGHUP reconciles rather than restarts. The registry is rewritten every
 	// time any node joins the mesh, and a restart to pick that up would drop
@@ -121,8 +186,12 @@ func main() {
 			fatal(err)
 		}
 		reconciler.Go(func() {
+			// This error is the withdrawal failing as often as it is the
+			// reconcile: routes left behind in the kernel after shutdown are
+			// exactly what an operator must not be told was a clean exit.
 			if err := routes.Run(ctx); err != nil {
 				log.Printf("kernel: %v", err)
+				failed.Store(true)
 			}
 		})
 		// The table is read back from the reconciler rather than from the
@@ -175,11 +244,27 @@ func main() {
 
 	if err := node.Run(meshCtx); err != nil && ctx.Err() == nil {
 		log.Printf("client: %v", err)
+		failed.Store(true)
 	}
 	// Whichever side stopped first, stop the other, then let the reconciler
 	// finish withdrawing before the process exits.
 	cancel()
 	reconciler.Wait()
+	if failed.Load() {
+		return 1
+	}
+	return 0
+}
+
+// watchSignals starts the shutdown on the first signal and gives up on the
+// second. Both come off one channel in order, which is what keeps a signal
+// from reaching nobody; see the registration above.
+func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force func()) {
+	<-signals
+	cancel()
+	<-signals
+	log.Print("second signal, exiting without finishing shutdown")
+	force()
 }
 
 // kernelConfig resolves the config file's kernel block against the device the

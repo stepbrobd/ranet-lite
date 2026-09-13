@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -166,5 +168,79 @@ func TestResolverNetworkFollowsTheDeclaredFamily(t *testing.T) {
 		if got := resolverNetwork(family); got != want {
 			t.Errorf("family %q resolves over %q, want %q", family, got, want)
 		}
+	}
+}
+
+// FindNode takes the first match within a block, so a common name that appears
+// twice in one block leaves the second node unreachable and says nothing about
+// it. An organization split across several blocks is a supported shape, each
+// with its own key, which is why the check is per block.
+func TestValidateRefusesADuplicateNodeInOneBlock(t *testing.T) {
+	reg, err := Load("testdata/registry.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := reg[0]
+	first.Nodes = append(append([]Node(nil), first.Nodes...), first.Nodes[0])
+	if err := (Registry{first}).Validate(); err == nil {
+		t.Error("a block naming one node twice was accepted, and the second is unreachable")
+	}
+	// The split shape is still accepted: the same name in two blocks is how
+	// an organization is carried across them.
+	left, right := reg[0], reg[0]
+	left.Nodes, right.Nodes = reg[0].Nodes[:1], reg[0].Nodes[1:]
+	if err := (Registry{left, right}).Validate(); err != nil {
+		t.Errorf("an organization split across two blocks was refused: %v", err)
+	}
+	// What the split may not carry is the same name twice. FindNode walks
+	// every block of a matching organization and takes the first hit, and it
+	// is the trust-root lookup, so two blocks naming one node under different
+	// keys leave the order of the array deciding who authenticates.
+	left, right = reg[0], reg[0]
+	left.Nodes, right.Nodes = reg[0].Nodes[:1], reg[0].Nodes[:1]
+	right.PublicKey = reg[1].PublicKey
+	if left.PublicKey == right.PublicKey {
+		t.Fatal("the fixture's two organizations share a key, so this proves nothing")
+	}
+	if err := (Registry{left, right}).Validate(); err == nil {
+		t.Error("one node carried two public keys across two blocks of one organization was accepted")
+	}
+}
+
+// DisallowUnknownFields catches a stray field inside the document. A second
+// document after it is what a partial write or a bad concatenation leaves, and
+// Decode reads the first and says nothing about the rest.
+func TestLoadRefusesTrailingData(t *testing.T) {
+	good, err := os.ReadFile("testdata/registry.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The bracket cases are the concatenation itself rather than a clean
+	// append: json.Decoder.More reports whether another element follows in the
+	// array or object being parsed, so it answers false on either closing
+	// bracket and lets the document behind one through.
+	for name, trailing := range map[string]string{
+		"a second document":              "\n{\"anything\":\"at all\"}\n",
+		"a stray bracket and a document": "]\n{\"anything\":\"at all\"}\n",
+		"a stray brace and a document":   "}\n{\"anything\":\"at all\"}\n",
+		"a stray bracket":                "]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "registry.json")
+			if err := os.WriteFile(path, append(append([]byte(nil), good...), trailing...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Errorf("a registry followed by %s was loaded without complaint", name)
+			}
+		})
+	}
+	// Trailing whitespace is not trailing data.
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := os.WriteFile(path, append(append([]byte(nil), good...), "\n\n  \n"...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Errorf("a registry with trailing whitespace was refused: %v", err)
 	}
 }

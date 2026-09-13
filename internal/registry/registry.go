@@ -12,7 +12,9 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 )
@@ -49,10 +51,29 @@ func Load(path string) (Registry, error) {
 	if err := decoder.Decode(&r); err != nil {
 		return nil, fmt.Errorf("registry: parse %s: %w", path, err)
 	}
+	// DisallowUnknownFields catches a stray field inside the document; this
+	// catches a second document after it, which is what a partial write or a
+	// bad concatenation leaves behind and which Decode would otherwise ignore
+	// entirely. Token rather than More: More answers "is there another element
+	// in the array or object being parsed" and so reports false on a stray "]"
+	// or "}", which is one character of the concatenation this is here to
+	// refuse. Only an exhausted reader gives io.EOF, and trailing whitespace
+	// still does.
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("registry: parse %s: trailing data after the registry", path)
+	}
 	return r, r.Validate()
 }
 
 func (r Registry) Validate() error {
+	// FindNode takes the first match and walks every block whose organization
+	// name matches, so a common name has to be unique across all of them and
+	// not merely within one block. Two blocks named alike, each carrying a
+	// node "a" with a different public key, would otherwise both validate and
+	// leave the order of the array to decide which key authenticates that
+	// peer, which is the trust-root lookup. Splitting an organization across
+	// blocks stays supported; only a name collision within one does not.
+	nodes := make(map[string]map[string]struct{}, len(r))
 	for _, organization := range r {
 		if organization.Organization == "" {
 			return fmt.Errorf("registry: organization name is required")
@@ -60,10 +81,19 @@ func (r Registry) Validate() error {
 		if _, err := organization.ParsePublicKey(); err != nil {
 			return err
 		}
+		named := nodes[organization.Organization]
+		if named == nil {
+			named = make(map[string]struct{}, len(organization.Nodes))
+			nodes[organization.Organization] = named
+		}
 		for _, node := range organization.Nodes {
 			if node.CommonName == "" {
 				return fmt.Errorf("registry: organization %q has a node without common_name", organization.Organization)
 			}
+			if _, exists := named[node.CommonName]; exists {
+				return fmt.Errorf("registry: duplicate node %q in organization %q", node.CommonName, organization.Organization)
+			}
+			named[node.CommonName] = struct{}{}
 			endpoints := make(map[string]struct{}, len(node.Endpoints))
 			for _, endpoint := range node.Endpoints {
 				if endpoint.SerialNumber == "" || endpoint.Port == 0 || (endpoint.AddressFamily != "ip4" && endpoint.AddressFamily != "ip6") {
