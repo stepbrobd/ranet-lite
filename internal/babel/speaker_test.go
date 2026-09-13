@@ -755,3 +755,34 @@ func TestTheEmittersCannotInvertWhatTheyDecided(t *testing.T) {
 		t.Fatalf("the neighbor was told %v, so it ends up holding the retraction that was decided first", order)
 	}
 }
+
+// Originating a prefix holds it unreachable, so a stale route to it learned
+// from a neighbor cannot take traffic this node is supposed to deliver
+// locally. Giving it back when the prefix stops being originated is the other
+// half: a reload that drops one from the configuration would otherwise leave
+// it black-holed for the life of the process, with a neighbor announcing a
+// perfectly good path to it the whole time.
+func TestAPrefixNoLongerOriginatedCanBeReachedAgain(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	covering := netip.MustParsePrefix("fd00::/16")
+	specific := netip.MustParsePrefix("fd00:1::/64")
+	inside := netip.MustParseAddr("fd00:1::1")
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{
+		EncodeRouterID([8]byte{1}),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: covering.Bits(), Prefix: covering.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 64}),
+	}))
+	if _, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); !ok {
+		t.Fatal("the covering route the neighbor announced never reached the forwarding table")
+	}
+
+	speaker.Originate(specific)
+	if peer, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); ok {
+		t.Fatalf("an originated prefix still forwards to %q, so the hold is doing nothing", peer.ID)
+	}
+	speaker.SetOriginated(nil)
+	if _, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); !ok {
+		t.Fatal("the prefix stayed held after this node stopped originating it, so it is black-holed for good")
+	}
+}

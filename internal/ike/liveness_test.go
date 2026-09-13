@@ -703,3 +703,34 @@ func TestUnansweredExchangeStillEnds(t *testing.T) {
 		t.Error("a liveness check kept retransmitting because other traffic was arriving")
 	}
 }
+
+// The retirement sweep used to be reached by a hundred-millisecond poll that
+// this series removed, so the loop's own deadline is now the only thing that
+// brings it around. Everything else the loop waits for on an idle session is
+// dead peer detection ten seconds out, so a replaced inbound SA would sit
+// registered until something unrelated happened to wake the loop.
+func TestTheRunLoopWakesForARetirement(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	retired := make(chan uint32, 1)
+	s := &Session{mux: mux, current: &ikeContext{}, requests: make(chan *localRequest)}
+	s.SetChildRetireHandler(func(spi uint32) error { retired <- spi; return nil })
+	const spi = uint32(0x11223344)
+	s.childMu.Lock()
+	s.retired = append(s.retired, childRetirement{spi: spi, expiresAt: time.Now().Add(200 * time.Millisecond)})
+	s.childMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	select {
+	case got := <-retired:
+		if got != spi {
+			t.Fatalf("retired SPI %08x, want %08x", got, spi)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the loop never woke for the retirement, so the replaced keys stay installed")
+	}
+	cancel()
+	<-done
+}

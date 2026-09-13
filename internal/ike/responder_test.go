@@ -921,3 +921,87 @@ func TestChaChaChildResponseEchoesNoKeyLength(t *testing.T) {
 		}
 	}
 }
+
+// A session that has just been established has to read as live before it has
+// carried anything. A peer that reboots leaves an SA here that looks
+// established for a full dead-peer-detection window, and the rule that sorts
+// that out asks whether a session has recently proved the peer is there. A
+// handshake that just completed is exactly that proof; without it a fresh
+// session reads as dead, the path is reported unheld, and the dialer opens
+// another SA over a perfectly good one on every reconnect delay.
+func TestAFreshlyEstablishedSessionReadsAsLive(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	initiator, err := h.dial(t)
+	if err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	defer initiator.Mux().Close()
+	if !initiator.Active() {
+		t.Error("the dialer's own session reads as dead the moment it is established")
+	}
+	var responder *Session
+	select {
+	case responder = <-h.sessions:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the responder produced no session")
+	}
+	defer responder.Mux().Close()
+	if !responder.Active() {
+		t.Error("the answering side of the same handshake reads as dead")
+	}
+}
+
+// Dead peer detection asks a peer that has gone quiet whether it is still
+// there. A peer sending continuously is not quiet, and ESP is the only thing
+// that says so on a link carrying nothing but data: without the loop consuming
+// that edge, a busy session is probed every ten seconds forever, and each
+// probe is a round trip the peer has to answer while it is already saturating
+// the link.
+func TestTrafficPostponesDeadPeerDetection(t *testing.T) {
+	probed := func(t *testing.T, traffic bool) bool {
+		t.Helper()
+		h := newResponderHarness(t, nil)
+		initiator, err := h.dial(t)
+		if err != nil {
+			t.Fatalf("initiate: %v", err)
+		}
+		t.Cleanup(func() { initiator.Mux().Close() })
+		var peer *Session
+		select {
+		case peer = <-h.sessions:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the responder produced no session")
+		}
+		t.Cleanup(func() { peer.Mux().Close() })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go func() { _ = initiator.Run(ctx) }()
+		if traffic {
+			go func() {
+				for ctx.Err() == nil {
+					initiator.NoteTraffic()
+					time.Sleep(200 * time.Millisecond)
+				}
+			}()
+		}
+		// Nothing runs the responder's own loop, so whatever arrives here is
+		// what the initiator sent unprompted.
+		_, err = peer.Mux().RecvIKEUntil(time.Now().Add(dpdInterval + 3*time.Second))
+		return err == nil
+	}
+	// The quiet session is the positive control: without it, a busy session
+	// that is never probed proves nothing about why.
+	t.Run("a quiet session", func(t *testing.T) {
+		t.Parallel()
+		if !probed(t, false) {
+			t.Error("a session that carried nothing was never probed, so dead peer detection is not running at all")
+		}
+	})
+	t.Run("a session carrying traffic", func(t *testing.T) {
+		t.Parallel()
+		if probed(t, true) {
+			t.Error("a session carrying traffic was probed anyway, so the traffic edge reaches nothing")
+		}
+	})
+}

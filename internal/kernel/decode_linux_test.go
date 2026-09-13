@@ -37,14 +37,26 @@ func TestLinuxDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 		{"another device", routeDump(ourTable, ourProtocol, unix.RTN_UNICAST, ourIndex+1, ours), false},
 		{"a blackhole of ours", routeDump(ourTable, ourProtocol, unix.RTN_BLACKHOLE, ourIndex, ours), false},
 		{"a local entry", routeDump(ourTable, ourProtocol, unix.RTN_LOCAL, ourIndex, ours), false},
+		// A retracted prefix is held as an unreachable route, and a hold this
+		// reconciler installed and cannot read back is one it re-adds on every
+		// pass, forever.
+		{"a hold of ours", routeDump(ourTable, ourProtocol, unix.RTN_UNREACHABLE, ourIndex, ours), true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			decoded, ok := plat.decodeRoute(test.message)
 			if ok != test.want {
 				t.Fatalf("claimed = %v, want %v (decoded %v)", ok, test.want, decoded)
 			}
-			if ok && decoded.Destination != ours {
+			if !ok {
+				return
+			}
+			if decoded.Destination != ours {
 				t.Errorf("decoded %s, want %s", decoded.Destination, ours)
+			}
+			// The hold has to come back as a hold, or the diff sees a path
+			// where there is a hold and replaces it every pass.
+			if want := test.message.Data[7] == unix.RTN_UNREACHABLE; decoded.Unreachable != want {
+				t.Errorf("decoded unreachable = %v, want %v", decoded.Unreachable, want)
 			}
 		})
 	}

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/babel"
@@ -24,6 +25,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
+	"github.com/NickCao/ranet-lite/internal/transport"
 	yaml "gopkg.in/yaml.v3"
 )
 
@@ -850,5 +852,78 @@ func TestReloadSkipsAPeerTheRegistryNoLongerNames(t *testing.T) {
 	}
 	if _, _, ok := c.registry().FindNode("example", "third"); ok {
 		t.Error("the decommissioned node is still in the registry this node holds")
+	}
+}
+
+// closeAll shuts the set so a handshake that finished behind the sweep is told
+// to go rather than installed with nothing left to serve it. Without the door
+// the peer carries a session this node has already forgotten until its own
+// dead peer detection expires, which is over a minute.
+func TestASessionLandingAfterTheSweepIsToldToGo(t *testing.T) {
+	set := newSessionSet()
+	var closed []*ike.Session
+	set.close = func(sess *ike.Session) { closed = append(closed, sess) }
+	set.active = func(*ike.Session) bool { return true }
+	set.closeAll()
+
+	late := &ike.Session{}
+	attached := false
+	release, adopted := set.adoptPreferred("path", late, true, func() func() {
+		attached = true
+		return func() {}
+	})
+	defer release()
+	if adopted {
+		t.Error("a handshake that finished after the sweep was installed anyway")
+	}
+	if attached {
+		t.Error("the late session registered a babel neighbor with nothing left to remove it")
+	}
+	if len(closed) != 1 || closed[0] != late {
+		t.Errorf("the late session was dropped without telling its peer: closed %d", len(closed))
+	}
+	if set.holds("path") {
+		t.Error("the set holds a path after the node has gone")
+	}
+}
+
+// holds is only worth anything where it is consulted. The peer reached us over
+// this same pair of endpoints, so dialing anyway opens a second SA that one end
+// has to resolve away, and doing that on every reconnect delay is how two nodes
+// spend a whole mesh replacing each other's sessions.
+func TestTheDialerStandsDownForASessionThePeerOpened(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	loopback := "127.0.0.1"
+	// A port nothing listens on, so a dial that happens anyway cannot succeed
+	// and cannot be mistaken for the stand-down.
+	reg[0].Nodes[1].Endpoints[0].Address = &loopback
+	hub, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := &Client{ctx: ctx, cancel: cancel, privateKey: privateKey, hub: hub, sessions: newSessionSet()}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+	c.sessions.close = func(*ike.Session) {}
+	c.sessions.active = func(*ike.Session) bool { return true }
+
+	local := cfg.Endpoints[0]
+	peer := cfg.Peers[0]
+	name := "example/gateway/1@0"
+	if _, adopted := c.sessions.adoptPreferred(name, &ike.Session{}, false, nil); !adopted {
+		t.Fatal("the session the peer opened was not adopted")
+	}
+
+	start := time.Now()
+	err = c.connectPeer(ctx, local, peer, name)
+	if !errors.Is(err, errSessionEstablished) {
+		t.Fatalf("the dialer reported %v, want the stand-down", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("the stand-down took %s, so it happened after the dial rather than instead of it", elapsed)
 	}
 }

@@ -1008,3 +1008,61 @@ func TestOriginSeqnoRisesAtMostOncePerPacket(t *testing.T) {
 		t.Errorf("a second packet raised the origin sequence number to %d above the start, want 2", total)
 	}
 }
+
+// Repeating the request is only half of it: something has to wake the run loop
+// when the repeat is due. Every other deadline the loop computes is a hello, a
+// periodic dump or a route expiry, all of them minutes out on a quiet link, so
+// without the starvation retry in the deadline the repeat waits for whatever
+// happens to wake the loop next, which on the link this matters for is nothing.
+func TestTheRunLoopWakesForAStarvationRetry(t *testing.T) {
+	quiet := Config{HelloInterval: time.Minute, UpdateInterval: time.Minute}
+	fabric := newMeshFabric(t, quiet, "a-b", "b-c", "a-d")
+	dest := netip.MustParsePrefix("fd00:c::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["c"].Originate(dest)
+	fabric.flush("c", "b", "a")
+	if got := fabric.nextHop("a", key); got != "b" {
+		t.Fatalf("a reaches the origin via %q, want \"b\"", got)
+	}
+	// b's path worsens past the distance a has already advertised, so a drops
+	// it and asks the origin for a sequence number that would make it usable.
+	fabric.inject("a", "b",
+		EncodeRouterID(routerID("c")),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 900}))
+	if len(seqnoRequestsFor(t, fabric.tlvs("a", "b"), dest)) != 1 {
+		t.Fatal("a did not ask for a new seqno when its route became unfeasible")
+	}
+
+	// Nothing answers. Bring the retry forward rather than waiting out the
+	// real backoff, and take the suppression window with it.
+	speaker := fabric.speakers["a"]
+	speaker.mu.Lock()
+	for _, retry := range speaker.starveRetries {
+		retry.nextAt = time.Now().Add(250 * time.Millisecond)
+	}
+	for index := range speaker.askedSeqno {
+		speaker.askedSeqno[index] = time.Now().Add(-seqnoRequestSuppress - time.Second)
+	}
+	pending := len(speaker.starveRetries)
+	speaker.mu.Unlock()
+	if pending == 0 {
+		t.Fatal("a kept no record of the starved prefix, so there is nothing to wake for")
+	}
+	fabric.reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); speaker.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(seqnoRequestsFor(t, fabric.tlvs("a", "b"), dest)) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the run loop never woke for the retry, so the prefix stays starved until something else happens to wake it")
+}
