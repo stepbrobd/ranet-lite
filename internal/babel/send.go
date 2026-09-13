@@ -15,11 +15,29 @@ type sendAction struct {
 	neighbor *neighborState
 	dest     netip.Addr
 	tlvs     []RawTLV
+	// rollback undoes the bookkeeping this packet consumed, and runs only if
+	// the packet was dropped. Recording has to happen while the actions are
+	// built, so that two requests in one packet do not each draw a full dump,
+	// but a record consumed by a packet that never left is a record nothing
+	// will redo: a dropped retraction takes the prefix out of every later
+	// dump as well, and the neighbor black-holes it until its own expiry.
+	rollback []func()
 }
 
 func (s *Speaker) sendActions(actions []sendAction) {
+	var undo []func()
 	for _, action := range coalesce(actions) {
-		s.sendBatchesTo(action.neighbor, action.dest, action.tlvs)
+		if !s.sendBatchesTo(action.neighbor, action.dest, action.tlvs) {
+			undo = append(undo, action.rollback...)
+		}
+	}
+	if len(undo) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, restore := range undo {
+		restore()
 	}
 }
 
@@ -58,15 +76,18 @@ func coalesce(actions []sendAction) []sendAction {
 			// that starves a thousand prefixes quadratic in the number of
 			// prefixes, which is the case this function exists for.
 			merged[i].tlvs = append(slices.Clone(merged[i].tlvs), action.tlvs...)
+			merged[i].rollback = append(slices.Clone(merged[i].rollback), action.rollback...)
 			owned[i] = true
 			continue
 		}
 		merged[i].tlvs = append(merged[i].tlvs, action.tlvs...)
+		merged[i].rollback = append(merged[i].rollback, action.rollback...)
 	}
 	return merged
 }
 
-func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) {
+// sendTo reports whether the packet reached the peer's ordered sender.
+func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) bool {
 	// Timestamp just before entering the packet/ESP queues, rather than when
 	// the timer collected actions for potentially many peers.
 	for i, tlv := range tlvs {
@@ -82,14 +103,20 @@ func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV
 	switch err := n.peer.SendRawOrDrop(pkt, esp.NextHeaderIPv6); {
 	case errors.Is(err, netstack.ErrSendQueueFull):
 		slog.Warn("babel packet dropped, peer send queue full", "peer", n.peer.ID, "tlvs", len(tlvs))
+		return false
 	case err != nil:
 		slog.Warn("babel send failed", "peer", n.peer.ID, "err", err)
+		return false
 	default:
 		slog.Debug("babel sent packet", "peer", n.peer.ID, "tlvs", len(tlvs), "bytes", len(pkt))
+		return true
 	}
 }
 
-func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) {
+// sendBatchesTo splits tlvs at the configured packet size and reports whether
+// every piece reached the peer's sender.
+func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) bool {
+	delivered := true
 	var batch []RawTLV
 	size := headerLen
 	for i := 0; i < len(tlvs); {
@@ -103,7 +130,7 @@ func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs [
 			groupSize += 2 + len(tlv.Body)
 		}
 		if len(batch) > 0 && size+groupSize > s.cfg.PacketSize {
-			s.sendTo(n, destination, batch)
+			delivered = s.sendTo(n, destination, batch) && delivered
 			batch, size = nil, headerLen
 		}
 		batch = append(batch, tlvs[i:end]...)
@@ -111,8 +138,9 @@ func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs [
 		i = end
 	}
 	if len(batch) > 0 {
-		s.sendTo(n, destination, batch)
+		delivered = s.sendTo(n, destination, batch) && delivered
 	}
+	return delivered
 }
 
 // The action builders below require s.mu. They never perform I/O.
@@ -127,7 +155,7 @@ func (s *Speaker) helloAction(n *neighborState, seqno uint16, now time.Time) sen
 	if n.haveTheirHello {
 		ihu.OriginTS, ihu.ReceiveTS, ihu.HasTS = n.theirHelloTxTS, n.theirHelloRxTS, true
 	}
-	return sendAction{n, multicastGroup, []RawTLV{
+	return sendAction{neighbor: n, dest: multicastGroup, tlvs: []RawTLV{
 		EncodeHello(Hello{Seqno: seqno, Interval: centis, HasTS: true}),
 		EncodeIHU(ihu),
 	}}
@@ -158,7 +186,10 @@ func (s *Speaker) advertisementFor(key routeKey) (advertisement, *neighborState,
 // feasibility distance of RFC 8966 section 3.7.3 an upper bound on what the
 // mesh has been told. force answers a route request, which must produce a
 // retraction even for a prefix we know nothing about (section 3.8.1.1).
-func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now time.Time) []RawTLV {
+// advertiseTo returns the TLVs for one prefix and, separately, how to undo the
+// bookkeeping it just consumed if the packet is dropped. See
+// sendAction.rollback.
+func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now time.Time) ([]RawTLV, func()) {
 	adv, nextHop, known := s.advertisementFor(key)
 	if !known {
 		adv = advertisement{routerID: s.cfg.RouterID, seqno: s.originSeqno, metric: MetricInfinity}
@@ -171,16 +202,21 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 		// its expiry timer.
 		adv.metric = MetricInfinity
 	}
+	var rollback func()
 	if adv.metric == MetricInfinity {
 		if _, sent := n.advertised[key]; !sent && !force {
-			return nil
+			return nil, nil
 		}
 		delete(n.advertised, key)
+		rollback = func() { n.advertised[key] = struct{}{} }
 	} else {
+		// observe records the feasibility distance this advertisement commits
+		// to, and is not rolled back: having promised a distance and then not
+		// sent it is safe, while sending one we did not record is not.
 		s.routes.observe(key, adv, now)
 		n.advertised[key] = struct{}{}
 	}
-	return updateTLVs(key, adv, s.cfg.UpdateInterval)
+	return updateTLVs(key, adv, s.cfg.UpdateInterval), rollback
 }
 
 func updateTLVs(key routeKey, adv advertisement, interval time.Duration) []RawTLV {
@@ -237,11 +273,16 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 	actions := make([]sendAction, 0, len(s.neighbors))
 	for _, n := range s.neighbors {
 		var tlvs []RawTLV
+		var rollback []func()
 		for _, key := range keys {
-			tlvs = append(tlvs, s.advertiseTo(n, key, false, now)...)
+			advertised, undo := s.advertiseTo(n, key, false, now)
+			tlvs = append(tlvs, advertised...)
+			if undo != nil {
+				rollback = append(rollback, undo)
+			}
 		}
 		if len(tlvs) > 0 {
-			actions = append(actions, sendAction{n, multicastGroup, tlvs})
+			actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, tlvs: tlvs, rollback: rollback})
 		}
 	}
 	return actions
@@ -303,7 +344,7 @@ func (s *Speaker) starvedActions(now time.Time) []sendAction {
 // suppression table.
 func (s *Speaker) seqnoRequestTo(n *neighborState, key routeKey, routerID [8]byte, seqno uint16, now time.Time) sendAction {
 	s.pendingSeqno[sourceKey{route: key, routerID: routerID}] = pendingSeqno{seqno: seqno, sentAt: now}
-	return sendAction{n, n.destination(), []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
+	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
 		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
 		Seqno: seqno, HopCount: seqnoRequestHopCount, RouterID: routerID,
 	})}}
@@ -313,7 +354,7 @@ func (s *Speaker) seqnoRequestAction(n *neighborState, key routeKey, routerID [8
 	if !s.allowSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, now) {
 		return sendAction{}, false
 	}
-	return sendAction{n, n.destination(), []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
+	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
 		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
 		Seqno: seqno, HopCount: hops, RouterID: routerID,
 	})}}, true

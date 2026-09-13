@@ -154,7 +154,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 
 		case TLVAckReq:
 			if nonce, err := DecodeAckReq(t.Body); err == nil && n.addr.IsValid() {
-				actions = append(actions, sendAction{n, n.addr, []RawTLV{EncodeAck(nonce)}})
+				actions = append(actions, sendAction{neighbor: n, dest: n.addr, tlvs: []RawTLV{EncodeAck(nonce)}})
 			}
 
 		case TLVRouteRequest:
@@ -188,21 +188,35 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 // since the periodic update carries the same thing.
 func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Time) []sendAction {
 	var tlvs []RawTLV
+	var rollback []func()
 	if request.AE == AEWildcard {
 		if !n.lastFullDump.IsZero() && now.Sub(n.lastFullDump) < s.cfg.UpdateInterval {
 			return nil
 		}
+		// Taken now, so forty requests in one packet draw one dump, and given
+		// back if the dump is dropped, so the next request is not refused over
+		// a dump the neighbor never received.
+		previous := n.lastFullDump
 		n.lastFullDump = now
+		rollback = append(rollback, func() { n.lastFullDump = previous })
 		for _, key := range s.advertisableKeys() {
-			tlvs = append(tlvs, s.advertiseTo(n, key, false, now)...)
+			advertised, undo := s.advertiseTo(n, key, false, now)
+			tlvs = append(tlvs, advertised...)
+			if undo != nil {
+				rollback = append(rollback, undo)
+			}
 		}
 	} else {
-		tlvs = s.advertiseTo(n, routeKey{source: request.SourcePrefix, dest: request.Prefix}, true, now)
+		advertised, undo := s.advertiseTo(n, routeKey{source: request.SourcePrefix, dest: request.Prefix}, true, now)
+		tlvs = advertised
+		if undo != nil {
+			rollback = append(rollback, undo)
+		}
 	}
 	if len(tlvs) == 0 {
 		return nil
 	}
-	return []sendAction{{n, n.destination(), tlvs}}
+	return []sendAction{{neighbor: n, dest: n.destination(), tlvs: tlvs, rollback: rollback}}
 }
 
 // seqnoReply implements RFC 8966 section 3.8.1.2: satisfy the request from a
@@ -219,14 +233,16 @@ func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Ti
 				s.routes.dirty[origin] = struct{}{}
 			}
 		}
-		return sendTLVs(n, s.advertiseTo(n, key, true, now))
+		advertised, undo := s.advertiseTo(n, key, true, now)
+		return sendTLVs(n, advertised, undo)
 	}
 	if entry := s.routes.entries[key]; entry != nil {
 		// Split horizon keeps us from answering the neighbor we learned the
 		// route from; forwarding the request onwards is the useful reply.
 		if sel := entry.selected; sel.neighbor != nil && sel.neighbor != n &&
 			(sel.routerID != request.RouterID || !seqnoGT(request.Seqno, sel.seqno)) {
-			return sendTLVs(n, s.advertiseTo(n, key, true, now))
+			advertised, undo := s.advertiseTo(n, key, true, now)
+			return sendTLVs(n, advertised, undo)
 		}
 	}
 	if request.RouterID == s.cfg.RouterID || request.HopCount < 2 {
@@ -274,11 +290,15 @@ func (s *Speaker) forwardTarget(key routeKey, from *neighborState) *neighborStat
 	return unfeasible
 }
 
-func sendTLVs(n *neighborState, tlvs []RawTLV) []sendAction {
+func sendTLVs(n *neighborState, tlvs []RawTLV, rollback func()) []sendAction {
 	if len(tlvs) == 0 {
 		return nil
 	}
-	return []sendAction{{n, n.destination(), tlvs}}
+	action := sendAction{neighbor: n, dest: n.destination(), tlvs: tlvs}
+	if rollback != nil {
+		action.rollback = []func(){rollback}
+	}
+	return []sendAction{action}
 }
 
 const rttTimestampHorizon = 3 * time.Minute
