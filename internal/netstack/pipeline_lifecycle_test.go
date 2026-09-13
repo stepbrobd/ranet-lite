@@ -255,3 +255,42 @@ func TestTunReadFailureIsReportedAndGivesTheBatchBack(t *testing.T) {
 		t.Errorf("a failed read said nothing: %s", logs.Bytes())
 	}
 }
+
+// Close has to return whether or not the sender does. A send already inside
+// the socket is not interrupted by closing the logical Mux -- that checks its
+// done channel on entry and then loops on the hub's bind, which only Hub.Close
+// closes and which sets no write deadline -- so an unbounded wait here makes
+// one session's teardown wait on a socket nobody is going to unblock, and the
+// client's peer group never drains behind it.
+func TestClosingAPeerDoesNotWaitOnTheTransportForever(t *testing.T) {
+	stuck, entered := make(chan struct{}), make(chan struct{})
+	defer close(stuck)
+	sealer := func(raw [][]byte, _ []byte, reuse [][]byte) ([][]byte, error) {
+		return append(reuse[:0], raw...), nil
+	}
+	p := NewPeerReserved("stuck",
+		func(int) (BatchSealer, error) { return sealer, nil },
+		func([][]byte) error { close(entered); <-stuck; return nil })
+	p.closeGrace = 100 * time.Millisecond
+
+	place, err := p.ReserveRawOrDrop([]byte("one packet"), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := place.Send(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sender never reached the transport, so this proves nothing")
+	}
+
+	done := make(chan struct{})
+	go func() { p.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on a sender stuck in the transport, so a session teardown holds the whole peer group")
+	}
+}

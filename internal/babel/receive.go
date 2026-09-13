@@ -6,7 +6,11 @@ import (
 	"time"
 )
 
-// handlePacket is also used by protocol tests that supply a bare Babel payload.
+// handlePacket takes one Babel payload the way Receive does, without the outer
+// IPv6 and UDP headers. Nothing in production calls it, because Receive is the
+// entry the transport reaches; it is here for the protocol tests that supply a
+// bare payload, and it takes the same lock and the same wake decision so that
+// what those tests drive is the path the transport drives.
 func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 	s.mu.Lock()
 	if s.neighbors[n.peer.ID] != n {

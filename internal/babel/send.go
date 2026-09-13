@@ -560,10 +560,20 @@ func (s *Speaker) seqnoRequestAction(n *neighborState, asker string, key routeKe
 	})}}, true
 }
 
+// flushUpdates sends the periodic dump out of band, the way a pass of the run
+// loop would. Nothing in production calls it: Run builds the same actions
+// itself. It is here for the tests that drive a dump without running the loop,
+// and it does what the loop does, wake included, so that what those tests
+// measure is the behavior the loop has rather than a simpler one.
 func (s *Speaker) flushUpdates() {
 	now := time.Now()
 	s.mu.Lock()
 	send := s.emitLocked(s.updateActions(now))
+	// updateActions drains the triggered queue and clears every owed set, and
+	// emitLocked puts them back for a neighbor it could not send to. Nothing
+	// here is a pass of the run loop, so the retry that rollback schedules has
+	// to be woken for the way an arriving packet is.
+	s.wakeForPacketLocked()
 	s.mu.Unlock()
 	send()
 }

@@ -39,6 +39,8 @@ type Peer struct {
 	// peer stays in that state. Dropped is the exact count.
 	sendErrReported atomic.Int64
 	started         time.Time
+	// closeGrace overrides defaultCloseGrace; zero means the default.
+	closeGrace time.Duration
 	// noteDiscarded is nil in production. A test replaces it to observe the
 	// order discardQueued gives batches back in, which nothing else can see.
 	noteDiscarded func(ticket uint64)
@@ -127,6 +129,22 @@ func newPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, err
 	return p
 }
 
+// defaultCloseGrace bounds how long Close waits for the ordered sender.
+//
+// Closing a Mux does not interrupt a send already in the socket: Mux.Close
+// consults its done channel once on entry and then loops on the hub's bind,
+// which only Hub.Close closes and which carries no write deadline. Process
+// shutdown reaches Hub.Close and so always finishes. One session's teardown --
+// a dialer a reload dropped, or the loser of a session replacement -- leaves
+// the hub open, and an unbounded wait there holds the client's peer group for
+// as long as the socket stays unwritable, which the next clean shutdown then
+// waits behind.
+//
+// Giving up leaves the sender running. It writes only to the transport and to
+// batches it owns, both of which outlive it, so this is a goroutine that
+// outlives Close rather than a use after free.
+const defaultCloseGrace = 5 * time.Second
+
 // Close stops the reserved peer's ordered sender. Compatibility peers do not
 // own a goroutine, so closing them is a no-op.
 func (p *Peer) Close() {
@@ -134,7 +152,18 @@ func (p *Peer) Close() {
 		return
 	}
 	p.closeOnce.Do(func() { close(p.stop) })
-	<-p.senderDone
+	grace := p.closeGrace
+	if grace <= 0 {
+		grace = defaultCloseGrace
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-p.senderDone:
+	case <-timer.C:
+		slog.Warn("netstack gave up waiting for a peer sender still in the transport",
+			"peer", p.ID, "waited", grace)
+	}
 }
 
 // ErrSendQueueFull reports a packet dropped rather than queued, so the caller

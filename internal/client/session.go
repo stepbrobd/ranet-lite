@@ -62,7 +62,15 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 		}
 		return sealer, err
 	}, sess.Mux().SendESPBatch)
-	defer peer.Close()
+	// The mux is closed before the peer's sender is waited for, not after.
+	// Peer.Close waits with no deadline for a sender that may be inside
+	// SendESPBatch on this very mux, and the defer at the top of this function
+	// runs last, so on that ordering a send that would not return held the
+	// whole shutdown. Closing twice is what Mux.Close is written for.
+	defer func() {
+		_ = sess.Mux().Close()
+		peer.Close()
+	}()
 	release, adopted := c.sessions.adopt(sessionName, sess, initiator, responder, remote, func() func() {
 		return c.speaker.AddPeer(peer).Close
 	})
