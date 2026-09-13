@@ -33,6 +33,9 @@ func main() { os.Exit(run()) }
 // options is the command line after parsing.
 type options struct {
 	configPath         string
+	registryPath       string
+	privateKeyPath     string
+	fullMesh           bool
 	pprofAddr          string
 	metricsAddr        string
 	contentionProfiles bool
@@ -48,6 +51,9 @@ func parseOptions(args []string, usage io.Writer) (options, error) {
 	fs.SetOutput(usage)
 	var o options
 	fs.StringVar(&o.configPath, "config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
+	fs.StringVar(&o.registryPath, "registry", "", "path to registry.json, overriding the config file; ranet spells it this way and its own config carries no such field")
+	fs.StringVar(&o.privateKeyPath, "key", "", "path to the PKCS8 PEM Ed25519 private key, overriding the config file; ranet spells it this way and its own config carries no such field")
+	fs.BoolVar(&o.fullMesh, "full-mesh", false, "dial every node the registry names, as ranet does; its own config file has no field to ask for this")
 	fs.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
 	fs.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
 	fs.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
@@ -97,7 +103,7 @@ func run() int {
 		}()
 	}
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -159,7 +165,7 @@ func run() int {
 			case <-ctx.Done():
 				return
 			case <-reload:
-				if err := node.Reload(*configPath); err != nil {
+				if err := node.Reload(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh); err != nil {
 					log.Printf("reload: %v", err)
 				}
 			}

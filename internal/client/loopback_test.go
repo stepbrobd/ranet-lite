@@ -177,7 +177,7 @@ originate:
 	if err := os.WriteFile(node.configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(node.configPath)
+	cfg, err := config.Load(node.configPath, "", "", false)
 	if err != nil {
 		t.Fatalf("%s: %v", node.name, err)
 	}
@@ -305,7 +305,7 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 
 	writeLoopbackConfig(t, alpha, bravo, alpha.cfg.PrivateKey, alpha.cfg.Registry,
 		[]string{alpha.prefix.String(), added.String()})
-	if err := alpha.client.Reload(alpha.configPath); err != nil {
+	if err := alpha.client.Reload(alpha.configPath, "", "", false); err != nil {
 		t.Fatalf("adding an originated prefix was refused: %v", err)
 	}
 

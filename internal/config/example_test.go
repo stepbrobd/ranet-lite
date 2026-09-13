@@ -15,7 +15,7 @@ import (
 // which is the one spelling this file accepts.
 func TestShippedExampleParses(t *testing.T) {
 	const example = "../../examples/config.yaml"
-	cfg, err := Load(example)
+	cfg, err := Load(example, "", "", false)
 	if err != nil {
 		t.Fatalf("%s: %v", example, err)
 	}
@@ -39,7 +39,7 @@ func TestShippedExampleParses(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err = Load(path)
+	cfg, err = Load(path, "", "", false)
 	if err != nil {
 		t.Fatalf("the sub-second spelling the integration test uses was refused: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestShippedExampleParses(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err = Load(path)
+	cfg, err = Load(path, "", "", false)
 	if err != nil {
 		t.Fatalf("a zero interval was refused: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestShippedExampleParses(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Load(path)
+	_, err = Load(path, "", "", false)
 	if err == nil {
 		t.Fatal("a sequence was accepted as a duration")
 	}

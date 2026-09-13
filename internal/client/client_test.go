@@ -200,6 +200,126 @@ func TestFullMeshDialsEveryNodeTheRegistryNames(t *testing.T) {
 	}
 }
 
+// Endpoint is compared with == to decide whether a reload may proceed, so
+// every field it gains has to compare by value. ranet's own config carries an
+// address and an updown path on each endpoint, and holding either behind a
+// pointer made two loads of one file differ: the node then refused every
+// SIGHUP with "local endpoints changed", which is the reload that exists so a
+// node joining the mesh does not restart every other node's dataplane.
+func TestReloadSurvivesRanetsEndpointFields(t *testing.T) {
+	const body = `{"organization":"ysun","common_name":"framework","full_mesh":true,
+		"registry":"r","private_key":"k",
+		"endpoints":[
+			{"serial_number":"0","address_family":"ip6","port":13000,
+			 "address":"framework.if.example.co","updown":"/nix/store/x-updown","fwmark":"0x726c"},
+			{"serial_number":"1","address_family":"ip4","port":13000,"address":null}]}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := config.Load(path, "", "", false)
+	if err != nil {
+		t.Fatalf("a null address was refused: %v", err)
+	}
+	second, err := config.Load(path, "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameEndpoints(first.Endpoints, second.Endpoints) {
+		t.Fatal("two loads of one file report different endpoints, so every reload is refused")
+	}
+	if err := reloadable(first, second); err != nil {
+		t.Fatalf("reloading an unchanged file was refused: %v", err)
+	}
+
+	// An endpoint's address and updown path change nothing this node runs on,
+	// so editing one must not force a restart. A redeploy that renames a host
+	// rewrites exactly those.
+	cosmetic := *second
+	cosmetic.Endpoints = slices.Clone(second.Endpoints)
+	cosmetic.Endpoints[0].Address = "renamed.if.example.co"
+	cosmetic.Endpoints[0].UpDown = "/nix/store/y-updown"
+	if err := reloadable(first, &cosmetic); err != nil {
+		t.Errorf("a changed address or updown forced a restart: %v", err)
+	}
+
+	// The two that do reach something still do.
+	for name, change := range map[string]func(*config.Config){
+		"family": func(c *config.Config) { c.Endpoints[0].AddressFamily = "ip4" },
+		"serial": func(c *config.Config) { c.Endpoints[0].SerialNumber = "9" },
+	} {
+		altered := *second
+		altered.Endpoints = slices.Clone(second.Endpoints)
+		change(&altered)
+		if err := reloadable(first, &altered); err == nil {
+			t.Errorf("a changed endpoint %s was accepted in place", name)
+		}
+	}
+}
+
+// ranet's config names neither the registry nor the key, so a node started
+// against it takes both from the command line. Reload re-reads the file, and
+// reading it without those paths makes it invalid: the node would then refuse
+// every reload it ever saw, and the registry is rewritten whenever any node
+// joins the mesh, so that is every reload that matters.
+func TestReloadKeepsThePathsTheCommandLineSupplied(t *testing.T) {
+	dir := t.TempDir()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+	reg := registry.Registry{{
+		Organization: "ysun", PublicKey: publicPEM,
+		Nodes: []registry.Node{
+			{CommonName: "framework", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
+			{CommonName: "butte", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
+		},
+	}}
+	registryPath := filepath.Join(dir, "registry.json")
+	writeRegistry(t, registryPath, reg)
+	keyPath := filepath.Join(dir, "key.pem")
+	writeKey(t, keyPath, privateKey)
+
+	// ranet's own shape: no registry, no private_key, the port on the endpoint.
+	configPath := filepath.Join(dir, "config.json")
+	body := `{"organization":"ysun","common_name":"framework","full_mesh":true,
+		"endpoints":[{"serial_number":"1","address_family":"ip4","port":13000}]}`
+	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath, registryPath, keyPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := babel.New(babel.Config{}, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{
+		ctx: ctx, cancel: cancel, privateKey: privateKey,
+		speaker: speaker, dialers: make(map[string]*dialer),
+	}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+	defer func() { cancel(); c.peers.Wait() }()
+
+	if err := c.Reload(configPath, registryPath, keyPath, false); err != nil {
+		t.Fatalf("reloading with the paths the command line supplied: %v", err)
+	}
+	if err := c.Reload(configPath, "", "", false); err == nil {
+		t.Error("reloading without them was accepted, so the fixture proves nothing")
+	}
+}
+
 func TestValidateESPTunnelPayload(t *testing.T) {
 	ipv4 := make([]byte, 20)
 	ipv4[0], ipv4[3] = 0x45, 20
@@ -367,10 +487,10 @@ func TestReloadRefusesAssignedAddressChanges(t *testing.T) {
 			next := *old
 			change(&next)
 			writeConfig(t, path, &next)
-			if _, err := config.Load(path); err != nil {
+			if _, err := config.Load(path, "", "", false); err != nil {
 				t.Fatalf("invalid reload fixture: %v", err)
 			}
-			if err := c.Reload(path); err == nil {
+			if err := c.Reload(path, "", "", false); err == nil {
 				t.Fatal("reload accepted an assigned address change")
 			}
 			if !slices.Equal(c.config().Originate, old.Originate) ||
@@ -867,7 +987,7 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	writeConfig(t, configPath, &next)
 
-	if err := c.Reload(configPath); err != nil {
+	if err := c.Reload(configPath, "", "", false); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if got := len(c.config().Peers); got != 2 {
@@ -1083,7 +1203,7 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	writeConfig(t, configPath, cfg)
 
-	if err := c.Reload(configPath); err != nil {
+	if err := c.Reload(configPath, "", "", false); err != nil {
 		t.Fatalf("one stale peer refused the whole reload: %v", err)
 	}
 	if _, _, ok := c.registry().FindNode("example", "fourth"); !ok {

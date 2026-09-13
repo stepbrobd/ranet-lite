@@ -89,8 +89,13 @@ func (c *Client) syncPeers() {
 // each such change alters what peers have already authenticated or
 // what the dataplane is attached to, so a restart is the honest way to change
 // them and a half-applied reload would be worse than none.
-func (c *Client) Reload(path string) error {
-	cfg, err := config.Load(path)
+// registryPath and privateKeyPath are the command line's, repeated here
+// because the file may name neither: ranet's own config has nowhere to put
+// them, and a node started that way would otherwise fail every reload it ever
+// saw. fullMesh is repeated for the same reason. The registry is rewritten whenever any node joins the mesh, so that is
+// every reload that matters.
+func (c *Client) Reload(path, registryPath, privateKeyPath string, fullMesh bool) error {
+	cfg, err := config.Load(path, registryPath, privateKeyPath, fullMesh)
 	if err != nil {
 		return err
 	}
@@ -260,7 +265,12 @@ func sameEndpoints(old, next []config.Endpoint) bool {
 		return false
 	}
 	for i := range old {
-		if old[i] != next[i] {
+		// Only what this node runs on. An Endpoint also carries ranet's own
+		// fields: the port and the mark are compared at the top level, having
+		// been adopted into it, and the address and the updown path change
+		// nothing here, so refusing a reload over one would force a restart
+		// for a field that was never read.
+		if old[i].SerialNumber != next[i].SerialNumber || old[i].AddressFamily != next[i].AddressFamily {
 			return false
 		}
 	}

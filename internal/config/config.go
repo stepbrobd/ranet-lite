@@ -7,7 +7,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"os"
 	"strings"
@@ -76,6 +78,8 @@ type Config struct {
 	Peers  []Peer `yaml:"peers"`
 	Babel  Babel  `yaml:"babel"`
 	Kernel Kernel `yaml:"kernel"`
+	// Experimental is ranet's block, carried so its config parses here.
+	Experimental Experimental `yaml:"experimental"`
 }
 
 // Kernel configures the optional kernel route reconciler in internal/kernel,
@@ -251,9 +255,48 @@ func (c *Config) RekeyRetryMaxValue() time.Duration {
 // Socket address selection is global: the transport binds Config.Port for
 // every family the platform gives it, one dual-stack socket on darwin and one
 // per family on linux, and the kernel selects the source address by route.
+// Endpoint carries ranet's own endpoint fields as well as ranet-lite's, so a
+// deployment can point this at the `config.json` its module already generates
+// rather than maintaining a second description of the same node. The fields
+// ranet acts on and this does not are named here rather than left unknown: the
+// loader refuses what it does not recognize, and an operator whose file is
+// rejected over `updown` learns nothing from "field not found".
 type Endpoint struct {
 	SerialNumber  string `yaml:"serial_number"`
 	AddressFamily string `yaml:"address_family"`
+	// Port is ranet's spelling of the one this node listens on. Every endpoint
+	// must agree, which ranet's own module already asserts, and it satisfies
+	// the top-level port when that is absent.
+	Port uint16 `yaml:"port"`
+	// Address, UpDown and FWMark are plain strings rather than pointers
+	// because absent and empty ask for the same thing, and because Endpoint is
+	// compared with == to decide whether a reload may proceed: a pointer would
+	// make two loads of one file differ and refuse every reload.
+	//
+	// Address is the endpoint's public address in ranet's config. The
+	// transport binds the wildcard and lets the kernel pick the source by
+	// route, so this selects nothing here; a node that sets it is told so once
+	// rather than left to wonder.
+	Address string `yaml:"address"`
+	// UpDown is ranet's per-peer interface hook, which strongSwan runs to
+	// create one xfrm interface per Child SA. This binary has one tun for the
+	// whole mesh and no per-peer interfaces, so there is nothing for a hook to
+	// create and none is run.
+	UpDown string `yaml:"updown"`
+	// FWMark is ranet's per-endpoint mark, which it passes to strongSwan as
+	// set_mark_out. That is an XFRM mark on the outbound SA, not a mark on the
+	// socket carrying IKE and ESP, and strongSwan spells it value[/mask] or
+	// %unique besides. It is named here so the file is not rejected over it
+	// and reported once as having no effect; the top-level fwmark is this
+	// tree's own socket mark and is set separately.
+	FWMark string `yaml:"fwmark"`
+}
+
+// Experimental mirrors ranet's block of the same name so its config parses
+// here. Nothing in it is implemented, so anything switched on is refused
+// rather than accepted and ignored.
+type Experimental struct {
+	IPTFS bool `yaml:"iptfs"`
 }
 
 type Peer struct {
@@ -413,7 +456,12 @@ func (b Babel) SpeakerConfig() babel.Config {
 		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost, NoTransit: b.NoTransit}
 }
 
-func Load(path string) (*Config, error) {
+// Load reads a configuration. registryPath and privateKeyPath override the
+// file's own when non-empty and fullMesh turns that field on, so ranet's
+// config.json runs here unchanged: it names none of the three, and ranet takes
+// the first two on its own command line and the third by always behaving that
+// way.
+func Load(path, registryPath, privateKeyPath string, fullMesh bool) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
@@ -424,8 +472,67 @@ func Load(path string) (*Config, error) {
 	if err := decoder.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
+	if err := c.adoptRanetEndpointFields(); err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
+	// Applied before validation, not after: ranet's own config file has
+	// nowhere to name the registry or the key, so a file that carries neither
+	// is valid exactly when the command line supplies them. Both take ranet's
+	// spelling, so its file runs here unchanged.
+	if registryPath != "" {
+		c.Registry = registryPath
+	}
+	if privateKeyPath != "" {
+		c.PrivateKey = privateKeyPath
+	}
+	if fullMesh {
+		c.FullMesh = true
+	}
 	c.setDefaults()
 	return &c, c.validate()
+}
+
+// adoptRanetEndpointFields lets ranet's own config.json stand in for this one,
+// since valid JSON is valid YAML and the two schemas differ in where they put
+// the same facts rather than in the facts themselves. ranet carries the port
+// and the socket mark per endpoint while this binds one socket for all of
+// them, so each is adopted only when every endpoint agrees and the top-level
+// spelling is absent. A disagreement is refused instead of picked from,
+// because ranet's own module already asserts that the ports match and a file
+// where they do not is one nothing should run.
+func (c *Config) adoptRanetEndpointFields() error {
+	for _, ep := range c.Endpoints {
+		if ep.Port == 0 {
+			continue
+		}
+		switch {
+		case c.Port == 0:
+			c.Port = ep.Port
+		case c.Port != ep.Port:
+			return fmt.Errorf("endpoint %q says port %d and the top level says %d", ep.SerialNumber, ep.Port, c.Port)
+		}
+	}
+	for _, ep := range c.Endpoints {
+		// Said once per endpoint rather than dropped. Both fields change what
+		// ranet does, so a file carrying them was written expecting an effect,
+		// and an operator who is not told keeps expecting it.
+		if ep.Address != "" {
+			log.Printf("config: endpoint %q address %q is not used: the transport binds every interface and lets the kernel pick the source by route", ep.SerialNumber, ep.Address)
+		}
+		if ep.UpDown != "" {
+			log.Printf("config: endpoint %q updown %q is not run: there are no per-peer interfaces here, one tun carries the whole mesh", ep.SerialNumber, ep.UpDown)
+		}
+		if ep.FWMark != "" {
+			log.Printf("config: endpoint %q fwmark %q is not applied: ranet hands that to strongSwan as set_mark_out, an XFRM mark on the outbound SA, and the top-level fwmark here is SO_MARK on the socket, which is a different thing set in a different place", ep.SerialNumber, ep.FWMark)
+		}
+	}
+	if c.Experimental.IPTFS {
+		// Accepted as a field so ranet's config parses, refused as a setting
+		// because this tree has no IP-TFS: taking it and carrying on would
+		// leave a node believing its traffic is padded when it is not.
+		return errors.New("experimental.iptfs is not implemented here")
+	}
+	return nil
 }
 
 func (c *Config) setDefaults() {

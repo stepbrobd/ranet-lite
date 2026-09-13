@@ -59,7 +59,7 @@ func TestRekeyIntervals(t *testing.T) {
 			if err := os.WriteFile(path, []byte(test.yaml), 0600); err != nil {
 				t.Fatal(err)
 			}
-			cfg, err := Load(path)
+			cfg, err := Load(path, "", "", false)
 			if test.wantErr {
 				if err == nil {
 					t.Fatal("Load succeeded, want error")
@@ -105,7 +105,7 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 			if err := os.WriteFile(path, []byte(testConfig+addition), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Load(path); err == nil {
+			if _, err := Load(path, "", "", false); err == nil {
 				t.Fatal("Load succeeded, want error")
 			}
 		})
@@ -129,7 +129,7 @@ registry: registry.json
 		if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := Load(path)
+		_, err := Load(path, "", "", false)
 		return err
 	}
 	if err := load(t, base); err == nil {
@@ -159,7 +159,7 @@ func TestExampleConfigParses(t *testing.T) {
 			if err := os.WriteFile(path, body, 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Load(path); err != nil {
+			if _, err := Load(path, "", "", false); err != nil {
 				t.Fatalf("the example no longer loads: %v", err)
 			}
 		})
@@ -177,7 +177,7 @@ func TestOriginateRefusesIPv4SourceSpecific(t *testing.T) {
 		if err := os.WriteFile(path, []byte(testConfig+addition), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := Load(path)
+		_, err := Load(path, "", "", false)
 		return err
 	}
 	err := load(t, "babel:\n  originate:\n    - {prefix: 0.0.0.0/0, from: 198.51.100.0/24}\n")
@@ -196,7 +196,7 @@ func TestOriginateRefusesUnknownField(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil {
+	if _, err := Load(path, "", "", false); err == nil {
 		t.Fatal("an unknown originate field was accepted")
 	}
 }
@@ -209,7 +209,7 @@ func TestOriginateRefusesMismatchedFamilies(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil {
+	if _, err := Load(path, "", "", false); err == nil {
 		t.Fatal("originate prefixes with mismatched address families were accepted")
 	}
 }
@@ -226,7 +226,7 @@ func TestConfigRejectsPort500(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil {
+	if _, err := Load(path, "", "", false); err == nil {
 		t.Error("port 500 was accepted")
 	}
 }
@@ -248,7 +248,7 @@ func TestBabelCostFieldsReachSpeaker(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := Load(path)
+	cfg, err := Load(path, "", "", false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -299,7 +299,7 @@ babel:
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := Load(path)
+		_, err := Load(path, "", "", false)
 		return err
 	}
 	if err := load(t, `{ prefix: "::/0", from: "2001:db8::/48" }`); err != nil {
@@ -368,7 +368,7 @@ func TestTopLevelListsRefuseWhatTheyCannotMean(t *testing.T) {
 		if err := os.WriteFile(path, []byte(testConfig+addition), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := Load(path)
+		_, err := Load(path, "", "", false)
 		return err
 	}
 	// The message matters as much as the refusal: an entry here is assigned,
@@ -419,7 +419,7 @@ func TestOriginateRefusalNamesTheSameFieldEveryTime(t *testing.T) {
 	}
 	var first string
 	for attempt := range 40 {
-		_, err := Load(path)
+		_, err := Load(path, "", "", false)
 		if err == nil {
 			t.Fatal("an entry whose prefix and from are both masked defaults was accepted")
 		}
@@ -430,5 +430,88 @@ func TestOriginateRefusalNamesTheSameFieldEveryTime(t *testing.T) {
 		if err.Error() != first {
 			t.Fatalf("load %d said %q, where the first said %q", attempt, err, first)
 		}
+	}
+}
+
+// ranet's own config.json, as its NixOS module generates it, so a deployment
+// can point this binary at the file it already has. Valid JSON is valid YAML,
+// so the parse was never the problem: the loader refuses unknown fields, and
+// ranet puts the port and the socket mark on each endpoint and names the
+// registry and the key on its command line instead of in the file.
+func TestRanetsOwnConfigIsAccepted(t *testing.T) {
+	const ranet = `{
+  "common_name": "framework",
+  "endpoints": [
+    {"address_family": "ip6", "port": 13000, "serial_number": "0", "updown": "/nix/store/deadbeef-updown"},
+    {"address_family": "ip4", "port": 13000, "serial_number": "1", "updown": "/nix/store/deadbeef-updown", "address": "framework.if.example.co", "fwmark": "0x726c"}
+  ],
+  "organization": "ysun",
+  "experimental": {"iptfs": false}
+}`
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	// Byte for byte what ranet's module generates, with nothing added. The
+	// registry, the key and the N-to-N reconciliation all come from the
+	// command line, which is where ranet takes the first two and where its
+	// own file has no field for the third.
+	path := write(t, ranet)
+	cfg, err := Load(path, "/etc/ranet/registry.json", "/run/secrets/ranet", true)
+	if err != nil {
+		t.Fatalf("ranet's own config was refused: %v", err)
+	}
+	if !cfg.FullMesh {
+		t.Error("the command line did not turn full_mesh on")
+	}
+	if cfg.Port != 13000 {
+		t.Errorf("the port on the endpoints did not reach the top level, got %d", cfg.Port)
+	}
+	// ranet's per-endpoint fwmark is strongSwan's set_mark_out, an XFRM mark
+	// on the SA rather than a mark on this tree's socket, so it is accepted
+	// and left alone rather than adopted into one.
+	if cfg.FWMark != 0 {
+		t.Errorf("ranet's endpoint fwmark was adopted as a socket mark, got %#x", cfg.FWMark)
+	}
+	if cfg.Registry != "/etc/ranet/registry.json" || cfg.PrivateKey != "/run/secrets/ranet" {
+		t.Errorf("the command line did not supply the registry and key: %q %q", cfg.Registry, cfg.PrivateKey)
+	}
+
+	// Without the flags the file is short of what it never names, and says
+	// which rather than complaining about a field it does not recognize.
+	if _, err := Load(path, "", "", false); err == nil {
+		t.Error("a config naming neither a registry nor a key was accepted")
+	} else if strings.Contains(err.Error(), "not found in type") {
+		t.Errorf("ranet's schema still reads as unknown fields: %v", err)
+	}
+}
+
+// Endpoints carrying different ports or marks describe a node this binds one
+// socket for, so picking one of them would be a guess. ranet's own module
+// asserts the ports match, and a file where they do not is one nothing should
+// run.
+func TestRanetEndpointFieldsMustAgree(t *testing.T) {
+	for name, body := range map[string]string{
+		"ports": `{"organization":"o","common_name":"c","full_mesh":true,
+			"endpoints":[{"serial_number":"0","address_family":"ip4","port":13000},
+			             {"serial_number":"1","address_family":"ip6","port":13001}]}`,
+		"iptfs": `{"organization":"o","common_name":"c","full_mesh":true,"port":13000,
+			"experimental":{"iptfs":true},
+			"endpoints":[{"serial_number":"0","address_family":"ip4"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path, "r", "k", false); err == nil {
+				t.Error("accepted a config this binary cannot honor")
+			}
+		})
 	}
 }
