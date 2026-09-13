@@ -598,3 +598,39 @@ func TestNoBatchIsLostBetweenTheStopCheckAndTheQueue(t *testing.T) {
 		}
 	}
 }
+
+// A compatibility peer has no sender goroutine, so nothing between the
+// encryptor and the transport counted anything: NewPeer and NewPeerBatched are
+// exported with a Dropped that was structurally zero. A partial failure is the
+// case that shows it, because the batch reports an error for the whole of
+// itself while some of its packets did leave.
+func TestACompatibilityPeerCountsWhatItLoses(t *testing.T) {
+	refused := errors.New("no key")
+	var seen int
+	peer := NewPeerBatched("peer",
+		func(raw []byte, _ byte) ([]byte, error) {
+			seen++
+			if seen == 2 {
+				return nil, refused
+			}
+			return raw, nil
+		},
+		func(sealed [][]byte) error { return nil })
+
+	b := peer.reserveBatchNow(3)
+	if b == nil {
+		t.Fatal("the peer refused a reservation while it was open")
+	}
+	for range 3 {
+		b.append([]byte{1}, 0)
+	}
+	if err := b.transmit(); !errors.Is(err, refused) {
+		t.Fatalf("transmit reported %v, want the encryptor's own error", err)
+	}
+	if got := peer.Dropped(); got != 1 {
+		t.Errorf("the peer counted %d of the one packet that never sealed", got)
+	}
+	if got := peer.SendFailed(); got != 0 {
+		t.Errorf("it counted %d as lost by the transport, which took everything it was given", got)
+	}
+}

@@ -406,10 +406,26 @@ func (b *peerBatch) send() error {
 	if !b.reserved {
 		b.encrypt()
 	}
+	var sendErr error
 	if len(b.sealed) != 0 {
-		if err := p.transmitBatchFn(b.sealed); err != nil && b.err == nil {
-			b.err = err
+		sendErr = p.transmitBatchFn(b.sealed)
+		if sendErr != nil && b.err == nil {
+			b.err = sendErr
 		}
+	}
+	// A compatibility peer has no sender goroutine, so this is the only place
+	// its packets can be counted, and without it Dropped was structurally zero
+	// on an exported constructor. Counted in two parts because they mean
+	// different things, and by difference rather than by batch so a batch that
+	// sealed some of its packets and lost the rest says so.
+	if !b.counted {
+		if missing := len(b.raw) - len(b.sealed); missing > 0 {
+			p.dropped.Add(uint64(missing))
+		}
+		if sendErr != nil {
+			p.sendFailed.Add(uint64(len(b.sealed)))
+		}
+		b.counted = true
 	}
 	return b.err
 }
