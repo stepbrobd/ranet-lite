@@ -325,6 +325,16 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 		return nil, Accepted{}, err
 	}
 
+	// The rest of RFC 7296 section 2.10 needs the PRF, which the proposal has
+	// just settled: a nonce "MUST be at least half the key size of the
+	// negotiated pseudorandom function". This is the one surface an
+	// unauthenticated peer reaches first, so leaving it on the length check
+	// alone left it as the one place a short nonce was taken.
+	if !validNonceFor(ni, suite.PRFID) {
+		r.sendStatelessNotify(datagram, spiI, N_NO_PROPOSAL_CHOSEN, nil)
+		return nil, Accepted{}, fmt.Errorf("ike: initiator nonce length %d is short for the negotiated PRF", len(ni))
+	}
+
 	dh, err := GenerateDH(suite.DHGroup)
 	if err != nil {
 		return nil, Accepted{}, err
@@ -860,16 +870,23 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 			continue
 		}
 		known := true
-		for _, transform := range proposal.Transforms {
+		var integ *Transform
+		for i := range proposal.Transforms {
+			transform := proposal.Transforms[i]
 			switch transform.Type {
 			case TransEncr, TransPRF, TransDH:
 			case TransInteg:
-				// RFC 7296 section 3.3.3 makes an integrity transform optional
-				// for IKE, and a peer that spells out NONE alongside an AEAD
-				// cipher is saying the same thing as omitting it. Anything
-				// else is a transform this implementation cannot use, because
-				// every cipher it offers is combined mode.
-				known = known && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes
+				// RFC 7296 section 3.3.2's transform registry gives integrity
+				// algorithm 0 the name NONE, and an AEAD cipher needs no
+				// integrity transform, so a peer spelling out NONE says the
+				// same thing as omitting it. Anything else is a transform this
+				// implementation has no key for, because every cipher it
+				// offers is combined mode.
+				if transform.ID != INTEG_NONE || transform.UnsupportedAttributes {
+					known = false
+					continue
+				}
+				integ = &transform
 			default:
 				known = false
 			}
@@ -907,7 +924,15 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 			}
 			continue
 		}
-		selected := Proposal{Number: proposal.Number, Protocol: ProtoIKE, Transforms: []Transform{encr, prfT, dhT}}
+		// "The accepted cryptographic suite MUST contain exactly one transform
+		// of each type included in the proposal", RFC 7296 section 3.3, so an
+		// integrity transform the initiator offered is echoed back rather than
+		// dropped from the answer.
+		transforms := []Transform{encr, prfT, dhT}
+		if integ != nil {
+			transforms = append(transforms, *integ)
+		}
+		selected := Proposal{Number: proposal.Number, Protocol: ProtoIKE, Transforms: transforms}
 		return selected, SASuite{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, PRFID: prfT.ID, DHGroup: dhT.ID}, nil
 	}
 	if preferredGroup != 0 {

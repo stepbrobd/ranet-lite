@@ -734,3 +734,42 @@ func TestRunLoopWakesForRetirement(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// The same wiring for a retained IKE SA. While one is held, handleIKERekey
+// answers every peer-initiated rekey with TEMPORARY_FAILURE, so the loop has
+// to wake for its deadline rather than leave it to whatever happens next: a
+// peer that rekeys once and goes quiet produces no other event at all.
+func TestRunLoopWakesForRetainedIKESA(t *testing.T) {
+	mine, theirs := lifecycleMuxes(t)
+	const spi = uint64(0x1122334455667788)
+	replaced := &ikeContext{spiI: spi, spiR: 2}
+	s := &Session{mux: mine, current: &ikeContext{spiI: 3, spiR: 4}, requests: make(chan *localRequest)}
+	if err := mine.RegisterIKE(spi); err != nil {
+		t.Fatal(err)
+	}
+	s.stateMu.Lock()
+	s.old, s.oldBy = replaced, time.Now().Add(200*time.Millisecond)
+	s.stateMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	deadline := time.Now().Add(3 * time.Second)
+	// Waited for on the SPI rather than on contextRetired: the flag flips
+	// under stateMu and the mux is told after the unlock, so polling the flag
+	// and then reading the hub reads through that window.
+	for theirs.RegisterIKE(spi) != nil {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("the loop never woke for the deadline, so every later peer rekey stays refused")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !s.contextRetired(replaced) {
+		t.Error("the SPI was released while the session still holds the SA it belongs to")
+	}
+	cancel()
+	<-done
+}

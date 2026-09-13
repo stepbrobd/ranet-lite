@@ -311,15 +311,22 @@ func TestSelectIKEProposalPrefersOurOrderAndReportsGroup(t *testing.T) {
 	// RFC 7296 section 3.3.3 makes an integrity transform optional for IKE,
 	// and a peer that spells out NONE alongside an AEAD cipher is saying the
 	// same thing as omitting it. strongSwan and libreswan both write it out.
-	t.Run("takes an offer that spells out INTEG NONE", func(t *testing.T) {
+	t.Run("takes an offer that spells out INTEG NONE and echoes it", func(t *testing.T) {
+		integ := Transform{Type: TransInteg, ID: INTEG_NONE}
 		body := offer(
 			Transform{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
 			Transform{Type: TransPRF, ID: PRF_HMAC_SHA2_256},
-			Transform{Type: TransInteg, ID: INTEG_NONE},
+			integ,
 			Transform{Type: TransDH, ID: DH_CURVE25519},
 		)
-		if _, _, err := selectIKEProposal(body, DH_CURVE25519); err != nil {
+		selected, _, err := selectIKEProposal(body, DH_CURVE25519)
+		if err != nil {
 			t.Fatalf("an offer naming INTEG NONE was refused: %v", err)
+		}
+		// "The accepted cryptographic suite MUST contain exactly one transform
+		// of each type included in the proposal", RFC 7296 section 3.3.
+		if !slices.Contains(selected.Transforms, integ) {
+			t.Errorf("the answer is %v, which drops a transform type the offer included", selected.Transforms)
 		}
 	})
 	t.Run("rejects an integrity transform it cannot use", func(t *testing.T) {
@@ -1279,11 +1286,12 @@ func TestCookieSurvivesRotationThatFollowsIt(t *testing.T) {
 }
 
 // RFC 7296 section 2.21.2 leaves the IKE SA created when only the Child SA
-// bundled into IKE_AUTH fails, and the initiator "MUST close it by sending an
-// INFORMATIONAL exchange with a Delete payload". This responder closes its mux
-// with that response, so the Delete is never answered. Retransmitting it to
-// the end of the ordinary budget delayed the dial's failure by sixty-two
-// seconds for a result the response had already named.
+// bundled into IKE_AUTH fails, and says the initiator "MAY, of course, for
+// reasons of policy later delete such an IKE SA". This fork's policy is to
+// delete it, and this responder closes its mux with that response, so the
+// Delete is never answered. Retransmitting it to the end of the ordinary
+// budget delayed the dial's failure by sixty-two seconds for a result the
+// response had already named.
 func TestTearingDownUnusableIKESADoesNotSpendTheWholeBudget(t *testing.T) {
 	if teardownRetransmits >= maxRetransmits {
 		t.Fatalf("the teardown budget is %d of %d attempts, so nothing is bounded", teardownRetransmits, maxRetransmits)
@@ -1300,5 +1308,78 @@ func TestTearingDownUnusableIKESADoesNotSpendTheWholeBudget(t *testing.T) {
 	// delays the next attempt rather than the failed one.
 	if budget > 10*time.Second {
 		t.Errorf("a Delete nobody answers costs %s, out of the %s an exchange that matters gets", budget, full)
+	}
+}
+
+// RFC 7296 section 2.10 is two rules, and the second needs the PRF: a nonce
+// "MUST be at least 128 bits in size, and MUST be at least half the key size
+// of the negotiated pseudorandom function". IKE_SA_INIT is the one exchange
+// where the nonce arrives before the PRF is chosen, and it is the surface an
+// unauthenticated peer reaches first, so checking only the length there left
+// it as the one place a short nonce was taken.
+func TestResponderChecksTheNonceAgainstTheNegotiatedPRF(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	mux, err := h.initiator.NewMux(net.ParseIP("127.0.0.1"), h.remotePort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mux.Close() })
+	spiI := randUint64Nonzero()
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	// Sixteen bytes: past the flat 128 bit floor, half the key size of
+	// HMAC-SHA2-256 and a third of HMAC-SHA2-384's.
+	short := bytes.Repeat([]byte{3}, 16)
+	withPRF := func(prf uint16) Proposal {
+		p := ikeProposal()
+		p.Transforms = slices.Clone(p.Transforms)
+		p.Transforms = slices.DeleteFunc(p.Transforms, func(t Transform) bool { return t.Type == TransPRF })
+		return Proposal{Number: p.Number, Protocol: p.Protocol,
+			Transforms: append(p.Transforms, Transform{Type: TransPRF, ID: prf})}
+	}
+	// offer retries, because these are datagrams on a loopback socket shared
+	// with every other test in this package, and answers a cookie challenge if
+	// one comes: whether return routability was demanded is not under test.
+	offer := func(t *testing.T, proposal Proposal) Notify {
+		t.Helper()
+		for range 4 {
+			for {
+				if _, err := mux.RecvIKEUntil(time.Now()); err != nil {
+					break
+				}
+			}
+			send := func(ahead []RawPayload) (Notify, bool) {
+				if err := mux.SendIKE(encodeTestSAInit(t, spiI, short, proposal, ahead)); err != nil {
+					t.Fatal(err)
+				}
+				reply, err := mux.RecvIKEUntil(time.Now().Add(5 * time.Second))
+				if err != nil {
+					return Notify{}, false
+				}
+				return firstTestNotify(t, reply), true
+			}
+			answer, ok := send(nil)
+			if !ok {
+				continue
+			}
+			if answer.Type != N_COOKIE {
+				return answer
+			}
+			if answer, ok := send([]RawPayload{{Type: PayloadN, Body: EncodeNotify(answer)}}); ok {
+				return answer
+			}
+		}
+		t.Fatal("the responder never answered")
+		return Notify{}
+	}
+
+	if got := offer(t, withPRF(PRF_HMAC_SHA2_384)).Type; got != N_NO_PROPOSAL_CHOSEN {
+		t.Errorf("a 16 byte nonce under HMAC-SHA2-384 drew notify %d, want NO_PROPOSAL_CHOSEN", got)
+	}
+	// The same nonce is long enough for the other PRF this responder offers,
+	// so what the first case proves is the PRF rule and not the flat floor.
+	if got := offer(t, withPRF(PRF_HMAC_SHA2_256)).Type; got == N_NO_PROPOSAL_CHOSEN {
+		t.Error("a 16 byte nonce under HMAC-SHA2-256 was refused, which is the length rule rather than the PRF one")
 	}
 }

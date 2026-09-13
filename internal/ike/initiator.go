@@ -724,9 +724,10 @@ func (s *Session) completeIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni
 	}
 
 	// RFC 7296 §2.21.2 says a valid responder AUTH establishes the IKE SA
-	// even when the Child SA creation bundled into IKE_AUTH fails. ranet cannot
-	// use an IKE SA without that Child SA, so close the authenticated SA with a
-	// normal encrypted IKE Delete before returning the Child negotiation error.
+	// even when the Child SA creation bundled into IKE_AUTH fails, and leaves
+	// deleting it to the initiator's policy. ranet cannot use an IKE SA
+	// without that Child SA, so close the authenticated SA with a normal
+	// encrypted IKE Delete before returning the Child negotiation error.
 	if deleteErr := s.deleteAuthenticatedIKE(); deleteErr != nil {
 		return fmt.Errorf("%w; additionally failed to delete authenticated IKE SA: %v", err, deleteErr)
 	}
@@ -734,11 +735,13 @@ func (s *Session) completeIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni
 }
 
 // teardownRetransmits bounds the Delete that closes an IKE SA this end
-// authenticated and cannot use. RFC 7296 section 2.21.2 makes sending it a
-// MUST, but nothing here depends on the answer: the SA is being discarded
-// either way, and the ordinary reason for silence is that the responder
-// discarded it first, which is what it does when the Child SA bundled into
-// IKE_AUTH fails. Spending the full budget delayed the dial's failure by
+// authenticated and cannot use. RFC 7296 section 2.21.2 leaves the IKE SA
+// created when only the Child SA bundled into IKE_AUTH fails and says the
+// initiator "MAY, of course, for reasons of policy later delete such an IKE
+// SA", which is this fork's policy: it has no use for an IKE SA without that
+// Child SA. Nothing here depends on the answer, and the ordinary reason for
+// silence is that the responder discarded the SA first, which is what it does
+// in exactly this case. Spending the full budget delayed the dial's failure by
 // sixty-two seconds for a result the response had already named.
 const teardownRetransmits = 2
 

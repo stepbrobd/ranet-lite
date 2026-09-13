@@ -90,7 +90,7 @@ func sendRecvWithin(mux *transport.Mux, req []byte, attempts int, accept func([]
 			// Not our response (e.g. an unrelated request); ignore and keep waiting.
 		}
 	}
-	return nil, fmt.Errorf("ike: no response after %d attempts", maxRetransmits)
+	return nil, fmt.Errorf("ike: no response after %d attempts", attempts)
 }
 
 func validResponseHeader(request, response *Header, rawLen int) bool {
