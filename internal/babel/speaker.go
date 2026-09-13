@@ -460,8 +460,9 @@ func (s *Speaker) wakeForPacketLocked() {
 // noteSendRetryLocked puts that on a timer instead.
 //
 // `routes.starved` is drained by `starvedActions` on the last line of
-// handlePacketLocked, so it is empty by the time this runs. It is tested as a
-// backstop for a writer that does not go through that path.
+// handlePacketLocked, so it is empty by the time the receive path asks. It is
+// here for a writer that does not go through that path, and the run loop asks
+// too.
 func (s *Speaker) pendingWorkLocked() bool {
 	return s.updatePending || len(s.routes.dirty) != 0 || len(s.routes.starved) != 0
 }
@@ -491,6 +492,17 @@ func (s *Speaker) deadlineLocked() time.Time {
 		}
 		if n.haveReportedCost {
 			deadline = earlier(deadline, n.ihuExpiry)
+		}
+		// Carried separately from ihuExpiry, because the two only move
+		// together while RTT samples keep arriving. A neighbor that stops
+		// sending Timestamp sub-TLVs, or whose clock steps so
+		// validTimestampGap refuses every sample, keeps refreshing ihuExpiry
+		// and leaves this one where it was; without a term of its own the
+		// sweep that drops the stale measurement waits for whatever pass comes
+		// next, and the advertised rxcost keeps moving to a measurement that
+		// has already expired.
+		if n.haveRTT {
+			deadline = earlier(deadline, n.rttExpiry)
 		}
 	}
 	return deadline

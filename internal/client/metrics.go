@@ -68,18 +68,20 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprint(w, "# TYPE ranet_lite_esp_inbound_dropped_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_esp_inbound_dropped_total %d\n", c.inboundDropped.Load())
 
-	// The inbound counterpart of ranet_lite_peer_send_dropped_total, and the
-	// only signal that this node is behind on receive rather than losing
-	// packets on the wire. Anyone who can reach the port can raise it, so a
-	// rising count is not by itself a fault.
+	c.renderReceiveCounters(w)
+}
+
+// renderReceiveCounters writes the two the hub keeps. They are separate series
+// on purpose: a rising dropped means this node is behind on receive, which is
+// the only signal there is for that, while a rising refused means somebody is
+// sending it datagrams it has nowhere to put. Anyone who can reach the port
+// can raise either, so neither is a fault by itself, and mixing them would
+// make the first unreadable.
+func (c *Client) renderReceiveCounters(w io.Writer) {
 	fmt.Fprint(w, "# HELP ranet_lite_receive_dropped_total Inbound datagrams a full receive queue refused.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_receive_dropped_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_receive_dropped_total %d\n", c.hubDropped())
 
-	// Separate from the line above on purpose: a rising dropped means this
-	// node is behind on receive, while this one means somebody is sending it
-	// datagrams it has nowhere to put. Anyone who can reach the port can raise
-	// either, and mixing them would make the first unreadable.
 	fmt.Fprint(w, "# HELP ranet_lite_receive_refused_total Inbound datagrams naming no SPI this node holds, or too short to name one.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_receive_refused_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_receive_refused_total %d\n", c.hubRefused())
@@ -153,13 +155,12 @@ func (s *sessionSet) paths() []string {
 }
 
 // countInbound is called once per decrypted batch rather than once per packet,
-// so the hot path pays two atomic adds per batch and nothing per packet.
-func (c *Client) countInbound(delivered, dropped int) {
+// so the hot path pays one atomic add per batch and nothing per packet. The
+// refused half is noteInboundDropped's, which counts and reports together: two
+// callers adding to one counter is how a batch gets counted twice.
+func (c *Client) countInbound(delivered int) {
 	if delivered > 0 {
 		c.inboundPackets.Add(uint64(delivered))
-	}
-	if dropped > 0 {
-		c.inboundDropped.Add(uint64(dropped))
 	}
 }
 

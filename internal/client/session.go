@@ -108,7 +108,7 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 		if dropped > 0 {
 			c.noteInboundDropped(name, dropped, lastError)
 		}
-		c.countInbound(len(results)-dropped, 0)
+		c.countInbound(len(results) - dropped)
 		c.Mesh.DeliverInboundBatch(plain)
 		clear(plain)
 	}

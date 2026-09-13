@@ -31,6 +31,9 @@ type Peer struct {
 	// peer stays in that state. Dropped is the exact count.
 	sendErrReported atomic.Int64
 	started         time.Time
+	// noteDiscarded is nil in production. A test replaces it to observe the
+	// order discardQueued gives batches back in, which nothing else can see.
+	noteDiscarded func(ticket uint64)
 
 	// Reserved peers hand completed crypto batches to one sender. slots bounds
 	// the total number of batches that may be encrypting, queued out of order,
@@ -404,6 +407,9 @@ func (p *Peer) discardQueued(pending map[uint64]*peerBatch) {
 			for _, ticket := range tickets {
 				b := pending[ticket]
 				delete(pending, ticket)
+				if p.noteDiscarded != nil {
+					p.noteDiscarded(ticket)
+				}
 				err := b.abandon()
 				if b.done != nil {
 					b.done <- err

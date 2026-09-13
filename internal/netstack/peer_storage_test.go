@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -379,27 +381,43 @@ func TestBatchesStrandedInTheSenderAreCounted(t *testing.T) {
 		},
 		func([][]byte) error { return nil })
 
-	first, second := peer.reserveBatchNow(3), peer.reserveBatchNow(5)
-	if first == nil || second == nil {
+	var discarded []uint64
+	peer.noteDiscarded = func(ticket uint64) { discarded = append(discarded, ticket) }
+	first, second, third := peer.reserveBatchNow(3), peer.reserveBatchNow(5), peer.reserveBatchNow(7)
+	if first == nil || second == nil || third == nil {
 		t.Fatal("the peer refused a reservation while it was open")
 	}
-	for range 3 {
-		first.append([]byte{1}, 0)
+	for _, reserved := range []struct {
+		batch *peerBatch
+		count int
+	}{{first, 3}, {second, 5}, {third, 7}} {
+		for range reserved.count {
+			reserved.batch.append([]byte{1}, 0)
+		}
 	}
-	for range 5 {
-		second.append([]byte{2}, 0)
-	}
-	// Only the second goes in, so the sender holds it waiting for the first,
-	// which is where Close finds it.
-	if err := second.enqueue(); err != nil {
-		t.Fatalf("an open peer refused the batch: %v", err)
+	// The first never goes in, so the sender holds the other two waiting for
+	// it, which is where Close finds them. They are queued out of order so the
+	// order they come back in is the sender's doing rather than the caller's.
+	for _, batch := range []*peerBatch{third, second} {
+		if err := batch.enqueue(); err != nil {
+			t.Fatalf("an open peer refused the batch: %v", err)
+		}
 	}
 	peer.Close()
 	if err := first.enqueue(); err == nil {
 		t.Fatal("a closed peer accepted the batch")
 	}
-	if got := peer.Dropped(); got != 8 {
-		t.Errorf("the peer counted %d of the 8 packets it will never send", got)
+	if got := peer.Dropped(); got != 15 {
+		t.Errorf("the peer counted %d of the 15 packets it will never send", got)
+	}
+	if len(discarded) != 2 {
+		t.Fatalf("the sender gave back %d batches, want the two it was holding", len(discarded))
+	}
+	// Given back in ticket order, which is the order everything else in this
+	// peer observes: a caller watching the counter while its own batch is
+	// discarded would otherwise see them arrive in map order.
+	if !slices.IsSorted(discarded) {
+		t.Errorf("the sender gave batches back in ticket order %v", discarded)
 	}
 }
 
@@ -430,3 +448,56 @@ func TestSealFailureOnAnOpenPeerIsCounted(t *testing.T) {
 		t.Errorf("the peer counted %d of the 4 packets that never reached the transport", got)
 	}
 }
+
+// A peer whose Child SA the other end deleted fails every reservation from
+// then on, so a line per failed batch is a line per TUN batch for as long as
+// that lasts. The count is exact; only the saying of it is bounded.
+func TestATransportFailureIsSaidRarely(t *testing.T) {
+	var lines atomic.Int64
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(countingWriter{&lines}, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	sending := errors.New("no route to host")
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return sending })
+	defer peer.Close()
+
+	// The transmission budget is the core count, and the sender gives a slot
+	// back only after the transport returns, so a batch that finds none free
+	// is waited for rather than counted as a failure to send.
+	const batches = 200
+	for sent := 0; sent < batches; {
+		b := peer.reserveBatchNow(1)
+		if b == nil {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		b.append([]byte{1}, 0)
+		if err := b.enqueue(); err != nil {
+			t.Fatalf("an open peer refused the batch: %v", err)
+		}
+		sent++
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for lines.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no failure was said at all, so an operator sees nothing")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := lines.Load(); got != 1 {
+		t.Errorf("%d failed batches wrote %d lines, want the one the interval allows", batches, got)
+	}
+}
+
+// countingWriter counts writes rather than keeping them, which is what a
+// report that must not be one line per batch is measured in.
+type countingWriter struct{ n *atomic.Int64 }
+
+func (w countingWriter) Write(b []byte) (int, error) { w.n.Add(1); return len(b), nil }

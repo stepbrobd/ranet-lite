@@ -1651,7 +1651,16 @@ func TestTheStarveRetryDeadlineIsNeverLate(t *testing.T) {
 	}
 	check := func(what string) {
 		t.Helper()
-		if want := truest(); speaker.nextStarveRetry.After(want) {
+		want := truest()
+		// Zero is not "early": earlier() reads it as no deadline at all, so a
+		// kept value that collapses to zero while retries remain is the late
+		// case this is named for, and After() alone never sees it.
+		if speaker.nextStarveRetry.IsZero() != want.IsZero() {
+			t.Errorf("after %s the kept deadline is %v and the earliest retry is due at %v",
+				what, speaker.nextStarveRetry, want)
+			return
+		}
+		if speaker.nextStarveRetry.After(want) {
 			t.Errorf("after %s the kept deadline is %v, later than the %v something is due at",
 				what, speaker.nextStarveRetry, want)
 		}
@@ -1683,6 +1692,12 @@ func TestTheStarveRetryDeadlineIsNeverLate(t *testing.T) {
 		}
 	}
 	check("a pass with some due and some not")
+
+	// And a pass in which every one of them is due, so the rebuild carries
+	// only what it rescheduled: that fold is the one no other pass reaches,
+	// and without it the kept value collapses to zero while retries remain.
+	speaker.retryStarvedLocked(now.Add(time.Minute))
+	check("a pass in which every retry was due")
 
 	// Passes until every retry has spent its attempts, which is what empties
 	// the map. A kept deadline that survives that is one the rebuild did not
@@ -1789,11 +1804,44 @@ func TestTheSuppressionWindowIsADeadlineOfItsOwn(t *testing.T) {
 		t.Fatalf("the loop sleeps until %v, past the %v the window expires at", got, want)
 	}
 
-	// The pass the deadline asks for gives the share back and leaves nothing
-	// behind to wake for.
+	// The record of what this node asked expires on the same window and is
+	// held by the same budget, so it is a deadline the same way.
+	speaker.nextRequestSweep = time.Time{}
+	if !speaker.allowAsk(neighbor, index.route, index.routerID, now) {
+		t.Fatal("the first ask was suppressed")
+	}
+	if got := speaker.deadlineLocked(); got.After(want) {
+		t.Errorf("after an ask the loop sleeps until %v, past the %v that window expires at", got, want)
+	}
+
+	// A sweep that leaves something behind has to carry it: the rebuild is
+	// what makes the kept value exact, and an entry it walks past without
+	// folding in is one the loop never wakes for again.
+	// One of each table survives the sweep, so both rebuilds have something to
+	// walk past and fold back in, and the ask is the earlier of the two so
+	// that its fold is the one the kept deadline depends on.
+	later := sourceKey{route: routeKey{dest: netip.MustParsePrefix("fd00:9::/64")}, routerID: [8]byte{4}}
+	if !speaker.allowAsk(neighbor, later.route, later.routerID, want) {
+		t.Fatal("the second ask was suppressed")
+	}
+	if !speaker.allowSeqnoRequest(later, 1, neighbor.peer.ID, want.Add(time.Second)) {
+		t.Fatal("the second request was suppressed")
+	}
 	speaker.sweepRequestsLocked(want)
-	if len(speaker.pendingSeqno) != 0 || len(speaker.pendingByAsker) != 0 {
-		t.Errorf("the sweep left %d entries and %d shares", len(speaker.pendingSeqno), len(speaker.pendingByAsker))
+	if len(speaker.askedSeqno) != 1 || len(speaker.pendingSeqno) != 1 {
+		t.Fatalf("the sweep left %d asks and %d entries, want one of each",
+			len(speaker.askedSeqno), len(speaker.pendingSeqno))
+	}
+	if got := speaker.nextRequestSweep; got.IsZero() || got.After(want.Add(seqnoRequestSuppress)) {
+		t.Errorf("the ask the sweep walked past is due at %v and the kept deadline is %v",
+			want.Add(seqnoRequestSuppress), got)
+	}
+
+	// And a sweep that empties both tables leaves nothing to wake for.
+	speaker.sweepRequestsLocked(want.Add(2 * seqnoRequestSuppress).Add(time.Second))
+	if len(speaker.pendingSeqno) != 0 || len(speaker.pendingByAsker) != 0 || len(speaker.askedSeqno) != 0 {
+		t.Errorf("the sweep left %d entries, %d shares and %d asks",
+			len(speaker.pendingSeqno), len(speaker.pendingByAsker), len(speaker.askedSeqno))
 	}
 	if !speaker.nextRequestSweep.IsZero() {
 		t.Errorf("with nothing left the sweep is still due at %v", speaker.nextRequestSweep)
@@ -1972,9 +2020,20 @@ func TestTheLoopsOwnTimersAreTermsOfItsDeadline(t *testing.T) {
 	speaker.mu.Lock()
 	defer speaker.mu.Unlock()
 	now := time.Now()
+	far := func() {
+		speaker.nextHello, speaker.nextUpdate = now.Add(time.Hour), now.Add(time.Hour)
+		speaker.nextStarveRetry, speaker.retryAt, speaker.nextRequestSweep = time.Time{}, time.Time{}, time.Time{}
+	}
 	for name, set := range map[string]func(){
-		"hello":  func() { speaker.nextHello, speaker.nextUpdate = now.Add(time.Second), now.Add(time.Hour) },
-		"update": func() { speaker.nextHello, speaker.nextUpdate = now.Add(time.Hour), now.Add(time.Second) },
+		"hello":  func() { far(); speaker.nextHello = now.Add(time.Second) },
+		"update": func() { far(); speaker.nextUpdate = now.Add(time.Second) },
+		// Each of the kept deadlines stands for work nothing else wakes for: a
+		// seqno request that has to be repeated, a pass that could not send
+		// what it built, and a suppression window whose budget is held until
+		// it is swept.
+		"starvation retry":   func() { far(); speaker.nextStarveRetry = now.Add(time.Second) },
+		"refused send retry": func() { far(); speaker.retryAt = now.Add(time.Second) },
+		"request sweep":      func() { far(); speaker.nextRequestSweep = now.Add(time.Second) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			set()
@@ -1997,9 +2056,46 @@ func TestAPendingDumpIsWorkTheNextPassOwes(t *testing.T) {
 	if speaker.pendingWorkLocked() {
 		t.Fatal("a speaker with nothing to do reports work, so this proves nothing")
 	}
-	speaker.updatePending = true
-	if !speaker.pendingWorkLocked() {
-		t.Error("a pending dump is not work, so it waits for whatever wakes the loop next")
+	for name, set := range map[string]func(){
+		"a pending dump":      func() { speaker.updatePending = true },
+		"a changed selection": func() { speaker.routes.dirty[routeKey{dest: netip.MustParsePrefix("fd00::/64")}] = struct{}{} },
+		"a starved prefix":    func() { speaker.routes.starved = []starveRequest{{}} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			speaker.updatePending = false
+			clear(speaker.routes.dirty)
+			speaker.routes.starved = nil
+			set()
+			if !speaker.pendingWorkLocked() {
+				t.Errorf("%s is not work, so it waits for whatever wakes the loop next", name)
+			}
+		})
+	}
+}
+
+// A speaker whose loop has not run yet is asleep on no deadline at all, and
+// every arriving packet has to wake it: the comparison below it is against a
+// zero time, which nothing is before.
+func TestAPacketWakesALoopThatHasNotRunYet(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	speaker.mu.Lock()
+	speaker.updatePending = false
+	clear(speaker.routes.dirty)
+	speaker.routes.starved = nil
+	for _, n := range speaker.neighbors {
+		n.sentHello = true
+	}
+	if !speaker.sleepUntil.IsZero() {
+		t.Fatal("the loop already recorded a deadline, so this proves nothing")
+	}
+	speaker.mu.Unlock()
+	select {
+	case <-speaker.changed:
+	default:
+	}
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 1, Interval: 400})}))
+	if len(speaker.changed) == 0 {
+		t.Error("the packet left the loop asleep on a deadline it has never set")
 	}
 }
 

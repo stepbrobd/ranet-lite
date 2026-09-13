@@ -436,7 +436,8 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 		t.Fatal("the session was not adopted, so the per-path lines would be empty")
 	}
 	defer release()
-	c.countInbound(7, 2)
+	c.countInbound(7)
+	c.noteInboundDropped("peer", 2, errors.New("replayed"))
 
 	// A hello, an IHU and one route, so every per-neighbor line below reads
 	// something other than the zero it would read with the counting deleted.

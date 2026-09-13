@@ -68,3 +68,36 @@ func TestTableFallsBackPastInapplicableDestination(t *testing.T) {
 		t.Fatalf("got %q, %v; want specific, true", got, ok)
 	}
 }
+
+// The index is one map per distinct source prefix length, not one per entry.
+// That is the whole basis of the bound: a lookup costs a map lookup per
+// length, which the address width caps at 129 however many sources one
+// destination carries. A group per entry is the linear scan again, with the
+// map overhead on top.
+func TestSourcesAreGroupedByLengthNotByEntry(t *testing.T) {
+	var table Table[int]
+	dst := prefix("fd00::/16")
+	for i := range 64 {
+		table.Set(netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, 0, byte(i)}), 48), dst, i+1)
+	}
+	table.Set(prefix("fd00:1::/32"), dst, 1000)
+	table.Set(netip.Prefix{}, dst, 2000)
+
+	root := table.roots.Load().ipv6
+	if root == nil {
+		t.Fatal("the table holds no IPv6 root")
+	}
+	node := root
+	for node != nil && int(node.prefixLen) != dst.Bits() {
+		node = node.child[0]
+	}
+	if node == nil {
+		t.Fatalf("no node for %v", dst)
+	}
+	if got := len(node.byLen); got != 2 {
+		t.Errorf("66 sources of two distinct lengths built %d groups, want 2", got)
+	}
+	if !node.haveAny {
+		t.Error("the match-all source is not held apart from the groups")
+	}
+}

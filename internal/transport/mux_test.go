@@ -823,3 +823,40 @@ func TestDatagramsWithNowhereToGoAreCounted(t *testing.T) {
 		})
 	}
 }
+
+// The socket layer refuses datagrams the hub never sees: on linux a GRO
+// control message that will not parse, and a reply source that will not
+// either. They are reported back through the receive function so the same
+// counter carries them, and an operator reading it gets one number for
+// "arrived here and went nowhere" rather than two halves of one.
+func TestWhatTheReceiverRefusedReachesTheCounter(t *testing.T) {
+	h := &Hub{bind: closedBind{}, ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux),
+		muxes: make(map[*Mux]struct{}), done: make(chan struct{}), started: time.Now()}
+	h.reported.Store(-int64(dropReportInterval))
+	done := make(chan struct{})
+	calls := 0
+	go func() {
+		defer close(done)
+		h.receiveLoop(func([][]byte, []int, []Endpoint) (int, int, error) {
+			calls++
+			if calls == 1 {
+				return 0, 3, nil
+			}
+			return 0, 0, errors.New("closed")
+		})
+	}()
+	<-done
+	if got := h.Refused(); got != 3 {
+		t.Errorf("the hub counted %d of the 3 datagrams its receiver refused", got)
+	}
+	if got := h.Dropped(); got != 0 {
+		t.Errorf("it also raised the queue-full counter to %d, which means something else", got)
+	}
+}
+
+// closedBind stands in for the socket a hand-built hub has none of.
+type closedBind struct{}
+
+func (closedBind) ParseEndpoint(string) (Endpoint, error) { return nil, errors.New("no bind") }
+func (closedBind) Send([][]byte, Endpoint) error          { return errors.New("no bind") }
+func (closedBind) Close() error                           { return nil }
