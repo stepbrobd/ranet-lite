@@ -1174,28 +1174,21 @@ func TestDarwinOccupiedRecordIsReadWithTheRowsOwnScope(t *testing.T) {
 	}
 	sock.err = nil
 
-	// The plain route to the same destination is a different key. It installs,
-	// and every later dump has to report it, or nothing can ever withdraw it.
-	plain, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
-		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC,
-		dst: dest, gateway: ourGateway(),
-	}))
+	// One dump carrying both rows, which is what the kernel returns: the
+	// plain route to the same destination is a different key, so it has to be
+	// reported or nothing can ever withdraw it, and the scoped one is still
+	// somebody else's.
+	got, err := plat.ownedRoutes(dumpRIB(t,
+		dumpEntry{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC,
+			dst: dest, gateway: ourGateway()},
+		dumpEntry{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+			dst: dest, gateway: ourGateway()},
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plain) != 1 || plain[0].Scoped {
-		t.Fatalf("the dump reported %v for a route this reconciler installed unscoped", plain)
-	}
-	// And the scoped key is still somebody else's.
-	foreign, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
-		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
-		dst: dest, gateway: ourGateway(),
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(foreign) != 0 {
-		t.Errorf("the dump claims %v, which another program holds", foreign)
+	if len(got) != 1 || got[0].Scoped {
+		t.Fatalf("the dump reported %v, want only the unscoped route this reconciler installed", got)
 	}
 }
 
@@ -1310,5 +1303,33 @@ func TestDarwinMonitorIgnoresItsOwnRefusedWrites(t *testing.T) {
 	truncated := echo(unix.RTM_ADD, monitor.self+1, 0)
 	if !monitor.interesting(truncated[:len(truncated)-4]) {
 		t.Error("a message that will not parse must wake rather than be dropped")
+	}
+}
+
+// A dump the kernel returns and this library cannot read is a pass that will
+// not reach any AddRoute either, so it must not consume a rotation. Two of
+// them would empty the record, and on this platform that record is also the
+// exception decodeRoute reads: a foreign route out of this interface would
+// then be reported as ours and reach a delete list.
+func TestDarwinKeepsTheRefusalRecordThroughAnUnparseableDump(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	dest := prefix("2001:db8:1::/48")
+	sock.err = unix.EEXIST
+	if err := plat.AddRoute(Route{Destination: dest, Metric: defaultIPv6Metric}); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("the refused install reported %v", err)
+	}
+	if len(plat.occupied) != 1 {
+		t.Fatalf("the refusal recorded %d keys, want one", len(plat.occupied))
+	}
+
+	// A message whose length field runs past the buffer it arrived in.
+	unreadable := []byte{100, 0, unix.RTM_VERSION, unix.RTM_GET, 0, 0, 0, 0}
+	for pass := range 2 {
+		if _, err := plat.ownedRoutes(unreadable); err == nil {
+			t.Fatalf("pass %d: an unreadable dump parsed, so this proves nothing", pass)
+		}
+	}
+	if len(plat.occupied) != 1 {
+		t.Errorf("two passes that never decoded a route emptied the record: %v", plat.occupied)
 	}
 }

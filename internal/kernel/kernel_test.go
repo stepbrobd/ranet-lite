@@ -32,6 +32,7 @@ type fakeKernel struct {
 	routes  map[Route]bool
 	foreign map[Route]bool
 	addrs   map[netip.Prefix]bool
+	deleted []netip.Prefix
 	master  string
 	name    string
 	closed  bool
@@ -126,6 +127,10 @@ func (f *fakeKernel) AddAddr(address netip.Prefix) error {
 func (f *fakeKernel) DelAddr(address netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Recorded as asked, not as matched: the address-only match models what
+	// the kernels do and would otherwise hide a withdrawal that named the
+	// wrong prefix length, which linux does refuse.
+	f.deleted = append(f.deleted, address)
 	for held := range f.addrs {
 		if held.Addr() == address.Addr() {
 			delete(f.addrs, held)
@@ -502,6 +507,13 @@ func TestApplyAddressesOnlyRemovesWhatItAdded(t *testing.T) {
 	}
 	if !fake.addrs[operator] {
 		t.Fatal("an address the reconciler did not add was removed")
+	}
+	// Named exactly as it was assigned. Both kernels match a delete on the
+	// address, so naming another length would take the same entry away and
+	// nothing here would notice; linux refuses one, which is a withdrawal that
+	// silently leaves the address behind.
+	if !slices.Equal(fake.deleted, []netip.Prefix{ours}) {
+		t.Errorf("withdrawal asked to delete %v, want only %s", fake.deleted, ours)
 	}
 }
 

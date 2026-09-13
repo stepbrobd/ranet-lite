@@ -215,11 +215,11 @@ func (p *routePlatform) rotateWarnings() {
 	// holds a hundred records forever, and a stale one hides a route from the
 	// dump.
 	//
-	// Rotated only for a pass that will go on to install: a failed dump
-	// returns before any AddRoute refills the record, and two such passes
-	// would empty it. On this platform that also clears the exception
-	// decodeRoute reads, so a foreign key could be adopted and reach a delete
-	// list.
+	// Rotated only for a pass that will go on to install: a dump that fails,
+	// in the kernel or in the parser, returns before any AddRoute refills the
+	// record, and two such passes would empty it. On this platform that also
+	// clears the exception decodeRoute reads, so a foreign key could be
+	// adopted and reach a delete list.
 	p.occupied, p.refused = p.refused, make(map[occupiedKey]bool, len(p.refused))
 }
 
@@ -228,7 +228,6 @@ func (p *routePlatform) Routes() ([]Route, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the routing table: %w", err)
 	}
-	p.rotateWarnings()
 	return p.ownedRoutes(rib)
 }
 
@@ -237,6 +236,11 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernel: parse the route dump: %w", err)
 	}
+	// After the parse, not before it: a dump the kernel returns and this
+	// library cannot read is a pass that will not reach any AddRoute either,
+	// and rotating for it would empty the record two passes later. See
+	// rotateWarnings.
+	p.rotateWarnings()
 	var out []Route
 	stillScoped := make(map[netip.Prefix]bool, len(p.scoped))
 	// Rebuilt rather than added to, so a route another program took over

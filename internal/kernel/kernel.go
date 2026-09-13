@@ -491,6 +491,13 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 		// never match the diff, and be withdrawn and reinstalled on every pass
 		// for the life of the process. Dropping the source says the same thing
 		// and installs.
+		//
+		// Nothing currently reaches this. RFC 9079 section 5 makes a
+		// zero-length source prefix an ordinary route, so babel's decoder
+		// refuses source plen 0 on the wire, originatedKey drops it from a
+		// local announcement, and the config refuses "from: ::/0". It is here
+		// because the cost of one of those changing is a route the kernel
+		// tears down and reinstalls four times a second.
 		if entry.Source.IsValid() && entry.Source.Bits() == 0 {
 			entry.Source = netip.Prefix{}
 		}
@@ -721,9 +728,12 @@ func (r *Reconciler) withdraw() error {
 	if err != nil {
 		errs = append(errs, fmt.Errorf("list routes: %w", err))
 	}
+	withdrawn := 0
 	for _, route := range routes {
 		if err := r.plat.DelRoute(route); err != nil {
 			errs = append(errs, fmt.Errorf("delete route %s: %w", route, err))
+		} else {
+			withdrawn++
 		}
 	}
 	// An address is removed only while the link still carries exactly what was
@@ -759,7 +769,9 @@ func (r *Reconciler) withdraw() error {
 			r.enslaved = false
 		}
 	}
-	slog.Info("kernel reconciler withdrawn", "routes", len(routes), "addresses", removed)
+	// Both counts are what left, so a line reporting nothing removed is a
+	// shutdown that removed nothing.
+	slog.Info("kernel reconciler withdrawn", "routes", withdrawn, "addresses", removed)
 	return errors.Join(errs...)
 }
 

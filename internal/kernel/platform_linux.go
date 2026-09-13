@@ -44,7 +44,7 @@ type netlinkPlatform struct {
 	// this, and it runs one pass at a time.
 	//
 	// refused is what the current pass has seen refused, and Routes swaps it
-	// into occupied at the start of the next one. A foreign route is filtered
+	// into occupied once the next one has dumped. A foreign route is filtered
 	// out of the dump by protocol, so it never reaches a delete list and
 	// DelRoute is never called for it: when the mesh stops announcing that
 	// prefix the record would have no exit at all.
