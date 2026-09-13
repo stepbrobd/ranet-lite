@@ -232,6 +232,7 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 		changed:        make(chan struct{}, 1),
 	}
 	s.routes = newRouteTable(s.installRoute)
+	s.routes.cost = s.cfg.Cost
 	s.routes.forget = func(key routeKey) { s.mesh.Routes.Remove(key.source, key.dest) }
 	// RFC 8966 Appendix A.3 recommends a hysteresis time constant of a small
 	// multiple of the Hello interval. One link's base cost is the scale at
@@ -772,7 +773,7 @@ func (s *Speaker) Stats() Stats {
 		stats.Neighbors = append(stats.Neighbors, NeighborStat{
 			Peer:       neighbor.peer.ID,
 			Alive:      neighbor.isAlive(now),
-			Cost:       neighbor.linkCost(now),
+			Cost:       neighbor.linkCost(now, s.cfg.Cost),
 			Routes:     received[neighbor],
 			Dropped:    neighbor.peer.Dropped(),
 			SendFailed: neighbor.peer.SendFailed(),

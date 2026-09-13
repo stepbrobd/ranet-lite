@@ -105,6 +105,10 @@ type routeTable struct {
 	// worse a selected route must get before it is worth a triggered update.
 	tau     time.Duration
 	trigger uint16
+	// cost carries the round-trip parameters into selection, since RFC 9616
+	// section 4.2 feeds its penalty to the metric computation a node runs on
+	// its own routes rather than to what it advertises.
+	cost    CostParams
 	install func(routeKey, routeSelection)
 	// forget drops the forwarding entry entirely, ending the
 	// unreachable hold install leaves behind for a retracted prefix.
@@ -206,7 +210,7 @@ func (rt *routeTable) selectRoute(key routeKey, entry *keyEntry, now time.Time) 
 		// minimum, whether or not it can be selected: a retracted one still
 		// has to be flushed when its hold runs out.
 		rt.noteExpiry(route.expiresAt)
-		cost := route.cost(n, now)
+		cost := route.cost(n, now, rt.cost)
 		if cost == MetricInfinity {
 			// Deliberately not smoothed. ms(R) follows an increase
 			// immediately, so feeding it infinity pins it there, and a link
@@ -317,8 +321,8 @@ func (r *routeInfo) advertised() advertisement {
 // metric. The link cost is clamped to one so that M stays strictly monotonic
 // even when a neighbor reports an rxcost of zero; without M(c, m) > m,
 // persistent routing loops are possible.
-func (r *routeInfo) cost(n *neighborState, now time.Time) uint16 {
-	return saturatingAdd(max(1, n.linkCost(now)), r.rxMetric)
+func (r *routeInfo) cost(n *neighborState, now time.Time, cost CostParams) uint16 {
+	return saturatingAdd(max(1, n.linkCost(now, cost)), r.rxMetric)
 }
 
 // smooth maintains ms(R) of RFC 8966 Appendix A.3 as an exponentially smoothed

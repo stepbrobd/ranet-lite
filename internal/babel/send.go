@@ -247,11 +247,7 @@ func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 	centis := uint16(s.cfg.HelloInterval / (10 * time.Millisecond))
 	n.sentHello = true
 	n.helloSeqno++
-	rxCost := s.cfg.Cost.RxCost
-	if n.isAlive(now) {
-		rxCost = s.cfg.Cost.Cost(n.measuredRTT, n.haveRTT)
-	}
-	ihu := IHU{RxCost: rxCost, Interval: centis}
+	ihu := IHU{RxCost: s.cfg.Cost.RxCost, Interval: centis}
 	if n.haveTheirHello {
 		ihu.OriginTS, ihu.ReceiveTS, ihu.HasTS = n.theirHelloTxTS, n.theirHelloRxTS, true
 	}

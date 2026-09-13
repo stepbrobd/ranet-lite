@@ -203,7 +203,7 @@ func TestZeroIHUIntervalIsIgnoredRatherThanHonored(t *testing.T) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cost := s.neighbors[a.ID].linkCost(time.Now()); cost == MetricInfinity {
+	if cost := s.neighbors[a.ID].linkCost(time.Now(), s.cfg.Cost); cost == MetricInfinity {
 		t.Error("an IHU with a zero interval took the link cost to infinity")
 	}
 }

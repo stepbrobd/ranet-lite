@@ -97,9 +97,15 @@ func (n *neighborState) isAlive(now time.Time) bool {
 	return n.alive && now.Before(n.helloExpiry())
 }
 
-func (n *neighborState) linkCost(now time.Time) uint16 {
+// linkCost is C(A,B) of RFC 8966 section 3.4.3, the cost this node puts on the
+// link for its own metric computation. It is the rxcost the neighbor reports
+// plus this node's own round-trip penalty, which RFC 9616 section 4.2 feeds to
+// exactly that computation. The penalty is not in what this node advertises:
+// both ends measure the same round trip, so adding it at both would count it
+// twice, and BIRD does not add it there either.
+func (n *neighborState) linkCost(now time.Time, cost CostParams) uint16 {
 	if !n.isAlive(now) || !n.haveReportedCost || !now.Before(n.ihuExpiry) {
 		return MetricInfinity
 	}
-	return n.reportedCost
+	return saturatingAdd(n.reportedCost, cost.RTTPenalty(n.measuredRTT, n.haveRTT))
 }

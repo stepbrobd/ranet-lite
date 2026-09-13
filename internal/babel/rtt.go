@@ -59,19 +59,31 @@ func DefaultCostParams() CostParams {
 // Cost implements the standard babeld/RFC 9616 RTT-cost formula: rxcost
 // alone below RTTMin, rxcost+RTTCost at/above RTTMax, linear in between.
 func (p CostParams) Cost(rtt time.Duration, haveRTT bool) uint16 {
-	if !haveRTT || p.RTTCost == 0 || p.RTTMax <= p.RTTMin {
-		return p.RxCost
-	}
-	if rtt <= p.RTTMin {
-		return p.RxCost
+	return saturatingAdd(p.RxCost, p.RTTPenalty(rtt, haveRTT))
+}
+
+// RTTPenalty is the same mapping without the nominal hop cost. RFC 9616
+// section 4.2 asks for it as input to "the metric computation procedure
+// (Section 3.5.2 of [RFC8966])". That procedure is the one a node runs on its
+// own routes, so the penalty belongs on the cost this node computes for the
+// link, added to the rxcost the neighbor reports, rather than on the rxcost
+// this node advertises.
+//
+// Measured against the fleet before this was so: every one of sixteen ysun
+// nodes reported cost 96 whether its real round trip was 10 ms or 307 ms,
+// because BIRD applies the penalty locally and advertises the nominal cost.
+// Selection could not tell Paris from Sydney and took a 202 ms exit from a
+// node 10 ms from Paris.
+func (p CostParams) RTTPenalty(rtt time.Duration, haveRTT bool) uint16 {
+	if !haveRTT || p.RTTCost == 0 || p.RTTMax <= p.RTTMin || rtt <= p.RTTMin {
+		return 0
 	}
 	if rtt >= p.RTTMax {
-		return saturatingAdd(p.RxCost, p.RTTCost)
+		return p.RTTCost
 	}
 	// int64 nanosecond products (e.g. 1024 * 1s) overflow uint32 well
 	// before the division brings the result back into range.
-	extra := uint64(p.RTTCost) * uint64(rtt-p.RTTMin) / uint64(p.RTTMax-p.RTTMin)
-	return saturatingAdd(p.RxCost, uint16(extra))
+	return uint16(uint64(p.RTTCost) * uint64(rtt-p.RTTMin) / uint64(p.RTTMax-p.RTTMin))
 }
 
 func saturatingAdd(a, b uint16) uint16 {

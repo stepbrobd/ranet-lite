@@ -1397,3 +1397,43 @@ func TestNoTransitAdvertisesOnlyWhatThisNodeOriginates(t *testing.T) {
 		}
 	}
 }
+
+// The round-trip penalty has to reach selection through the speaker, not only
+// through linkCost called directly. Deleting the one line that hands the cost
+// parameters to the route table zeroes RTTCost, which makes RTTPenalty return
+// zero and puts selection back exactly where it was before the penalty moved,
+// while every unit test on the formula stays green. So this asserts the metric
+// the route table actually selected, which is the number the penalty has to
+// be inside of.
+func TestSelectionCarriesTheRoundTripPenalty(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b")
+	dest := netip.MustParsePrefix("fd00:d::/64")
+	key := routeKey{dest: dest}
+	fabric.speakers["b"].Originate(dest)
+	fabric.flush("b", "a")
+
+	nominal := fabric.selected("a", key).cost
+	if nominal == 0 || nominal == MetricInfinity {
+		t.Fatalf("nothing was selected at cost %d, so this proves nothing", nominal)
+	}
+
+	// Four hundred milliseconds, well inside rtt-max, so the penalty is a
+	// proportion rather than the ceiling and a wrong scale shows up as a wrong
+	// number rather than as infinity.
+	s := fabric.speakers["a"]
+	s.mu.Lock()
+	n := fabric.neighbor("a", "b")
+	n.measuredRTT, n.haveRTT = 400*time.Millisecond, true
+	n.rttExpiry = time.Now().Add(time.Hour)
+	s.routes.sweepExpired(time.Now())
+	s.mu.Unlock()
+
+	penalty := DefaultCostParams().RTTPenalty(400*time.Millisecond, true)
+	if penalty == 0 {
+		t.Fatal("the fixture produced no penalty, so this proves nothing")
+	}
+	if got, want := fabric.selected("a", key).cost, nominal+penalty; got != want {
+		t.Errorf("selection used cost %d, want %d, the %d it used before plus the %d penalty: it never reached the route table",
+			got, want, nominal, penalty)
+	}
+}
