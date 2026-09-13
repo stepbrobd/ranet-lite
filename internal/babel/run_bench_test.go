@@ -91,3 +91,28 @@ func BenchmarkRunLoopDeadline(b *testing.B) {
 		s.mu.Unlock()
 	}
 }
+
+// BenchmarkReceiveHello is what an arriving Hello costs, which is the figure
+// the wake decision in wakeForPacketLocked trades against a full pass. It is
+// measured on the same eight-neighbor table BenchmarkRunLoopPass uses, because
+// a figure taken on a one-neighbor table and set against a pass taken on this
+// one compares two different fixtures.
+//
+// The neighbor holds the whole table, which is the shape one peer can build:
+// maxRouteKeys is table-wide and has no per-neighbor share.
+func BenchmarkReceiveHello(b *testing.B) {
+	hello := EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 1, Interval: 400})})
+	for _, neighbors := range []int{1, 8} {
+		b.Run(fmt.Sprintf("neighbors=%d", neighbors), func(b *testing.B) {
+			s := fillRouteTable(b, neighbors, maxRouteKeys)
+			n := s.neighbors["peer0"]
+			n.addr = netip.MustParseAddr("fe80::2")
+			b.ResetTimer()
+			for b.Loop() {
+				s.mu.Lock()
+				s.handlePacketLocked(n, hello, time.Now())
+				s.mu.Unlock()
+			}
+		})
+	}
+}

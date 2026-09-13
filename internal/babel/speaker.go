@@ -433,11 +433,27 @@ func (s *Speaker) wake() {
 // the whole route table, 22 ms at maxRouteKeys prefixes over eight neighbors
 // and under the lock that is also every other neighbor's receive path, the
 // hello emitter and route installation, so a wake for every arriving packet
-// lets one neighbor charge this node that much for a sixty byte Hello as fast
+// let one neighbor charge this node that much for a sixty byte Hello as fast
 // as the link carries them. Deciding instead costs the 230 ns of
 // deadlineLocked, and the Hello and IHU a packet refreshes move their own
 // deadlines later, never earlier, which is the case this leaves asleep. Both
 // figures are floors, taken on an idle machine; see BenchmarkRunLoopPass.
+//
+// It does not make an arriving packet free. Every Hello and IHU calls
+// routes.recomputeNeighbor on the receive path, which reselects every prefix
+// that neighbor holds under the same lock, and the cost is the same order as
+// the pass it no longer also pays for: on the eight-neighbor table at
+// maxRouteKeys, 7.6 ms against 19 ms, both measured on the same fixture by
+// BenchmarkReceiveHello and BenchmarkRunLoopPass. Comparing a one-neighbor
+// receive against an eight-neighbor pass, which an earlier note here did, puts
+// the ratio out by a factor of five. maxRouteKeys is a table-wide cap with no
+// per-neighbor share, so one neighbor can fill it and then charge that.
+//
+// The recompute fires on every Hello rather than on one that moves the link
+// cost: linkChanged is set unconditionally by both TLVs, while linkCost is
+// reportedCost gated on liveness, which a refreshing Hello from a live
+// neighbor does not move. Gating it on the cost actually changing is the next
+// thing worth doing here.
 func (s *Speaker) wakeForPacketLocked() {
 	if s.pendingWorkLocked() || s.sleepUntil.IsZero() || s.deadlineLocked().Before(s.sleepUntil) {
 		s.wake()

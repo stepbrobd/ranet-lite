@@ -140,8 +140,13 @@ func TestClearRangeClearsExactlyItsBits(t *testing.T) {
 
 // A peer chooses its own sequence numbers, so the cost of one commit must not
 // be proportional to how far it jumped. Both figures are measured in the same
-// run on the same machine, and the threshold sits far below what a per-bit
-// loop costs, which was about three thousand times the in-order case.
+// run on the same machine.
+//
+// The threshold has to sit below what the word-at-a-time loop costs, not only
+// below the per-bit loop it replaced: the per-bit form was about three
+// thousand times the in-order case and the word form is thirty to forty-five,
+// so a threshold sized for the first passes with the second still in place.
+// Twenty is under the word loop and well over the memclr's fifteen.
 func TestReplayCommitCostDoesNotFollowJumpDistance(t *testing.T) {
 	const window = DefaultReplayWindow
 	measure := func(jump uint32) time.Duration {
@@ -167,7 +172,7 @@ func TestReplayCommitCostDoesNotFollowJumpDistance(t *testing.T) {
 	if inOrder <= 0 {
 		t.Skip("the clock is too coarse to measure this")
 	}
-	if ratio := worst / inOrder; ratio > 500 {
+	if ratio := worst / inOrder; ratio > 20 {
 		t.Errorf("a commit that jumps %d costs %s against %s in order, %dx, "+
 			"so the cost still follows the distance the peer chose", window-1, worst, inOrder, ratio)
 	}
