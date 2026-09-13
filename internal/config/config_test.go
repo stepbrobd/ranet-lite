@@ -99,6 +99,7 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 		"duplicate endpoint":    "endpoints:\n  - serial_number: \"0\"\n    address_family: ip4\n  - serial_number: \"0\"\n    address_family: ip4\n",
 		"duplicate peer":        "peers:\n  - common_name: gateway\n  - common_name: gateway\n",
 		"unrepresentable babel": "babel:\n  update_interval: 11m\n",
+		"a second document":     "---\nresponder: false\npeers: []\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yaml")
@@ -107,6 +108,28 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 			}
 			if _, err := Load(path, "", "", false); err == nil {
 				t.Fatal("Load succeeded, want error")
+			}
+		})
+	}
+}
+
+// A file assembled by concatenation ends in a separator, and the document
+// after it carries nothing. Refusing it refuses a configuration that is whole,
+// and every later SIGHUP with it.
+func TestLoadTakesAConfigurationEndingInASeparator(t *testing.T) {
+	for name, tail := range map[string]string{
+		"a bare separator":          "---\n",
+		"a separator and a comment": "---\n# nothing here\n",
+		"an end of document marker": "...\n",
+		"trailing blank lines":      "\n\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(testConfig+tail), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path, "", "", false); err != nil {
+				t.Errorf("a configuration ending in %q was refused: %v", tail, err)
 			}
 		})
 	}

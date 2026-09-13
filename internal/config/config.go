@@ -9,6 +9,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/netip"
 	"os"
@@ -463,6 +464,18 @@ func (b Babel) SpeakerConfig() babel.Config {
 		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost, NoTransit: b.NoTransit}
 }
 
+// emptyDocument reports a document carrying nothing, which a file ending in a
+// separator decodes to: yaml.v3 answers that as a document wrapping a null
+// scalar rather than as io.EOF. A file assembled by concatenation ends that
+// way, and refusing it refuses a configuration that is whole.
+func emptyDocument(node *yaml.Node) bool {
+	if node.Kind != yaml.DocumentNode || len(node.Content) != 1 {
+		return node.Kind == 0
+	}
+	child := node.Content[0]
+	return child.Kind == yaml.ScalarNode && child.Tag == "!!null"
+}
+
 // Load reads a configuration. registryPath and privateKeyPath override the
 // file's own when non-empty and fullMesh turns that field on, so ranet's
 // config.json runs here unchanged: it names none of the three, and ranet takes
@@ -478,6 +491,20 @@ func Load(path, registryPath, privateKeyPath string, fullMesh bool) (*Config, er
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	// KnownFields catches a stray key inside the document; this catches a
+	// second document after it. A file assembled by concatenation, or half
+	// pasted below a stray "---", otherwise starts on the first half alone and
+	// validates cleanly, so a node comes up with the responder off or the
+	// wrong peer set and nothing says so. registry.Load refuses the identical
+	// case in JSON.
+	var trailing yaml.Node
+	switch err := decoder.Decode(&trailing); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
+		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	case !emptyDocument(&trailing):
+		return nil, fmt.Errorf("config: parse %s: a second document follows the first", path)
 	}
 	if err := c.adoptRanetEndpointFields(); err != nil {
 		return nil, fmt.Errorf("config: %s: %w", path, err)
