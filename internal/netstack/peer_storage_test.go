@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -73,5 +74,109 @@ func TestReservedPeerKeepsCiphertextUntilSendCompletes(t *testing.T) {
 				t.Fatalf("in-flight ciphertext was overwritten: got %v", sent)
 			}
 		})
+	}
+}
+
+// The speaker walks every neighbor from one goroutine, and Receive runs on the
+// sending peer's decrypt path, so a control send that waits on a backed-up
+// peer stops every other neighbor with it and lets two such peers hold each
+// other's emitter. Dropping keeps the stall local.
+func TestSendRawOrDropDoesNotWaitForABackedUpPeer(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	var sent atomic.Int64
+	peer := NewPeerReserved("stalled", func(int) (BatchSealer, error) {
+		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+			return append(out[:0], raw...), nil
+		}, nil
+	}, func(sealed [][]byte) error {
+		<-release
+		sent.Add(int64(len(sealed))) // the sender merges batches into one call
+		return nil
+	})
+	defer func() { unblock(); peer.Close() }()
+
+	// Fill the queue, then keep going against a transport that never returns.
+	// Each attempt gives up after controlSendWait rather than waiting for a
+	// slot that is never coming, so the whole run is bounded. The sends are on
+	// their own goroutine so a blocking one is reported rather than hanging.
+	// Enough to fill the queue and then keep pushing at a transport that has
+	// stopped, which is the case the bound exists for.
+	const beyond = 20
+	attempts := cap(peer.slots) + beyond
+	dropped := make(chan int, 1)
+	go func() {
+		n := 0
+		for range attempts {
+			if err := peer.SendRawOrDrop([]byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
+				n++
+			}
+		}
+		dropped <- n
+	}()
+	var lost int
+	budget := time.Duration(attempts)*controlSendWait + 10*time.Second
+	select {
+	case lost = <-dropped:
+	case <-time.After(budget):
+		t.Fatalf("%d control sends against a stalled peer took longer than %s", attempts, budget)
+	}
+	if lost == 0 {
+		t.Fatal("nothing was dropped, so the queue never filled and this proves nothing")
+	}
+
+	// A dropped packet must not have consumed a ticket or a sequence range,
+	// or the ordered sender would never reach the batches behind it.
+	unblock()
+	drained := time.Now().Add(10 * time.Second)
+	for int(sent.Load()) < attempts-lost {
+		if time.Now().After(drained) {
+			t.Fatalf("the sender stalled at %d of %d queued packets", sent.Load(), attempts-lost)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The bound has to be generous enough that a queue busy with bulk data never
+// starves the control traffic keeping the adjacency up. Refusing outright cost
+// the integration VM its babel routes twice during an iperf3 run: the queue was
+// full of data, every hello and update was dropped, and the neighbor flapped.
+func TestControlPacketsSurviveAQueueFullOfData(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var sent atomic.Int64
+	peer := NewPeerReserved("busy", func(int) (BatchSealer, error) {
+		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+			return append(out[:0], raw...), nil
+		}, nil
+	}, func(sealed [][]byte) error {
+		// Busy, not stopped: the transport is working through a backlog the
+		// way it does under load.
+		<-release
+		sent.Add(int64(len(sealed)))
+		return nil
+	})
+	defer func() { releaseOnce.Do(func() { close(release) }); peer.Close() }()
+
+	// Fill every slot, then let the transport start draining while control
+	// packets keep arriving.
+	for range cap(peer.slots) {
+		b := peer.reserveBatch(1)
+		b.append([]byte("bulk"), 41)
+		if err := b.enqueue(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+
+	var dropped int
+	for range 200 {
+		if err := peer.SendRawOrDrop([]byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
+			dropped++
+		}
+	}
+	if dropped != 0 {
+		t.Errorf("%d of 200 control packets were dropped by a peer whose transport was working", dropped)
 	}
 }

@@ -1,10 +1,12 @@
 package netstack
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // Peer separates parallel packet encryption from ordered, batched transport.
@@ -102,6 +104,29 @@ func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
 	return b.transmit()
 }
 
+// ErrSendQueueFull reports a packet dropped rather than queued, so the caller
+// can count it without treating the peer as broken.
+var ErrSendQueueFull = errors.New("netstack: peer send queue is full")
+
+// SendRawOrDrop hands one packet to the peer's ordered sender without waiting
+// for the transport to finish with it, and gives up if no transmission slot
+// comes free within controlSendWait. Babel sends this way because waiting
+// there does not stay local: the speaker walks every neighbor from one
+// goroutine, and Receive runs on the sending peer's own decrypt path, so one
+// peer whose queue is backed up would stop hellos, updates and retractions to
+// every other neighbor until it drained, and two such peers would each hold
+// the other's emitter. Bounding the wait rather than refusing outright is what
+// keeps a queue full of bulk data from starving the control traffic that keeps
+// the adjacency up.
+func (p *Peer) SendRawOrDrop(raw []byte, nextHeader byte) error {
+	b := p.reserveBatchWithin(1, controlSendWait)
+	if b == nil {
+		return ErrSendQueueFull
+	}
+	b.append(raw, nextHeader)
+	return b.enqueue()
+}
+
 type peerBatch struct {
 	peer      *Peer
 	ticket    uint64
@@ -136,6 +161,46 @@ func (p *Peer) reserveBatchUntil(count int, canceled <-chan struct{}) *peerBatch
 			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: packet intake closed")}
 		}
 	}
+	return p.reserveBatchWithSlot(count, hasSlot)
+}
+
+// controlSendWait bounds how long a control packet waits for a transmission
+// slot. Long enough that an ordinary burst drains, which takes microseconds
+// even when the queue is full of bulk data, and short enough that a peer whose
+// transport has stopped cannot hold the babel speaker, which walks every
+// neighbor from one goroutine and runs on the sending peer's own decrypt path
+// when a packet arrives.
+const controlSendWait = 50 * time.Millisecond
+
+// reserveBatchWithin takes a transmission slot, waiting at most wait for one.
+// A caller that would rather drop its packet than wait indefinitely gets nil,
+// having consumed neither a ticket nor a sequence range, which is why the slot
+// is taken before either: a reserved ticket that never reaches the sender
+// stalls it forever.
+func (p *Peer) reserveBatchWithin(count int, wait time.Duration) *peerBatch {
+	if p.slots == nil {
+		return p.reserveBatchWithSlot(count, false)
+	}
+	select {
+	case p.slots <- struct{}{}:
+		return p.reserveBatchWithSlot(count, true)
+	case <-p.stop:
+		return nil
+	default:
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case p.slots <- struct{}{}:
+		return p.reserveBatchWithSlot(count, true)
+	case <-p.stop:
+		return nil
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (p *Peer) reserveBatchWithSlot(count int, hasSlot bool) *peerBatch {
 	p.reserveMu.Lock()
 	ticket := p.reserved
 	p.reserved++

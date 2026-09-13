@@ -1,12 +1,14 @@
 package babel
 
 import (
+	"errors"
 	"log/slog"
 	"net/netip"
 	"slices"
 	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
 type sendAction struct {
@@ -77,9 +79,12 @@ func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV
 		}
 	}
 	pkt := buildPacket(s.cfg.LinkLocalAddr, destination, EncodePacket(tlvs))
-	if err := n.peer.SendRaw(pkt, esp.NextHeaderIPv6); err != nil {
+	switch err := n.peer.SendRawOrDrop(pkt, esp.NextHeaderIPv6); {
+	case errors.Is(err, netstack.ErrSendQueueFull):
+		slog.Warn("babel packet dropped, peer send queue full", "peer", n.peer.ID, "tlvs", len(tlvs))
+	case err != nil:
 		slog.Warn("babel send failed", "peer", n.peer.ID, "err", err)
-	} else {
+	default:
 		slog.Debug("babel sent packet", "peer", n.peer.ID, "tlvs", len(tlvs), "bytes", len(pkt))
 	}
 }

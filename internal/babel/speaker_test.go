@@ -438,3 +438,63 @@ func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 		t.Fatalf("missing route reply = %+v, %v", update, err)
 	}
 }
+
+// The speaker sends to every neighbor from one goroutine, and Receive runs on
+// the sending peer's own decrypt path. A send that waits on a peer whose queue
+// is backed up therefore stops hellos, updates and retractions to every other
+// neighbor, and at the default dead timeout each of them declares this node
+// down fourteen seconds later.
+func TestAStalledNeighborDoesNotHoldTheOthers(t *testing.T) {
+	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := func(int) (netstack.BatchSealer, error) {
+		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+			return append(out[:0], raw...), nil
+		}, nil
+	}
+	block := make(chan struct{})
+	stalled := netstack.NewPeerReserved("stalled", seal, func([][]byte) error {
+		<-block
+		return nil
+	})
+	// The transport has to be released before Close, which waits for the
+	// sender goroutine sitting inside it.
+	defer func() { close(block); stalled.Close() }()
+	healthy := make(chan struct{}, 64)
+	moving := netstack.NewPeerReserved("moving", seal, func(sealed [][]byte) error {
+		for range sealed {
+			select {
+			case healthy <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	})
+	defer moving.Close()
+	speaker.AddPeer(stalled)
+	speaker.AddPeer(moving)
+
+	// Something to say to both of them, and enough rounds to fill the stalled
+	// peer's queue several times over.
+	speaker.Originate(netip.MustParsePrefix("fd00:a::/64"))
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		for range 200 {
+			speaker.mu.Lock()
+			actions := speaker.updateActions(time.Now())
+			speaker.mu.Unlock()
+			speaker.sendActions(actions)
+		}
+	}()
+	select {
+	case <-sent:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the speaker was held by one neighbor whose transport never returned")
+	}
+	if len(healthy) == 0 {
+		t.Error("the healthy neighbor received nothing")
+	}
+}
