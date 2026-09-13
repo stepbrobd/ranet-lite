@@ -2,8 +2,11 @@ package babel
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -556,5 +559,92 @@ func TestBabelDefaultsMatchFleet(t *testing.T) {
 	if cfg.HelloInterval != 4*time.Second || cfg.UpdateInterval != 16*time.Second {
 		t.Errorf("default intervals are %s and %s, want the 4s and 16s of RFC 8966 Appendix B",
 			cfg.HelloInterval, cfg.UpdateInterval)
+	}
+}
+
+// A retraction consumes the record that says the neighbor was ever told about
+// the prefix, and advertisableKeys reads that record. If a dropped packet
+// consumed it anyway, the prefix leaves every later dump too and the neighbor
+// black-holes it until its own expiry, which at the defaults is 56 seconds.
+func TestDroppedRetractionIsSentAgain(t *testing.T) {
+	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := func(int) (netstack.BatchSealer, error) {
+		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+			return append(out[:0], raw...), nil
+		}, nil
+	}
+	block := make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(block) }) }
+	var blocking atomic.Bool
+	blocking.Store(true)
+	var delivered atomic.Int64
+	peer := netstack.NewPeerReserved("peer", seal, func(sealed [][]byte) error {
+		if blocking.Load() {
+			<-block
+		}
+		delivered.Add(int64(len(sealed)))
+		return nil
+	})
+	defer func() { unblock(); peer.Close() }()
+	defer speaker.AddPeer(peer).Close()
+
+	dest := netip.MustParsePrefix("fd00:a::/64")
+	key := routeKey{dest: dest}
+	speaker.Originate(dest)
+	speaker.mu.Lock()
+	announce := speaker.updateActions(time.Now())
+	speaker.mu.Unlock()
+	speaker.sendActions(announce)
+	speaker.mu.Lock()
+	_, told := speaker.neighbors["peer"].advertised[key]
+	speaker.mu.Unlock()
+	if !told {
+		t.Fatal("the announcement was not recorded, so there is no record for a retraction to consume")
+	}
+
+	// The peer's transport is stuck, so fill its queue through the same path
+	// babel uses until it starts refusing, and the retraction is then dropped.
+	for range 4096 {
+		if errors.Is(peer.SendRawOrDrop([]byte("bulk"), 41), netstack.ErrSendQueueFull) {
+			break
+		}
+	}
+	speaker.SetOriginated(nil)
+	speaker.mu.Lock()
+	retract := speaker.updateActions(time.Now())
+	speaker.mu.Unlock()
+	speaker.sendActions(retract)
+
+	speaker.mu.Lock()
+	_, stillTold := speaker.neighbors["peer"].advertised[key]
+	speaker.mu.Unlock()
+	if !stillTold {
+		t.Fatal("a dropped retraction consumed the record, so no later dump will carry it")
+	}
+
+	// With the transport working again the very next dump carries it.
+	blocking.Store(false)
+	unblock()
+	speaker.mu.Lock()
+	again := speaker.updateActions(time.Now())
+	speaker.mu.Unlock()
+	var retractions int
+	for _, action := range again {
+		for _, tlv := range action.tlvs {
+			if tlv.Type != TLVUpdate {
+				continue
+			}
+			var decoder PrefixDecoder
+			if u, err := decoder.Decode(tlv.Body); err == nil && u.Metric == MetricInfinity {
+				retractions++
+			}
+		}
+	}
+	if retractions == 0 {
+		t.Error("the next dump did not carry the retraction the dropped packet lost")
 	}
 }

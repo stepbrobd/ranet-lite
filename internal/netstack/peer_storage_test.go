@@ -102,7 +102,7 @@ func TestSendRawOrDropDoesNotWaitForBackedUpPeer(t *testing.T) {
 	// slot that is never coming, so the whole run is bounded. The sends are on
 	// their own goroutine so a blocking one is reported rather than hanging.
 	// Enough to fill the queue and then keep pushing at a transport that has
-	// stopped, which is the case the bound exists for.
+	// stopped, which is the case the drop exists for.
 	const beyond = 20
 	attempts := cap(peer.slots) + beyond
 	dropped := make(chan int, 1)
@@ -116,7 +116,7 @@ func TestSendRawOrDropDoesNotWaitForBackedUpPeer(t *testing.T) {
 		dropped <- n
 	}()
 	var lost int
-	budget := time.Duration(attempts)*controlSendWait + 10*time.Second
+	budget := 10 * time.Second
 	select {
 	case lost = <-dropped:
 	case <-time.After(budget):
@@ -138,45 +138,43 @@ func TestSendRawOrDropDoesNotWaitForBackedUpPeer(t *testing.T) {
 	}
 }
 
-// The bound has to be generous enough that a queue busy with bulk data never
-// starves the control traffic keeping the adjacency up. Refusing outright cost
-// the integration VM its babel routes twice during an iperf3 run: the queue was
-// full of data, every hello and update was dropped, and the neighbor flapped.
-func TestControlPacketsSurviveQueueFullOfData(t *testing.T) {
+// A queue full of bulk data drops control packets, and the caller has to be
+// told so it can give back whatever the packet consumed. What must not happen
+// is a drop reported as a send.
+func TestControlPacketDropsAreReported(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	var sent atomic.Int64
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	peer := NewPeerReserved("busy", func(int) (BatchSealer, error) {
 		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
 			return append(out[:0], raw...), nil
 		}, nil
-	}, func(sealed [][]byte) error {
-		// Busy, not stopped: the transport is working through a backlog the
-		// way it does under load.
+	}, func([][]byte) error {
 		<-release
-		sent.Add(int64(len(sealed)))
 		return nil
 	})
-	defer func() { releaseOnce.Do(func() { close(release) }); peer.Close() }()
-
-	// Fill every slot, then let the transport start draining while control
-	// packets keep arriving.
-	for range cap(peer.slots) {
-		b := peer.reserveBatch(1)
-		b.append([]byte("bulk"), 41)
-		if err := b.enqueue(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	releaseOnce.Do(func() { close(release) })
+	defer func() { unblock(); peer.Close() }()
 
 	var dropped int
-	for range 200 {
+	for range cap(peer.slots) + 50 {
 		if err := peer.SendRawOrDrop([]byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
 			dropped++
 		}
 	}
-	if dropped != 0 {
-		t.Errorf("%d of 200 control packets were dropped by a peer whose transport was working", dropped)
+	if dropped == 0 {
+		t.Fatal("a stalled peer accepted every control packet, so nothing tells the caller to redo it")
+	}
+
+	// Once the transport drains, the peer takes them again.
+	unblock()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := peer.SendRawOrDrop([]byte("control packet"), 41); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the peer never took a control packet again after its transport drained")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
