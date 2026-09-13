@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -272,5 +273,49 @@ func TestBabelCostFieldsReachTheSpeaker(t *testing.T) {
 	bare := Babel{}.SpeakerConfig()
 	if bare.Cost != babel.DefaultCostParams() {
 		t.Errorf("an empty block changed the defaults to %+v", bare.Cost)
+	}
+}
+
+// Both refusals below are written by hand, because the nested decoder does not
+// inherit KnownFields from the outer one.
+func TestOriginateMappingRefusesWhatItCannotMean(t *testing.T) {
+	load := func(t *testing.T, entry string) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := fmt.Sprintf(`organization: example
+common_name: node
+port: 13000
+endpoints:
+  - serial_number: "0"
+    address_family: ip4
+private_key: /dev/null
+registry: /dev/null
+responder: true
+babel:
+  originate:
+    - %s
+`, entry)
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		return err
+	}
+	if err := load(t, `{ prefix: "::/0", from: "2001:db8::/48" }`); err != nil {
+		t.Fatalf("a well-formed source-specific announcement was refused: %v", err)
+	}
+	for name, entry := range map[string]string{
+		// A key nobody reads is a prefix nobody announces, and the operator
+		// has no way to tell from the outside.
+		"unknown field": `{ prefix: "::/0", form: "2001:db8::/48" }`,
+		// Neither family has a lookup that could express this, and installing
+		// it as an ordinary route would steal traffic from every other source.
+		"mismatched families": `{ prefix: "::/0", from: "10.0.0.0/8" }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := load(t, entry); err == nil {
+				t.Error("the config loaded, so nothing says this cannot mean what it looks like")
+			}
+		})
 	}
 }
