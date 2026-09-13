@@ -148,7 +148,9 @@ func TestUDPReceiveSkipsTruncatedMessagesAndPreservesGROTail(t *testing.T) {
 		t.Fatalf("receive: n=%d err=%v, want three intact GRO segments", n, err)
 	}
 	// The two the kernel truncated went nowhere, and the hub's counter is what
-	// tells an operator that from an idle socket.
+	// tells an operator that from an idle socket. Each carries one datagram
+	// here; a coalesced one carries as many as it was cut into, which is the
+	// unit the third arm and the help text both use.
 	if refused != 2 {
 		t.Errorf("the receiver reported %d refused, want the two truncated messages", refused)
 	}
@@ -269,5 +271,28 @@ func TestUDPReceiveDropsDatagramWithNoUsableSource(t *testing.T) {
 	}
 	if packets[0][4] == packets[1][4] {
 		t.Error("the same datagram was returned twice, so the drop lost the loop's place")
+	}
+}
+
+// One GRO buffer is up to forty datagrams, and the counter says datagrams.
+// Counting the message instead undercounts a truncated coalesced read by that
+// much, from an arm adjacent to one that counts them individually.
+func TestATruncatedGROReadIsCountedInDatagrams(t *testing.T) {
+	const segment, total = 8, 40
+	socket := &udpSocket{pc: scriptedUDP{read: func(messages []ipv4.Message) (int, error) {
+		m := &messages[0]
+		m.N, m.Flags = segment*total, unix.MSG_TRUNC
+		control := appendUDPSegment(m.OOB[:0], segment)
+		(*unix.Cmsghdr)(unsafe.Pointer(&control[0])).Type = unix.UDP_GRO
+		m.NN = len(control)
+		return 1, nil
+	}}}
+	packets, sizes, endpoints := make([][]byte, 128), make([]int, 128), make([]Endpoint, 128)
+	n, refused, err := socket.receiver()(packets, sizes, endpoints)
+	if err != nil || n != 0 {
+		t.Fatalf("receive: n=%d err=%v, want the whole truncated read discarded", n, err)
+	}
+	if refused != total {
+		t.Errorf("a truncated read of %d datagrams counted %d", total, refused)
 	}
 }

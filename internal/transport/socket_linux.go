@@ -167,17 +167,23 @@ func (s *udpSocket) receiver() receiveFunc {
 		for index < count && n < len(bufs) {
 			m := &messages[index]
 			if offset == 0 {
-				// A zero-length datagram is refused too. It arrived, it goes
-				// nowhere, and leaving it out is the "a flood reads as
-				// silence" case on the one platform this is deployed on.
+				// Counted in datagrams, which is what the counter's help text
+				// says and what the third arm below already does: one GRO
+				// buffer is up to forty of them, so counting the message would
+				// undercount by that much. A zero-length datagram is refused
+				// too -- it arrived and goes nowhere, and leaving it out is
+				// the "a flood reads as silence" case on the one platform this
+				// is deployed on.
 				if m.Flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || m.N == 0 {
-					refused++
+					refused += datagramsIn(m)
 					index++
 					continue
 				}
 				var err error
 				segment, err = udpGROSize(m.OOB[:m.NN])
 				if err != nil {
+					// The segment size is exactly what would not parse, so
+					// this is the one arm that cannot do better than one.
 					refused++
 					index++
 					continue
@@ -217,6 +223,20 @@ func (s *udpSocket) receiver() receiveFunc {
 		}
 		return n, refused, nil
 	}
+}
+
+// datagramsIn is how many datagrams a received message carries, which is one
+// unless the kernel coalesced it and said so. A control buffer that will not
+// parse leaves one, which is the floor rather than a guess.
+func datagramsIn(m *ipv4.Message) int {
+	if m.N == 0 {
+		return 1
+	}
+	segment, err := udpGROSize(m.OOB[:m.NN])
+	if err != nil || segment <= 0 {
+		return 1
+	}
+	return (m.N + segment - 1) / segment
 }
 
 func (s *udpSocket) replyEndpoint(m *ipv4.Message) (*udpEndpoint, error) {
