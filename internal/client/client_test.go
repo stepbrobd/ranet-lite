@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -125,24 +126,40 @@ func TestValidateESPTunnelPayload(t *testing.T) {
 	ipv4[0], ipv4[3] = 0x45, 20
 	ipv6 := make([]byte, 40)
 	ipv6[0] = 0x60
+	// A payload length of zero is the jumbogram encoding, which this tunnel
+	// does not carry, so the padded case needs a packet with a real payload.
+	ipv6Payload := make([]byte, 48)
+	ipv6Payload[0] = 0x60
+	binary.BigEndian.PutUint16(ipv6Payload[4:6], 8)
 	for _, test := range []struct {
 		name    string
 		plain   []byte
 		nh      byte
 		deliver bool
 		wantErr bool
+		want    []byte
 	}{
 		{name: "IPv4", plain: ipv4, nh: esp.NextHeaderIPv4, deliver: true},
 		{name: "IPv6", plain: ipv6, nh: esp.NextHeaderIPv6, deliver: true},
 		{name: "dummy", plain: ipv6, nh: esp.NextHeaderNone},
 		{name: "version mismatch", plain: ipv6, nh: esp.NextHeaderIPv4, wantErr: true},
 		{name: "unsupported", plain: ipv4, nh: 6, wantErr: true},
-		{name: "IPv4 trailing data", plain: append(append([]byte(nil), ipv4...), 0), nh: esp.NextHeaderIPv4, wantErr: true},
+		// RFC 4303 section 2.7: a sender may append Traffic Flow
+		// Confidentiality padding after the payload in tunnel mode, and the
+		// IP length field is what lets the receiver discard it. Refusing the
+		// packet instead dropped every packet from a peer with tfcpad set,
+		// silently, since nothing above ESP reads the length.
+		{name: "IPv4 with TFC padding", plain: append(append([]byte(nil), ipv4...), 0, 0, 0), nh: esp.NextHeaderIPv4, deliver: true, want: ipv4},
+		{name: "IPv6 with TFC padding", plain: append(append([]byte(nil), ipv6Payload...), 7, 7), nh: esp.NextHeaderIPv6, deliver: true, want: ipv6Payload},
+		{name: "IPv4 shorter than its header claims", plain: ipv4[:len(ipv4)-1], nh: esp.NextHeaderIPv4, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			deliver, err := validateESPTunnelPayload(test.plain, test.nh)
+			inner, deliver, err := validateESPTunnelPayload(test.plain, test.nh)
 			if (err != nil) != test.wantErr || deliver != test.deliver {
 				t.Fatalf("got deliver=%v err=%v; want deliver=%v err=%v", deliver, err, test.deliver, test.wantErr)
+			}
+			if test.want != nil && !bytes.Equal(inner, test.want) {
+				t.Errorf("the delivered packet is %x, want %x", inner, test.want)
 			}
 		})
 	}

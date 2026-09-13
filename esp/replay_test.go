@@ -188,3 +188,29 @@ func TestProactiveRekeyLeavesTimeAndNotJustPackets(t *testing.T) {
 		t.Errorf("the rekey margin is %d packets, over an eighth of the sequence space", margin)
 	}
 }
+
+// The circular index arithmetic adds a window to a position, so a window above
+// half the sequence space overflows the 32-bit counter it is computed in, and
+// a caller of the exported option can ask for any uint32. Clamping is also
+// what keeps the mask allocation bounded: one bit per sequence number means
+// 2^32 of them is half a gigabyte per SA.
+func TestReplayWindowIsClamped(t *testing.T) {
+	var sa InboundSA
+	WithReplayWindow(1 << 31)(&sa)
+	if sa.window.window != MaxReplayWindow {
+		t.Errorf("a window of 2^31 was built as %d, want it clamped to %d", sa.window.window, MaxReplayWindow)
+	}
+	if got, want := uint64(len(sa.window.mask))*64, uint64(MaxReplayWindow); got < want || got > want+64 {
+		t.Errorf("the mask holds %d bits for a %d wide window", got, MaxReplayWindow)
+	}
+
+	// Anything at or below the cap is taken as asked, including the zero that
+	// turns replay checking off.
+	for _, window := range []uint32{0, 1, 64, MaxReplayWindow} {
+		var sa InboundSA
+		WithReplayWindow(window)(&sa)
+		if sa.window.window != window {
+			t.Errorf("a window of %d was built as %d", window, sa.window.window)
+		}
+	}
+}

@@ -659,3 +659,29 @@ func TestTamperedPacketRejected(t *testing.T) {
 		t.Fatal("tampered packet was accepted")
 	}
 }
+
+// RFC 4303 section 2.4 right-aligns the Pad Length and Next Header octets in a
+// four-byte word, so a conformant sender's plaintext is always a multiple of
+// four. Taking anything else accepts a payload no sender should have produced,
+// and this end's own padding follows the same rule.
+func TestPlaintextMustBeFourByteAligned(t *testing.T) {
+	// Twenty bytes of payload, two of padding, then the Pad Length and Next
+	// Header octets: twenty-four, a multiple of four.
+	aligned := make([]byte, 24)
+	aligned[0] = 0x45
+	// RFC 4303 section 2.4 numbers the padding 1..n.
+	aligned[20], aligned[21] = 1, 2
+	aligned[22], aligned[23] = 2, 4
+	if _, _, err := parseTrailer(aligned); err != nil {
+		t.Fatalf("a four-byte aligned plaintext was refused: %v", err)
+	}
+	for _, length := range []int{1, 2, 3, 5, 6, 7} {
+		plain := make([]byte, length)
+		if length >= 2 {
+			plain[length-1] = 4
+		}
+		if _, _, err := parseTrailer(plain); err == nil {
+			t.Errorf("a %d byte plaintext was accepted, and no conformant sender produces one", length)
+		}
+	}
+}

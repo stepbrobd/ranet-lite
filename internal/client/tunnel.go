@@ -165,13 +165,20 @@ func (t *tunnel) decryptBatch(packets [][]byte, results []inboundDecrypted) []in
 	return results
 }
 
-func validateESPTunnelPayload(plain []byte, nextHeader byte) (bool, error) {
+// validateESPTunnelPayload returns the inner packet a decrypted ESP payload
+// carries, trimmed to the length its own header declares. RFC 4303 section 2.7
+// lets a sender append Traffic Flow Confidentiality padding after it in tunnel
+// mode, which ESP cannot tell from the payload, so requiring the payload to be
+// exactly one packet dropped every padded packet from such a peer and left the
+// loss visible only as a drop count. The second result is false for a Next
+// Header of 59, which carries no packet at all.
+func validateESPTunnelPayload(plain []byte, nextHeader byte) ([]byte, bool, error) {
 	if nextHeader == esp.NextHeaderNone {
-		return false, nil
+		return nil, false, nil
 	}
-	version := packet.Version(plain)
+	inner, version := packet.Payload(plain)
 	if (nextHeader == esp.NextHeaderIPv4 && version == 4) || (nextHeader == esp.NextHeaderIPv6 && version == 6) {
-		return true, nil
+		return inner, true, nil
 	}
-	return false, fmt.Errorf("invalid IP tunnel payload for ESP Next Header %d", nextHeader)
+	return nil, false, fmt.Errorf("invalid IP tunnel payload for ESP Next Header %d", nextHeader)
 }

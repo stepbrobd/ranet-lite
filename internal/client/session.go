@@ -83,13 +83,13 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 				continue
 			}
 			sess.NoteTraffic()
-			deliver, err := validateESPTunnelPayload(raw, nextHeader)
+			inner, deliver, err := validateESPTunnelPayload(raw, nextHeader)
 			if err != nil {
 				dropped, lastError = dropped+1, err
 				continue
 			}
-			if deliver && !c.speaker.Receive(peer, raw) {
-				plain = append(plain, raw)
+			if deliver && !c.speaker.Receive(peer, inner) {
+				plain = append(plain, inner)
 			}
 		}
 		if dropped > 0 {
