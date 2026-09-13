@@ -624,9 +624,9 @@ func TestForwardedSeqnoRequestsAreBounded(t *testing.T) {
 		t.Fatalf("b held %d forwarded seqno requests, so the flood never reached the table", got)
 	}
 
-	// And another neighbor can still have one forwarded, which is the point of
-	// the share: one of them flooding must not turn forwarding off for the
-	// rest, or a prefix starving behind this node stops recovering.
+	// And another neighbor can still have one forwarded. One of them flooding
+	// must not turn forwarding off for the rest, or a prefix starving behind
+	// this node stops recovering.
 	fresh := sourceKey{route: key, routerID: [8]byte{0xff}}
 	speaker.mu.Lock()
 	allowed := speaker.allowSeqnoRequest(fresh, 9, "c", time.Now())
@@ -812,8 +812,9 @@ func TestOriginatingLearnedPrefixDoesNotLoop(t *testing.T) {
 	}
 }
 
-// Originate reaches the same purge through its own entry point, which is the
-// one a plain originate: list in the config uses.
+// Originate reaches the same purge through its own entry point. The config
+// goes through SetOriginated instead, so this covers the path cmd/babeltest
+// and any single-prefix caller takes.
 func TestOriginateAlsoDropsWhatThisNodeLearned(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
 	dest := netip.MustParsePrefix("fd00:a::/64")
@@ -1173,7 +1174,7 @@ func TestStarvationBookkeepingIsBounded(t *testing.T) {
 // restart rate does not merely stop this node learning something new: it drops
 // the route it already had and holds the prefix unreachable until the source
 // table collects, three minutes after the churn stops.
-func TestRestartChurnDoesNotBlackholeThePrefix(t *testing.T) {
+func TestRestartChurnDoesNotBlackholePrefix(t *testing.T) {
 	// b learns the prefix through a and has c to advertise it to, which is
 	// what records the distance: split horizon makes the dump back to a a
 	// retraction, so a lone neighbor never spends the budget at all.
@@ -1192,5 +1193,154 @@ func TestRestartChurnDoesNotBlackholeThePrefix(t *testing.T) {
 		if got := fabric.nextHop("b", key); got != "a" {
 			t.Fatalf("restart %d left the prefix with next hop %q, so the cap dropped a route this node already had", i+1, got)
 		}
+	}
+}
+
+// The per-neighbor share of the source table is charged to whoever caused the
+// advertisement, and gcAt is refreshed by every advertisement, so an entry one
+// neighbor created and another keeps alive would stay charged to the first
+// forever. It is then refused a share it is not using, and since selectRoute
+// rechecks feasibility, a refused origin is a route dropped rather than a
+// route not learned.
+func TestSourceChargeFollowsWhoeverKeepsItAlive(t *testing.T) {
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	key := routeKey{dest: netip.MustParsePrefix("fd00:1::/64")}
+	now := time.Now()
+	adv := advertisement{routerID: [8]byte{1}, seqno: 1, metric: 64}
+	rt.observe(key, adv, "a", now)
+	if rt.sourcesByPeer["a"] != 1 {
+		t.Fatalf("the first advertisement charged %d to a, want one", rt.sourcesByPeer["a"])
+	}
+
+	// b takes over and keeps the entry alive past the point where a's own
+	// advertisement would have been collected.
+	for i := range 3 {
+		now = now.Add(sourceGCTime - time.Second)
+		rt.observe(key, adv, "b", now)
+		rt.sweepSources(now)
+		if rt.sourcesByPeer["a"] != 0 {
+			t.Fatalf("after %d refreshes by b, a still holds %d of the table", i+1, rt.sourcesByPeer["a"])
+		}
+		if rt.sourcesByPeer["b"] != 1 {
+			t.Fatalf("after %d refreshes, b holds %d of the table, want one", i+1, rt.sourcesByPeer["b"])
+		}
+	}
+	if got := rt.originsBy[originShare{route: key, peer: "a"}]; got != 0 {
+		t.Errorf("a still holds %d of the prefix it stopped advertising", got)
+	}
+}
+
+// The per-prefix share stops one neighbor denying another the same prefix; it
+// does not stop one neighbor spending the whole table across many prefixes and
+// denying every other neighbor every prefix. That is what maxSourcesPerNeighbor
+// bounds, and refusing an origin refuses a route, because selectRoute rechecks
+// feasibility for routes already stored.
+func TestOneNeighborCannotSpendTheWholeSourceTable(t *testing.T) {
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	now := time.Now()
+	adv := advertisement{routerID: [8]byte{1}, seqno: 1, metric: 64}
+	for i := range maxSourcesPerNeighbor + 512 {
+		key := routeKey{dest: netip.MustParsePrefix(fmt.Sprintf("fd00:%x:%x::/64", i>>16, i&0xffff))}
+		if rt.feasible(key, adv, "flooder") {
+			rt.observe(key, adv, "flooder", now)
+		}
+	}
+	switch got := rt.sourcesByPeer["flooder"]; {
+	case got > maxSourcesPerNeighbor:
+		t.Errorf("one neighbor holds %d of the source table, past its share of %d", got, maxSourcesPerNeighbor)
+	case got < maxSourcesPerNeighbor:
+		t.Fatalf("only %d entries were recorded, so the flood never reached the table", got)
+	}
+
+	// And another neighbor's prefix is still learnable.
+	fresh := routeKey{dest: netip.MustParsePrefix("fd00:ffff:ffff::/64")}
+	if !rt.feasible(fresh, adv, "peer") {
+		t.Error("a second neighbor was refused a prefix because the first had flooded the table")
+	}
+	if len(rt.sources) >= maxSources {
+		t.Fatalf("the global cap was reached at %d entries, so this proves nothing about the share", len(rt.sources))
+	}
+}
+
+// The global bound is the one that keeps the table from growing without limit
+// when many neighbors each stay inside their own share. Nothing else caps the
+// router-id dimension, which the sender chooses.
+func TestSourceTableHasGlobalCeilingToo(t *testing.T) {
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	now := time.Now()
+	key := routeKey{dest: netip.MustParsePrefix("fd00:1::/64")}
+	// Enough neighbors that no per-neighbor share is reached first.
+	for i := range maxSources + maxSourcesPerNeighbor {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i)+1)
+		adv := advertisement{routerID: id, seqno: 1, metric: 64}
+		from := fmt.Sprintf("peer-%d", i/64)
+		dest := netip.MustParsePrefix(fmt.Sprintf("fd00:%x:%x::/64", i>>16, i&0xffff))
+		if rt.feasible(routeKey{dest: dest}, adv, from) {
+			rt.observe(routeKey{dest: dest}, adv, from, now)
+		}
+	}
+	if got := len(rt.sources); got > maxSources {
+		t.Errorf("the source table holds %d entries, past its cap of %d", got, maxSources)
+	} else if got < maxSources {
+		t.Fatalf("only %d entries were recorded, so the flood never reached the cap", got)
+	}
+	if rt.feasible(key, advertisement{routerID: [8]byte{9, 9}, seqno: 1, metric: 64}, "late") {
+		t.Error("a full source table still accepted a distance it has nowhere to record")
+	}
+}
+
+// The per-neighbor share keeps one neighbor from turning RFC 8966 section
+// 3.8.1.2 forwarding off for every other; the global cap is what keeps the
+// table bounded when many neighbors each stay inside their share. Its index
+// carries a router id the sender writes into the packet, so nothing else
+// bounds it.
+func TestPendingSeqnoHasGlobalCeilingToo(t *testing.T) {
+	speaker, _, _ := captureSpeaker(t, Config{})
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	for i := range maxPendingSeqno + maxPendingSeqnoPerNeighbor {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i)+1)
+		index := sourceKey{route: routeKey{dest: netip.MustParsePrefix("fd00:1::/64")}, routerID: id}
+		// A fresh asker every share, so no neighbor reaches its own limit.
+		speaker.allowSeqnoRequest(index, 1, fmt.Sprintf("peer-%d", i/maxPendingSeqnoPerNeighbor), now)
+	}
+	switch got := len(speaker.pendingSeqno); {
+	case got > maxPendingSeqno:
+		t.Errorf("the speaker is forwarding %d requests, past its cap of %d", got, maxPendingSeqno)
+	case got < maxPendingSeqno:
+		t.Fatalf("only %d were recorded, so the flood never reached the cap", got)
+	}
+}
+
+// "A node SHOULD repeat such a request a small number of times", RFC 8966
+// section 3.8.2.1, and a neighbor's share of the repeat table has to come back
+// when its repeats are spent. Holding it would let the ordinary route
+// acquisition path fill one neighbor's share permanently.
+func TestSpentRetryGivesItsNeighborTheShareBack(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	now := time.Now()
+	key := routeKey{dest: netip.MustParsePrefix("fd00:1::/64")}
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	speaker.rememberStarved(key, [8]byte{1}, 1, neighbor.peer.ID, now)
+	if speaker.starveBy[neighbor.peer.ID] != 1 {
+		t.Fatalf("the request charged %d to its neighbor, want one", speaker.starveBy[neighbor.peer.ID])
+	}
+
+	// Walk it through its whole budget. Nothing selects the prefix, so the
+	// entry leaves only when the repeats are spent.
+	for range seqnoRequestRetries + 1 {
+		now = now.Add(seqnoRetryInitial * 8)
+		speaker.retryStarvedLocked(now)
+	}
+	if len(speaker.starveRetries) != 0 {
+		t.Fatalf("the entry outlived its %d repeats", seqnoRequestRetries)
+	}
+	if got := speaker.starveBy[neighbor.peer.ID]; got != 0 {
+		t.Errorf("its neighbor still holds %d of its share for a request nothing repeats any more", got)
 	}
 }

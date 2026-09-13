@@ -257,7 +257,7 @@ func TestRouterIDRoundTrip(t *testing.T) {
 func TestNextHopRoundTrip(t *testing.T) {
 	addr := net.ParseIP("10.99.1.1").To4()
 	tlv := EncodeNextHop(addr)
-	got, err := DecodeNextHop(tlv.Body)
+	got, _, err := DecodeNextHop(tlv.Body)
 	if err != nil {
 		t.Fatal(err)
 	}

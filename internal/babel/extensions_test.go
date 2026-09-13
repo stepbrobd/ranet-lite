@@ -12,7 +12,7 @@ func TestRTTReplyMayReferToAnOlderHello(t *testing.T) {
 	s, neighbor, _ := captureSpeaker(t, Config{})
 	now := time.Now()
 	// Our next scheduled Hello overtakes their reply to a previous Hello.
-	s.helloAction(neighbor, 2, now)
+	s.helloAction(neighbor, now)
 	ihu := EncodeIHU(IHU{RxCost: 32, Interval: 100, HasTS: true,
 		OriginTS: uint32(now.Add(-50 * time.Millisecond).UnixMicro()), ReceiveTS: 1000})
 	hello := EncodeHello(Hello{Seqno: 2, Interval: 100, HasTS: true, TxTS: 11_000})
@@ -106,7 +106,7 @@ func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 			}
 			return err
 		}},
-		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), func(b []byte) error { _, err := DecodeNextHop(b); return err }},
+		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), func(b []byte) error { _, _, err := DecodeNextHop(b); return err }},
 		{"AckReq", EncodeAckReq(1, 100), func(b []byte) error { _, err := DecodeAckReq(b); return err }},
 		{"RouteRequest", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
 		{"WildcardRequest", EncodeRouteRequest(RouteRequest{AE: AEWildcard}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
@@ -157,7 +157,7 @@ func TestUpdateWithZeroIntervalIsIgnored(t *testing.T) {
 func TestRTTMeasurementThatStoppedArrivingStopsBeingUsed(t *testing.T) {
 	s, neighbor, _ := captureSpeaker(t, Config{})
 	now := time.Now()
-	s.helloAction(neighbor, 2, now)
+	s.helloAction(neighbor, now)
 	ihu := EncodeIHU(IHU{RxCost: 32, Interval: 100, HasTS: true,
 		OriginTS: uint32(now.Add(-50 * time.Millisecond).UnixMicro()), ReceiveTS: 1000})
 	hello := EncodeHello(Hello{Seqno: 2, Interval: 100, HasTS: true, TxTS: 11_000})

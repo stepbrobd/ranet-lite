@@ -390,7 +390,6 @@ func (s *Speaker) Run(ctx context.Context) error {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	nextHello, nextUpdate := time.Now(), time.Now()
-	var seqno uint16
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -401,12 +400,11 @@ func (s *Speaker) Run(ctx context.Context) error {
 		var actions []sendAction
 		helloDue := !now.Before(nextHello)
 		if helloDue {
-			seqno++
 			nextHello = now.Add(s.cfg.HelloInterval)
 		}
 		for _, n := range s.neighbors {
 			if helloDue || !n.sentHello {
-				actions = append(actions, s.helloAction(n, seqno, now))
+				actions = append(actions, s.helloAction(n, now))
 			}
 		}
 		if !now.Before(nextUpdate) || s.updatePending {
@@ -541,8 +539,9 @@ func (s *Speaker) sweepRequestsLocked(now time.Time) {
 	}
 }
 
-// NeighborStat is one neighbor as an operator sees it, the same three facts
-// `birdc show babel neighbors` reports.
+// NeighborStat is one neighbor as an operator sees it: what `birdc show babel
+// neighbors` reports, plus the packets this node's own dataplane could not
+// hand to that peer, which BIRD has no equivalent of.
 type NeighborStat struct {
 	Peer   string
 	Alive  bool

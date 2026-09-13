@@ -11,9 +11,29 @@ import (
 	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
+// sendPriority orders what a pass gives up first when the peer's transmission
+// budget runs out. emitLocked takes a place for every packet before any is
+// sent, so a pass that fills the budget drops whatever it reached last.
+type sendPriority int
+
+const (
+	// A Hello and its IHU hold the adjacency up: three lost in a row withdraw
+	// every route through the neighbor, and the only retry is the next hello
+	// interval.
+	priorityHello sendPriority = iota
+	// A request is recorded as asked before it leaves, and that record is
+	// what stops it being asked again, so a dropped one is a prefix that
+	// stops being asked about at all.
+	priorityRequest
+	// A dump is the largest action of a pass and the one that can wait for
+	// the next interval.
+	priorityDump
+)
+
 type sendAction struct {
 	neighbor *neighborState
 	dest     netip.Addr
+	priority sendPriority
 	tlvs     []RawTLV
 	// rollback undoes the bookkeeping this packet consumed, and runs only if
 	// the packet was dropped. Recording has to happen while the actions are
@@ -22,14 +42,6 @@ type sendAction struct {
 	// will redo: a dropped retraction takes the prefix out of every later
 	// dump as well, and the neighbor black-holes it until its own expiry.
 	rollback []func()
-}
-
-// boolOrder sorts false before true.
-func boolOrder(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // emitLocked fixes the transmission order of everything the caller decided
@@ -49,16 +61,14 @@ func boolOrder(b bool) int {
 // it consumed is rolled back while the lock is still held.
 func (s *Speaker) emitLocked(actions []sendAction) func() {
 	var packets []*netstack.Place
-	// Unicast first. A place is taken for every packet before any is sent, so
-	// a pass that fills the peer's budget drops whatever it reached last, and
-	// the periodic dump is both the largest action and the one that can wait
-	// for the next interval. A seqno request cannot: allowAsk and
-	// rememberStarved have already recorded it as asked, and nothing rolls
-	// that back, so a dropped request is a prefix that stops being asked
-	// about. The dump is the only multicast action babel sends.
+	// Ordered by what a pass can afford to lose, least first. Sorting on the
+	// destination instead put the Hello behind every request of the pass,
+	// because a Hello is multicast too and coalesce had merged it into the
+	// dump; a Hello is the one packet here that nothing else can stand in
+	// for. See sendPriority.
 	merged := coalesce(actions)
 	slices.SortStableFunc(merged, func(a, b sendAction) int {
-		return boolOrder(a.dest == multicastGroup) - boolOrder(b.dest == multicastGroup)
+		return int(a.priority) - int(b.priority)
 	})
 	for _, action := range merged {
 		reserved, whole := s.reserveBatchesTo(action.neighbor, action.dest, action.tlvs)
@@ -86,7 +96,7 @@ func (s *Speaker) emitLocked(actions []sendAction) func() {
 // one, preserving order. Requests are produced one per TLV, so one arriving
 // packet carrying forty seqno requests for forty prefixes would otherwise
 // leave as forty packets aimed at whichever third peer can answer them, and a
-// neighbor loss that starves a thousand prefixes as a thousand. sendBatchesTo
+// neighbor loss that starves a thousand prefixes as a thousand. reserveBatchesTo
 // still splits whatever this produces at the configured packet size.
 func coalesce(actions []sendAction) []sendAction {
 	if len(actions) < 2 {
@@ -95,6 +105,7 @@ func coalesce(actions []sendAction) []sendAction {
 	type target struct {
 		neighbor *neighborState
 		dest     netip.Addr
+		priority sendPriority
 	}
 	merged := make([]sendAction, 0, len(actions))
 	at := make(map[target]int, len(actions))
@@ -103,7 +114,7 @@ func coalesce(actions []sendAction) []sendAction {
 		if len(action.tlvs) == 0 {
 			continue
 		}
-		key := target{action.neighbor, action.dest}
+		key := target{action.neighbor, action.dest, action.priority}
 		i, seen := at[key]
 		if !seen {
 			at[key] = len(merged)
@@ -195,9 +206,10 @@ func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlv
 }
 
 // The action builders below require s.mu. They never perform I/O.
-func (s *Speaker) helloAction(n *neighborState, seqno uint16, now time.Time) sendAction {
+func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 	centis := uint16(s.cfg.HelloInterval / (10 * time.Millisecond))
 	n.sentHello = true
+	n.helloSeqno++
 	rxCost := s.cfg.Cost.RxCost
 	if n.isAlive(now) {
 		rxCost = s.cfg.Cost.Cost(n.measuredRTT, n.haveRTT)
@@ -206,10 +218,15 @@ func (s *Speaker) helloAction(n *neighborState, seqno uint16, now time.Time) sen
 	if n.haveTheirHello {
 		ihu.OriginTS, ihu.ReceiveTS, ihu.HasTS = n.theirHelloTxTS, n.theirHelloRxTS, true
 	}
-	return sendAction{neighbor: n, dest: multicastGroup, tlvs: []RawTLV{
-		EncodeHello(Hello{Seqno: seqno, Interval: centis, HasTS: true}),
+	return sendAction{neighbor: n, dest: multicastGroup, priority: priorityHello, tlvs: []RawTLV{
+		EncodeHello(Hello{Seqno: n.helloSeqno, Interval: centis, HasTS: true}),
 		EncodeIHU(ihu),
-	}}
+	}, rollback: []func(){func() {
+		// The seqno is not given back: a Hello that was not sent is a Hello
+		// the neighbor lost, which is what the counter is for. What the next
+		// wake has to redo is the Hello itself.
+		n.sentHello = false
+	}}}
 }
 
 // advertisementFor states what this node has to say about one prefix: a local
@@ -255,11 +272,21 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 	}
 	var rollback func()
 	if adv.metric == MetricInfinity {
-		if _, sent := n.advertised[key]; !sent && !force {
+		_, sent := n.advertised[key]
+		if !sent && !force {
 			return nil, nil
 		}
-		delete(n.advertised, key)
-		rollback = func() { n.advertised[key] = struct{}{} }
+		// Only what was actually spent is given back. A forced retraction for
+		// a prefix this node never advertised consumes nothing, and rolling
+		// one back recorded a prefix the neighbor chose as advertised: the
+		// key comes out of its Route Request, advertisableKeys unions the set,
+		// and every later dump then carried an Update for a prefix that does
+		// not exist. Nothing bounds that set, and each dropped dump rolls the
+		// phantoms back in, so it never drains.
+		if sent {
+			delete(n.advertised, key)
+			rollback = func() { n.advertised[key] = struct{}{} }
+		}
 	} else {
 		// observe records the feasibility distance this advertisement commits
 		// to, and is not rolled back: having promised a distance and then not
@@ -282,15 +309,22 @@ func (s *Speaker) selectedPeer(key routeKey) string {
 	return entry.selected.neighbor.peer.ID
 }
 
-func updateTLVs(key routeKey, adv advertisement, interval time.Duration) []RawTLV {
-	ae := aeFor(key.dest)
-	if ae == AEIPv4 {
-		// The ESP control link has an IPv6 link-local address only. AE 4
-		// tells BIRD/Linux to use that address as the IPv4 route's next hop.
-		ae = AEIPv4ViaIPv6
+// updateAE is the address encoding an Update carries, which is not the one a
+// request carries. The ESP control link has an IPv6 link-local address only,
+// so an IPv4 prefix has no next hop of its own family in the packet and RFC
+// 8966 section 4.6.9 would have the receiver ignore a plain AE 1 Update. RFC
+// 9229's AE 4 says to take the packet's IPv6 source as the next hop, which is
+// what this link offers. Requests stay on AE 1, per RFC 9229 section 2.3.
+func updateAE(p netip.Prefix) uint8 {
+	if p.Addr().Is4() {
+		return AEIPv4ViaIPv6
 	}
+	return AEIPv6
+}
+
+func updateTLVs(key routeKey, adv advertisement, interval time.Duration) []RawTLV {
 	return []RawTLV{EncodeRouterID(adv.routerID), EncodeUpdate(Update{
-		AE: ae, Plen: key.dest.Bits(), Prefix: key.dest.Addr().AsSlice(),
+		AE: updateAE(key.dest), Plen: key.dest.Bits(), Prefix: key.dest.Addr().AsSlice(),
 		Interval:     uint16(interval / (10 * time.Millisecond)),
 		Seqno:        adv.seqno,
 		Metric:       adv.metric,
@@ -345,7 +379,7 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 			}
 		}
 		if len(tlvs) > 0 {
-			actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, tlvs: tlvs, rollback: rollback})
+			actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, priority: priorityDump, tlvs: tlvs, rollback: rollback})
 		}
 	}
 	return actions
@@ -367,7 +401,18 @@ func (s *Speaker) updateActions(now time.Time) []sendAction {
 // collected by the route table and flushed by Run rather than sent from the
 // receive path, so a burst of updates in one packet produces one advertisement.
 func (s *Speaker) triggeredActions(now time.Time) []sendAction {
-	return s.updateActionsFor(s.routes.takeDirty(), now)
+	keys := s.routes.takeDirty()
+	actions := s.updateActionsFor(keys, now)
+	// "Whenever it changes the selected router-id for a given destination, a
+	// node MUST send an update as an urgent TLV", section 3.7.2, and the
+	// record that one is owed left with takeDirty. A dropped packet without
+	// this leaves the change to the next periodic dump, which is sixteen
+	// seconds at the defaults and four expiries at a neighbor that has lost
+	// the prefix.
+	for i := range actions {
+		actions[i].rollback = append(actions[i].rollback, func() { s.routes.markDirty(keys) })
+	}
+	return actions
 }
 
 // starvedActions turns the route table's pending seqno requests into unicast
@@ -407,7 +452,7 @@ func (s *Speaker) seqnoRequestTo(n *neighborState, key routeKey, routerID [8]byt
 	// only half true; refusing to record one costs the suppression that stops
 	// it being relayed twice, not the request itself, which still goes out.
 	s.allowSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, "", now)
-	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
+	return sendAction{neighbor: n, dest: n.destination(), priority: priorityRequest, tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
 		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
 		Seqno: seqno, HopCount: seqnoRequestHopCount, RouterID: routerID,
 	})}}
@@ -417,7 +462,7 @@ func (s *Speaker) seqnoRequestAction(n *neighborState, asker string, key routeKe
 	if !s.allowSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, asker, now) {
 		return sendAction{}, false
 	}
-	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
+	return sendAction{neighbor: n, dest: n.destination(), priority: priorityRequest, tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
 		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
 		Seqno: seqno, HopCount: hops, RouterID: routerID,
 	})}}, true
@@ -441,10 +486,11 @@ func aeFor(p netip.Prefix) uint8 {
 // rememberStarved records a prefix whose seqno request has just gone out, so
 // it can be repeated if no feasible route appears. RFC 8966 section 3.8.2.1.
 //
-// It is bounded by maxStarveRetries. The index carries a router id a neighbor
-// writes into a packet, so a neighbor that alternates a feasible update with
-// an unfeasible one on an origin this node has not recorded starves a new
-// entry every packet; each lives through four retries, and retryStarvedLocked
+// It is bounded by maxStarveRetries and by maxStarveRetriesPerNeighbor. The
+// index carries a router id a neighbor writes into a packet, so a neighbor
+// that alternates a feasible update with an unfeasible one on an origin this
+// node has not recorded starves a new entry every packet; each lives through
+// four retries, and retryStarvedLocked
 // walks the whole map on every wake of the run loop, under the lock that also
 // carries hellos and retractions.
 func (s *Speaker) rememberStarved(key routeKey, routerID [8]byte, seqno uint16, asker string, now time.Time) {

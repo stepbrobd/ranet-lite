@@ -24,6 +24,13 @@ type neighborState struct {
 	theirHelloRxTS uint32
 	haveTheirHello bool
 	sentHello      bool
+	// helloSeqno is this node's Hello counter toward one neighbor. RFC 8966
+	// section 4.6.5: "Every time a Hello is sent, the corresponding seqno
+	// counter MUST be incremented." Each peer is its own point-to-point link
+	// here, so each carries its own counter; one counter shared across
+	// neighbors repeated a seqno to whichever neighbor drew an extra Hello
+	// between two intervals, which is every neighbor on the pass it joins.
+	helloSeqno uint16
 
 	reportedCost     uint16
 	haveReportedCost bool

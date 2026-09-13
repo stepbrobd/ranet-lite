@@ -140,14 +140,14 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 // tests exercising receive-side handling build the bytes directly, same
 // as tlv_test.go's TestUpdateWithSourcePrefix.
 func sourceSpecificUpdateTLV(dest netip.Prefix, source netip.Prefix, metric uint16) RawTLV {
-	ae := aeFor(dest)
+	ae := updateAE(dest)
 	destBytes := dest.Addr().AsSlice()
-	if ae == AEIPv4 {
+	if dest.Addr().Is4() {
 		b := dest.Addr().As4()
 		destBytes = b[:]
 	}
 	srcBytes := source.Addr().AsSlice()
-	if aeFor(source) == AEIPv4 {
+	if source.Addr().Is4() {
 		b := source.Addr().As4()
 		srcBytes = b[:]
 	}
@@ -810,8 +810,12 @@ func TestDefaultsMatchFleetTheyReplace(t *testing.T) {
 	if cost.RTTCost != 1024 {
 		t.Errorf("default rtt cost is %d, want 1024", cost.RTTCost)
 	}
-	if cost.RTTMax != 1024*time.Millisecond || cost.RTTMin != 0 {
-		t.Errorf("default rtt window is %s..%s, want 0..1024ms", cost.RTTMin, cost.RTTMax)
+	// RFC 9616 section 4.2 RECOMMENDS rtt-min = 10 ms and asks for the mapping
+	// to be "constant around 0". rtt-max stays wider than the 120 ms it
+	// RECOMMENDS because this is a global mesh, where 120 ms saturates every
+	// intercontinental path and the penalty stops ranking them.
+	if cost.RTTMax != 1024*time.Millisecond || cost.RTTMin != 10*time.Millisecond {
+		t.Errorf("default rtt window is %s..%s, want 10ms..1024ms", cost.RTTMin, cost.RTTMax)
 	}
 
 	var cfg Config
@@ -971,7 +975,7 @@ func TestDroppedDumpDoesNotRefundTheRateLimit(t *testing.T) {
 // interval; a seqno request cannot, because allowAsk and rememberStarved have
 // already recorded it as asked and nothing rolls that back, so a dropped
 // request is a prefix that stops being asked about at all.
-func TestADumpDoesNotStarveTheRequestsDecidedWithIt(t *testing.T) {
+func TestDumpDoesNotStarveRequestsDecidedWithIt(t *testing.T) {
 	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
@@ -1014,13 +1018,13 @@ func TestADumpDoesNotStarveTheRequestsDecidedWithIt(t *testing.T) {
 	var actions []sendAction
 	for i := range 1 << 15 {
 		prefix := netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i))
-		actions = append(actions, sendAction{neighbor: neighbor, dest: multicastGroup, tlvs: []RawTLV{
+		actions = append(actions, sendAction{neighbor: neighbor, dest: multicastGroup, priority: priorityDump, tlvs: []RawTLV{
 			EncodeRouterID([8]byte{1}),
 			EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
 				Interval: 6000, Seqno: 1, Metric: 64}),
 		}})
 	}
-	actions = append(actions, sendAction{neighbor: neighbor, dest: neighbor.destination(), tlvs: []RawTLV{
+	actions = append(actions, sendAction{neighbor: neighbor, dest: neighbor.destination(), priority: priorityRequest, tlvs: []RawTLV{
 		EncodeSeqnoRequest(SeqnoRequest{AE: AEIPv6, Prefix: netip.MustParsePrefix("fd00:ffff::/64"),
 			Seqno: 9, HopCount: 8, RouterID: [8]byte{1}}),
 	}})
@@ -1037,5 +1041,192 @@ func TestADumpDoesNotStarveTheRequestsDecidedWithIt(t *testing.T) {
 	case <-asked:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the request decided with the dump never left, so the prefix it asks about stops being asked about")
+	}
+}
+
+// RFC 8966 section 3.8.1.1 makes a request for a prefix this node knows
+// nothing about draw a retraction, and the prefix comes out of the neighbor's
+// own Route Request. Recording that retraction as an advertisement when its
+// packet is dropped puts a prefix the neighbor chose into n.advertised, which
+// advertisableKeys unions into every later dump, and nothing bounds it: each
+// dropped dump rolls the phantoms back in, so the set never drains and every
+// dump carries an Update for a prefix that does not exist.
+func TestRetractionForUnadvertisedPrefixCostsNothing(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	blocked := make(chan struct{})
+	var release sync.Once
+	stuck := netstack.NewPeerReserved("peer",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { <-blocked; return nil })
+	defer func() { release.Do(func() { close(blocked) }); stuck.Close() }()
+	speaker.mu.Lock()
+	neighbor.peer = stuck
+	speaker.mu.Unlock()
+	for {
+		place, err := stuck.ReserveRawOrDrop([]byte("bulk"), 41)
+		if errors.Is(err, netstack.ErrSendQueueFull) {
+			break
+		}
+		place.Send()
+	}
+
+	// Prefixes this node has never heard of, asked about by the neighbor
+	// while nothing it produces can leave.
+	const asked = 4096
+	var requests []RawTLV
+	for i := range asked {
+		prefix := netip.MustParsePrefix(fmt.Sprintf("fd00:dead:%x::/64", i))
+		requests = append(requests, EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}))
+	}
+	speaker.handlePacket(neighbor, EncodePacket(requests))
+
+	speaker.mu.Lock()
+	phantoms := len(neighbor.advertised)
+	known := len(speaker.routes.entries)
+	speaker.mu.Unlock()
+	if known != 0 {
+		t.Fatalf("the node learned %d of the prefixes it was asked about, so this proves nothing", known)
+	}
+	if phantoms != 0 {
+		t.Errorf("%d prefixes the neighbor named are recorded as advertised, and every later dump carries an update for each", phantoms)
+	}
+}
+
+// A Hello is multicast, like the dump, so ordering a pass by destination put
+// it behind every unicast request the same pass decided, and coalesce had
+// already merged it into the dump's action. Three lost Hellos withdraw every
+// route through the neighbor, and the only retry is the next hello interval,
+// so it is the one packet of a pass that nothing else can stand in for.
+func TestHelloSurvivesPassThatFillsTheBudget(t *testing.T) {
+	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arrived := make(chan struct{})
+	var once sync.Once
+	blocked := make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(blocked) }) }
+	peer := netstack.NewPeerReserved("peer",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func(sealed [][]byte) error {
+			<-blocked
+			for _, raw := range sealed {
+				tlvs, err := DecodePacket(raw[ipv6HeaderLen+udpHeaderLen:])
+				if err != nil {
+					return err
+				}
+				for _, tlv := range tlvs {
+					if tlv.Type == TLVHello {
+						once.Do(func() { close(arrived) })
+					}
+				}
+			}
+			return nil
+		})
+	defer func() { unblock(); peer.Close() }()
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	neighbor := speaker.neighbors[peer.ID]
+	neighbor.addr = netip.MustParseAddr("fe80::2")
+
+	// One pass carrying more requests than the peer can hold, decided with
+	// the Hello that keeps the adjacency up.
+	speaker.mu.Lock()
+	actions := []sendAction{speaker.helloAction(neighbor, time.Now())}
+	for i := range 1 << 15 {
+		prefix := netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i))
+		actions = append(actions, sendAction{neighbor: neighbor, dest: neighbor.destination(), priority: priorityRequest, tlvs: []RawTLV{
+			EncodeSeqnoRequest(SeqnoRequest{AE: AEIPv6, Prefix: prefix, Seqno: 9, HopCount: 8, RouterID: [8]byte{1}}),
+		}})
+	}
+	send := speaker.emitLocked(actions)
+	speaker.mu.Unlock()
+	send()
+	if dropped := peer.Dropped(); dropped == 0 {
+		t.Fatal("the whole pass fit inside the peer's budget, so nothing had to be given up and this proves nothing")
+	}
+	unblock()
+
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hello was dropped for the requests decided with it, so the adjacency goes and every route through it with it")
+	}
+}
+
+// RFC 8966 section 4.6.5: "Every time a Hello is sent, the corresponding seqno
+// counter MUST be incremented." A neighbor that joins between two intervals
+// draws an extra Hello, which a counter incremented per interval repeats.
+func TestEveryHelloCarriesItsOwnSeqno(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	now := time.Now()
+	seen := map[uint16]bool{}
+	for range 3 {
+		action := speaker.helloAction(neighbor, now)
+		hello, err := DecodeHello(action.tlvs[0].Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[hello.Seqno] {
+			t.Fatalf("hello seqno %d was sent twice, so the neighbor reads a repeat as a loss", hello.Seqno)
+		}
+		seen[hello.Seqno] = true
+	}
+}
+
+// RFC 8966 section 3.7.2: "whenever it changes the selected router-id for a
+// given destination, a node MUST send an update as an urgent TLV". takeDirty
+// consumes the record that one is owed, so a dropped triggered update leaves
+// the change to the next periodic dump, which is sixteen seconds at the
+// defaults and four expiries at a neighbor that has lost the prefix.
+func TestDroppedTriggeredUpdateIsStillOwed(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	blocked := make(chan struct{})
+	var release sync.Once
+	stuck := netstack.NewPeerReserved("peer",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { <-blocked; return nil })
+	defer func() { release.Do(func() { close(blocked) }); stuck.Close() }()
+	speaker.mu.Lock()
+	neighbor.peer = stuck
+	speaker.mu.Unlock()
+	for {
+		place, err := stuck.ReserveRawOrDrop([]byte("bulk"), 41)
+		if errors.Is(err, netstack.ErrSendQueueFull) {
+			break
+		}
+		place.Send()
+	}
+
+	prefix := netip.MustParsePrefix("fd00:7::/64")
+	speaker.Originate(prefix)
+	speaker.mu.Lock()
+	if len(speaker.routes.dirty) == 0 {
+		speaker.routes.dirty[routeKey{dest: prefix}] = struct{}{}
+	}
+	emitLockedNow := speaker.emitLocked(speaker.triggeredActions(time.Now()))
+	speaker.mu.Unlock()
+	emitLockedNow()
+
+	speaker.mu.Lock()
+	owed := len(speaker.routes.dirty)
+	speaker.mu.Unlock()
+	if owed == 0 {
+		t.Error("the urgent update was dropped and nothing still owes it, so the change waits for the next periodic dump")
 	}
 }

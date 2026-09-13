@@ -41,25 +41,33 @@ func EncodeNextHop(addr net.IP) RawTLV {
 	return RawTLV{Type: TLVNextHop, Body: body}
 }
 
-func DecodeNextHop(body []byte) (net.IP, error) {
+// DecodeNextHop returns the next hop and the address encoding that named it.
+// The encoding is reported rather than inferred from the address: RFC 8966
+// section 4.6.9 pairs an Update with "the last preceding Next Hop TLV with a
+// matching address family (IPv4 or IPv6)", and an AE 2 body carrying
+// ::ffff:a.b.c.d is an IPv6 next hop that net.IP.To4 reports as IPv4. Taking
+// it for one enables the AE 1 Updates behind it, which that section says MUST
+// be ignored for want of a next hop.
+func DecodeNextHop(body []byte) (net.IP, uint8, error) {
 	if len(body) < 2 {
-		return nil, fmt.Errorf("babel: short NextHop TLV")
+		return nil, 0, fmt.Errorf("babel: short NextHop TLV")
 	}
-	addr, err := decodeAddress(body[0], body[2:])
+	ae := body[0]
+	addr, err := decodeAddress(ae, body[2:])
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	length := len(addr)
-	if body[0] == AEIPv6LinkLocal {
+	if ae == AEIPv6LinkLocal {
 		length = 8
 	}
 	if _, err := decodeOptionalSubTLVs(body[2+length:]); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return addr, nil
+	return addr, ae, nil
 }
 
-// AckReq / Ack, RFC 8966 §4.6.2/§4.6.3 — used for reliable signaling of
+// AckReq / Ack, RFC 8966 §4.6.3/§4.6.4 — used for reliable signaling of
 // e.g. link-down Updates. We answer AckReq (being unresponsive would make
 // us a badly behaved peer) but don't originate AckReq ourselves in this
 // minimal speaker.

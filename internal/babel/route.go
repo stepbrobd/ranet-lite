@@ -230,7 +230,13 @@ func (rt *routeTable) selectRoute(key routeKey, entry *keyEntry, now time.Time) 
 	}
 
 	previous := entry.selected
-	if selected.neighbor != previous.neighbor || selected.cost != previous.cost {
+	// Only a changed next hop changes the forwarding table: the cost is what
+	// this node advertises, which significant below decides, and is not part
+	// of the entry. Reinstalling on a cost change alone logged a line, wrote
+	// the same entry and woke the kernel reconciler for every prefix through
+	// a neighbor whose measured RTT moved, which under RFC 9616 costing is
+	// most IHUs.
+	if selected.neighbor != previous.neighbor {
 		rt.install(key, selected)
 	}
 	if rt.significant(previous, selected) {
@@ -386,6 +392,15 @@ func (rt *routeTable) nextExpiry() time.Time {
 		}
 	}
 	return deadline
+}
+
+// markDirty puts keys back after the packet that would have carried them was
+// dropped. RFC 8966 section 3.7.2 makes a triggered update owed rather than
+// optional, and takeDirty has already consumed the record that it is owed.
+func (rt *routeTable) markDirty(keys []routeKey) {
+	for _, key := range keys {
+		rt.dirty[key] = struct{}{}
+	}
 }
 
 // takeDirty returns the keys whose advertisement changed since the last call.

@@ -25,18 +25,19 @@ const (
 	TLVSeqnoRequest TLVType = 10
 )
 
-// Sub-TLV types shared by Hello/IHU (and, per RFC 8966, any TLV), §4.6.
+// Sub-TLV types shared by Hello/IHU (and, per RFC 8966, any TLV), §4.4.
 const (
 	SubTLVPad1 uint8 = 0
 	SubTLVPadN uint8 = 1
 	// SubTLVTimestamp carries the RTT extension's timestamps, RFC 9616 §6
-	// ("Babel Route Selection with Metric Extensions" — confirmed against
-	// both the RFC text and BIRD's actual wire encoding, which agree: 3,
-	// not the more mnemonic-seeming 4 this was initially miscoded as).
+	// ("Delay-Based Metric Extension for the Babel Routing Protocol").
+	// Confirmed against both the RFC text and BIRD's actual wire encoding,
+	// which agree: 3, not the more mnemonic-seeming 4 this was initially
+	// miscoded as.
 	SubTLVTimestamp uint8 = 3
 )
 
-// Address Encodings, RFC 8966 §4.4.
+// Address Encodings, RFC 8966 §4.1.4.
 const (
 	AEWildcard      uint8 = 0
 	AEIPv4          uint8 = 1

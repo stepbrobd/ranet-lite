@@ -13,7 +13,7 @@ const (
 	nextHeaderUDP = 17
 	ipv6HeaderLen = 40
 	udpHeaderLen  = 8
-	babelHopLimit = 1 // link-local multicast must not be forwarded, RFC 8966 §4.1
+	babelHopLimit = 1 // link-local multicast must not be forwarded, RFC 8966 §4
 )
 
 // buildPacket wraps a Babel payload in a minimal IPv6+UDP packet.

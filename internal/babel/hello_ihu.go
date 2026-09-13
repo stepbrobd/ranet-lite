@@ -6,7 +6,7 @@ import (
 	"net"
 )
 
-// Hello is RFC 8966 §4.6.4. We always send what the RFC calls a
+// Hello is RFC 8966 §4.6.5. We always send what the RFC calls a
 // "Multicast Hello" (Unicast flag clear) — a slight misnomer, since it's
 // delivered as one packet per neighbor over each point-to-point ESP
 // tunnel, not literally multicast on the wire. The classification matters

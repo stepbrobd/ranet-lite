@@ -45,6 +45,15 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 	var prefixDec PrefixDecoder
 	var routerID [8]byte
 	var haveRouterID bool
+	// haveIPv4NextHop is the packet's next-hop parser state for the IPv4
+	// family, RFC 8966 section 4.5. There is no IPv6 counterpart because every
+	// babel packet here is sent from an IPv6 link-local address, which is the
+	// next hop an IPv6 prefix falls back to.
+	var haveIPv4NextHop bool
+	// One MTU-sized packet holds about ninety Update TLVs, so a peer that
+	// sends a packet of malformed ones costs one log line rather than ninety.
+	// RFC 8966 section 4.6.9 asks for them to be "silently ignored".
+	badUpdates := 0
 	linkChanged := false
 	for _, t := range tlvs {
 		switch t.Type {
@@ -91,6 +100,17 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 					continue
 				}
 			}
+			if ihu.Interval == 0 {
+				// RFC 8966 section 4.6.6 on the same field the hold is
+				// computed from: "An upper bound, expressed in centiseconds,
+				// on the time after which the sending node will send a new
+				// IHU; this MUST NOT be 0." Honoring a zero puts ihuExpiry at
+				// now, which takes the link cost to infinity and unselects
+				// every route through this neighbor in this same call, so one
+				// eight-byte TLV retracts everything it carries. PrefixDecoder
+				// refuses the identical rule on the Update TLV.
+				continue
+			}
 			n.reportedCost, n.haveReportedCost = ihu.RxCost, true
 			n.ihuExpiry = now.Add(deadTimeout(time.Duration(ihu.Interval) * 10 * time.Millisecond))
 			// A new Hello can overtake the reply to an older one. RFC 9616
@@ -109,6 +129,17 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			}
 			linkChanged = true
 
+		case TLVNextHop:
+			// Kept as parser state and not as a destination: these are
+			// point-to-point ESP tunnels, so the next hop toward a prefix a
+			// neighbor announces is that neighbor. What the TLV decides here
+			// is whether an IPv4 prefix has a next hop at all.
+			// Matched on the encoding, which is the address family section
+			// 4.6.9 pairs an Update with. See DecodeNextHop.
+			if _, ae, err := DecodeNextHop(t.Body); err == nil && ae == AEIPv4 {
+				haveIPv4NextHop = true
+			}
+
 		case TLVRouterID:
 			// The parser state is set even when the TLV is ignored, which the
 			// second result reports. Only a malformed TLV leaves it alone.
@@ -119,7 +150,10 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 		case TLVUpdate:
 			u, err := prefixDec.Decode(t.Body)
 			if err != nil {
-				slog.Warn("babel bad update", "err", err)
+				if badUpdates == 0 {
+					slog.Warn("babel bad update", "peer", n.peer.ID, "err", err)
+				}
+				badUpdates++
 				continue
 			}
 			if u.HasRouterID {
@@ -130,6 +164,17 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			}
 			if u.AE == AEWildcard {
 				s.routes.retractNeighbor(n, now)
+				continue
+			}
+			// RFC 8966 section 4.6.9: the next hop "is taken from the last
+			// preceding Next Hop TLV with a matching address family ... if no
+			// such TLV exists, it is taken from the network-layer source
+			// address of this packet if it belongs to the same address family
+			// as the prefix being announced; otherwise, this Update MUST be
+			// ignored." Every packet here is IPv6, so a plain AE 1 prefix has
+			// neither. RFC 9229's AE 4 is the spelling that does, and is what
+			// this node sends.
+			if u.AE == AEIPv4 && !haveIPv4NextHop {
 				continue
 			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
@@ -167,7 +212,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 
 		case TLVAckReq:
 			if nonce, err := DecodeAckReq(t.Body); err == nil && n.addr.IsValid() {
-				actions = append(actions, sendAction{neighbor: n, dest: n.addr, tlvs: []RawTLV{EncodeAck(nonce)}})
+				actions = append(actions, sendAction{neighbor: n, dest: n.addr, priority: priorityRequest, tlvs: []RawTLV{EncodeAck(nonce)}})
 			}
 
 		case TLVRouteRequest:
@@ -180,6 +225,10 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 				actions = append(actions, s.seqnoReply(n, request, now)...)
 			}
 		}
+	}
+	if badUpdates > 1 {
+		slog.Warn("babel ignored more malformed updates in the same packet",
+			"peer", n.peer.ID, "count", badUpdates-1)
 	}
 	if linkChanged {
 		s.routes.recomputeNeighbor(n, now)
@@ -194,8 +243,8 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 //
 // The same section says a full dump SHOULD be rate-limited, and on a transit
 // node it has to be. The dump is the whole learned table, so one 1400 byte
-// packet holds 349 four byte wildcard requests and, unlimited, each would draw
-// its own copy: measured at 5000 routes that is 41,880 packets and 58 MB out
+// packet holds 337 four byte wildcard requests and, unlimited, each would draw
+// its own copy: measured at 5000 routes that is 42,125 packets and 59 MB out
 // for one packet in, with the table walked under the lock the whole protocol
 // runs under. One dump per update interval is all a neighbor can use anyway,
 // since the periodic update carries the same thing.
@@ -230,7 +279,7 @@ func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Ti
 	if len(tlvs) == 0 {
 		return nil
 	}
-	return []sendAction{{neighbor: n, dest: n.destination(), tlvs: tlvs, rollback: rollback}}
+	return []sendAction{{neighbor: n, dest: n.destination(), priority: priorityRequest, tlvs: tlvs, rollback: rollback}}
 }
 
 // seqnoReply implements RFC 8966 section 3.8.1.2: satisfy the request from a
@@ -314,7 +363,7 @@ func sendTLVs(n *neighborState, tlvs []RawTLV, rollback func()) []sendAction {
 	if len(tlvs) == 0 {
 		return nil
 	}
-	action := sendAction{neighbor: n, dest: n.destination(), tlvs: tlvs}
+	action := sendAction{neighbor: n, dest: n.destination(), priority: priorityRequest, tlvs: tlvs}
 	if rollback != nil {
 		action.rollback = []func(){rollback}
 	}

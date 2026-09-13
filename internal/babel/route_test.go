@@ -73,18 +73,35 @@ func TestInfiniteLinkCostNeverBecomesReachable(t *testing.T) {
 	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, time.Minute, time.Now())
 }
 
-func TestSelectedMetricChangeIsPublished(t *testing.T) {
+// A worsened link is re-advertised, because the metric is what this node tells
+// the mesh, and is not reinstalled, because the metric is not part of the
+// forwarding entry. Reinstalling on it wrote the same entry, logged a line and
+// woke the kernel reconciler once per prefix through that neighbor, which
+// under RFC 9616 costing is most IHUs.
+func TestSelectedMetricChangeIsAdvertisedRatherThanReinstalled(t *testing.T) {
 	now := time.Now()
 	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
 	makeNeighborReachable(n)
+	installs := 0
 	var got routeSelection
-	rt := newRouteTable(func(_ routeKey, sel routeSelection) { got = sel })
+	rt := newRouteTable(func(_ routeKey, sel routeSelection) { installs, got = installs+1, sel })
 	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
 	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 10}, time.Minute, now)
+	if installs != 1 || got.neighbor != n {
+		t.Fatalf("the route was installed %d times as %+v", installs, got)
+	}
+	rt.takeDirty()
+
 	n.reportedCost = 100
 	rt.recomputeNeighbor(n, now)
-	if got.neighbor != n || got.cost != 110 {
-		t.Fatalf("new metric was not published: %+v", got)
+	if rt.entries[key].selected.cost != 110 {
+		t.Errorf("the selected cost is %d, want the worsened 110", rt.entries[key].selected.cost)
+	}
+	if len(rt.takeDirty()) == 0 {
+		t.Error("a worsened link was not re-advertised, so the mesh keeps routing through it")
+	}
+	if installs != 1 {
+		t.Errorf("the forwarding entry was rewritten %d times for a change it does not carry", installs)
 	}
 }
 

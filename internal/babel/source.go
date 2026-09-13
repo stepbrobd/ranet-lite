@@ -19,9 +19,12 @@ type sourceEntry struct {
 	seqno  uint16
 	metric uint16
 	gcAt   time.Time
-	// owner is the neighbor whose route caused this node to advertise the
-	// distance, or empty for a prefix this node originates. It is the peer's
-	// name rather than its state, so an entry cannot pin a retired neighbor.
+	// owner is the neighbor whose route last caused this node to advertise
+	// the distance, or empty for a prefix this node originates, and is what
+	// the per-neighbor shares are charged to. It follows the latest
+	// advertisement rather than the first, because the latest is also what
+	// keeps refreshing gcAt. It is the peer's name rather than its state, so
+	// an entry cannot pin a retired neighbor.
 	owner string
 }
 
@@ -43,8 +46,9 @@ const sourceGCTime = 3 * time.Minute
 // new router id, which is what a node that lost its sequence number state
 // does.
 //
-// A prefix legitimately has a handful of origins, so thirty-two is far above
-// anycast and far below what a flood needs.
+// The numbers sit far above what a legitimate prefix or a restarting neighbor
+// produces and far below what a flood needs; see maxOriginsPerPrefixPerNeighbor
+// for why the first version of them was too small.
 const (
 	maxSources          = 1 << 16
 	maxOriginsPerPrefix = 1 << 10
@@ -128,8 +132,22 @@ func (rt *routeTable) observe(key routeKey, adv advertisement, from string, now 
 		rt.originsPerKey[key]++
 		rt.originsBy[originShare{route: key, peer: from}]++
 		rt.sourcesByPeer[from]++
-	} else if entry.better(adv.seqno, adv.metric) {
-		entry.seqno, entry.metric = adv.seqno, adv.metric
+	} else {
+		if entry.better(adv.seqno, adv.metric) {
+			entry.seqno, entry.metric = adv.seqno, adv.metric
+		}
+		// The charge follows whoever is keeping the entry alive. It was
+		// frozen at whoever created it, and gcAt is refreshed by every
+		// advertisement, so a neighbor that advertised one origin once and
+		// went quiet stayed charged for it as long as any other neighbor kept
+		// announcing the same prefix, and could then be refused a share it
+		// was not using.
+		if entry.owner != from {
+			rt.releaseOrigin(key, entry.owner)
+			rt.originsBy[originShare{route: key, peer: from}]++
+			rt.sourcesByPeer[from]++
+			entry.owner = from
+		}
 	}
 	entry.gcAt = now.Add(sourceGCTime)
 }
@@ -170,16 +188,22 @@ func (rt *routeTable) sweepSources(now time.Time) {
 		} else {
 			rt.originsPerKey[index.route]--
 		}
-		share := originShare{route: index.route, peer: entry.owner}
-		if rt.originsBy[share] <= 1 {
-			delete(rt.originsBy, share)
-		} else {
-			rt.originsBy[share]--
-		}
-		if rt.sourcesByPeer[entry.owner] <= 1 {
-			delete(rt.sourcesByPeer, entry.owner)
-		} else {
-			rt.sourcesByPeer[entry.owner]--
-		}
+		rt.releaseOrigin(index.route, entry.owner)
+	}
+}
+
+// releaseOrigin gives one neighbor back the share it holds of one prefix and
+// of the whole source table.
+func (rt *routeTable) releaseOrigin(key routeKey, owner string) {
+	share := originShare{route: key, peer: owner}
+	if rt.originsBy[share] <= 1 {
+		delete(rt.originsBy, share)
+	} else {
+		rt.originsBy[share]--
+	}
+	if rt.sourcesByPeer[owner] <= 1 {
+		delete(rt.sourcesByPeer, owner)
+	} else {
+		rt.sourcesByPeer[owner]--
 	}
 }

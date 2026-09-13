@@ -37,8 +37,20 @@ func DefaultCostParams() CostParams {
 		// uses as BABEL_RXCOST_WIRED, and what the fleet sets explicitly. At
 		// 32 a ranet-lite hop looks three times cheaper than a BIRD hop, so a
 		// mixed fleet pulls transit onto whichever nodes run this.
-		RxCost:  96,
-		RTTMin:  0,
+		RxCost: 96,
+		// RFC 9616 section 4.2: "The mapping should also be constant around 0,
+		// so that small oscillations in the RTT of low-RTT links do not
+		// contribute to routing instability", and it RECOMMENDS rtt-min = 10
+		// ms for it. At zero the mapping was linear from the origin, so the
+		// exponential average of a link with ordinary jitter moved the
+		// advertised rxcost on most IHUs.
+		RTTMin: 10 * time.Millisecond,
+		// rtt-max and max-rtt-penalty deviate from the 120 ms and 150 the same
+		// section RECOMMENDS, deliberately. This is a global mesh: 120 ms
+		// saturates every intercontinental path, so the penalty stops ranking
+		// exactly the links it exists to rank, and a penalty of 150 against a
+		// wired rxcost of 96 makes a satellite hop cost less than two wired
+		// ones.
 		RTTMax:  1024 * time.Millisecond,
 		RTTCost: 1024,
 	}
