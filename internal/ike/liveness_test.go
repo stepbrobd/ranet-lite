@@ -522,7 +522,7 @@ func TestChildRequestCreatesMissingChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := decodeChildExchangePayloads(inner); err != nil {
+	if _, err := decodeChildExchangePayloads(inner, PRF_HMAC_SHA2_256); err != nil {
 		t.Fatalf("invalid Child SA creation response: %v", err)
 	}
 	child := s.currentChild()

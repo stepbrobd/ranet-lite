@@ -74,7 +74,7 @@ func TestDecodeChildExchangePayloadsRejectsDuplicatesAndCriticalUnknowns(t *test
 		{Type: PayloadType(250), Critical: true},
 	} {
 		payloads := append(append([]RawPayload(nil), base...), extra)
-		if _, err := decodeChildExchangePayloads(payloads); err == nil {
+		if _, err := decodeChildExchangePayloads(payloads, PRF_HMAC_SHA2_256); err == nil {
 			t.Fatalf("accepted invalid extra payload %+v", extra)
 		}
 	}
@@ -84,7 +84,7 @@ func TestDecodeChildNegotiationResponseHandlesNotifyOnlyError(t *testing.T) {
 	_, err := decodeChildNegotiationResponse([]RawPayload{{
 		Type: PayloadN,
 		Body: EncodeNotify(Notify{Type: N_TEMPORARY_FAILURE}),
-	}})
+	}}, PRF_HMAC_SHA2_256)
 	if err == nil || !strings.Contains(err.Error(), "rejected: notify type 43") {
 		t.Fatalf("notify-only response error = %v", err)
 	}
@@ -98,5 +98,28 @@ func TestValidateFullRangeSelectors(t *testing.T) {
 	narrow := EncodeTS([]TrafficSelector{FullRangeV4()})
 	if err := validateFullRangeSelectors(&RawPayload{Body: narrow}, &RawPayload{Body: want}); err == nil {
 		t.Fatal("accepted narrowed traffic selectors")
+	}
+}
+
+// RFC 7296 section 2.10: a nonce "MUST be at least 128 bits in size, and MUST
+// be at least half the key size of the negotiated pseudorandom function". The
+// second half was missing, so a 16 byte nonce was taken under HMAC-SHA2-384,
+// whose preferred key size is 48.
+func TestNonceLengthFollowsTheNegotiatedPRF(t *testing.T) {
+	for _, test := range []struct {
+		prf    uint16
+		length int
+		want   bool
+	}{
+		{PRF_HMAC_SHA2_256, 15, false},
+		{PRF_HMAC_SHA2_256, 16, true},
+		{PRF_HMAC_SHA2_384, 16, false},
+		{PRF_HMAC_SHA2_384, 23, false},
+		{PRF_HMAC_SHA2_384, 24, true},
+		{PRF_HMAC_SHA2_384, 257, false},
+	} {
+		if got := validNonceFor(make([]byte, test.length), test.prf); got != test.want {
+			t.Errorf("a %d byte nonce under PRF %d was accepted=%v, want %v", test.length, test.prf, got, test.want)
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -83,10 +84,15 @@ type Session struct {
 	stateMu sync.RWMutex
 	current *ikeContext
 	old     *ikeContext
-	// collision retains the losing peer-initiated candidate until the local
-	// rekey exchange can delete it. The normal current/old pair retains the
-	// winning candidate and the SA it replaces.
-	collision     *ikeContext
+	// collision retains a peer-initiated candidate that a simultaneous rekey
+	// decided against: the losing one until the local rekey exchange can
+	// delete it, or the peer's own losing one until the peer deletes it. The
+	// normal current/old pair retains the winning candidate and the SA it
+	// replaces.
+	collision *ikeContext
+	// oldBy and collisionBy bound how long each waits for the peer's Delete.
+	oldBy         time.Time
+	collisionBy   time.Time
 	localRekey    *ikeRekey
 	ikeRekeyNonce func([]byte) error
 
@@ -165,6 +171,72 @@ func (s *Session) nextPeerMessageID(ctx *ikeContext) uint32 {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	return ctx.nextPeerMID
+}
+
+// retainedContextDeadline bounds how long a replaced or redundant IKE SA is
+// held for the peer's Delete. RFC 7296 section 2.8.2 makes that Delete a
+// SHOULD, and handleIKERekey answers every peer-initiated rekey with
+// TEMPORARY_FAILURE while either is set, so a peer that rekeys once and never
+// sends the Delete would refuse every later rekey for the life of the session,
+// which is what retirementDeadline already stops for a Child SA. It sits above
+// the 62 second retransmission budget of one exchange, so a Delete still in
+// flight is not answered by a session that has already forgotten the SA.
+const retainedContextDeadline = 2 * time.Minute
+
+// retainOldLocked keeps the SA a rekey replaced reachable for the peer's
+// Delete. It must be called with stateMu held.
+func (s *Session) retainOldLocked(ctx *ikeContext) {
+	s.old, s.oldBy = ctx, time.Now().Add(retainedContextDeadline)
+}
+
+// retainCollisionLocked does the same for the candidate a simultaneous rekey
+// decided against. It must be called with stateMu held.
+func (s *Session) retainCollisionLocked(ctx *ikeContext) {
+	s.collision, s.collisionBy = ctx, time.Now().Add(retainedContextDeadline)
+}
+
+// expireRetainedContexts drops a retained IKE SA whose Delete never arrived.
+// Its SPI leaves the mux with it, so a later datagram naming it is answered
+// the way any other unknown SA is.
+func (s *Session) expireRetainedContexts(now time.Time) {
+	s.stateMu.Lock()
+	var dropped []*ikeContext
+	// An undated context is dated here rather than dropped: the zero time
+	// means the deadline has not been set yet, not that it has passed.
+	for _, held := range []struct {
+		ctx *ikeContext
+		by  *time.Time
+		out **ikeContext
+	}{{s.old, &s.oldBy, &s.old}, {s.collision, &s.collisionBy, &s.collision}} {
+		switch {
+		case held.ctx == nil:
+		case held.by.IsZero():
+			*held.by = now.Add(retainedContextDeadline)
+		case !now.Before(*held.by):
+			dropped, *held.out = append(dropped, held.ctx), nil
+		}
+	}
+	s.stateMu.Unlock()
+	for _, ctx := range dropped {
+		slog.Warn("ike dropping an IKE SA the peer never deleted",
+			"spi", ctx.spiI, "after", retainedContextDeadline)
+		s.mux.UnregisterIKE(ctx.spiI)
+	}
+}
+
+// nextRetainedExpiry is when the earliest retained IKE SA may be dropped, so
+// the control loop can wait for it rather than poll for it.
+func (s *Session) nextRetainedExpiry() (time.Time, bool) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	var earliest time.Time
+	if s.old != nil {
+		earliest = s.oldBy
+	}
+	if s.collision != nil && !s.collisionBy.IsZero() && (earliest.IsZero() || s.collisionBy.Before(earliest)) {
+		earliest = s.collisionBy
+	}
+	return earliest, !earliest.IsZero()
 }
 
 func (s *Session) removeRetainedContext(ctx *ikeContext) bool {
@@ -533,9 +605,9 @@ func InitiateContext(ctx context.Context, cfg PeerConfig) (session *Session, err
 		return nil, fmt.Errorf("ike: KE group mismatch (got %d, used %d)", peerGroup, group)
 	}
 	nr := DecodeNonce(noncePl.Body)
-	if !validNonce(nr) {
+	if !validNonceFor(nr, suite.PRFID) {
 		mux.Close()
-		return nil, fmt.Errorf("ike: responder nonce length %d is outside 16..256", len(nr))
+		return nil, fmt.Errorf("ike: responder nonce length %d is short for the negotiated PRF", len(nr))
 	}
 
 	shared, err := dh.SharedSecret(peerPub)
@@ -638,11 +710,11 @@ func suiteFromProposal(p Proposal) (SASuite, error) {
 	if !encrOK || !prfOK || !dhOK {
 		return SASuite{}, fmt.Errorf("ike: incomplete selected IKE proposal")
 	}
-	kb := encr.KeyLengthBits
-	if encr.ID == ENCR_CHACHA20_POLY1305 {
-		kb = 256
-	}
-	return SASuite{EncrID: encr.ID, EncrKeyBits: kb, PRFID: prfT.ID, DHGroup: dhT.ID}, nil
+	// The key length is the transform's own: ChaCha20-Poly1305 carries no
+	// KEY_LENGTH attribute, which canonicalEncryptionTransform enforces, and
+	// aeadParams reads its fixed 32 bytes from the cipher rather than from
+	// here. Substituting 256 named a number the wire never carried.
+	return SASuite{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, PRFID: prfT.ID, DHGroup: dhT.ID}, nil
 }
 
 func (s *Session) completeIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr []byte) error {
@@ -660,6 +732,15 @@ func (s *Session) completeIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni
 	}
 	return err
 }
+
+// teardownRetransmits bounds the Delete that closes an IKE SA this end
+// authenticated and cannot use. RFC 7296 section 2.21.2 makes sending it a
+// MUST, but nothing here depends on the answer: the SA is being discarded
+// either way, and the ordinary reason for silence is that the responder
+// discarded it first, which is what it does when the Child SA bundled into
+// IKE_AUTH fails. Spending the full budget delayed the dial's failure by
+// sixty-two seconds for a result the response had already named.
+const teardownRetransmits = 2
 
 func (s *Session) deleteAuthenticatedIKE() error {
 	ctx := s.current
@@ -681,7 +762,7 @@ func (s *Session) deleteAuthenticatedIKE() error {
 	if err != nil {
 		return fmt.Errorf("ike: build IKE Delete: %w", err)
 	}
-	resp, inner, err := encryptedRoundTrip(s.mux, ctx, req)
+	resp, inner, err := encryptedRoundTripWithin(s.mux, ctx, req, teardownRetransmits)
 	if err != nil {
 		return err
 	}
@@ -815,7 +896,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 // acting on. Only two let the exchange make progress, each once: N(COOKIE)
 // asks us to prove return routability (RFC 7296 §2.6) and
 // N(INVALID_KE_PAYLOAD) names a Diffie-Hellman group the responder will take
-// (§1.3). Everything else unauthenticated is ignored, so sendRecv keeps
+// (§1.2). Everything else unauthenticated is ignored, so sendRecv keeps
 // waiting for the real response rather than letting anyone who can spoof our
 // SPI abort the handshake.
 func usefulInitNotify(m *Message, cookieUsed, groupUsed bool) (Notify, bool) {

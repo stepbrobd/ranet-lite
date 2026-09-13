@@ -57,9 +57,9 @@ func identityFromID(body []byte) (Identity, error) {
 }
 
 // ResponderConfig is what answering an unsolicited peer needs, as against
-// PeerConfig which describes one peer we dial. The asymmetry is the point: a
-// responder does not know who is calling until IDi arrives, so the peer's key
-// and the local endpoint identity are both resolved during the exchange.
+// PeerConfig which describes one peer we dial. A responder does not know who
+// is calling until IDi arrives, so the peer's key and the local endpoint
+// identity are both resolved during the exchange rather than configured.
 type ResponderConfig struct {
 	Hub *transport.Hub
 
@@ -92,10 +92,12 @@ const (
 	// peer can make us allocate.
 	handshakeTimeout = 30 * time.Second
 
-	// cookieThreshold is the number of concurrent half-open SAs above which
-	// IKE_SA_INIT is answered with a COOKIE instead of state (RFC 7296 section 2.6).
-	// Below it, cookies cost a round trip for no benefit on a mesh whose peers
-	// are all known.
+	// cookieThreshold is the number of concurrent half-open SAs at which
+	// IKE_SA_INIT starts being answered with a COOKIE instead of state (RFC
+	// 7296 section 2.6). It is not the only thing that demands one: see
+	// halfOpenPerSourceWithoutCookie, which reaches the same answer for one
+	// address on an idle node. Below both, cookies cost a round trip for no
+	// benefit on a mesh whose peers are all known.
 	cookieThreshold = 32
 
 	// halfOpenLimit caps what a flood can allocate even with a valid cookie.
@@ -158,8 +160,17 @@ type Responder struct {
 	// halfOpenBySource is how many of those one address is holding.
 	halfOpenBySource map[netip.Addr]int
 	cookieSecret     [32]byte
-	cookieVersion    uint8
-	cookieRotated    time.Time
+	// previousSecret is the secret one rotation back, and previousValid says
+	// whether there has been a rotation at all. A cookie is issued and echoed
+	// a round trip apart, so rotating without keeping the old one refuses
+	// every cookie in flight at that moment; the initiator accepts one COOKIE
+	// per dial, so it then retransmits a cookie that can never be accepted
+	// until its whole budget runs out. One generation back is all it takes,
+	// because a cookie older than that is older than cookieLifetime.
+	previousSecret [32]byte
+	previousValid  bool
+	cookieVersion  uint8
+	cookieRotated  time.Time
 }
 
 func NewResponder(cfg ResponderConfig) (*Responder, error) {
@@ -743,10 +754,11 @@ func (r *Responder) leaveHalfOpen(source netip.Addr) {
 	r.mu.Unlock()
 }
 
-// cookieRequired implements RFC 7296 section 2.6. Below the threshold it does
-// nothing. Above it, a request without a currently valid cookie is answered
-// with one and reports true so the caller stops without allocating; the
-// initiator retries with the cookie echoed as its first payload.
+// cookieRequired implements RFC 7296 section 2.6. With neither the global
+// count nor this address's share of it under pressure it does nothing. Under
+// either, a request without a currently valid cookie is answered with one and
+// reports true so the caller stops without allocating; the initiator retries
+// with the cookie echoed as its first payload.
 func (r *Responder) cookieRequired(request *Message, ni []byte, spiI uint64, endpoint transport.Endpoint) (bool, error) {
 	source := endpoint.AddrPort().Addr()
 	r.mu.Lock()
@@ -759,26 +771,39 @@ func (r *Responder) cookieRequired(request *Message, ni []byte, spiI uint64, end
 	pressure := r.halfOpen >= cookieThreshold ||
 		r.halfOpenBySource[source] >= halfOpenPerSourceWithoutCookie
 	if pressure && time.Since(r.cookieRotated) > cookieLifetime {
-		if _, err := rand.Read(r.cookieSecret[:]); err != nil {
+		var next [32]byte
+		if _, err := rand.Read(next[:]); err != nil {
 			r.mu.Unlock()
 			return false, err
 		}
+		r.previousSecret, r.previousValid = r.cookieSecret, true
+		r.cookieSecret = next
 		r.cookieVersion++
 		r.cookieRotated = time.Now()
 	}
 	secret, version := r.cookieSecret, r.cookieVersion
+	previous, havePrevious := r.previousSecret, r.previousValid
 	r.mu.Unlock()
 	if !pressure {
 		return false, nil
 	}
 	expected := cookieValue(secret, version, ni, spiI, endpoint)
+	accepted := [][]byte{expected}
+	if havePrevious {
+		accepted = append(accepted, cookieValue(previous, version-1, ni, spiI, endpoint))
+	}
 	for _, payload := range request.Payloads {
 		if payload.Type != PayloadN {
 			continue
 		}
 		notify, err := DecodeNotify(payload.Body)
-		if err == nil && notify.Type == N_COOKIE && hmac.Equal(notify.Data, expected) {
-			return false, nil
+		if err != nil || notify.Type != N_COOKIE {
+			continue
+		}
+		for _, candidate := range accepted {
+			if hmac.Equal(notify.Data, candidate) {
+				return false, nil
+			}
 		}
 	}
 	header := Header{SPIInitiator: spiI, ExchangeType: IKE_SA_INIT, Flags: FlagResponse, MessageID: 0}
@@ -838,6 +863,13 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 		for _, transform := range proposal.Transforms {
 			switch transform.Type {
 			case TransEncr, TransPRF, TransDH:
+			case TransInteg:
+				// RFC 7296 section 3.3.3 makes an integrity transform optional
+				// for IKE, and a peer that spells out NONE alongside an AEAD
+				// cipher is saying the same thing as omitting it. Anything
+				// else is a transform this implementation cannot use, because
+				// every cipher it offers is combined mode.
+				known = known && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes
 			default:
 				known = false
 			}
@@ -875,12 +907,8 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 			}
 			continue
 		}
-		keyBits := encr.KeyLengthBits
-		if encr.ID == ENCR_CHACHA20_POLY1305 {
-			keyBits = 256
-		}
 		selected := Proposal{Number: proposal.Number, Protocol: ProtoIKE, Transforms: []Transform{encr, prfT, dhT}}
-		return selected, SASuite{EncrID: encr.ID, EncrKeyBits: keyBits, PRFID: prfT.ID, DHGroup: dhT.ID}, nil
+		return selected, SASuite{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, PRFID: prfT.ID, DHGroup: dhT.ID}, nil
 	}
 	if preferredGroup != 0 {
 		return Proposal{}, SASuite{}, &invalidKEError{preferredGroup}

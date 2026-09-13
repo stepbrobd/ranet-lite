@@ -11,10 +11,16 @@ import (
 // header matches the outstanding exchange (RFC 7296 section 2.21). Once the
 // tag verifies, syntax errors are returned to the caller rather than retried.
 func encryptedRoundTrip(mux *transport.Mux, ctx *ikeContext, req []byte) (*Message, []RawPayload, error) {
+	return encryptedRoundTripWithin(mux, ctx, req, maxRetransmits)
+}
+
+// encryptedRoundTripWithin is encryptedRoundTrip with its own retransmission
+// budget, for an exchange whose answer this end does not depend on.
+func encryptedRoundTripWithin(mux *transport.Mux, ctx *ikeContext, req []byte, attempts int) (*Message, []RawPayload, error) {
 	var response *Message
 	var first PayloadType
 	var plain []byte
-	_, err := sendRecv(mux, req, func(raw []byte) bool {
+	_, err := sendRecvWithin(mux, req, attempts, func(raw []byte) bool {
 		m, err := DecodeMessage(raw)
 		if err != nil {
 			return false
@@ -44,6 +50,11 @@ func encryptedRoundTrip(mux *transport.Mux, ctx *ikeContext, req []byte) (*Messa
 // lets each exchange decide what counts as a real response worth stopping
 // for; a nil accept treats any correlated response as final.
 func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte, error) {
+	return sendRecvWithin(mux, req, maxRetransmits, accept)
+}
+
+// sendRecvWithin is sendRecv with the retransmission budget as a parameter.
+func sendRecvWithin(mux *transport.Mux, req []byte, attempts int, accept func([]byte) bool) ([]byte, error) {
 	reqHdr, err := decodeHeader(req)
 	if err != nil {
 		return nil, err
@@ -53,7 +64,7 @@ func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte,
 	if err := mux.RegisterIKE(reqHdr.SPIInitiator); err != nil {
 		return nil, err
 	}
-	for attempt := 0; attempt < maxRetransmits; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if err := mux.SendIKE(req); err != nil {
 			return nil, err
 		}

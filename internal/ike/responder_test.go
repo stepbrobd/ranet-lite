@@ -89,8 +89,8 @@ func (h *responderHarness) dial(t *testing.T) (*Session, error) {
 }
 
 // Initiate is the blocking form, and the one the package documents its whole
-// profile on. Nothing in this repository calls it, so without this it is
-// reached by nothing at all and could stop compiling to the same thing.
+// profile on. Only the cmd test binaries call it, so without this no test
+// reaches it and it could stop compiling to the same thing.
 func TestInitiateIsInitiateContextWithNoDeadline(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	session, err := Initiate(h.peerConfig())
@@ -306,6 +306,31 @@ func TestSelectIKEProposalPrefersOurOrderAndReportsGroup(t *testing.T) {
 		)
 		if _, _, err := selectIKEProposal(body, DH_CURVE25519); err == nil {
 			t.Fatal("an unknown transform type was accepted")
+		}
+	})
+	// RFC 7296 section 3.3.3 makes an integrity transform optional for IKE,
+	// and a peer that spells out NONE alongside an AEAD cipher is saying the
+	// same thing as omitting it. strongSwan and libreswan both write it out.
+	t.Run("takes an offer that spells out INTEG NONE", func(t *testing.T) {
+		body := offer(
+			Transform{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+			Transform{Type: TransPRF, ID: PRF_HMAC_SHA2_256},
+			Transform{Type: TransInteg, ID: INTEG_NONE},
+			Transform{Type: TransDH, ID: DH_CURVE25519},
+		)
+		if _, _, err := selectIKEProposal(body, DH_CURVE25519); err != nil {
+			t.Fatalf("an offer naming INTEG NONE was refused: %v", err)
+		}
+	})
+	t.Run("rejects an integrity transform it cannot use", func(t *testing.T) {
+		body := offer(
+			Transform{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+			Transform{Type: TransPRF, ID: PRF_HMAC_SHA2_256},
+			Transform{Type: TransInteg, ID: 12},
+			Transform{Type: TransDH, ID: DH_CURVE25519},
+		)
+		if _, _, err := selectIKEProposal(body, DH_CURVE25519); err == nil {
+			t.Fatal("an integrity transform this implementation has no key for was accepted")
 		}
 	})
 	t.Run("rejects an offer with no cipher in common", func(t *testing.T) {
@@ -1119,7 +1144,7 @@ func TestHalfOpenShareIsPerAddressNotPerFlow(t *testing.T) {
 // IPCOMP_SUPPORTED notify) are not acceptable for the responder".
 // AUTHENTICATION_FAILED is defined there as
 // the answer to an IKE_AUTH message, and this exchange has not reached one.
-func TestResponderRefusesAnOfferItCannotAuthenticate(t *testing.T) {
+func TestResponderRefusesOfferItCannotAuthenticate(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	mux, err := h.initiator.NewMux(net.ParseIP("127.0.0.1"), h.remotePort)
 	if err != nil {
@@ -1163,7 +1188,7 @@ func TestResponderRefusesAnOfferItCannotAuthenticate(t *testing.T) {
 // forging a victim's address takes the victim's whole share below the
 // threshold, at sixteen packets every thirty seconds, and the victim is then
 // refused in silence for as long as the attacker keeps it up.
-func TestOneAddressCannotSpendItsShareWithoutACookie(t *testing.T) {
+func TestOneAddressCannotSpendItsShareWithoutCookie(t *testing.T) {
 	hub, err := transport.NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1202,5 +1227,78 @@ func TestOneAddressCannotSpendItsShareWithoutACookie(t *testing.T) {
 	}
 	if r.halfOpen >= cookieThreshold {
 		t.Fatalf("the global threshold was reached at %d, so this proves nothing about the per-address one", r.halfOpen)
+	}
+}
+
+// A cookie is issued and echoed a round trip apart. Rotating the secret in
+// between refused every cookie in flight, and RFC 7296 section 2.6's retry
+// carries the one cookie the initiator was given, so the exchange then failed
+// on a cookie that could never be accepted. The per-address pressure term
+// makes "under pressure" the ordinary state for any address holding two
+// half-open exchanges, so the rotation is no longer a load condition.
+func TestCookieSurvivesRotationThatFollowsIt(t *testing.T) {
+	hub, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	r := &Responder{}
+	r.cfg.Hub = hub
+	if _, err := rand.Read(r.cookieSecret[:]); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := observedEndpoint(t, hub, randUint64Nonzero())
+	nonce := bytes.Repeat([]byte{7}, 32)
+	// Enough half-open exchanges from this address that a cookie is demanded.
+	r.halfOpenBySource = map[netip.Addr]int{endpoint.AddrPort().Addr(): halfOpenPerSourceWithoutCookie}
+	r.cookieRotated = time.Now()
+
+	issued := cookieValue(r.cookieSecret, r.cookieVersion, nonce, 1, endpoint)
+	echoed := &Message{Payloads: []RawPayload{
+		{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_COOKIE, Data: issued})},
+	}}
+	if required, err := r.cookieRequired(echoed, nonce, 1, endpoint); err != nil || required {
+		t.Fatalf("the responder refused the cookie it had just issued: required=%v err=%v", required, err)
+	}
+
+	// The secret rotates while the retry is still on the wire.
+	r.cookieRotated = time.Now().Add(-2 * cookieLifetime)
+	if required, err := r.cookieRequired(echoed, nonce, 1, endpoint); err != nil || required {
+		t.Errorf("a cookie in flight through a rotation was refused: required=%v err=%v", required, err)
+	}
+	if !r.previousValid {
+		t.Fatal("no rotation happened, so this proves nothing")
+	}
+
+	// One generation is all that is kept: a cookie two rotations old is older
+	// than the lifetime it was issued under.
+	r.cookieRotated = time.Now().Add(-2 * cookieLifetime)
+	if required, err := r.cookieRequired(echoed, nonce, 1, endpoint); err != nil || !required {
+		t.Errorf("a cookie two rotations old was still accepted: required=%v err=%v", required, err)
+	}
+}
+
+// RFC 7296 section 2.21.2 leaves the IKE SA created when only the Child SA
+// bundled into IKE_AUTH fails, and the initiator "MUST close it by sending an
+// INFORMATIONAL exchange with a Delete payload". This responder closes its mux
+// with that response, so the Delete is never answered. Retransmitting it to
+// the end of the ordinary budget delayed the dial's failure by sixty-two
+// seconds for a result the response had already named.
+func TestTearingDownUnusableIKESADoesNotSpendTheWholeBudget(t *testing.T) {
+	if teardownRetransmits >= maxRetransmits {
+		t.Fatalf("the teardown budget is %d of %d attempts, so nothing is bounded", teardownRetransmits, maxRetransmits)
+	}
+	var budget time.Duration
+	for attempt := range teardownRetransmits {
+		budget += retransmitDelay(attempt + 1)
+	}
+	var full time.Duration
+	for attempt := range maxRetransmits {
+		full += retransmitDelay(attempt + 1)
+	}
+	// runPeer redials every ten seconds, so a teardown that outlasts that
+	// delays the next attempt rather than the failed one.
+	if budget > 10*time.Second {
+		t.Errorf("a Delete nobody answers costs %s, out of the %s an exchange that matters gets", budget, full)
 	}
 }

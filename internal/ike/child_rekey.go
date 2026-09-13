@@ -97,7 +97,7 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		return fmt.Errorf("ike: Child SA negotiation request: %w", err)
 	}
 
-	payloads, err := decodeChildNegotiationResponse(response)
+	payloads, err := decodeChildNegotiationResponse(response, context.suite.PRFID)
 	if err != nil {
 		return err
 	}
@@ -154,7 +154,7 @@ func (e *childNegotiationRejectedError) Error() string {
 	return fmt.Sprintf("ike: Child SA negotiation rejected: notify type %d", e.notify.Type)
 }
 
-func decodeChildNegotiationResponse(response []RawPayload) (childExchangePayloads, error) {
+func decodeChildNegotiationResponse(response []RawPayload, prfID uint16) (childExchangePayloads, error) {
 	payloads, err := parseChildExchangePayloads(response)
 	if err != nil {
 		return childExchangePayloads{}, fmt.Errorf("ike: invalid Child SA negotiation response: %w", err)
@@ -167,7 +167,7 @@ func decodeChildNegotiationResponse(response []RawPayload) (childExchangePayload
 			return childExchangePayloads{}, &childNegotiationRejectedError{notify: notify}
 		}
 	}
-	if err := validateCompleteChildExchange(payloads); err != nil {
+	if err := validateCompleteChildExchange(payloads, prfID); err != nil {
 		return childExchangePayloads{}, fmt.Errorf("ike: invalid Child SA negotiation response: %w", err)
 	}
 	if payloads.ke != nil {
@@ -203,7 +203,7 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 		// after state loss, RFC 7296 §2.25 expects creation from scratch.
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_ADDITIONAL_SAS)
 	}
-	payloads, err := decodeChildExchangePayloads(inner)
+	payloads, err := decodeChildExchangePayloads(inner, ctx.suite.PRFID)
 	if err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}

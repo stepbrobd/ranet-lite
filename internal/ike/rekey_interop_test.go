@@ -45,7 +45,7 @@ func TestPeerChildRekeyWithPFS(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				payloads, err := decodeChildExchangePayloads(inner)
+				payloads, err := decodeChildExchangePayloads(inner, PRF_HMAC_SHA2_256)
 				if err != nil || payloads.ke == nil {
 					t.Fatalf("invalid PFS response: %v, %v", inner, err)
 				}
@@ -240,7 +240,8 @@ func TestHandleChildRekeyRefusesSecondRekeyInSameInterval(t *testing.T) {
 	}
 }
 
-// The same rule on the CREATE_CHILD_SA response path, which has its own copy.
+// ChaCha20-Poly1305 carries no KEY_LENGTH attribute, and the CREATE_CHILD_SA
+// response path has its own copy of the rule that suppresses it.
 func TestChaChaChildRekeyResponseEchoesNoKeyLength(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
@@ -275,7 +276,7 @@ func TestChaChaChildRekeyResponseEchoesNoKeyLength(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payloads, err := decodeChildExchangePayloads(inner)
+	payloads, err := decodeChildExchangePayloads(inner, PRF_HMAC_SHA2_256)
 	if err != nil {
 		t.Fatalf("the rekey was refused rather than answered: %v, %v", inner, err)
 	}

@@ -64,12 +64,12 @@ type childExchangePayloads struct {
 	notifies                []Notify
 }
 
-func decodeChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, error) {
+func decodeChildExchangePayloads(payloads []RawPayload, prfID uint16) (childExchangePayloads, error) {
 	out, err := parseChildExchangePayloads(payloads)
 	if err != nil {
 		return childExchangePayloads{}, err
 	}
-	if err := validateCompleteChildExchange(out); err != nil {
+	if err := validateCompleteChildExchange(out, prfID); err != nil {
 		return childExchangePayloads{}, err
 	}
 	return out, nil
@@ -116,14 +116,27 @@ func parseChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, e
 	return out, nil
 }
 
-func validateCompleteChildExchange(payloads childExchangePayloads) error {
-	if payloads.sa == nil || payloads.nonce == nil || payloads.tsi == nil || payloads.tsr == nil || !validNonce(payloads.nonce.Body) {
+func validateCompleteChildExchange(payloads childExchangePayloads, prfID uint16) error {
+	if payloads.sa == nil || payloads.nonce == nil || payloads.tsi == nil || payloads.tsr == nil ||
+		!validNonceFor(payloads.nonce.Body, prfID) {
 		return fmt.Errorf("ike: incomplete Child SA exchange")
 	}
 	return nil
 }
 
+// validNonce is RFC 7296 section 2.10 without its second half: "Nonces used in
+// IKEv2 MUST be randomly chosen, MUST be at least 128 bits in size, and MUST
+// be at least half the key size of the negotiated pseudorandom function." It
+// is what the responder can check on an IKE_SA_INIT request, where the nonce
+// arrives alongside the proposals the PRF is still to be chosen from.
 func validNonce(nonce []byte) bool { return len(nonce) >= 16 && len(nonce) <= 256 }
+
+// validNonceFor adds the second half, for every exchange whose PRF is settled.
+// The PRFs here are HMAC constructions, whose preferred key size is their
+// output size, so a 16 byte nonce is short for HMAC-SHA2-384.
+func validNonceFor(nonce []byte, prfID uint16) bool {
+	return validNonce(nonce) && len(nonce) >= PRFOutputLen(prfID)/2
+}
 
 func canonicalEncryptionTransform(t Transform) (Transform, error) {
 	if t.Type != TransEncr {

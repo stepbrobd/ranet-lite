@@ -87,14 +87,18 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 		if count == 0 || count > 4 || len(b) < count {
 			return 0, nil, nil, fmt.Errorf("ike: unsupported DER length")
 		}
+		// DER requires the shortest encoding: a long form below 128, or one
+		// carrying a leading zero octet, is a second spelling of a length that
+		// already has one. Accepting both makes two byte sequences decode to
+		// the same name, and a peer's identity is the name this reads out.
+		if b[0] == 0 {
+			return 0, nil, nil, fmt.Errorf("ike: non-minimal DER length")
+		}
 		length = 0
 		for _, octet := range b[:count] {
 			length = length<<8 | int(octet)
 		}
 		b = b[count:]
-		// DER requires the shortest encoding, so a long form below 128 or
-		// with a leading zero octet is a different encoding of the same
-		// value, which would break the byte-exact identity comparison.
 		if length < 128 {
 			return 0, nil, nil, fmt.Errorf("ike: non-minimal DER length")
 		}
@@ -113,7 +117,9 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 // while strongSwan picks the type from the characters in the value, so the
 // same name reaches the wire in either form. The name is not what
 // authenticates a peer: AUTH signs the bytes actually received, so a
-// re-encoded name still needs that peer's key to be accepted.
+// re-encoded name still needs that peer's key to be accepted. Identities are
+// compared as parsed names rather than as bytes, which is what makes that
+// tolerance safe.
 func derAttribute(rdn []byte) (oid []byte, value string, err error) {
 	setTag, set, rest, err := derElement(rdn)
 	if err != nil {

@@ -246,7 +246,7 @@ func TestChildNotFoundRecoveryCreatesNewChild(t *testing.T) {
 	if second.exchange != CREATE_CHILD_SA || findType(second.inner, PayloadN) != nil {
 		t.Fatalf("replacement request still contains REKEY_SA: %#v", second.inner)
 	}
-	requestPayloads, err := decodeChildExchangePayloads(second.inner)
+	requestPayloads, err := decodeChildExchangePayloads(second.inner, PRF_HMAC_SHA2_256)
 	if err != nil {
 		t.Fatalf("invalid replacement request: %v", err)
 	}
@@ -331,7 +331,7 @@ func driveChildRekey(t *testing.T, s *Session, old ChildSA, respond func(*localR
 	go func() { done <- s.RekeyChild() }()
 
 	rekey := <-s.requests
-	payloads, err := decodeChildExchangePayloads(rekey.inner)
+	payloads, err := decodeChildExchangePayloads(rekey.inner, PRF_HMAC_SHA2_256)
 	if err != nil {
 		t.Fatalf("invalid rekey request: %v", err)
 	}
@@ -447,5 +447,53 @@ func TestPeerChildRekeysAreRateLimited(t *testing.T) {
 	s.started = s.started.Add(-minPeerChildRekeyInterval)
 	if !s.allowPeerChildRekey() {
 		t.Error("a peer rekey was still refused a whole interval later")
+	}
+}
+
+// A peer owes a Delete for the Child SA a rekey replaced, and is free not to
+// send one. While the replaced SA is still latched, every rekey in both
+// directions is refused, so a peer that rekeys once and goes quiet would lock
+// the session out of rekeying for its whole life. It is retired on the timer
+// instead, and its inbound keys drain like any other replaced SA.
+func TestReplacedChildSAThePeerNeverDeletesIsRetiredAnyway(t *testing.T) {
+	mine, _ := lifecycleMuxes(t)
+	s := &Session{mux: mine}
+	const replaced, current = uint32(0x11111111), uint32(0x22222222)
+	retired := make(chan uint32, 4)
+	s.SetChildRetireHandler(func(spi uint32) error { retired <- spi; return nil })
+	if err := mine.RegisterESP(replaced); err != nil {
+		t.Fatal(err)
+	}
+	s.childMu.Lock()
+	s.Child = ChildSA{LocalSPI: current}
+	s.retiring = ChildSA{LocalSPI: replaced}
+	s.retiringBy = time.Now().Add(retirementDeadline)
+	s.childMu.Unlock()
+
+	// Held for as long as the peer's Delete could still arrive.
+	if err := s.expireRetiredChildren(time.Now().Add(retirementDeadline - time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if s.retiringChild().LocalSPI != replaced {
+		t.Fatal("the replaced SA was dropped while the peer's Delete could still arrive")
+	}
+	when, ok := s.nextRetirement()
+	if !ok || when.IsZero() {
+		t.Fatal("nothing wakes the control loop to give up on a Delete that is not coming")
+	}
+
+	if err := s.expireRetiredChildren(time.Now().Add(retirementDeadline)); err != nil {
+		t.Fatal(err)
+	}
+	if s.retiringChild().LocalSPI != 0 {
+		t.Error("the replaced SA is still latched, so every later rekey is refused")
+	}
+	select {
+	case spi := <-retired:
+		if spi != replaced {
+			t.Errorf("retired SPI %08x, want the replaced %08x", spi, replaced)
+		}
+	default:
+		t.Error("the replaced SA's inbound keys were never dropped")
 	}
 }

@@ -166,3 +166,44 @@ func TestRequestOnRetiredIKESAFailsRatherThanPends(t *testing.T) {
 		t.Error("a retained collision candidate reports as retired")
 	}
 }
+
+// RFC 7296 section 2.8.2 makes the Delete for a replaced or redundant IKE SA a
+// SHOULD, and handleIKERekey refuses every peer-initiated rekey while either
+// is still held. A peer that rekeys once and never sends the Delete would
+// otherwise lock this end out of rekeying for the life of the session, which
+// is the shape retirementDeadline already stops for a Child SA.
+func TestRetainedIKESAThePeerNeverDeletesIsGivenUp(t *testing.T) {
+	mine, theirs := lifecycleMuxes(t)
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	replaced := &ikeContext{suite: suite, spiI: 11, spiR: 12}
+	redundant := &ikeContext{suite: suite, spiI: 21, spiR: 22}
+	s := &Session{mux: mine, current: &ikeContext{suite: suite, spiI: 31, spiR: 32}}
+	for _, spi := range []uint64{replaced.spiI, redundant.spiI} {
+		if err := mine.RegisterIKE(spi); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.stateMu.Lock()
+	s.retainOldLocked(replaced)
+	s.retainCollisionLocked(redundant)
+	s.stateMu.Unlock()
+	if _, ok := s.nextRetainedExpiry(); !ok {
+		t.Fatal("nothing wakes the control loop to give up on a Delete that is not coming")
+	}
+
+	// Held for as long as the peer's Delete could still be in flight.
+	s.expireRetainedContexts(time.Now().Add(retainedContextDeadline - time.Second))
+	if s.contextRetired(replaced) || s.contextRetired(redundant) {
+		t.Fatal("an SA was dropped while the peer's Delete could still be outstanding")
+	}
+
+	s.expireRetainedContexts(time.Now().Add(retainedContextDeadline))
+	if !s.contextRetired(replaced) || !s.contextRetired(redundant) {
+		t.Error("an SA the peer never deleted is still held, so every later peer rekey is refused")
+	}
+	for _, spi := range []uint64{replaced.spiI, redundant.spiI} {
+		if err := theirs.RegisterIKE(spi); err != nil {
+			t.Errorf("SPI %016x is still routed to a session that gave up on it: %v", spi, err)
+		}
+	}
+}

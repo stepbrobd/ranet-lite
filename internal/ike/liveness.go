@@ -221,6 +221,7 @@ func (s *Session) Run(ctx context.Context) error {
 		if err := s.expireRetiredChildren(time.Now()); err != nil {
 			return err
 		}
+		s.expireRetainedContexts(time.Now())
 		select {
 		case result := <-rekeyResult:
 			if result.err != nil {
@@ -281,6 +282,9 @@ func (s *Session) Run(ctx context.Context) error {
 		// of the things the loop actually waits for.
 		if retire, ok := s.nextRetirement(); ok && retire.Before(deadline) {
 			deadline = retire
+		}
+		if expiry, ok := s.nextRetainedExpiry(); ok && expiry.Before(deadline) {
+			deadline = expiry
 		}
 
 		// Everything this loop reacts to is selectable, so it sleeps until one

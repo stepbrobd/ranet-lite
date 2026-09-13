@@ -105,7 +105,7 @@ func (s *Session) RekeyIKE() error {
 			ke = &response[i]
 		}
 	}
-	if sa == nil || nonce == nil || ke == nil || !validNonce(nonce.Body) {
+	if sa == nil || nonce == nil || ke == nil {
 		return fmt.Errorf("ike: incomplete IKE SA rekey response")
 	}
 	props, err := DecodeSA(sa.Body)
@@ -120,6 +120,11 @@ func (s *Session) RekeyIKE() error {
 	}
 	if suite.DHGroup != group {
 		return fmt.Errorf("ike: IKE SA rekey chose DH group %d, want %d", suite.DHGroup, group)
+	}
+	// Checked here rather than with the other payloads, because half the rule
+	// is the key size of the PRF this proposal just settled.
+	if !validNonceFor(nonce.Body, suite.PRFID) {
+		return fmt.Errorf("ike: IKE SA rekey nonce length %d is short for the negotiated PRF", len(nonce.Body))
 	}
 	for _, selected := range props[0].Transforms {
 		matched := false
@@ -164,9 +169,9 @@ func (s *Session) RekeyIKE() error {
 			// Both the winner and the redundant context must remain visible
 			// to dispatch while the Delete exchange is outstanding.
 			s.stateMu.Lock()
-			s.old = old
+			s.retainOldLocked(old)
 			s.current = collision
-			s.collision = newContext
+			s.retainCollisionLocked(newContext)
 			s.stateMu.Unlock()
 			// The redundant SA goes whether or not the peer answers. Leaving
 			// it in s.collision refuses every later peer rekey, and the next
@@ -187,22 +192,25 @@ func (s *Session) RekeyIKE() error {
 			}
 			return nil
 		}
+		// The redundant SA is the one the peer created, and RFC 7296 section
+		// 2.8.2 leaves it to its creator: "The new IKE SA containing the
+		// lowest nonce SHOULD be deleted by the node that created it." This
+		// end deleting it too put two Deletes on the wire at once. The peer's
+		// arrives first, because it was sent before ours could have reached
+		// it, and answering it retires the SA our own Delete is outstanding
+		// on, so that exchange fails with contextRetired and RekeyIKE returns
+		// before registering the winning SA: the peer holds the new SA as
+		// current, this end never does, and the session dies of unanswered
+		// liveness checks. It stays registered so the peer's Delete can be
+		// answered, and expireRetainedContexts gives up on a Delete that
+		// never comes.
 		slog.Info("ike simultaneous rekey selected local candidate")
-		if _, err := s.requestOnLocked(collision, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
-			return fmt.Errorf("ike: delete redundant peer IKE SA: %w", err)
-		}
-		s.mux.UnregisterIKE(collision.spiI)
-		s.stateMu.Lock()
-		if s.collision == collision {
-			s.collision = nil
-		}
-		s.stateMu.Unlock()
 	}
 	if err := s.mux.RegisterIKE(spiI); err != nil {
 		return fmt.Errorf("ike: register rekeyed IKE SA: %w", err)
 	}
 	s.stateMu.Lock()
-	s.old = old
+	s.retainOldLocked(old)
 	s.current = newContext
 	s.stateMu.Unlock()
 
@@ -253,6 +261,8 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	if sa == nil || nonce == nil || ke == nil || !validNonce(nonce.Body) {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
+	// The rest of RFC 7296 section 2.10 needs the PRF, which the proposal
+	// below settles; see the second check after suiteFromProposal.
 	props, err := DecodeSA(sa.Body)
 	if err != nil || len(props) == 0 {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
@@ -293,6 +303,11 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		// uses a different group.
 		return s.responseNotifyData(ctx, msgID, CREATE_CHILD_SA, N_INVALID_KE_PAYLOAD, data)
 	}
+	// The PRF is settled now, so the rest of RFC 7296 section 2.10 can be
+	// applied to the nonce that arrived with the proposal.
+	if !validNonceFor(nonce.Body, suite.PRFID) {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
 	spiI := binary.BigEndian.Uint64(selectedProposal.SPI)
 	dh, err := GenerateDH(group)
 	if err != nil {
@@ -320,9 +335,9 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	if local != nil && local.old == ctx {
 		local.peerNonce = append([]byte(nil), nonce.Body...)
 		local.peerResponseNonce = append([]byte(nil), nr...)
-		s.collision = newContext
+		s.retainCollisionLocked(newContext)
 	} else {
-		s.old = ctx
+		s.retainOldLocked(ctx)
 		s.current = newContext
 	}
 	s.stateMu.Unlock()

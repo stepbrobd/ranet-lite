@@ -80,7 +80,10 @@ const (
 	PRF_HMAC_SHA2_256 uint16 = 5
 	PRF_HMAC_SHA2_384 uint16 = 6
 
-	// Integrity (Transform Type 3) — none needed when using an AEAD cipher.
+	// Integrity (Transform Type 3). An AEAD cipher needs none, and RFC 7296
+	// section 3.3.3 lets a peer say so either by omitting the transform or by
+	// offering NONE.
+	INTEG_NONE uint16 = 0
 
 	// DH groups (Transform Type 4)
 	DH_ECP_256    uint16 = 19

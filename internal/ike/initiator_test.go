@@ -870,38 +870,9 @@ func TestSessionRekeyIKECollisionKeepsHigherNonceCandidate(t *testing.T) {
 			return
 		}
 
-		n, _, err = peer.ReadFromUDP(buf)
-		if err != nil {
-			t.Errorf("read loser delete: %v", err)
-			return
-		}
-		deleteRaw := append([]byte(nil), buf[4:n]...)
-		deleteMessage, err := DecodeMessage(deleteRaw)
-		if err != nil {
-			t.Errorf("decode loser delete: %v", err)
-			return
-		}
-		deleteInner, err := DecryptMessage(suite, collisionKeys.SKer, deleteRaw, deleteMessage)
-		deletePayload := findType(deleteInner, PayloadD)
-		if err != nil || deletePayload == nil {
-			t.Errorf("invalid loser delete: %v", err)
-			return
-		}
-		deleteRequest, err := DecodeDelete(deletePayload.Body)
-		if err != nil || deleteMessage.Header.SPIInitiator != peerSPIi || deleteMessage.Header.SPIResponder != peerSPIr || deleteRequest.Protocol != ProtoIKE {
-			t.Errorf("loser delete = %#v, %#v, %v", deleteMessage.Header, deleteRequest, err)
-			return
-		}
-		deleteResponse, err := EncryptMessage(suite, collisionKeys.SKei, Header{SPIInitiator: peerSPIi, SPIResponder: peerSPIr, ExchangeType: INFORMATIONAL, Flags: FlagInitiator | FlagResponse, MessageID: deleteMessage.Header.MessageID}, nil, nil)
-		if err != nil {
-			t.Errorf("build loser delete response: %v", err)
-			return
-		}
-		if _, err := peer.WriteToUDP(withNonESPMarker(deleteResponse), addr); err != nil {
-			t.Errorf("write loser delete response: %v", err)
-			return
-		}
-
+		// The winner sends exactly one Delete, for the SA its rekey replaced.
+		// RFC 7296 section 2.8.2 leaves the redundant candidate to the node
+		// that created it, which here is the peer.
 		n, _, err = peer.ReadFromUDP(buf)
 		if err != nil {
 			t.Errorf("read replaced-context delete: %v", err)
@@ -926,6 +897,34 @@ func TestSessionRekeyIKECollisionKeepsHigherNonceCandidate(t *testing.T) {
 		}
 		if _, err := peer.WriteToUDP(withNonESPMarker(oldDeleteResponse), addr); err != nil {
 			t.Errorf("write replaced-context delete response: %v", err)
+			return
+		}
+
+		// And the peer retires its own losing candidate, which this end has
+		// kept routable for exactly that.
+		loserDelete, err := EncryptMessage(suite, collisionKeys.SKei, Header{SPIInitiator: peerSPIi, SPIResponder: peerSPIr, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: 0}, nil, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}})
+		if err != nil {
+			t.Errorf("build loser delete: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(loserDelete), addr); err != nil {
+			t.Errorf("write loser delete: %v", err)
+			return
+		}
+		n, _, err = peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read loser delete response: %v", err)
+			return
+		}
+		loserRaw := append([]byte(nil), buf[4:n]...)
+		loserResponse, err := DecodeMessage(loserRaw)
+		if err != nil {
+			t.Errorf("decode loser delete response: %v", err)
+			return
+		}
+		if _, err := DecryptMessage(suite, collisionKeys.SKer, loserRaw, loserResponse); err != nil {
+			t.Errorf("invalid loser delete response: %v", err)
+			return
 		}
 	}()
 
