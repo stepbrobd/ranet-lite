@@ -93,6 +93,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 					} else {
 						n.measuredRTT, n.haveRTT = rtt, true
 					}
+					n.rttExpiry = n.ihuExpiry
 				}
 			}
 			linkChanged = true

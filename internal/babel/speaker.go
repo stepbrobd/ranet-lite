@@ -434,6 +434,9 @@ func (s *Speaker) sweepExpiredLocked(now time.Time) {
 		if n.haveReportedCost && !now.Before(n.ihuExpiry) {
 			n.haveReportedCost = false
 		}
+		if n.haveRTT && !now.Before(n.rttExpiry) {
+			n.haveRTT = false
+		}
 	}
 	// Selection reruns for every prefix, which covers both the link costs that
 	// have just gone infinite and the routes that have expired. The routes of

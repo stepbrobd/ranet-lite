@@ -138,3 +138,35 @@ func TestUpdateWithZeroIntervalIsIgnored(t *testing.T) {
 		t.Errorf("a retraction was ignored (err %v)", err)
 	}
 }
+
+// The RFC 9616 timestamps are read off a wall clock, so a step makes
+// validTimestampGap reject every sample from then on. Without an expiry the
+// neighbor keeps the last cost it computed for the life of the session, and
+// nothing can correct it.
+func TestAnRTTMeasurementThatStoppedArrivingStopsBeingUsed(t *testing.T) {
+	s, neighbor, _ := captureSpeaker(t, Config{})
+	now := time.Now()
+	s.helloAction(neighbor, 2, now)
+	ihu := EncodeIHU(IHU{RxCost: 32, Interval: 100, HasTS: true,
+		OriginTS: uint32(now.Add(-50 * time.Millisecond).UnixMicro()), ReceiveTS: 1000})
+	hello := EncodeHello(Hello{Seqno: 2, Interval: 100, HasTS: true, TxTS: 11_000})
+	s.handlePacket(neighbor, EncodePacket([]RawTLV{hello, ihu}))
+	if !neighbor.haveRTT {
+		t.Fatal("a valid sample was discarded, so there is nothing here to expire")
+	}
+
+	// Still fresh well before the window is out.
+	s.mu.Lock()
+	s.sweepExpiredLocked(now.Add(time.Millisecond))
+	s.mu.Unlock()
+	if !neighbor.haveRTT {
+		t.Error("a measurement that had just arrived was already treated as stale")
+	}
+
+	s.mu.Lock()
+	s.sweepExpiredLocked(neighbor.rttExpiry.Add(time.Millisecond))
+	s.mu.Unlock()
+	if neighbor.haveRTT {
+		t.Error("a measurement that stopped arriving is still costing this link")
+	}
+}
