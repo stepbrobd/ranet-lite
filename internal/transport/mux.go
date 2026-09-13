@@ -16,6 +16,14 @@ import (
 )
 
 const (
+	// nonESPMarkerLen is the four zero octets of RFC 3948 section 2.2 that
+	// tell an IKE message from an ESP packet on one port. The same length test
+	// discards the one byte 0xff NAT keepalive of section 4, which satisfies
+	// "The receiver SHOULD ignore a received NAT-keepalive packet" by arriving
+	// at the same place rather than by name. This end never sends one: the
+	// mapping is refreshed far more often than the twenty second default by
+	// the babel hellos inside ESP, and internal/ike/natt.go says why nothing
+	// here acts on NAT detection either.
 	nonESPMarkerLen = 4
 	readBufferSize  = 65536
 	espSendBatch    = 128
@@ -61,6 +69,13 @@ type Hub struct {
 	// Reading the counter is what an operator needs; the log line only has to
 	// point at it.
 	dropped atomic.Uint64
+	// refused counts datagrams this node read and did not deliver because
+	// nothing here wanted them: too short to carry an SPI, or naming an SPI no
+	// Mux holds. Anyone who can reach the port can raise it, which is why it
+	// is a counter and not a log line, and why it is separate from dropped: a
+	// rising dropped means this node is behind on receive, and mixing the two
+	// would make the one number an operator watches unreadable.
+	refused atomic.Uint64
 	// reported is nanoseconds since started, which is read through time.Since
 	// so it comes from the monotonic clock: on the wall clock a step backwards
 	// silences the report for the length of the step. It starts one interval
@@ -78,6 +93,10 @@ const dropReportInterval = 10 * time.Second
 // is the inbound counterpart of Peer.Dropped, and the only signal that this
 // node is behind on receive rather than losing packets on the wire.
 func (h *Hub) Dropped() uint64 { return h.dropped.Load() }
+
+// Refused is how many inbound datagrams this node read and had nowhere to put:
+// see Hub.refused.
+func (h *Hub) Refused() uint64 { return h.refused.Load() }
 
 // noteDrop counts refused datagrams and reports them at most once an interval.
 func (h *Hub) noteDrop(count int, reason string) {
@@ -118,7 +137,10 @@ type packetBind interface {
 }
 
 // A receiver owns its buffers; their views remain valid until its next call.
-type receiveFunc func([][]byte, []int, []Endpoint) (int, error)
+// receiveFunc fills the vectors and reports how many datagrams it produced
+// and how many it read and could not use, which the hub counts so an operator
+// can tell a receive path that is discarding from one that is idle.
+type receiveFunc func([][]byte, []int, []Endpoint) (n, refused int, err error)
 
 // Datagram is one received IKE message and the endpoint it arrived from.
 type Datagram struct {
@@ -268,7 +290,10 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 	ikeDatagrams := make([]pendingIKE, 0, batch)
 	unclaimed := make([]int, 0, batch)
 	for {
-		n, err := fn(bufs, sizes, eps)
+		n, refused, err := fn(bufs, sizes, eps)
+		if refused > 0 {
+			h.refused.Add(uint64(refused))
+		}
 		if err != nil {
 			if h.closed.Load() {
 				h.fail(fmt.Errorf("transport: closed"))
@@ -280,22 +305,31 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 		clear(espBatches)
 		ikeDatagrams = ikeDatagrams[:0]
 		unclaimed = unclaimed[:0]
+		unwanted := 0
 		h.mu.Lock()
 		for i := 0; i < n; i++ {
 			raw := bufs[i][:sizes[i]]
+			// Every arm that reaches no Mux is counted. The SPI is cleartext,
+			// so anyone who can reach the port can send these, which is the
+			// case an operator needs a number for rather than a log line.
 			if len(raw) < nonESPMarkerLen {
+				unwanted++
 				continue
 			}
 			if raw[0]|raw[1]|raw[2]|raw[3] == 0 {
-				if len(raw) >= nonESPMarkerLen+8 {
-					spi := uint64(raw[4])<<56 | uint64(raw[5])<<48 | uint64(raw[6])<<40 | uint64(raw[7])<<32 | uint64(raw[8])<<24 | uint64(raw[9])<<16 | uint64(raw[10])<<8 | uint64(raw[11])
-					if m := h.ike[spi]; m != nil {
-						ikeDatagrams = append(ikeDatagrams, pendingIKE{mux: m, index: i})
-					} else if h.listen != nil && eps[i] != nil {
-						// An SA no Mux owns yet. Only a listening hub keeps
-						// these; otherwise they stay dropped as before.
-						unclaimed = append(unclaimed, i)
-					}
+				if len(raw) < nonESPMarkerLen+8 {
+					unwanted++
+					continue
+				}
+				spi := uint64(raw[4])<<56 | uint64(raw[5])<<48 | uint64(raw[6])<<40 | uint64(raw[7])<<32 | uint64(raw[8])<<24 | uint64(raw[9])<<16 | uint64(raw[10])<<8 | uint64(raw[11])
+				if m := h.ike[spi]; m != nil {
+					ikeDatagrams = append(ikeDatagrams, pendingIKE{mux: m, index: i})
+				} else if h.listen != nil && eps[i] != nil {
+					// An SA no Mux owns yet. Only a listening hub keeps
+					// these; otherwise they stay dropped as before.
+					unclaimed = append(unclaimed, i)
+				} else {
+					unwanted++
 				}
 			} else {
 				spi := uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
@@ -305,10 +339,15 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 					// all packets for a peer into one allocation before fn is
 					// allowed to reuse the buffers.
 					espBatches[m] = append(espBatches[m], raw)
+				} else {
+					unwanted++
 				}
 			}
 		}
 		h.mu.Unlock()
+		if unwanted > 0 {
+			h.refused.Add(uint64(unwanted))
+		}
 		// The queue is tested before the datagram is copied, not after, so a
 		// flood from an unauthenticated peer is refused without allocating for
 		// it. The send still cannot block: a hub runs one receive loop per

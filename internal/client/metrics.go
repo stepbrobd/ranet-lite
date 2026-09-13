@@ -70,15 +70,30 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprint(w, "# HELP ranet_lite_receive_dropped_total Inbound datagrams a full receive queue refused.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_receive_dropped_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_receive_dropped_total %d\n", c.hubDropped())
+
+	// Separate from the line above on purpose: a rising dropped means this
+	// node is behind on receive, while this one means somebody is sending it
+	// datagrams it has nowhere to put. Anyone who can reach the port can raise
+	// either, and mixing them would make the first unreadable.
+	fmt.Fprint(w, "# HELP ranet_lite_receive_refused_total Inbound datagrams naming no SPI this node holds, or too short to name one.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_receive_refused_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_receive_refused_total %d\n", c.hubRefused())
 }
 
-// hubDropped is zero before the hub exists, which is every call from a test
-// that builds a Client by hand.
+// hubDropped and hubRefused are zero before the hub exists, which is every
+// call from a test that builds a Client by hand.
 func (c *Client) hubDropped() uint64 {
 	if c.hub == nil {
 		return 0
 	}
 	return c.hub.Dropped()
+}
+
+func (c *Client) hubRefused() uint64 {
+	if c.hub == nil {
+		return 0
+	}
+	return c.hub.Refused()
 }
 
 // MetricsHandler serves Metrics, for mounting next to the pprof endpoint.

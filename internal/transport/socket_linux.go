@@ -147,8 +147,9 @@ func (s *udpSocket) receiver() receiveFunc {
 	if s.raw != nil {
 		read = newUDPReader(s.raw, messages).read
 	}
-	var count, index, offset, segment int
-	return func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+	var count, index, offset, segment, refused int
+	return func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, int, error) {
+		refused = 0
 		if index == count {
 			var err error
 			count, err = read()
@@ -158,7 +159,7 @@ func (s *udpSocket) receiver() receiveFunc {
 				count, err = read()
 			}
 			if err != nil {
-				return 0, err
+				return 0, 0, err
 			}
 			index, offset, segment = 0, 0, 0
 		}
@@ -167,12 +168,16 @@ func (s *udpSocket) receiver() receiveFunc {
 			m := &messages[index]
 			if offset == 0 {
 				if m.Flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || m.N == 0 {
+					if m.N != 0 {
+						refused++
+					}
 					index++
 					continue
 				}
 				var err error
 				segment, err = udpGROSize(m.OOB[:m.NN])
 				if err != nil {
+					refused++
 					index++
 					continue
 				}
@@ -184,15 +189,16 @@ func (s *udpSocket) receiver() receiveFunc {
 			raw := m.Buffers[0][offset:end]
 			bufs[n], sizes[n], endpoints[n] = raw, len(raw), nil
 			if len(raw) >= 4 && binary.BigEndian.Uint32(raw[:4]) == 0 {
-				// A datagram whose control message will not parse is dropped,
-				// not reported: receiveLoop fails the whole hub on an error,
-				// which closes every session on this node, and the GRO sizing
-				// two branches up already skips the same class of failure.
-				// Without the endpoint the responder cannot answer, so the
-				// datagram is of no use anyway.
+				// A datagram whose control message will not parse is counted
+				// and dropped, not returned as an error: receiveLoop fails the
+				// whole hub on an error, which closes every session on this
+				// node, and the GRO sizing two branches up already skips the
+				// same class of failure. Without the endpoint the responder
+				// cannot answer, so the datagram is of no use anyway.
 				if ep, err := s.replyEndpoint(m); err == nil {
 					endpoints[n] = ep
 				} else {
+					refused++
 					offset = end
 					if offset == m.N {
 						index++
@@ -208,7 +214,7 @@ func (s *udpSocket) receiver() receiveFunc {
 				offset = 0
 			}
 		}
-		return n, nil
+		return n, refused, nil
 	}
 }
 

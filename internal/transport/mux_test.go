@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -780,4 +781,45 @@ func captureTransportLogs(t *testing.T) *bytes.Buffer {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	return &logs
+}
+
+// The SPI is cleartext in every datagram, so anyone who can reach the port can
+// send one this node has nowhere to put. An operator needs to be able to tell
+// that from silence, and from a receive path that is merely behind, which is
+// what the other counter means.
+func TestDatagramsWithNowhereToGoAreCounted(t *testing.T) {
+	hub, err := NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	sender, err := net.Dial("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(hub.LocalAddr().(*net.UDPAddr).Port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	for name, raw := range map[string][]byte{
+		"too short for an spi":      {1, 2},
+		"non-esp marked but short":  {0, 0, 0, 0, 1, 2, 3},
+		"an esp spi nothing claims": {9, 9, 9, 9, 0, 0, 0, 1, 0, 0, 0, 0},
+		"an ike spi nothing claims": {0, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := hub.Refused()
+			if _, err := sender.Write(raw); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for hub.Refused() == before {
+				if time.Now().After(deadline) {
+					t.Fatal("the datagram was discarded without being counted, so a flood reads as silence")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if hub.Dropped() != 0 {
+				t.Errorf("it also raised the queue-full counter to %d, which means something else", hub.Dropped())
+			}
+		})
+	}
 }

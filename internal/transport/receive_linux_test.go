@@ -85,7 +85,7 @@ func BenchmarkUDPReceiveVector(b *testing.B) {
 					b.Fatal(err)
 				}
 				for received := 0; received < len(packets); {
-					n, err := receive(bufs, sizes, endpoints)
+					n, _, err := receive(bufs, sizes, endpoints)
 					if err != nil {
 						b.Fatal(err)
 					}

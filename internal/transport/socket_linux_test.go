@@ -49,7 +49,7 @@ func TestUDPReceivePreservesGROOverflowAndFullBatchReads(t *testing.T) {
 	receive := socket.receiver()
 	packets, sizes, endpoints := make([][]byte, 128), make([]int, 128), make([]Endpoint, 128)
 	for batch := range 2 {
-		n, err := receive(packets, sizes, endpoints)
+		n, _, err := receive(packets, sizes, endpoints)
 		if err != nil || n != 128 || reads != 1 {
 			t.Fatalf("batch %d: n=%d err=%v reads=%d", batch, n, err, reads)
 		}
@@ -143,7 +143,7 @@ func TestUDPReceiveSkipsTruncatedMessagesAndPreservesGROTail(t *testing.T) {
 		return 3, nil
 	}}}
 	packets, sizes, endpoints := make([][]byte, 128), make([]int, 128), make([]Endpoint, 128)
-	n, err := socket.receiver()(packets, sizes, endpoints)
+	n, _, err := socket.receiver()(packets, sizes, endpoints)
 	if err != nil || n != 3 {
 		t.Fatalf("receive: n=%d err=%v, want three intact GRO segments", n, err)
 	}
@@ -200,7 +200,7 @@ func TestUDPKernelGSORoundTrip(t *testing.T) {
 			bufs, sizes, endpoints := make([][]byte, 128), make([]int, 128), make([]Endpoint, 128)
 			seen := 0
 			for seen < count {
-				n, err := receivers[index](bufs, sizes, endpoints)
+				n, _, err := receivers[index](bufs, sizes, endpoints)
 				if err != nil {
 					t.Fatalf("received %d/%d packets: %v", seen, count, err)
 				}
@@ -247,7 +247,7 @@ func TestUDPReceiveDropsDatagramWithNoUsableSource(t *testing.T) {
 	}}}
 	receive := socket.receiver()
 	packets, sizes, endpoints := make([][]byte, 8), make([]int, 8), make([]Endpoint, 8)
-	n, err := receive(packets, sizes, endpoints)
+	n, _, err := receive(packets, sizes, endpoints)
 	if err != nil {
 		t.Fatalf("one unparseable control message failed the whole receive: %v", err)
 	}

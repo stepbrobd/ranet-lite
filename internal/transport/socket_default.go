@@ -41,7 +41,7 @@ func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
 	for _, fn := range fns {
 		size := b.BatchSize()
 		eps := make([]conn.Endpoint, size)
-		receivers = append(receivers, func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+		receivers = append(receivers, func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, int, error) {
 			for i := range size {
 				if bufs[i] == nil {
 					bufs[i] = make([]byte, readBufferSize)
@@ -51,7 +51,9 @@ func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
 			for i := range n {
 				endpoints[i] = &portableEndpoint{eps[i]}
 			}
-			return n, err
+			// This bind hands every datagram it reads straight through, so
+			// there is nothing it refuses of its own.
+			return n, 0, err
 		})
 	}
 	return b, receivers, port, nil
