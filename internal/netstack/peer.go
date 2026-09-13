@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -157,8 +159,15 @@ type peerBatch struct {
 	headers   []byte
 	encrypted bool
 	err       error
-	done      chan error
-	hasSlot   bool
+	// counted says this batch's packets have already reached p.dropped, so
+	// whoever discards it last leaves the counter alone. Only reserve failure
+	// counts early, because that is where the packet count is still known, and
+	// an implicit test on err would read every other reason err is set -- a
+	// batch that failed to seal, say -- as counted too, and lose those
+	// packets from the counter entirely.
+	counted bool
+	done    chan error
+	hasSlot bool
 	// control says which budget the place came from, so it goes back where it
 	// was taken from.
 	control bool
@@ -243,6 +252,7 @@ func (p *Peer) reserveBatchWithSlot(count int, hasSlot, control bool) *peerBatch
 		// not exist. Counted here rather than where the sender discards it,
 		// because this is where the packet count is still known.
 		p.dropped.Add(uint64(count))
+		b.counted = true
 	}
 	b.raw = make([][]byte, 0, count)
 	b.headers = make([]byte, 0, count)
@@ -310,13 +320,16 @@ func (b *peerBatch) enqueue() error {
 }
 
 // abandon gives back what a batch reserved and counts its packets as dropped,
-// for a peer that closed after it had its ticket. A batch whose sealer already
-// failed was counted where that happened, and the two overlap in the ordinary
-// teardown window: a peer that deleted its Child SA cannot hand out a sequence
-// range, and Close follows on the same path.
+// for a peer that closed after it had its ticket. A batch that could not
+// reserve a sequence range was counted there instead, and the two overlap in
+// the ordinary teardown window: a peer that deleted its Child SA cannot hand
+// out a sequence range, and Close follows on the same path. Anything else that
+// leaves a batch unsendable -- a seal that failed on the way here -- is
+// counted once, here, which is the same thing the caller is told.
 func (b *peerBatch) abandon() error {
-	if b.err == nil {
+	if !b.counted {
 		b.peer.dropped.Add(uint64(len(b.raw)))
+		b.counted = true
 	}
 	b.releaseStorage()
 	b.releaseSlot()
@@ -366,6 +379,29 @@ func (b *peerBatch) send() error {
 	return b.err
 }
 
+// discardQueued gives back every batch the sender still holds, in ticket
+// order so a caller watching the counter sees what it expects, and drains
+// whatever else is already in the queue behind them.
+func (p *Peer) discardQueued(pending map[uint64]*peerBatch) {
+	for {
+		select {
+		case b := <-p.completed:
+			pending[b.ticket] = b
+		default:
+			tickets := slices.Sorted(maps.Keys(pending))
+			for _, ticket := range tickets {
+				b := pending[ticket]
+				delete(pending, ticket)
+				err := b.abandon()
+				if b.done != nil {
+					b.done <- err
+				}
+			}
+			return
+		}
+	}
+}
+
 func (b *peerBatch) releaseSlot() {
 	if !b.hasSlot {
 		return
@@ -398,6 +434,12 @@ func (p *Peer) senderLoop() {
 			case b := <-p.completed:
 				pending[b.ticket] = b
 			case <-p.stop:
+				// Everything queued behind the stop is given back rather than
+				// left where it is: each of these holds a transmission slot
+				// and a place in the order, and its packets have been counted
+				// by nothing. A caller waiting on one is told, or transmit
+				// never returns.
+				p.discardQueued(pending)
 				return
 			}
 		}
@@ -429,6 +471,14 @@ func (p *Peer) senderLoop() {
 		for _, b := range ready {
 			if b.err == nil {
 				b.err = sendErr
+			}
+			// A batch that sealed nothing never reached the transport at all,
+			// so its packets are gone and nothing else counts them. One that
+			// sealed and then failed in the syscall was attempted, which is a
+			// different thing and stays a log line.
+			if b.err != nil && len(b.sealed) == 0 && !b.counted {
+				p.dropped.Add(uint64(len(b.raw)))
+				b.counted = true
 			}
 			b.releaseStorage()
 			b.releaseSlot()

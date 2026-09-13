@@ -333,3 +333,100 @@ func TestReservationFailureIsCountedOnce(t *testing.T) {
 		t.Errorf("the peer counted %d drops for one packet it was given once", got)
 	}
 }
+
+// The reservation is the only place a batch is counted early, so that is the
+// only thing abandon may treat as already counted. A batch that reserved a
+// sequence range and then failed to seal has its packets counted by nothing
+// else, and reading the error field instead of a flag that says "counted"
+// silently puts every such packet outside the one counter that would show it.
+func TestSealFailureOnAClosedPeerIsStillCounted(t *testing.T) {
+	sealing := errors.New("seal")
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func([][]byte, []byte, [][]byte) ([][]byte, error) { return nil, sealing }, nil
+		},
+		func([][]byte) error { t.Error("a closed peer transmitted"); return nil })
+
+	b := peer.reserveBatchNow(2)
+	if b == nil {
+		t.Fatal("the peer refused a reservation while it was open")
+	}
+	b.append([]byte{1}, 0)
+	b.append([]byte{2}, 0)
+	if got := peer.Dropped(); got != 0 {
+		t.Fatalf("a reservation that succeeded counted %d drops", got)
+	}
+	peer.Close()
+	if err := b.enqueue(); err == nil {
+		t.Fatal("a closed peer accepted the batch")
+	}
+	if got := peer.Dropped(); got != 2 {
+		t.Errorf("the peer counted %d of the 2 packets it will never send", got)
+	}
+}
+
+// Every packet a peer will not send has to reach the counter exactly once, and
+// the sender's own stop path was the hole: a batch already queued behind the
+// one the sender is waiting for is holding a transmission slot and a place in
+// the transmission order, and returning from the loop left both, with its
+// packets counted by nothing.
+func TestBatchesStrandedInTheSenderAreCounted(t *testing.T) {
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return nil })
+
+	first, second := peer.reserveBatchNow(3), peer.reserveBatchNow(5)
+	if first == nil || second == nil {
+		t.Fatal("the peer refused a reservation while it was open")
+	}
+	for range 3 {
+		first.append([]byte{1}, 0)
+	}
+	for range 5 {
+		second.append([]byte{2}, 0)
+	}
+	// Only the second goes in, so the sender holds it waiting for the first,
+	// which is where Close finds it.
+	if err := second.enqueue(); err != nil {
+		t.Fatalf("an open peer refused the batch: %v", err)
+	}
+	peer.Close()
+	if err := first.enqueue(); err == nil {
+		t.Fatal("a closed peer accepted the batch")
+	}
+	if got := peer.Dropped(); got != 8 {
+		t.Errorf("the peer counted %d of the 8 packets it will never send", got)
+	}
+}
+
+// A batch that could not seal produced nothing for the transport, so its
+// packets are gone whether or not the peer is closing. The sender logged that
+// and counted nothing, which put every packet lost this way outside the one
+// counter that would show it.
+func TestSealFailureOnAnOpenPeerIsCounted(t *testing.T) {
+	sealing := errors.New("seal")
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func([][]byte, []byte, [][]byte) ([][]byte, error) { return nil, sealing }, nil
+		},
+		func([][]byte) error { t.Error("a batch that sealed nothing reached the transport"); return nil })
+	defer peer.Close()
+
+	b := peer.reserveBatchNow(4)
+	if b == nil {
+		t.Fatal("the peer refused a reservation while it was open")
+	}
+	for range 4 {
+		b.append([]byte{1}, 0)
+	}
+	if err := b.transmit(); !errors.Is(err, sealing) {
+		t.Fatalf("transmit reported %v, want the sealer's own error", err)
+	}
+	if got := peer.Dropped(); got != 4 {
+		t.Errorf("the peer counted %d of the 4 packets that never reached the transport", got)
+	}
+}

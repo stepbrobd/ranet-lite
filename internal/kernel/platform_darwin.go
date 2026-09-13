@@ -205,8 +205,12 @@ func (p *routePlatform) prefSrc(destination netip.Prefix) netip.Addr {
 	return netip.Addr{}
 }
 
-// rotateWarnings ends one deduplication window and starts the next. Routes is
-// the first thing every reconcile pass calls, so that is the boundary.
+// rotateWarnings ends one deduplication window and starts the next. A window
+// is one reconcile pass, which starts with a dump, so ownedRoutes is the only
+// caller on the live path: it is the one place that knows the dump both
+// arrived and parsed, and every record rotated here is refilled by the
+// AddRoute calls a dump is followed by. A second call inside one pass, or a
+// call from a path that will not go on to install, empties them.
 func (p *routePlatform) rotateWarnings() {
 	p.warned, p.pending = p.pending, make(map[Route]bool, len(p.pending))
 	// occupied is rebuilt by the passes that refuse, the same way warned is,
