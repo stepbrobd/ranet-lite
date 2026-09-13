@@ -117,7 +117,7 @@ babel:
 #   table: 200
 #   protocol: 155
 #   metric: 64                    # BIRD's kbabel uses 32, so not 32 while it shares this table
-#   prefsrc4: 10.66.0.5
+#   prefsrc4: 10.66.0.5            # linux only, refused on darwin, which has no preferred source
 #   addresses: ["10.66.0.5/32"]
 #   assign_originated: false
 #   vrf: gravity

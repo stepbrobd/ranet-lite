@@ -109,6 +109,14 @@ func newPlatform(cfg Config) (platform, error) {
 	if cfg.VRF != "" {
 		return nil, fmt.Errorf("kernel: darwin has no VRF, %s cannot be enslaved to %s", cfg.Interface, cfg.VRF)
 	}
+	if cfg.PrefSrc4.IsValid() {
+		// The same reasoning as the three above. There is no RTA_PREFSRC here,
+		// and the address a route prefers is whichever one the interface
+		// carries, so a configuration that names one is asking for something
+		// this platform decides for itself. Put the address on the tun with
+		// kernel.addresses and source selection reaches the same answer.
+		return nil, fmt.Errorf("kernel: darwin has no preferred source, prefsrc4 %s has no meaning here", cfg.PrefSrc4)
+	}
 	if len(cfg.Interface) >= unix.IFNAMSIZ {
 		return nil, fmt.Errorf("kernel: interface name %q does not fit an ifreq", cfg.Interface)
 	}

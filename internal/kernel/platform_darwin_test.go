@@ -1398,3 +1398,33 @@ func TestDarwinNamesTheTwoSourceRefusalsApart(t *testing.T) {
 		t.Fatal("the refusal was not recorded, so this proves nothing")
 	}
 }
+
+// A linux-shaped configuration names things this platform does not have. Each
+// is refused by name before the interface is even looked up, so a deployment
+// carrying one is wrong at startup rather than looking like it works. prefsrc4
+// was the one that was silently accepted and quietly did nothing: darwin has
+// no RTA_PREFSRC, and the address a route prefers is whichever one the tun
+// carries.
+func TestDarwinRefusesSettingsItCannotHonor(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"table":    func(c *Config) { c.Table = DefaultTable + 1 },
+		"protocol": func(c *Config) { c.Protocol = DefaultProtocol + 1 },
+		"vrf":      func(c *Config) { c.VRF = "gravity" },
+		"prefsrc4": func(c *Config) { c.PrefSrc4 = netip.MustParseAddr("23.161.104.117") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Deliberately a device that does not exist: each refusal has to
+			// come before the interface lookup, or a node only learns on a
+			// host where the tun already exists.
+			cfg := Config{Interface: "utun-absent", Table: DefaultTable, Protocol: DefaultProtocol}
+			mutate(&cfg)
+			_, err := newPlatform(cfg)
+			if err == nil {
+				t.Fatalf("darwin accepted %s", name)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), name) {
+				t.Errorf("the refusal for %s reads %q and does not name it", name, err)
+			}
+		})
+	}
+}
