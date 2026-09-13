@@ -62,12 +62,18 @@ func (w *replayWindow) commit(seq uint32) {
 }
 
 // clearRange clears n bits from start, wrapping at the window. The positions a
-// forward jump skips are one or two contiguous runs, so they come out a word at
-// a time rather than one division and one mask per bit. A peer that chooses its
-// sequence numbers just under a window apart maximizes that loop: on the
-// default 4096-packet window it cost microseconds of the per-session commit
-// emitter, which is single-threaded and holds the inbound SA's lock, for a
-// packet the peer spent about a hundred nanoseconds sealing.
+// forward jump skips are one or two contiguous runs, so they come out as two
+// partial words and one memclr rather than one division and one mask per bit.
+//
+// A peer chooses how far to jump, so it chooses how much of this it pays for,
+// on the per-session commit emitter, which is single-threaded and holds the
+// inbound SA's lock. Sequence numbers just under a window apart are the worst
+// case: they skip the whole window on every packet and miss the full-clear
+// path by one. Measured per packet against 3.3 ns for a peer that counts by
+// one, before and after the memclr: 94 ns and 17 ns at the 4096 default, 24.8
+// us and 1.07 us at the 1048576 the configuration allows. The second figure is
+// now what the full clear beside it costs, which is the floor for a window
+// that size. See BenchmarkReplayCommitJumpDistances.
 func (w *replayWindow) clearRange(start, n uint32) {
 	if n == 0 {
 		return
@@ -84,15 +90,25 @@ func (w *replayWindow) clearRange(start, n uint32) {
 
 // clearSpan clears n bits from start without wrapping.
 func (w *replayWindow) clearSpan(start, n uint32) {
-	for end := start + n; start < end; {
-		offset := start % 64
-		bits := min(64-offset, end-start)
-		mask := ^uint64(0)
-		if bits < 64 {
-			mask = uint64(1)<<bits - 1
-		}
-		w.mask[start/64] &^= mask << offset
-		start += bits
+	if n == 0 {
+		return
+	}
+	end := start + n
+	first, last := start/64, (end-1)/64
+	if first == last {
+		w.mask[first] &^= (^uint64(0) >> (64 - n)) << (start % 64)
+		return
+	}
+	if offset := start % 64; offset != 0 {
+		w.mask[first] &^= ^uint64(0) << offset
+		first++
+	}
+	if tail := end % 64; tail != 0 {
+		w.mask[last] &^= ^uint64(0) >> (64 - tail)
+		last--
+	}
+	if first <= last {
+		clear(w.mask[first : last+1])
 	}
 }
 

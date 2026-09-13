@@ -87,21 +87,26 @@ func TestReplayWindowMatchesReference(t *testing.T) {
 
 // The cost of one commit must not depend on how far the peer chose to jump.
 func BenchmarkReplayCommitJumpDistances(b *testing.B) {
-	for _, jump := range []uint32{1, DefaultReplayWindow / 2, DefaultReplayWindow - 1, DefaultReplayWindow} {
-		b.Run(fmt.Sprint(jump), func(b *testing.B) {
-			w := newReplayWindow(DefaultReplayWindow)
-			seq := uint32(1)
-			w.commit(seq)
-			b.ResetTimer()
-			for b.Loop() {
-				seq += jump
-				if seq < jump { // wrapped, start over rather than measure the reset
-					seq = 1
-					w = newReplayWindow(DefaultReplayWindow)
-				}
+	// The largest window Config.Validate accepts is measured too: a peer
+	// jumping just under it skips the whole window on every packet, which is
+	// the case clearSpan's memclr exists for.
+	for _, window := range []uint32{DefaultReplayWindow, 1 << 20} {
+		for _, jump := range []uint32{1, window / 2, window - 1, window} {
+			b.Run(fmt.Sprintf("window=%d/jump=%d", window, jump), func(b *testing.B) {
+				w := newReplayWindow(window)
+				seq := uint32(1)
 				w.commit(seq)
-			}
-		})
+				b.ResetTimer()
+				for b.Loop() {
+					seq += jump
+					if seq < jump { // wrapped, start over rather than measure the reset
+						seq = 1
+						w = newReplayWindow(window)
+					}
+					w.commit(seq)
+				}
+			})
+		}
 	}
 }
 
