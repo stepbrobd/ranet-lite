@@ -37,7 +37,7 @@ func TestDERLengthMustBeMinimal(t *testing.T) {
 // what caught it was a minimality test meant for something else, which called
 // the same bytes non-minimal on one build and truncated on another.
 //
-// The word size is the whole point, so on amd64 this passes with the bound in
+// The word size decides the outcome, so on amd64 this passes with the bound in
 // derElement deleted: the later length test produces the same message. On 386
 // it does not, and deleting the bound panics on the slice rather than
 // refusing. `CGO_ENABLED=0 GOARCH=386 go test ./internal/ike/ -run TestDER`

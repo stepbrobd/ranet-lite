@@ -560,7 +560,7 @@ func TestRefusedRekeyResponseDeletesTheSAItLeftAtThePeer(t *testing.T) {
 	// RFC 7296 section 1.4.1 sends "the SPIs (as they would be expected in the
 	// headers of inbound packets) of the SAs to be deleted", so the sender
 	// names its own half. Naming the peer's matches nothing at the far end and
-	// deletes nothing, which is the whole point of the exchange.
+	// deletes nothing, so the exchange does none of the work it exists for.
 	if len(named) != 1 || named[0] != localSPI {
 		t.Errorf("the Delete names %v, want %d, the inbound SPI this end offered", named, localSPI)
 	}

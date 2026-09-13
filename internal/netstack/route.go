@@ -86,7 +86,7 @@ func (rt *RouteTable) RemovePeer(peer *Peer) {
 
 // Lookup answers with the most specific entry that matches. An entry holding
 // Unreachable answers "no route" rather than letting the lookup continue to a
-// covering prefix, which is the whole point of holding it: the caller sees the
+// covering prefix, which is the reason for holding it: the caller sees the
 // same "drop this packet" it would see for an unknown destination, and the
 // shorter prefix is not consulted.
 func (rt *RouteTable) Lookup(src, dst netip.Addr) (*Peer, bool) {

@@ -194,8 +194,8 @@ func (s *udpSocket) receiver() receiveFunc {
 				var err error
 				segment, err = udpGROSize(m.OOB[:m.NN])
 				if err != nil {
-					// The segment size is exactly what would not parse, so
-					// this is the one arm that cannot do better than one.
+					// The segment size itself would not parse, so this
+					// is the one arm that cannot do better than one.
 					refused++
 					index++
 					continue

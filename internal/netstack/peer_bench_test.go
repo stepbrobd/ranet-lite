@@ -29,10 +29,9 @@ func benchPeer(b *testing.B) *Peer {
 }
 
 // The send pipeline's own cost on the path routed traffic takes, with the
-// crypto and the syscall replaced by nothing. What remains is exactly what
-// ordered transmission buys and charges for: the slot semaphore, the ticket
-// and sequence-range allocation under one lock, the allocations ReportAllocs
-// counts, the handoff
+// crypto and the syscall replaced by nothing. What remains is the price of
+// ordered transmission: the slot semaphore, the ticket and sequence-range
+// allocation under one lock, the allocations ReportAllocs counts, the handoff
 // to the ordered sender, and its reorder map.
 //
 // enqueue is the data path and does not wait for the send; transmit is the

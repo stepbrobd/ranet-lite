@@ -419,8 +419,8 @@ func preferredGroupFromNotify(n Notify) (uint16, bool) {
 func TestEverySiteThatSendsInvalidKECarriesTheGroup(t *testing.T) {
 	// Read out of the source rather than driven, because one of the three sits
 	// inside completeResponderAuth and is reachable only through a whole
-	// handshake. What matters is that no site spells this notify without the
-	// data, which is exactly what the text says.
+	// handshake. It holds that no site spells this notify without the data,
+	// which the text requires.
 	for _, name := range []string{"child_rekey.go", "ike_rekey.go", "responder.go"} {
 		body, err := os.ReadFile(name)
 		if err != nil {

@@ -17,12 +17,13 @@ import (
 // goFiles walks the tree from its root, which is one directory up.
 func goFiles(t *testing.T) []string { return treeFiles(t, map[string]int{".go": 50}) }
 
-// prose covers the go files and the two documents an operator reads. The rules
-// are about writing rather than about Go, and scanning only the source left
-// the readme with three instances of the phrasing the sweep had removed
-// everywhere else, because nothing looked there.
+// prose covers every file in the tree that carries English written for a
+// reader: the go sources, the documents an operator reads, and the nix and
+// python that build and measure it. The rules are about writing rather than
+// about Go, and every widening so far has found violations in the files it
+// reached for the first time.
 func proseFiles(t *testing.T) []string {
-	return treeFiles(t, map[string]int{".go": 50, ".md": 1, ".yaml": 1})
+	return treeFiles(t, map[string]int{".go": 50, ".md": 1, ".yaml": 1, ".nix": 5, ".py": 1})
 }
 
 // least is per suffix rather than a total. The tree holds well over a hundred
@@ -67,8 +68,14 @@ func treeFiles(t *testing.T, least map[string]int) []string {
 // The framing the prose rules ban, which says a thing matters instead of
 // saying what it does. Upstream carries one instance of the substring, inside
 // "doesn't care what order", so the pattern requires the whole phrase.
+//
+// An adverb or a negation between the verb and the noun leaves the framing
+// intact, so the pattern takes one of those. Both lists enumerate rather than
+// taking any word: "is of what" and "is beyond what" are prepositions rather
+// than the cleft, and "is the entry point" names a thing.
 func TestNoFramingPhrase(t *testing.T) {
-	banned := regexp.MustCompile(`\b(is|are|was|were) what\b|\bis the point\b`)
+	banned := regexp.MustCompile(`\b(is|are|was|were)( not| also| already| exactly| precisely| still| simply| just| only| really)? what\b` +
+		`|\b(is|are|was|were) the( whole| entire| very| real| only)? point\b`)
 	for _, path := range proseFiles(t) {
 		body, err := os.ReadFile(path)
 		if err != nil {
@@ -107,7 +114,8 @@ func TestNoArticleLeadingTestName(t *testing.T) {
 // the go files alone satisfy any total the documents were added to. The walk
 // that was widened past them is guarded by naming them.
 func TestProseChecksReachTheDocuments(t *testing.T) {
-	want := map[string]bool{"../readme.md": false, "../examples/config.yaml": false}
+	want := map[string]bool{"../readme.md": false, "../examples/config.yaml": false,
+		"../integration/nixos-test.nix": false, "../integration/performance.py": false}
 	for _, path := range proseFiles(t) {
 		if _, named := want[path]; named {
 			want[path] = true

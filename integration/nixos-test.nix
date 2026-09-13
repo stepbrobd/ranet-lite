@@ -99,8 +99,8 @@ in
             connections.ranet = {
               version = 2;
               local_addrs = [ "0.0.0.0/0" ];
-              # A wildcard remote can only answer. Naming the client is what
-              # lets swanctl --initiate dial it.
+              # A wildcard remote can only answer. Naming the client lets
+              # swanctl --initiate dial it.
               remote_addrs = if responder then [ nodes.client.networking.primaryIPAddress ] else [ "0.0.0.0/0" ];
               local_port = 13000;
               remote_port = 14000;

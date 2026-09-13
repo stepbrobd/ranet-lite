@@ -128,9 +128,9 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 // Both UTF8String and PrintableString are accepted for any attribute. ranet
 // writes O and CN as UTF8String and the serial number as PrintableString,
 // while strongSwan picks the type from the characters in the value, so the
-// same name reaches the wire in either form. The name is not what
-// authenticates a peer: AUTH signs the bytes actually received, so a
-// re-encoded name still needs that peer's key to be accepted. Identities are
+// same name reaches the wire in either form. The name does not authenticate a
+// peer on its own: AUTH signs the bytes actually received, so a re-encoded
+// name still needs that peer's key to be accepted. Identities are
 // compared as parsed names rather than as bytes, which makes that tolerance
 // safe.
 func derAttribute(rdn []byte) (oid []byte, value string, err error) {
