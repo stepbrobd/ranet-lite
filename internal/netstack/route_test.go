@@ -351,3 +351,30 @@ func TestEveryTableChangeWakesReconciler(t *testing.T) {
 		})
 	}
 }
+
+// Snapshot hands out the unreachable holds, and the sentinel in them is not a
+// Peer anything can send through: nothing in it is initialized. A caller that
+// treats one as a destination dereferences a nil, so the question has a name.
+func TestSnapshotHandsOutTheHoldAsASentinel(t *testing.T) {
+	table := NewRouteTable()
+	dest := netip.MustParsePrefix("fd00:5::/64")
+	table.Set(netip.Prefix{}, dest, Unreachable)
+
+	held := false
+	for _, route := range table.Snapshot() {
+		if route.Destination != dest {
+			continue
+		}
+		held = true
+		if !IsUnreachable(route.Value) {
+			t.Errorf("the hold for %v came back as %v, which a caller would send through", dest, route.Value)
+		}
+	}
+	if !held {
+		t.Fatal("the snapshot does not carry the hold at all, so a mirror would fall through to a shorter prefix")
+	}
+	// And a lookup answers it rather than continuing to a covering entry.
+	if _, ok := table.Lookup(netip.Addr{}, dest.Addr().Next()); ok {
+		t.Error("a lookup landing on the hold reported a route")
+	}
+}

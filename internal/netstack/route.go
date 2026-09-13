@@ -25,7 +25,16 @@ func NewRouteTable() *RouteTable { return &RouteTable{changed: make(chan struct{
 // a more specific prefix that has just been retracted immediately starts
 // following the default a transit node also carries, and the two ends pass the
 // packet back and forth until its hop limit runs out.
+// It is a sentinel rather than a usable Peer: nothing in it is initialized, so
+// anything that sends through it instead of comparing against it dereferences
+// a nil. Lookup answers it as "no route", and Snapshot hands it out as a value
+// a caller has to recognize, which is what the doc there says.
 var Unreachable = &Peer{ID: "unreachable"}
+
+// IsUnreachable reports whether a peer from Snapshot or Lookup is the hold a
+// retracted prefix leaves behind rather than somewhere to send. Comparing
+// against the sentinel directly works too; this names the question.
+func IsUnreachable(p *Peer) bool { return p == Unreachable }
 
 // Changed carries one coalesced notification per batch of forwarding table
 // changes, so a mirror outside this process reconciles from Snapshot rather
@@ -40,6 +49,8 @@ func (rt *RouteTable) Changed() <-chan struct{} { return rt.changed }
 // their value. They exist to stop a packet for a retracted prefix following a
 // shorter one instead, and a mirror of this table has to hold them for the
 // same reason rather than letting its own longest-prefix match fall through.
+// The sentinel is not a Peer that can be sent through, so a caller walking
+// these has to ask IsUnreachable before treating one as a destination.
 func (rt *RouteTable) Snapshot() []sadr.Route[*Peer] {
 	var out []sadr.Route[*Peer]
 	for route := range rt.table.All() {
