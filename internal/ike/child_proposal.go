@@ -291,7 +291,7 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 			continue
 		}
 		var encryption, integ Transform
-		var haveEncryption, haveESN, unacceptable bool
+		var haveEncryption, haveESN, haveInteg, offeredInteg, unacceptable bool
 		for _, transform := range p.Transforms {
 			switch transform.Type {
 			case TransEncr:
@@ -309,15 +309,24 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 			case TransInteg:
 				// See decodeChildProposal: NONE alongside an AEAD cipher says
 				// what omitting the transform says, and anything else is a
-				// transform this implementation has no key for.
-				if transform.ID != INTEG_NONE || transform.UnsupportedAttributes {
-					unacceptable = true
-					break
+				// transform this implementation has no key for. RFC 7296
+				// §3.3.6 makes that one transform unacceptable rather than the
+				// proposal it sits in, so an offer naming an integrity
+				// algorithm alongside NONE is still answered.
+				offeredInteg = true
+				if !haveInteg && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes {
+					integ = transform
+					haveInteg = true
 				}
-				integ = transform
 			default:
 				unacceptable = true
 			}
+		}
+		// An offer that named integrity transforms and none this end can take
+		// has no complete set of parameters in it, but the rest of the SA
+		// payload is still considered.
+		if offeredInteg && !haveInteg {
+			unacceptable = true
 		}
 		if !unacceptable && haveEncryption && haveESN {
 			dh, preferred, ok := selectDHTransform(p.Transforms, keGroup, true)

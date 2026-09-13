@@ -858,11 +858,13 @@ func (r *Responder) sendStatelessNotify(datagram transport.Unclaimed, spiI uint6
 // is acceptable except for its DH group reports the group we want, which the
 // caller turns into INVALID_KE_PAYLOAD.
 //
-// An unknown transform type rejects the whole proposal, which RFC 7296
-// section 3.3.6 requires: an unrecognized alternative of a known type is
-// skipped and the others of that type are still considered, but a type we
-// cannot name may change what the proposal means,
-// and the child selection in this package already takes the same view.
+// RFC 7296 section 3.3.6 splits the two refusals: a Transform Type this end
+// cannot name makes the whole proposal unacceptable, because a type we cannot
+// name may change what the proposal means, while an unacceptable transform of
+// a known type makes only that transform unacceptable and "other transforms
+// with the same Transform Type are processed as usual". Either way the other
+// proposals in the same SA payload are still considered, and the child
+// selection in this package takes the same view.
 func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 	proposals, err := DecodeSA(body)
 	if err != nil {
@@ -876,6 +878,7 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 		}
 		known := true
 		var integ *Transform
+		offeredInteg := false
 		for i := range proposal.Transforms {
 			transform := proposal.Transforms[i]
 			switch transform.Type {
@@ -886,17 +889,26 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 				// integrity transform, so a peer spelling out NONE says the
 				// same thing as omitting it. Anything else is a transform this
 				// implementation has no key for, because every cipher it
-				// offers is combined mode.
-				if transform.ID != INTEG_NONE || transform.UnsupportedAttributes {
-					known = false
-					continue
+				// offers is combined mode, and section 3.3.6 makes that one
+				// transform unacceptable rather than the proposal it sits in.
+				// A peer offering an integrity algorithm alongside NONE, which
+				// is the shape an implementation that also has non-AEAD
+				// ciphers produces, therefore still gets an answer.
+				offeredInteg = true
+				if integ == nil && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes {
+					integ = &transform
 				}
-				integ = &transform
 			default:
 				known = false
 			}
 		}
 		if !known {
+			continue
+		}
+		// Every alternative of a type the offer did include was unacceptable,
+		// so there is no complete set of parameters to take out of this
+		// proposal. The rest of the SA payload is still considered.
+		if offeredInteg && integ == nil {
 			continue
 		}
 		// An offered transform carries no unsupported attributes, so struct

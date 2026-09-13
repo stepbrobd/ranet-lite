@@ -185,3 +185,63 @@ func TestInvalidKEErrorNamesGroup(t *testing.T) {
 		t.Errorf("the error reads %q and does not name group %d", message, DH_CURVE25519)
 	}
 }
+
+// Section 3.3.6 draws the line between the two refusals: an unknown Transform
+// Type makes the whole proposal unacceptable, but an unacceptable transform of
+// a known type makes only that transform unacceptable, and "other transforms
+// with the same Transform Type are processed as usual". A peer that also has
+// non-AEAD ciphers offers its integrity algorithms alongside NONE in the one
+// proposal, and refusing the proposal for the algorithm this end has no key
+// for would refuse a suite both ends can run.
+func TestAnUnusableIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.T) {
+	base := []Transform{
+		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+		{Type: TransPRF, ID: PRF_HMAC_SHA2_256},
+		{Type: TransDH, ID: DH_CURVE25519},
+	}
+	none := Transform{Type: TransInteg, ID: INTEG_NONE}
+	unusable := Transform{Type: TransInteg, ID: 12}
+	withBoth := append(slices.Clone(base), unusable, none)
+
+	body := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, Transforms: withBoth}})
+	selected, _, err := selectIKEProposal(body, DH_CURVE25519)
+	if err != nil {
+		t.Fatalf("an offer naming an integrity algorithm alongside NONE was refused: %v", err)
+	}
+	if !slices.Contains(selected.Transforms, none) {
+		t.Errorf("the answer is %v, which names no integrity transform of the type the offer included", selected.Transforms)
+	}
+	if slices.Contains(selected.Transforms, unusable) {
+		t.Errorf("the answer is %v, which takes an integrity algorithm there is no key for", selected.Transforms)
+	}
+
+	rekeySelected, _, _, ok := selectIKERekeyProposal(Proposal{Number: 1, Protocol: ProtoIKE, Transforms: withBoth},
+		DH_CURVE25519, PRF_HMAC_SHA2_256)
+	if !ok {
+		t.Fatal("the same offer was refused on rekey, so a peer this end established cannot rekey from its own side")
+	}
+	if !slices.Contains(rekeySelected, none) || slices.Contains(rekeySelected, unusable) {
+		t.Errorf("the rekey answer is %v", rekeySelected)
+	}
+
+	// An offer whose only alternatives of that type are all unacceptable has
+	// no complete set of parameters in it, and is still refused.
+	onlyUnusable := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, Transforms: append(slices.Clone(base), unusable)}})
+	if _, _, err := selectIKEProposal(onlyUnusable, DH_CURVE25519); err == nil {
+		t.Error("an offer whose every integrity alternative is unusable was accepted")
+	}
+	// The rekey selector takes the same view of an offer it can use none of.
+	if _, _, _, ok := selectIKERekeyProposal(Proposal{Number: 1, Protocol: ProtoIKE,
+		Transforms: append(slices.Clone(base), unusable)}, DH_CURVE25519, PRF_HMAC_SHA2_256); ok {
+		t.Error("a rekey offer whose every integrity alternative is unusable was accepted")
+	}
+	// Other proposals in the same SA payload are processed as usual, so the
+	// unacceptable one does not take the acceptable one down with it.
+	pair := EncodeSA([]Proposal{
+		{Number: 1, Protocol: ProtoIKE, Transforms: append(slices.Clone(base), unusable)},
+		{Number: 2, Protocol: ProtoIKE, Transforms: slices.Clone(base)},
+	})
+	if selected, _, err := selectIKEProposal(pair, DH_CURVE25519); err != nil || selected.Number != 2 {
+		t.Errorf("the second proposal was not considered: %v, %v", selected.Number, err)
+	}
+}

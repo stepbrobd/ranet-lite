@@ -426,10 +426,11 @@ func ikeRekeyProposal(spi []byte, prfID uint16) Proposal {
 
 func selectIKERekeyProposal(proposal Proposal, keGroup, prfID uint16) ([]Transform, SASuite, uint16, bool) {
 	// RFC 7296 §3.3.6 makes an entire proposal unacceptable when it contains
-	// an unknown or unsupported Transform Type. Unknown attributes are marked
-	// on individual transforms by DecodeSA and skipped by exact matching below,
-	// allowing another transform of the same type to be selected.
+	// an unknown Transform Type. Unknown attributes are marked on individual
+	// transforms by DecodeSA and skipped by exact matching below, allowing
+	// another transform of the same type to be selected.
 	var integ *Transform
+	offeredInteg := false
 	for i := range proposal.Transforms {
 		transform := proposal.Transforms[i]
 		switch transform.Type {
@@ -439,14 +440,22 @@ func selectIKERekeyProposal(proposal Proposal, keGroup, prfID uint16) ([]Transfo
 			// NONE says the same thing as omitting it, the way
 			// selectIKEProposal already takes it on the initial exchange.
 			// Refusing it here would leave such a peer established and unable
-			// to rekey from its own side.
-			if transform.ID != INTEG_NONE || transform.UnsupportedAttributes {
-				return nil, SASuite{}, 0, false
+			// to rekey from its own side. An integrity algorithm this end has
+			// no key for is one unacceptable transform, not an unacceptable
+			// proposal: "other transforms with the same Transform Type are
+			// processed as usual".
+			offeredInteg = true
+			if integ == nil && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes {
+				integ = &transform
 			}
-			integ = &transform
 		default:
 			return nil, SASuite{}, 0, false
 		}
+	}
+	// The offer named integrity transforms and this end can take none of them,
+	// so there is no complete set of parameters to select.
+	if offeredInteg && integ == nil {
+		return nil, SASuite{}, 0, false
 	}
 	offered := ikeRekeyProposal(nil, prfID).Transforms
 	selected := make([]Transform, 0, 4)

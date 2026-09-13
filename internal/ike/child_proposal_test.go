@@ -165,6 +165,43 @@ func TestIntegNoneIsTakenAndEchoedOnEveryProposal(t *testing.T) {
 	}
 }
 
+// The Child SA selector draws the same line as the IKE one: RFC 7296 §3.3.6
+// makes an integrity algorithm this end has no key for one unacceptable
+// transform, and "other transforms with the same Transform Type are processed
+// as usual", so an offer naming one alongside NONE still has an answer.
+func TestAnUnusableChildIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.T) {
+	spi := []byte{0, 0, 0, 7}
+	base := []Transform{
+		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+		{Type: TransESN, ID: ESN_NO},
+	}
+	none := Transform{Type: TransInteg, ID: INTEG_NONE}
+	unusable := Transform{Type: TransInteg, ID: 12}
+
+	body := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi,
+		Transforms: append(slices.Clone(base), unusable, none)}})
+	selection, err := selectChildRequestProposal(body, nil, 0)
+	if err != nil {
+		t.Fatalf("an offer naming an integrity algorithm alongside NONE was refused: %v", err)
+	}
+	if selection.integ != none {
+		t.Errorf("the answer carries integrity transform %v, want the NONE the offer included", selection.integ)
+	}
+
+	onlyUnusable := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi,
+		Transforms: append(slices.Clone(base), unusable)}})
+	if _, err := selectChildRequestProposal(onlyUnusable, nil, 0); err == nil {
+		t.Error("an offer whose every integrity alternative is unusable was accepted")
+	}
+	pair := EncodeSA([]Proposal{
+		{Number: 1, Protocol: ProtoESP, SPI: spi, Transforms: append(slices.Clone(base), unusable)},
+		{Number: 2, Protocol: ProtoESP, SPI: spi, Transforms: slices.Clone(base)},
+	})
+	if selection, err := selectChildRequestProposal(pair, nil, 0); err != nil || selection.proposal.Number != 2 {
+		t.Errorf("the second proposal was not considered: %v, %v", selection.proposal.Number, err)
+	}
+}
+
 // decodeChildProposal is the initiator reading the answer to its own offer,
 // which is espProposal. RFC 7296 section 3.3.6 has it "check that the accepted
 // offer is consistent with one of its proposals, and if not MUST terminate the
