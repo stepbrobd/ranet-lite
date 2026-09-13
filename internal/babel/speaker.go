@@ -211,7 +211,8 @@ func (s *Speaker) AddPeer(peer *netstack.Peer) *PeerHandle {
 	if old := s.neighbors[peer.ID]; old != nil {
 		s.routes.expireNeighbor(old, time.Now())
 	}
-	n := &neighborState{peer: peer, advertised: make(map[routeKey]struct{})}
+	n := &neighborState{peer: peer,
+		advertised: make(map[routeKey]struct{}), owed: make(map[routeKey]struct{})}
 	s.neighbors[peer.ID] = n
 	s.updatePending = true
 	s.wake()

@@ -3,6 +3,7 @@ package babel
 import (
 	"errors"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"slices"
 	"time"
@@ -394,6 +395,9 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 func (s *Speaker) updateActions(now time.Time) []sendAction {
 	keys := s.advertisableKeys()
 	s.routes.takeDirty()
+	for _, n := range s.neighbors {
+		clear(n.owed)
+	}
 	return s.updateActionsFor(keys, now)
 }
 
@@ -401,16 +405,44 @@ func (s *Speaker) updateActions(now time.Time) []sendAction {
 // collected by the route table and flushed by Run rather than sent from the
 // receive path, so a burst of updates in one packet produces one advertisement.
 func (s *Speaker) triggeredActions(now time.Time) []sendAction {
-	keys := s.routes.takeDirty()
-	actions := s.updateActionsFor(keys, now)
-	// "Whenever it changes the selected router-id for a given destination, a
-	// node MUST send an update as an urgent TLV", section 3.7.2, and the
-	// record that one is owed left with takeDirty. A dropped packet without
-	// this leaves the change to the next periodic dump, which is sixteen
-	// seconds at the defaults and four expiries at a neighbor that has lost
-	// the prefix.
-	for i := range actions {
-		actions[i].rollback = append(actions[i].rollback, func() { s.routes.markDirty(keys) })
+	for _, key := range s.routes.takeDirty() {
+		for _, n := range s.neighbors {
+			n.owed[key] = struct{}{}
+		}
+	}
+	var actions []sendAction
+	for _, n := range s.neighbors {
+		if len(n.owed) == 0 {
+			continue
+		}
+		keys := slices.Collect(maps.Keys(n.owed))
+		clear(n.owed)
+		var tlvs []RawTLV
+		var rollback []func()
+		for _, key := range keys {
+			advertised, undo := s.advertiseTo(n, key, false, now)
+			tlvs = append(tlvs, advertised...)
+			if undo != nil {
+				rollback = append(rollback, undo)
+			}
+		}
+		if len(tlvs) == 0 {
+			continue
+		}
+		// "Whenever it changes the selected router-id for a given destination,
+		// a node MUST send an update as an urgent TLV", section 3.7.2, and
+		// takeDirty has already consumed the record that one is owed. A
+		// dropped packet without this leaves the change to the next periodic
+		// dump, which is sixteen seconds at the defaults and four expiries at
+		// a neighbor that has lost the prefix. Only this neighbor's copy goes
+		// back, so one congested peer does not make the speaker repeat the
+		// update to every healthy one on every wake.
+		rollback = append(rollback, func() {
+			for _, key := range keys {
+				n.owed[key] = struct{}{}
+			}
+		})
+		actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, priority: priorityDump, tlvs: tlvs, rollback: rollback})
 	}
 	return actions
 }

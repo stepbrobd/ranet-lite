@@ -257,12 +257,25 @@ func TestRouterIDRoundTrip(t *testing.T) {
 func TestNextHopRoundTrip(t *testing.T) {
 	addr := net.ParseIP("10.99.1.1").To4()
 	tlv := EncodeNextHop(addr)
-	got, _, err := DecodeNextHop(tlv.Body)
-	if err != nil {
-		t.Fatal(err)
+	got, _, ignore, err := DecodeNextHop(tlv.Body)
+	if err != nil || ignore {
+		t.Fatalf("decode reported ignore=%v err=%v", ignore, err)
 	}
 	if !got.Equal(addr) {
 		t.Fatalf("got %v, want %v", got, addr)
+	}
+
+	// RFC 8966 section 4.6.8: "This TLV sets up the next hop for subsequent
+	// Update TLVs even if it is otherwise ignored due to an unknown mandatory
+	// sub-TLV." Returning nothing made every following IPv4 Update in that
+	// packet look like one with no next hop at all.
+	mandatory := append(append([]byte(nil), tlv.Body...), 0x80, 0)
+	got, _, ignore, err = DecodeNextHop(mandatory)
+	if err != nil || !ignore {
+		t.Fatalf("an unknown mandatory sub-TLV reported ignore=%v err=%v", ignore, err)
+	}
+	if !got.Equal(addr) {
+		t.Errorf("the ignored TLV gave back %v, want the next hop %v it still sets", got, addr)
 	}
 }
 

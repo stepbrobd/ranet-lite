@@ -106,7 +106,15 @@ func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 			}
 			return err
 		}},
-		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), func(b []byte) error { _, _, err := DecodeNextHop(b); return err }},
+		// NextHop reports the ignore the same way, and for the same reason:
+		// RFC 8966 section 4.6.8 sets the next hop either way.
+		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), func(b []byte) error {
+			_, _, ignore, err := DecodeNextHop(b)
+			if ignore {
+				return errIgnoredTLV
+			}
+			return err
+		}},
 		{"AckReq", EncodeAckReq(1, 100), func(b []byte) error { _, err := DecodeAckReq(b); return err }},
 		{"RouteRequest", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
 		{"WildcardRequest", EncodeRouteRequest(RouteRequest{AE: AEWildcard}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},

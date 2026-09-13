@@ -1224,9 +1224,131 @@ func TestDroppedTriggeredUpdateIsStillOwed(t *testing.T) {
 	emitLockedNow()
 
 	speaker.mu.Lock()
-	owed := len(speaker.routes.dirty)
+	owed := len(neighbor.owed)
 	speaker.mu.Unlock()
 	if owed == 0 {
 		t.Error("the urgent update was dropped and nothing still owes it, so the change waits for the next periodic dump")
+	}
+}
+
+// And what goes back is that neighbor's copy. A shared record put the whole
+// triggered update back for every neighbor, so one congested peer made the
+// speaker repeat it to every healthy one on every wake of the run loop until
+// the next periodic dump, which on a neighbor loss is a full multi-packet dump
+// several times a second.
+func TestOneJammedNeighborDoesNotRepeatTheUpdateToTheRest(t *testing.T) {
+	speaker, jammed, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(jammed)
+	blocked := make(chan struct{})
+	var release sync.Once
+	stuck := netstack.NewPeerReserved("stuck",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { <-blocked; return nil })
+	defer func() { release.Do(func() { close(blocked) }); stuck.Close() }()
+	speaker.mu.Lock()
+	jammed.peer = stuck
+	speaker.mu.Unlock()
+	for {
+		place, err := stuck.ReserveRawOrDrop([]byte("bulk"), 41)
+		if errors.Is(err, netstack.ErrSendQueueFull) {
+			break
+		}
+		place.Send()
+	}
+
+	var healthy atomic.Int64
+	peer := netstack.NewPeer("healthy", func(raw []byte, _ byte) ([]byte, error) { return raw, nil },
+		func([]byte) error { healthy.Add(1); return nil })
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	makeNeighborReachable(speaker.neighbors[peer.ID])
+
+	prefix := netip.MustParsePrefix("fd00:7::/64")
+	speaker.Originate(prefix)
+	const passes = 20
+	for pass := range passes {
+		speaker.mu.Lock()
+		// Seeded on the first pass only: Originate wakes the run loop rather
+		// than leaving the key for the next pass to pick up, and what is being
+		// measured is what the later passes repeat on their own.
+		if pass == 0 {
+			speaker.routes.dirty[routeKey{dest: prefix}] = struct{}{}
+		}
+		send := speaker.emitLocked(speaker.triggeredActions(time.Now()))
+		speaker.mu.Unlock()
+		send()
+	}
+	if got := healthy.Load(); got > 2 {
+		t.Errorf("the healthy neighbor was sent %d copies of one triggered update across %d passes", got, passes)
+	}
+	speaker.mu.Lock()
+	stillOwed := len(jammed.owed)
+	speaker.mu.Unlock()
+	if stillOwed == 0 {
+		t.Error("the jammed neighbor stopped being owed the update it never got")
+	}
+}
+
+// A dropped Hello is the one packet of a pass that nothing else stands in for,
+// so the pass that lost it has to put the record back: Run re-emits only for a
+// neighbor whose sentHello is clear or whose interval is due, and three lost
+// Hellos in a row withdraw every route through the neighbor.
+func TestDroppedHelloIsSentAgainOnTheNextWake(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	closed := netstack.NewPeerReserved("closed",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return nil })
+	closed.Close()
+	speaker.mu.Lock()
+	neighbor.peer = closed
+	hello := speaker.helloAction(neighbor, time.Now())
+	sent := neighbor.sentHello
+	send := speaker.emitLocked([]sendAction{hello})
+	speaker.mu.Unlock()
+	send()
+
+	if !sent {
+		t.Fatal("helloAction did not record the hello it built, so this proves nothing")
+	}
+	speaker.mu.Lock()
+	still := neighbor.sentHello
+	speaker.mu.Unlock()
+	if still {
+		t.Error("a dropped hello is still recorded as sent, so the next wake does not redo it")
+	}
+}
+
+// The Hello and the dump are both multicast, so coalescing on the destination
+// alone merged them into one action and one priority. The priority is part of
+// the key for that reason: a dump decided before its Hello would otherwise
+// carry the Hello into the droppable tail, and a truncated dump would roll the
+// Hello's own record back with it.
+func TestHelloIsNotCoalescedIntoTheDump(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	prefix := netip.MustParsePrefix("fd00:9::/64")
+	dump := sendAction{neighbor: neighbor, dest: multicastGroup, priority: priorityDump, tlvs: []RawTLV{
+		EncodeRouterID([8]byte{1}),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 64}),
+	}}
+	speaker.mu.Lock()
+	// The dump first, which is the order that used to swallow the hello.
+	merged := coalesce([]sendAction{dump, speaker.helloAction(neighbor, time.Now())})
+	speaker.mu.Unlock()
+	if len(merged) != 2 {
+		t.Fatalf("coalesce produced %d actions, so the hello shares the dump's place in the queue", len(merged))
+	}
+	if merged[0].priority == merged[1].priority {
+		t.Error("the two actions carry one priority, so the sort cannot tell them apart")
 	}
 }

@@ -134,9 +134,13 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			// point-to-point ESP tunnels, so the next hop toward a prefix a
 			// neighbor announces is that neighbor. What the TLV decides here
 			// is whether an IPv4 prefix has a next hop at all.
+			// Section 4.6.8: "This TLV sets up the next hop for subsequent
+			// Update TLVs even if it is otherwise ignored due to an unknown
+			// mandatory sub-TLV", so the state follows the address rather than
+			// the decision to ignore.
 			// Matched on the encoding, which is the address family section
 			// 4.6.9 pairs an Update with. See DecodeNextHop.
-			if _, ae, err := DecodeNextHop(t.Body); err == nil && ae == AEIPv4 {
+			if _, ae, _, err := DecodeNextHop(t.Body); err == nil && ae == AEIPv4 {
 				haveIPv4NextHop = true
 			}
 
@@ -174,7 +178,14 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			// ignored." Every packet here is IPv6, so a plain AE 1 prefix has
 			// neither. RFC 9229's AE 4 is the spelling that does, and is what
 			// this node sends.
-			if u.AE == AEIPv4 && !haveIPv4NextHop {
+			//
+			// A retraction is exempt, by the same section: "If the metric
+			// field is FFFF hexadecimal, this TLV specifies a retraction. In
+			// that case, the router-id, next hop, and seqno are not used."
+			// RFC 9229 section 2.1 says so for this link in as many words, and
+			// dropping one holds the withdrawn prefix until it expires while
+			// this node keeps advertising it onward.
+			if u.AE == AEIPv4 && !haveIPv4NextHop && u.Metric != MetricInfinity {
 				continue
 			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)

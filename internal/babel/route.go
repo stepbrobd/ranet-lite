@@ -394,15 +394,6 @@ func (rt *routeTable) nextExpiry() time.Time {
 	return deadline
 }
 
-// markDirty puts keys back after the packet that would have carried them was
-// dropped. RFC 8966 section 3.7.2 makes a triggered update owed rather than
-// optional, and takeDirty has already consumed the record that it is owed.
-func (rt *routeTable) markDirty(keys []routeKey) {
-	for _, key := range keys {
-		rt.dirty[key] = struct{}{}
-	}
-}
-
 // takeDirty returns the keys whose advertisement changed since the last call.
 func (rt *routeTable) takeDirty() []routeKey {
 	if len(rt.dirty) == 0 {

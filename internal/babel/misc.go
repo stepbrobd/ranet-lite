@@ -41,30 +41,28 @@ func EncodeNextHop(addr net.IP) RawTLV {
 	return RawTLV{Type: TLVNextHop, Body: body}
 }
 
-// DecodeNextHop returns the next hop and the address encoding that named it.
-// The encoding is reported rather than inferred from the address: RFC 8966
-// section 4.6.9 pairs an Update with "the last preceding Next Hop TLV with a
-// matching address family (IPv4 or IPv6)", and an AE 2 body carrying
-// ::ffff:a.b.c.d is an IPv6 next hop that net.IP.To4 reports as IPv4. Taking
-// it for one enables the AE 1 Updates behind it, which that section says MUST
-// be ignored for want of a next hop.
-func DecodeNextHop(body []byte) (net.IP, uint8, error) {
+// DecodeNextHop returns the next hop and, as the second result, whether the
+// TLV is otherwise ignored. RFC 8966 section 4.6.8: "This TLV sets up the next
+// hop for subsequent Update TLVs even if it is otherwise ignored due to an
+// unknown mandatory sub-TLV", which is why the address comes back either way.
+// Only a malformed TLV returns an error.
+func DecodeNextHop(body []byte) (addr net.IP, ae uint8, ignore bool, err error) {
 	if len(body) < 2 {
-		return nil, 0, fmt.Errorf("babel: short NextHop TLV")
+		return nil, 0, false, fmt.Errorf("babel: short NextHop TLV")
 	}
-	ae := body[0]
-	addr, err := decodeAddress(ae, body[2:])
+	ae = body[0]
+	addr, err = decodeAddress(ae, body[2:])
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 	length := len(addr)
 	if ae == AEIPv6LinkLocal {
 		length = 8
 	}
 	if _, err := decodeOptionalSubTLVs(body[2+length:]); err != nil {
-		return nil, 0, err
+		return addr, ae, true, nil
 	}
-	return addr, ae, nil
+	return addr, ae, false, nil
 }
 
 // AckReq / Ack, RFC 8966 §4.6.3/§4.6.4 — used for reliable signaling of

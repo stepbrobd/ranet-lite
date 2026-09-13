@@ -159,6 +159,20 @@ func TestIPv4UpdateWithNoNextHopIsIgnored(t *testing.T) {
 	if got, _ := s.mesh.Routes.Lookup(src, dest.Addr()); got != a {
 		t.Error("an IPv4 update carrying a next hop was ignored too")
 	}
+
+	// And the withdrawal of it needs no next hop, by RFC 8966 section 4.6.9:
+	// "If the metric field is FFFF hexadecimal, this TLV specifies a
+	// retraction. In that case, the router-id, next hop, and seqno are not
+	// used." RFC 9229 section 2.1 says a node "MAY send IPv4 retractions only"
+	// on a link with no IPv4 address, which is this one.
+	s.Receive(a, buildPacket(netip.MustParseAddr("fe80::2"), multicastGroup, EncodePacket([]RawTLV{
+		EncodeRouterID([8]byte{1}),
+		EncodeUpdate(Update{AE: AEIPv4, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Seqno: 2, Metric: MetricInfinity, Interval: 1000}),
+	})))
+	if got, _ := s.mesh.Routes.Lookup(src, dest.Addr()); got == a {
+		t.Error("an IPv4 retraction was ignored, so the prefix is held until it expires and advertised onward meanwhile")
+	}
 }
 
 // RFC 8966 section 4.6.6 on the IHU's Interval: "An upper bound, expressed in
