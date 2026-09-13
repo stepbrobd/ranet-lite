@@ -1,11 +1,16 @@
 package kernel
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/netip"
 	"slices"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -354,6 +359,77 @@ func TestReconcileRepairsAfterFailedApply(t *testing.T) {
 	}
 }
 
+func captureKernelLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &logs
+}
+
+func TestReconcileCountsOnlyAppliedRoutes(t *testing.T) {
+	logs := captureKernelLogs(t)
+	reconciler, table, fake := harness(t, Config{})
+	installed := Route{Destination: prefix("198.51.100.0/24")}
+	occupied := Route{Destination: prefix("203.0.113.0/24")}
+	removed := Route{Destination: prefix("192.0.2.0/25")}
+	retained := Route{Destination: prefix("192.0.2.128/25")}
+	fake.routes[removed], fake.routes[retained] = true, true
+	fake.failAdd[occupied] = syscall.EEXIST
+	fake.failDel[retained] = syscall.EPERM
+	table.Set(netip.Prefix{}, installed.Destination, nil)
+	table.Set(netip.Prefix{}, occupied.Destination, nil)
+	for pass := range 2 {
+		logs.Reset()
+		err := reconciler.reconcile()
+		if pass == 0 && (!errors.Is(err, syscall.EEXIST) || !errors.Is(err, syscall.EPERM)) {
+			t.Fatalf("reconcile returned %v, want both refused operations", err)
+		}
+		if pass == 1 && err != nil {
+			t.Fatal(err)
+		}
+		var counts struct {
+			Added   int
+			Removed int
+		}
+		if err := json.Unmarshal(logs.Bytes(), &counts); err != nil {
+			t.Fatal(err)
+		}
+		if counts.Added != 1 || counts.Removed != 1 {
+			t.Errorf("pass %d reported added=%d removed=%d, want added=1 removed=1", pass, counts.Added, counts.Removed)
+		}
+		want := []Route{installed, retained}
+		if pass == 1 {
+			want = []Route{installed, occupied}
+		}
+		slices.SortFunc(want, compareRoutes)
+		if got := fake.snapshot(); !slices.Equal(got, want) {
+			t.Fatalf("pass %d holds %v, want %v", pass, got, want)
+		}
+		delete(fake.failAdd, occupied)
+		delete(fake.failDel, retained)
+	}
+}
+
+func TestReconcileDoesNotCountSkippedRoutes(t *testing.T) {
+	logs := captureKernelLogs(t)
+	reconciler, table, fake := harness(t, Config{})
+	skipped := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
+	fake.failAdd[skipped] = errRouteSkipped
+	table.Set(skipped.Source, skipped.Destination, nil)
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatalf("an unrepresentable route triggered retry: %v", err)
+	}
+	var counts map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &counts); err != nil {
+		t.Fatal(err)
+	}
+	if counts["added"] != float64(0) {
+		t.Errorf("an unrepresentable route was counted as added: %v", counts["added"])
+	}
+}
+
 // A dump that fails must not be read as an empty kernel, which would delete
 // nothing but would also install every route a second time.
 func TestReconcileReportsAFailedDump(t *testing.T) {
@@ -497,4 +573,37 @@ func waitFor(t *testing.T, done func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition was not reached in time")
+}
+
+// A route the platform refuses is neither installed nor a failure. Counting it
+// as added makes the reconcile line report the opposite of what the kernel
+// holds, for as long as the other writer keeps the key, and the route stays in
+// the diff so the count repeats every pass.
+func TestSkippedRoutesAreNotCountedAndDoNotFailThePass(t *testing.T) {
+	r, table, kernel := harness(t, Config{})
+	occupied := prefix("2001:db8::/48")
+	table.Set(netip.Prefix{}, occupied, nil)
+	table.Set(netip.Prefix{}, prefix("2001:db8:1::/48"), nil)
+	for _, route := range r.desired(table.Snapshot()) {
+		if route.Destination == occupied {
+			kernel.failAdd[route] = fmt.Errorf("another writer holds it: %w", errRouteSkipped)
+		}
+	}
+	if len(kernel.failAdd) != 1 {
+		t.Fatalf("the occupied route was not among the desired ones: %v", r.desired(table.Snapshot()))
+	}
+
+	if err := r.applyRoutes(); err != nil {
+		t.Fatalf("a refused route failed the whole pass: %v", err)
+	}
+	if kernel.adds != 1 {
+		t.Fatalf("the kernel took %d routes, want 1", kernel.adds)
+	}
+	// Still wanted, so the next pass tries again rather than forgetting it.
+	if err := r.applyRoutes(); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if kernel.adds != 1 {
+		t.Fatalf("the kernel took %d routes across two passes, want 1", kernel.adds)
+	}
 }

@@ -91,11 +91,11 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 		t.Fatalf("table holds %v, want %v (err %v)", got, want, err)
 	}
 
-	// An add is a replace, so repeating one is not an error and changes
-	// nothing: this is what lets a reconcile pass repair a partial apply.
+	// an exclusive install must report a collision even if the route is ours,
+	// so a race after the dump cannot be counted as a successful addition
 	for _, route := range want {
-		if err := plat.AddRoute(route); err != nil {
-			t.Fatalf("reinstall %s: %v", route, err)
+		if err := plat.AddRoute(route); !errors.Is(err, unix.EEXIST) {
+			t.Fatalf("reinstall %s: got %v, want EEXIST", route, err)
 		}
 	}
 	if got, _ := plat.Routes(); !slices.Equal(got, want) {
@@ -176,6 +176,50 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 	}
 
 	testVRFEnslavement(t, conn, plat)
+}
+
+func TestNetlinkReportsOccupiedRoute(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("the real netlink path needs root on linux")
+	}
+	enterThrowawayNamespace(t)
+	conn, err := dialNetlink()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	requireEmptyNamespace(t, conn)
+	// the namespace's own loopback needs no optional link driver
+	const device = "lo"
+	index, _, err := conn.link(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setLinkFlags(t, conn, index, unix.IFF_UP)
+	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
+	opened, err := newPlatform(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	plat := opened.(*netlinkPlatform)
+	cfg.Protocol++
+	foreign := &netlinkPlatform{cfg: cfg, index: index, conn: conn}
+	announced := Route{Destination: prefix("198.51.100.0/24")}
+	if err := foreign.AddRoute(announced); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := range 2 {
+		if err := plat.AddRoute(announced); !errors.Is(err, unix.EEXIST) {
+			t.Errorf("attempt %d reported %v, want EEXIST for the foreign route", attempt, err)
+		}
+	}
+	if got, err := plat.Routes(); err != nil || len(got) != 0 {
+		t.Fatalf("refused route appeared owned: %v, error %v", got, err)
+	}
+	if got, err := foreign.Routes(); err != nil || !slices.Equal(got, []Route{announced}) {
+		t.Fatalf("foreign route changed: %v, error %v", got, err)
+	}
 }
 
 // testVRFEnslavement runs last: joining a VRF flushes the device's addresses

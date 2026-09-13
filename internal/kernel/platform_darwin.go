@@ -375,8 +375,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 			// addresses cannot be expressed: interface scope selects on the
 			// socket's bound address, so it can only stand in for "from an
 			// address of ours".
-			p.skipSourceSpecific(r)
-			return nil
+			return p.skipSourceSpecific(r)
 		}
 	}
 	if scopeOnDarwin(r) {
@@ -387,8 +386,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 			// competing with a source-specific route to the same destination.
 			// Skipping says so once; installing would collide, and recording
 			// it would make the two take turns being reported as installed.
-			p.skipSourceSpecific(r)
-			return nil
+			return p.skipSourceSpecific(r)
 		}
 	}
 	message, err := p.routeMessage(unix.RTM_ADD, r)
@@ -413,7 +411,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 				"destination", r.Destination, "interface", p.cfg.Interface,
 				"detail", "darwin cannot replace a route, so this one was not installed")
 		}
-		return nil
+		return errRouteSkipped
 	}
 	delete(p.occupied, r.Destination)
 	// Recorded only after the write lands, and only for a route that actually
@@ -500,16 +498,18 @@ func (p *routePlatform) DelRoute(r Route) error {
 }
 
 // skipSourceSpecific reports a route the darwin FIB cannot express, once per
-// route rather than once per pass. Returning success is deliberate: the
-// reconciler would otherwise retry with backoff forever over something no
-// retry can fix, and the mesh's own table still forwards by source.
-func (p *routePlatform) skipSourceSpecific(r Route) {
+// route rather than once per pass. errRouteSkipped rather than a failure is
+// deliberate: the reconciler would otherwise retry with backoff forever over
+// something no retry can fix, and the mesh's own table still forwards by
+// source.
+func (p *routePlatform) skipSourceSpecific(r Route) error {
 	key := Route{Destination: r.Destination, Source: r.Source}
 	if !p.warned[key] {
 		slog.Warn("kernel cannot install a source-specific route on darwin",
 			"destination", r.Destination, "source", r.Source)
 	}
 	p.pending[key] = true
+	return errRouteSkipped
 }
 
 func (p *routePlatform) Addrs() ([]netip.Prefix, error) {

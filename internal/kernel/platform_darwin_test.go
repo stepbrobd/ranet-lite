@@ -370,8 +370,8 @@ func TestDarwinSkipsSourceSpecificRoutes(t *testing.T) {
 		Metric:      defaultIPv6Metric,
 	}
 
-	if err := plat.AddRoute(specific); err != nil {
-		t.Fatalf("a source-specific route has to be skipped, not failed: %v", err)
+	if err := plat.AddRoute(specific); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("a source-specific route has to report itself skipped, not %v", err)
 	}
 	// deleting one has to be a no-op too: dropping the source and deleting what
 	// is left would take out the default route.
@@ -388,8 +388,8 @@ func TestDarwinSkipsSourceSpecificRoutes(t *testing.T) {
 	}
 	// the report is deduplicated across passes, and Routes starts every pass.
 	plat.rotateWarnings()
-	if err := plat.AddRoute(specific); err != nil {
-		t.Fatalf("add the same route again: %v", err)
+	if err := plat.AddRoute(specific); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("adding the same route again reported %v", err)
 	}
 	if !plat.warned[key] {
 		t.Fatal("the second pass did not see the route as already reported")
@@ -757,8 +757,8 @@ func TestDarwinRefusesASecondSourceForOneDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	written := len(sock.sent)
-	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("203.0.113.0/24")}); err != nil {
-		t.Fatalf("the second source was reported as an error rather than skipped: %v", err)
+	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("203.0.113.0/24")}); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("the second source reported %v rather than reporting itself skipped", err)
 	}
 	if len(sock.sent) != written {
 		t.Error("a second source prefix for one destination was written to the kernel")
@@ -835,5 +835,30 @@ func TestDarwinDeleteSelectsTheScopeOfTheRouteItWithdraws(t *testing.T) {
 	written = sock.messages(t)
 	if len(written) != 2 || written[1].Flags&unix.RTF_IFSCOPE == 0 {
 		t.Fatal("withdrawing an announced default did not select its interface scope")
+	}
+}
+
+// A route the kernel refuses is neither installed nor an error. Reported as
+// installed it would make the reconcile line say the opposite of what the
+// kernel holds, for as long as the other writer keeps the key; reported as a
+// failure it would put every pass into backoff over something no retry frees.
+func TestDarwinReportsAnOccupiedRouteAsSkipped(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	announced := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
+	plat.addrs = func() ([]netip.Prefix, error) {
+		return []netip.Prefix{prefix("2001:db8::1/128")}, nil
+	}
+	sock.err = unix.EEXIST
+	for attempt := range 2 {
+		if err := plat.AddRoute(announced); !errors.Is(err, errRouteSkipped) {
+			t.Errorf("attempt %d reported %v, want the route reported as not installed", attempt, err)
+		}
+	}
+	actual, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+		dst: announced.Destination, gateway: ourGateway(),
+	}))
+	if err != nil || len(actual) != 0 {
+		t.Fatalf("refused route appeared owned: %v, error %v", actual, err)
 	}
 }

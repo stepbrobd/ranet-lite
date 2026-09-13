@@ -90,6 +90,15 @@ const (
 // implementation. A darwin backend is separate work.
 var ErrUnsupported = errors.New("kernel: route reconciliation is unsupported on this platform")
 
+// errRouteSkipped distinguishes a route that was deliberately not installed
+// from one that was, and from a transient failure. It covers a route the
+// platform cannot represent and a key another writer already holds. The
+// reconciler neither counts it as added nor retries with backoff: counting it
+// would report the opposite of what the kernel holds, and backing off would
+// stand down over something no retry can fix. The install is still attempted
+// on the next pass, because the route stays in the diff until it is there.
+var errRouteSkipped = errors.New("kernel: route was not installed")
+
 type Config struct {
 	// Interface is the TUN device every installed route points at, named as
 	// the kernel named it (netstack.Mesh.Name, not the requested name).
@@ -356,10 +365,8 @@ func (r *Reconciler) reconcile() error {
 	return errors.Join(r.applyMaster(), r.applyAddresses(), r.applyRoutes())
 }
 
-// applyRoutes removes before it installs. A route pointing at an interface
-// carrying no address is harmless, but the kernel drops routes when the last
-// address goes away, so putting additions first is never wrong and sometimes
-// avoids a gap.
+// applyRoutes removes before it installs, so a changed non-key attribute does
+// not collide with the old route under the exclusive-install policy.
 func (r *Reconciler) applyRoutes() error {
 	actual, err := r.plat.Routes()
 	if err != nil {
@@ -367,6 +374,7 @@ func (r *Reconciler) applyRoutes() error {
 	}
 	add, del := diffRoutes(r.desired(r.src.Snapshot()), actual)
 	var errs []error
+	added, removed := 0, 0
 	// Withdraw before installing. An install refuses a key another writer
 	// already holds rather than taking it over, so a route of ours that
 	// changed only in an attribute the kernel does not key on, a preferred
@@ -376,15 +384,19 @@ func (r *Reconciler) applyRoutes() error {
 	for _, route := range del {
 		if err := r.plat.DelRoute(route); err != nil {
 			errs = append(errs, fmt.Errorf("delete route %s: %w", route, err))
+		} else {
+			removed++
 		}
 	}
 	for _, route := range add {
-		if err := r.plat.AddRoute(route); err != nil {
+		if err := r.plat.AddRoute(route); err == nil {
+			added++
+		} else if !errors.Is(err, errRouteSkipped) {
 			errs = append(errs, fmt.Errorf("add route %s: %w", route, err))
 		}
 	}
 	if len(add) > 0 || len(del) > 0 {
-		slog.Info("kernel routes reconciled", "added", len(add), "removed", len(del))
+		slog.Info("kernel routes reconciled", "added", added, "removed", removed)
 	}
 	return errors.Join(errs...)
 }

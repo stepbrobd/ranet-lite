@@ -218,7 +218,10 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 				"route", key, "table", p.cfg.Table,
 				"detail", "something else holds this prefix at this metric in this table, so it was not installed")
 		}
-		return nil
+		// Not a failure and not an install. Reported as an error it would put
+		// the whole pass into backoff over a key no retry can free, once per
+		// pass, forever.
+		return errRouteSkipped
 	}
 	if errors.Is(err, unix.EINVAL) && route.PrefSrc.IsValid() {
 		// The one EINVAL with a cause an operator can act on, and the reason
