@@ -109,8 +109,9 @@ func (c *Config) KernelAddresses() ([]netip.Prefix, error) {
 	// its transit prefix, and assign_originated would otherwise try to put
 	// "::/0" on the tun on every pass and fail on every one. The test is the
 	// address rather than the prefix length, because a prefix length says
-	// nothing about whether an address can be assigned; validate refuses the
-	// other zero-length spellings outright.
+	// nothing about whether an address can be assigned. validate refuses every
+	// other zero-length spelling, on both originate lists and on
+	// kernel.addresses, so this is the one that is left.
 	add := func(prefix netip.Prefix) {
 		if prefix.Addr().IsUnspecified() || seen[prefix] {
 			return
@@ -305,12 +306,17 @@ func (o *OriginatePrefix) UnmarshalYAML(value *yaml.Node) error {
 		}
 		*target = prefix
 	}
-	for name, prefix := range map[string]netip.Prefix{"prefix": o.Prefix, "from": o.From} {
-		if !prefix.IsValid() {
+	// In this order, so an entry whose prefix and from are both wrong names
+	// the same one every time it is loaded.
+	for _, field := range []struct {
+		name   string
+		prefix netip.Prefix
+	}{{"prefix", o.Prefix}, {"from", o.From}} {
+		if !field.prefix.IsValid() {
 			continue
 		}
-		if err := maskedDefault(prefix); err != nil {
-			return fmt.Errorf("config: originate %s %q %w", name, prefix, err)
+		if err := maskedDefault(field.prefix); err != nil {
+			return fmt.Errorf("config: originate %s %q %w", field.name, field.prefix, err)
 		}
 	}
 	switch {
@@ -467,9 +473,14 @@ func (c *Config) validate() error {
 		// Assigning the unspecified address is not something an interface can
 		// do, and KernelAddresses skips it, so accepting the entry and
 		// dropping it silently is the one outcome that tells the operator
-		// nothing.
+		// nothing. A masked default is refused for the same reason it is in
+		// originate: the length is what an interface carries the address
+		// under, and zero is not one an operator can have meant.
 		if prefix.Addr().IsUnspecified() {
 			return fmt.Errorf("config: kernel.addresses %q is not an address an interface can carry", raw)
+		}
+		if err := maskedDefault(prefix); err != nil {
+			return fmt.Errorf("config: kernel.addresses %q %w", raw, err)
 		}
 	}
 	return nil

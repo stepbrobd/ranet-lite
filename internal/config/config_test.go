@@ -375,6 +375,10 @@ func TestTopLevelListsRefuseWhatTheyCannotMean(t *testing.T) {
 		"originate masked default":    "originate:\n  - 2001:db8::1/0\n",
 		"originate masked default v4": "originate:\n  - 198.51.100.1/0\n",
 		"kernel address unspecified":  "kernel:\n  enabled: true\n  addresses:\n    - \"::/0\"\n",
+		// The same masked default, on the one list whose entries are assigned
+		// rather than announced: the length is what an interface carries the
+		// address under.
+		"kernel address masked default": "kernel:\n  enabled: true\n  addresses:\n    - 2001:db8::1/0\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := load(t, addition); err == nil {
