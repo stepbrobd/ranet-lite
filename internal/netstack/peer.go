@@ -208,6 +208,17 @@ func (p *Peer) ReserveRawOrDrop(raw []byte, nextHeader byte) (*Place, error) {
 // reserved ahead of it has gone.
 func (p *Place) Send() error { return p.batch.enqueue() }
 
+// OnFailure registers what to run if this packet does not reach the wire. Send
+// reports only that the packet was queued: the transport error surfaces on the
+// sender goroutine, after Send has returned, so a caller that gave back its
+// bookkeeping at the reservation alone never hears about a packet lost from
+// there on.
+//
+// It must be called before Send, because the batch belongs to the sender from
+// then on. The callback runs at most once, on whichever goroutine finishes
+// with the batch, so it must not block.
+func (p *Place) OnFailure(f func(error)) { p.batch.onFailure = f }
+
 type peerBatch struct {
 	peer      *Peer
 	ticket    uint64
@@ -227,7 +238,12 @@ type peerBatch struct {
 	// packets from the counter entirely.
 	counted bool
 	done    chan error
-	hasSlot bool
+	// onFailure is the caller's completion signal, set through Place. failed
+	// keeps it to one call: a batch reaches exactly one terminal state, but
+	// several sites decide it.
+	onFailure func(error)
+	failed    bool
+	hasSlot   bool
 	// control says which budget the place came from, so it goes back where it
 	// was taken from.
 	control bool
@@ -397,7 +413,19 @@ func (b *peerBatch) abandon() error {
 	}
 	b.releaseStorage()
 	b.releaseSlot()
-	return fmt.Errorf("netstack: peer %s closed", b.peer.ID)
+	err := fmt.Errorf("netstack: peer %s closed", b.peer.ID)
+	b.fail(err)
+	return err
+}
+
+// fail tells whoever reserved the place that this packet will not reach the
+// wire, once.
+func (b *peerBatch) fail(err error) {
+	if b.onFailure == nil || b.failed {
+		return
+	}
+	b.failed = true
+	b.onFailure(err)
 }
 
 // transmit is the synchronous form used by control traffic and tests. Routed
@@ -456,6 +484,9 @@ func (b *peerBatch) send() error {
 			p.sendFailed.Add(uint64(len(b.sealed)))
 		}
 		b.counted = true
+	}
+	if b.err != nil {
+		b.fail(b.err)
 	}
 	return b.err
 }
@@ -588,6 +619,9 @@ func (p *Peer) senderLoop() {
 			}
 			b.releaseStorage()
 			b.releaseSlot()
+			if b.err != nil {
+				b.fail(b.err)
+			}
 			if b.done != nil {
 				b.done <- b.err
 			} else if b.err != nil {

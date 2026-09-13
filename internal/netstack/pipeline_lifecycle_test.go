@@ -12,6 +12,81 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
+// Both halves of Place.OnFailure: a packet the transport loses is reported,
+// and one it carries is not.
+func TestOnFailureReportsAPacketLostAfterItWasQueued(t *testing.T) {
+	for name, fails := range map[string]bool{
+		"the transport fails": true,
+		"the transport works": false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			peer := NewPeerReserved("peer",
+				func(int) (BatchSealer, error) {
+					return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+						return append(out[:0], raw...), nil
+					}, nil
+				}, func([][]byte) error {
+					if fails {
+						return errors.New("sendto: network is unreachable")
+					}
+					return nil
+				})
+			defer peer.Close()
+			place, err := peer.ReserveRawOrDrop([]byte("packet"), 41)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lost := make(chan error, 1)
+			place.OnFailure(func(err error) { lost <- err })
+			if err := place.Send(); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			select {
+			case err := <-lost:
+				if !fails {
+					t.Errorf("a packet that reached the wire was reported lost: %v", err)
+				}
+				if err == nil {
+					t.Error("the callback ran with no error")
+				}
+			case <-time.After(500 * time.Millisecond):
+				if fails {
+					t.Error("a packet lost in the transport was never reported back")
+				}
+			}
+		})
+	}
+}
+
+// A peer that closes before its sender takes the batch loses it too, and the
+// caller has to hear about that the same way.
+func TestOnFailureReportsWhatAClosedPeerDropped(t *testing.T) {
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		}, func([][]byte) error { return nil })
+	place, err := peer.ReserveRawOrDrop([]byte("packet"), 41)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost := make(chan error, 1)
+	place.OnFailure(func(err error) { lost <- err })
+	// Closed with the place taken and not yet sent, which is the teardown
+	// window: the batch holds a ticket the sender is waiting on, and nothing
+	// will transmit it.
+	peer.Close()
+	if err := place.Send(); err == nil {
+		t.Error("sending into a closed peer reported success")
+	}
+	select {
+	case <-lost:
+	case <-time.After(2 * time.Second):
+		t.Error("a packet a closing peer gave back was never reported to its caller")
+	}
+}
+
 func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 	firstReserved := make(chan struct{})
 	releaseFirst := make(chan struct{})
