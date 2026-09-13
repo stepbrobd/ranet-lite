@@ -247,7 +247,7 @@ func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 	centis := uint16(s.cfg.HelloInterval / (10 * time.Millisecond))
 	n.sentHello = true
 	n.helloSeqno++
-	ihu := IHU{RxCost: s.cfg.Cost.RxCost, Interval: centis}
+	ihu := IHU{RxCost: s.cfg.Cost.rxCost(&n.multicastHistory), Interval: centis}
 	if n.haveTheirHello {
 		ihu.OriginTS, ihu.ReceiveTS, ihu.HasTS = n.theirHelloTxTS, n.theirHelloRxTS, true
 	}
@@ -255,9 +255,15 @@ func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 		EncodeHello(Hello{Seqno: n.helloSeqno, Interval: centis, HasTS: true}),
 		EncodeIHU(ihu),
 	}, rollback: []func(){func() {
-		// The seqno is not given back: a Hello that was not sent is a Hello
-		// the neighbor lost, and that is the counter's subject. The next wake
-		// redoes the Hello itself.
+		// The seqno is given back. RFC 8966 section 4.6.5 counts Hellos that
+		// were sent, and a refused reservation is one that never reached the
+		// wire, so keeping the increment tells the neighbor it lost a Hello
+		// nobody transmitted. That was cosmetic until Hello loss became a
+		// cost: the speaker retries every quarter interval, so a few seconds
+		// of a stalled tunnel burned several sequence numbers and the peer's
+		// six-entry window read them all as loss, costing the link up to six
+		// times nominal at each end over a local queue that dropped nothing.
+		n.helloSeqno--
 		n.sentHello = false
 	}}}
 }

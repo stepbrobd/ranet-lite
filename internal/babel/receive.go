@@ -86,7 +86,22 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 				} else {
 					n.lastHelloTime = now
 					n.helloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
+					// Appendix A.1 resets the timer to 1.5 times the advertised
+					// interval, the margin absorbing jitter, and this node's own
+					// deadTimeout already carries that shape.
+					n.nextHelloDue = now.Add(n.helloInterval + n.helloInterval/2)
 				}
+			}
+			// Only the kind this tree sends has a history, which is the kind
+			// Appendix A.2.2 reads. An unscheduled Hello still counts as one
+			// that arrived: it carries a sequence number and the sender
+			// incremented its counter for it.
+			if !h.Unicast && !n.multicastHistory.record(h.Seqno) {
+				// Appendix A.1: past the window the sender has probably
+				// rebooted and lost its counter, so the vector no longer
+				// describes the link and is started again from this Hello.
+				n.multicastHistory = helloHistory{}
+				n.multicastHistory.record(h.Seqno)
 			}
 			if h.HasTS {
 				n.theirHelloTxTS, n.theirHelloRxTS, n.haveTheirHello = h.TxTS, recvTS, true

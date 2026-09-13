@@ -18,6 +18,15 @@ type neighborState struct {
 	unicastHelloTime     time.Time
 	unicastHelloInterval time.Duration
 
+	// multicastHistory is the Hello history of RFC 8966 Appendix A.1 for the
+	// kind of Hello this tree sends, which Appendix A.2.2 reads the reception
+	// probability off. nextHelloDue is when the next one is expected, so a
+	// Hello that never arrives becomes a zero in the vector rather than
+	// nothing at all: without the timer half, a link that goes quiet keeps
+	// whatever quality its last Hello gave it until the neighbor expires.
+	multicastHistory helloHistory
+	nextHelloDue     time.Time
+
 	// RFC 9616 timestamps: echo their latest Hello in our IHU. Their reply
 	// may refer to an older local Hello, so local transmit history is unneeded.
 	theirHelloTxTS uint32
@@ -107,5 +116,7 @@ func (n *neighborState) linkCost(now time.Time, cost CostParams) uint16 {
 	if !n.isAlive(now) || !n.haveReportedCost || !now.Before(n.ihuExpiry) {
 		return MetricInfinity
 	}
-	return saturatingAdd(n.reportedCost, cost.RTTPenalty(n.measuredRTT, n.haveRTT))
+	return saturatingAdd(
+		cost.linkQualityCost(&n.multicastHistory, n.reportedCost),
+		cost.RTTPenalty(n.measuredRTT, n.haveRTT))
 }

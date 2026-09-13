@@ -509,6 +509,9 @@ func (s *Speaker) deadlineLocked() time.Time {
 	for _, n := range s.neighbors {
 		if n.alive {
 			deadline = earlier(deadline, n.helloExpiry())
+			if !n.nextHelloDue.IsZero() {
+				deadline = earlier(deadline, n.nextHelloDue)
+			}
 		}
 		if n.haveReportedCost {
 			deadline = earlier(deadline, n.ihuExpiry)
@@ -637,6 +640,16 @@ func (s *Speaker) installRoute(key routeKey, sel routeSelection) {
 
 func (s *Speaker) sweepExpiredLocked(now time.Time) {
 	for _, n := range s.neighbors {
+		// The timer half of RFC 8966 Appendix A.1, before liveness, so a
+		// neighbor going quiet writes zeros into its history on the way down
+		// rather than keeping the quality of its last Hello. Bounded by the
+		// vector width: a link silent for an hour costs the same walk as one
+		// silent for two intervals.
+		for i := 0; i < historyDepth && n.helloInterval > 0 &&
+			!n.nextHelloDue.IsZero() && !now.Before(n.nextHelloDue); i++ {
+			n.multicastHistory.missed()
+			n.nextHelloDue = n.nextHelloDue.Add(n.helloInterval)
+		}
 		if n.alive && !n.isAlive(now) {
 			slog.Info("babel neighbor down", "peer", n.peer.ID)
 			n.alive, n.haveReportedCost = false, false

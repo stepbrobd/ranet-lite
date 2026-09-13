@@ -83,6 +83,13 @@ babel:
   # rtt_min: 10ms
   # rtt_max: 1024ms
 
+  # How a link's Hello loss becomes a cost, RFC 8966 Appendix A.2, spelled the
+  # way BIRD spells it. The fleet runs the default "etx" on these same
+  # tunnels, and a link dropping one Hello in six then costs a fifth more.
+  # Setting "none" costs every live link alike however much it drops, the
+  # behavior this had before it kept any Hello history.
+  # link_quality: etx
+
   # Advertise only this node's own prefixes and never relay a route learned
   # from a peer. Off by default, because a converted fleet needs the relaying.
   # Turn it on for a leaf: a node that redistributes is offering to carry the

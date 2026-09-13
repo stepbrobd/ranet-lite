@@ -29,6 +29,9 @@ type CostParams struct {
 	RTTMin  time.Duration
 	RTTMax  time.Duration
 	RTTCost uint16
+	// LinkQuality selects the Appendix A.2 estimator. The zero value is ETX,
+	// which the other end of every link on this mesh already runs.
+	LinkQuality LinkQuality
 }
 
 func DefaultCostParams() CostParams {

@@ -327,6 +327,10 @@ type Babel struct {
 	RTTCost *uint16   `yaml:"rtt_cost"`
 	RTTMin  *Duration `yaml:"rtt_min"`
 	RTTMax  *Duration `yaml:"rtt_max"`
+	// LinkQuality names the estimator that turns Hello loss into a cost,
+	// spelled as BIRD spells it: "etx", which the fleet runs on these same
+	// tunnels, or "none" to cost every live link the same whatever it drops.
+	LinkQuality string `yaml:"link_quality"`
 	// Originate announces source-specific prefixes, which the plain top-level
 	// originate list cannot express.
 	Originate []OriginatePrefix `yaml:"originate"`
@@ -451,6 +455,9 @@ func (b Babel) SpeakerConfig() babel.Config {
 	}
 	if b.RTTMax != nil {
 		cost.RTTMax = time.Duration(*b.RTTMax)
+	}
+	if b.LinkQuality == "none" {
+		cost.LinkQuality = babel.LinkQualityNone
 	}
 	return babel.Config{HelloInterval: time.Duration(b.HelloInterval),
 		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost, NoTransit: b.NoTransit}
@@ -589,6 +596,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than ike_rekey_interval")
 	}
 	// Validate the whole speaker configuration, link costs included, so a bad
+	switch c.Babel.LinkQuality {
+	case "", "etx", "none":
+	default:
+		return fmt.Errorf("config: babel.link_quality %q is not etx or none", c.Babel.LinkQuality)
+	}
 	// rxcost fails at load rather than at speaker construction.
 	if err := c.Babel.SpeakerConfig().Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
