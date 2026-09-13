@@ -1333,3 +1333,68 @@ func TestDarwinKeepsTheRefusalRecordThroughAnUnparseableDump(t *testing.T) {
 		t.Errorf("two passes that never decoded a route emptied the record: %v", plat.occupied)
 	}
 }
+
+// darwin holds one source per destination, so where two exits announce a
+// default from prefixes this node holds an address in, one of them is all the
+// FIB can express. Which one is kept must be the more specific source, the
+// tiebreaker RFC 9079 section 4 applies among equally specific destinations,
+// rather than whichever exit sorts lower by address.
+func TestDarwinKeepsTheMoreSpecificSourceAtOneDestination(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	held := prefix("2602:f590::23:161:104:117/128")
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
+
+	wide := Route{Destination: prefix("::/0"), Source: prefix("2602:f590::/36")}
+	narrow := Route{Destination: prefix("::/0"), Source: prefix("2602:f590::/48")}
+	for _, r := range []*Route{&wide, &narrow} {
+		r.Metric = plat.metric(r.Destination)
+	}
+
+	// diffRoutes orders the installs, so the preference has to survive it
+	// rather than only hold inside AddRoute.
+	add, _ := diffRoutes([]Route{wide, narrow}, nil, plat.scopes)
+	if len(add) != 2 {
+		t.Fatalf("the diff offered %d routes, want both", len(add))
+	}
+	if add[0].Source != narrow.Source {
+		t.Fatalf("the diff offered %s first, want the more specific %s", add[0].Source, narrow.Source)
+	}
+
+	var installed, skipped []netip.Prefix
+	for _, r := range add {
+		switch err := plat.AddRoute(r); {
+		case err == nil:
+			installed = append(installed, r.Source)
+		case errors.Is(err, errRouteSkipped):
+			skipped = append(skipped, r.Source)
+		default:
+			t.Fatal(err)
+		}
+	}
+	if len(installed) != 1 || installed[0] != narrow.Source {
+		t.Errorf("installed %v, want just the more specific %s", installed, narrow.Source)
+	}
+	if len(skipped) != 1 || skipped[0] != wide.Source {
+		t.Errorf("skipped %v, want just the less specific %s", skipped, wide.Source)
+	}
+}
+
+// A source prefix holding none of our addresses and a second source competing
+// for one destination are different refusals, and an operator told the wrong
+// one goes looking for a competing route that does not exist. Every exit
+// announcing a default from a prefix this node has no address in reaches the
+// first case, which on a real mesh is most of them.
+func TestDarwinNamesTheTwoSourceRefusalsApart(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	held := prefix("2602:f590::23:161:104:117/128")
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
+
+	foreign := Route{Destination: prefix("::/0"), Source: prefix("2602:f590:a::/48")}
+	foreign.Metric = plat.metric(foreign.Destination)
+	if err := plat.AddRoute(foreign); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("a source holding none of our addresses reported %v", err)
+	}
+	if _, warned := plat.warned[Route{Destination: foreign.Destination, Source: foreign.Source}]; warned {
+		t.Fatal("the refusal was not recorded, so this proves nothing")
+	}
+}

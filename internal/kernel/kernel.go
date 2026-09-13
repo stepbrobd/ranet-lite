@@ -624,7 +624,7 @@ func boolOrder(b bool) int {
 func compareRoutes(a, b Route) int {
 	return cmp.Or(
 		comparePrefixes(a.Destination, b.Destination),
-		comparePrefixes(a.Source, b.Source),
+		compareSourceSpecificity(a.Source, b.Source),
 		a.PrefSrc.Compare(b.PrefSrc),
 		cmp.Compare(a.Metric, b.Metric),
 		cmp.Compare(boolOrder(a.Unreachable), boolOrder(b.Unreachable)),
@@ -634,6 +634,20 @@ func compareRoutes(a, b Route) int {
 
 func comparePrefixes(a, b netip.Prefix) int {
 	return cmp.Or(a.Addr().Compare(b.Addr()), cmp.Compare(a.Bits(), b.Bits()))
+}
+
+// compareSourceSpecificity orders the more specific source prefix first, which
+// is the tiebreaker RFC 9079 section 4 applies among equally specific
+// destinations, with an absent source last because it stands for every source.
+//
+// Ordering carries policy here rather than only presentation. darwin holds one
+// source per destination, so where two source-specific routes reach the same
+// destination the one this list offers first is the one installed and the
+// other is skipped; ordering by address instead would hand that decision to
+// whichever exit happened to be numbered lower. Nothing on linux depends on
+// it, where both routes are installed and the FIB does the matching.
+func compareSourceSpecificity(a, b netip.Prefix) int {
+	return cmp.Or(cmp.Compare(b.Bits(), a.Bits()), a.Addr().Compare(b.Addr()))
 }
 
 // applyAddresses adds the configured addresses that are missing. It removes

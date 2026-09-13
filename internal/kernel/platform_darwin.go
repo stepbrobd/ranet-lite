@@ -487,8 +487,11 @@ func (p *routePlatform) AddRoute(r Route) error {
 			// A source prefix that is not one of this interface's own
 			// addresses cannot be expressed: interface scope selects on the
 			// socket's bound address, so it can only stand in for "from an
-			// address of ours".
-			return p.skipSourceSpecific(r)
+			// address of ours". Reported in its own words, because an operator
+			// reading the other message would look for a competing route and
+			// find none: an exit announcing a default from a prefix this node
+			// holds no address in is the ordinary case, one line per exit.
+			return p.skipRoute(r, "no address of ours falls inside the source prefix")
 		}
 	}
 	if scopeOnDarwin(r) {
@@ -499,6 +502,10 @@ func (p *routePlatform) AddRoute(r Route) error {
 			// competing with a source-specific route to the same destination.
 			// Skipping says so once; installing would collide, and recording
 			// it would make the two take turns being reported as installed.
+			//
+			// Which one is held is not an accident of arrival:
+			// compareSourceSpecificity offers the most specific source first,
+			// so the one kept is the one RFC 9079 section 4 would select.
 			return p.skipSourceSpecific(r)
 		}
 	}
