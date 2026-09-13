@@ -1224,6 +1224,16 @@ func TestDarwinWithdrawingUnscopedKeepsTheScopedSource(t *testing.T) {
 	}
 }
 
+// The space this reconciler owns is what an operator reads in the startup
+// line, and on darwin it is the interface: there is one FIB and Config.Table
+// means nothing here.
+func TestDarwinOwnsAnInterfaceRatherThanATable(t *testing.T) {
+	plat, _ := testPlatform(t, Config{Interface: "utun9", Table: DefaultTable})
+	if got := plat.where(plat.cfg); got != "interface utun9" {
+		t.Errorf("darwin reports %q, want the interface it owns", got)
+	}
+}
+
 // EEXIST says that the key is taken, not by whom, and a pass that repairs a
 // partial apply re-adds a route this process installed moments earlier. Read
 // as another program's, the reconciler's own route stopped being reported by

@@ -789,14 +789,12 @@ func cookieValue(secret [32]byte, version uint8, ni []byte, spiI uint64, endpoin
 	var spi [8]byte
 	binary.BigEndian.PutUint64(spi[:], spiI)
 	mac.Write(spi[:])
-	if addr, ok := endpoint.(fmt.Stringer); ok {
-		mac.Write([]byte(addr.String()))
-	}
+	mac.Write([]byte(endpoint.String()))
 	return append([]byte{version}, mac.Sum(nil)...)
 }
 
 // sendStatelessNotify answers an IKE_SA_INIT we will not carry forward. The
-// responder SPI is zero because no SA was created (RFC 7296 section 2.6.1).
+// responder SPI is zero because no SA was created (RFC 7296 section 2.6).
 func (r *Responder) sendStatelessNotify(datagram transport.Unclaimed, spiI uint64, notify NotifyType, data []byte) {
 	header := Header{SPIInitiator: spiI, ExchangeType: IKE_SA_INIT, Flags: FlagResponse, MessageID: 0}
 	message := &Message{Header: header, Payloads: []RawPayload{
@@ -811,9 +809,10 @@ func (r *Responder) sendStatelessNotify(datagram transport.Unclaimed, spiI uint6
 // is acceptable except for its DH group reports the group we want, which the
 // caller turns into INVALID_KE_PAYLOAD.
 //
-// An unknown transform type rejects the whole proposal rather than being
-// skipped. RFC 7296 section 3.3.6 allows skipping unsupported alternatives of
-// a known type, but a type we cannot name may change what the proposal means,
+// An unknown transform type rejects the whole proposal, which RFC 7296
+// section 3.3.6 requires: an unrecognized alternative of a known type is
+// skipped and the others of that type are still considered, but a type we
+// cannot name may change what the proposal means,
 // and the child selection in this package already takes the same view.
 func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 	proposals, err := DecodeSA(body)

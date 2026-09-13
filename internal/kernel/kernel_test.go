@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"runtime"
 	"slices"
 	"sync"
 	"syscall"
@@ -33,6 +32,7 @@ type fakeKernel struct {
 	foreign map[Route]bool
 	addrs   map[netip.Prefix]bool
 	master  string
+	name    string
 	closed  bool
 	adds    int
 	dels    int
@@ -141,6 +141,13 @@ func (f *fakeKernel) Release() error {
 }
 
 func (f *fakeKernel) Notify() <-chan struct{} { return f.signal }
+
+func (f *fakeKernel) where(cfg Config) string {
+	if f.name != "" {
+		return f.name
+	}
+	return fmt.Sprintf("table %d", cfg.Table)
+}
 
 func (f *fakeKernel) Close() error {
 	f.mu.Lock()
@@ -690,16 +697,10 @@ func TestRetractedPrefixIsHeldInKernelTable(t *testing.T) {
 // platform with no routing tables it used to print table 0, the config's
 // zero value read before defaults were applied, on a machine that has no
 // tables at all.
-func TestWhereNamesTheSpaceThisPlatformHas(t *testing.T) {
-	r, _, _ := harness(t, Config{Interface: "utun9", Table: DefaultTable})
-	where := r.Where()
-	if runtime.GOOS == "darwin" {
-		if where != "interface utun9" {
-			t.Errorf("darwin reports %q, want the interface it owns", where)
-		}
-		return
-	}
-	if where != fmt.Sprintf("table %d", DefaultTable) {
-		t.Errorf("reports %q, want the table it owns", where)
+func TestWhereComesFromThePlatform(t *testing.T) {
+	r, _, fake := harness(t, Config{Interface: "utun9", Table: DefaultTable})
+	fake.name = "somewhere"
+	if got := r.Where(); got != "somewhere" {
+		t.Errorf("the reconciler reports %q rather than asking the platform", got)
 	}
 }

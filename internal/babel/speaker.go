@@ -67,7 +67,8 @@ const seqnoRequestSuppress = 2 * time.Second
 // other half is the router id the requester wrote into the packet, which
 // nothing bounds, and eighty seqno requests fit in a single packet. Past a cap
 // the request is not forwarded, which is what the suppression above does with
-// a redundant one and is the rate limiting RFC 8966 section 3.8.1.2 asks for.
+// a redundant one, and is the list of recently forwarded requests RFC 8966
+// section 3.8.1.2 asks a node to keep.
 //
 // The per-neighbor share is what keeps one of them from turning forwarding off
 // for the rest: a flood that filled a single global table would stop every

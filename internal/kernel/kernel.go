@@ -55,7 +55,6 @@ import (
 	"log/slog"
 	"maps"
 	"net/netip"
-	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -197,6 +196,9 @@ type platform interface {
 	// Routes returns only the routes carrying the reconciler's protocol, in
 	// its table, out of its interface.
 	Routes() ([]Route, error)
+	// where names the space this platform gives a reconciler to own.
+	where(Config) string
+
 	AddRoute(Route) error
 	// DelRoute treats a route that is already gone as success.
 	DelRoute(Route) error
@@ -290,6 +292,11 @@ func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 	}
 }
 
+// Where names the space this reconciler owns, for an operator reading a log
+// line: a routing table where the platform has them, and the interface itself
+// where it does not.
+func (r *Reconciler) Where() string { return r.plat.where(r.cfg) }
+
 // Run reconciles until ctx is canceled, then withdraws everything this
 // reconciler installed and closes its netlink sockets. It is called once.
 //
@@ -298,16 +305,6 @@ func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 // own when the TUN disappears, so a device that is already gone is not an
 // error. Run returns the withdrawal error, never a reconcile error: a failed
 // pass is logged and retried instead.
-// Where names the space this reconciler owns, for an operator reading a log
-// line: a routing table where the platform has them, and the interface itself
-// where it does not.
-func (r *Reconciler) Where() string {
-	if runtime.GOOS == "darwin" {
-		return "interface " + r.cfg.Interface
-	}
-	return fmt.Sprintf("table %d", r.cfg.Table)
-}
-
 func (r *Reconciler) Run(ctx context.Context) error {
 	changed := r.src.Changed()
 	notify := r.plat.Notify()

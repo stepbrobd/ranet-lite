@@ -153,12 +153,12 @@ reset the same backoff, so the retry is drawn from the upper half of its window
 rather than run at the window's end. Without that spread the retry reproduces
 the phase difference that caused the collision and collides again indefinitely,
 which is the jitter
-[RFC 7296 section 2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)
+[RFC 7296 section 2.8.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8.1)
 asks for.
 
 A responder switches its outbound Child SA to the replacement just before it
 sends the rekey response rather than just after.
-[RFC 7296 section 2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)
+[RFC 7296 section 2.8.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8.1)
 permits sending on the new SA "as soon as it sends its response", so the
 difference is the time to encrypt one message. What the same section also offers
 is the conservative option, continuing on the old SA until the peer proves it
@@ -293,7 +293,7 @@ babel:
 #   enabled: true
 #   table: 200                     # the table the policy rules look up
 #   protocol: 155                  # rt_proto marking this reconciler's routes
-#   metric: 32
+#   metric: 64                     # BIRD's kbabel uses 32, so not 32 while it shares this table
 #   prefsrc4: 10.66.0.5            # linux only: RTA_PREFSRC on v4 routes, as krt_prefsrc
 #   addresses: ["10.66.0.5/32"]    # assigned to the TUN, removed again at exit
 #   assign_originated: false       # also assign every prefix in originate
@@ -317,10 +317,10 @@ only synthetic fixtures belong in version control (see `.gitignore`).
 own listener, separate from `-pprof` so a fleet node can be scraped without
 exposing a profiler. It reports what `prometheus-bird-exporter` reported while
 Babel lived in BIRD: neighbor liveness and link cost, routes received per
-neighbor, routes selected and originated, established sessions per path, and
-inbound ESP packet and drop counters. Everything is read from live state at
-scrape time, so a scrape reflects the instant it happened rather than a sampled
-snapshot.
+neighbor, routes selected and originated, established sessions per path, packets
+each peer refused to queue, and inbound ESP packet and drop counters. Everything
+is read from live state at scrape time, so a scrape reflects the instant it
+happened rather than a sampled snapshot.
 
 ## Sharing a host with other networking
 

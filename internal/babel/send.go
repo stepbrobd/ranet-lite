@@ -352,19 +352,14 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 }
 
 // updateActions is the periodic full dump of RFC 8966 section 3.7.1. It
-// supersedes any triggered update still queued, except for prefixes that have
-// been flushed from the route table: those are gone from the dump and would
-// otherwise never be retracted.
+// supersedes any triggered update still queued, so the queue is cleared here
+// rather than left to fire again behind the dump. A prefix flushed from the
+// route table is still covered: advertisableKeys carries everything any
+// neighbor was told is reachable, which is exactly the set that still needs
+// retracting.
 func (s *Speaker) updateActions(now time.Time) []sendAction {
 	keys := s.advertisableKeys()
-	for _, key := range s.routes.takeDirty() {
-		if _, known := s.routes.entries[key]; known {
-			continue
-		}
-		if _, local := s.originate[key]; !local {
-			keys = append(keys, key)
-		}
-	}
+	s.routes.takeDirty()
 	return s.updateActionsFor(keys, now)
 }
 

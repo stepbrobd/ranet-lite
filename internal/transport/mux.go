@@ -357,11 +357,6 @@ type Mux struct {
 	ownHub        bool
 }
 
-// dispatchESP assigns a receive-order ticket at the socket demultiplexer.
-// Both the ticket and channel insertion happen under one lock because a Hub
-// may have separate IPv4 and IPv6 receive loops. A dropped batch does not
-// consume a ticket, so the ordered decrypt emitter can never wait forever on
-// a hole caused by backpressure.
 // hasRoomForESP is consulted before packReceivedBatch copies a batch onto the
 // heap. dispatchESP still decides; this only keeps the copy from happening for
 // a batch that is about to be dropped anyway.
@@ -645,7 +640,6 @@ func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 
 var errTimeout = fmt.Errorf("transport: receive timeout")
 
-func IsTimeout(err error) bool     { return err == errTimeout }
 func (m *Mux) closeDone(err error) { m.doneOnce.Do(func() { m.doneErr.Store(err); close(m.done) }) }
 func (m *Mux) doneError() error {
 	if err, _ := m.doneErr.Load().(error); err != nil {

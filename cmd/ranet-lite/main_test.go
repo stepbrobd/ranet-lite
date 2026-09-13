@@ -19,7 +19,7 @@ func TestKernelConfigAddresses(t *testing.T) {
 		want             []netip.Prefix
 	}{
 		{
-			name:             "assigns Babel destinations without source selectors",
+			name:             "assigns every originated prefix, source-specific ones included",
 			assignOriginated: true,
 			want:             []netip.Prefix{explicit, topLevel, plain, sourceSpecific},
 		},

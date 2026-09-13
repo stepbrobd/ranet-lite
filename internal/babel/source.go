@@ -40,7 +40,8 @@ const sourceGCTime = 3 * time.Minute
 // per-prefix share is what keeps the damage local: a global cap alone is first
 // come, so one neighbor churning the origin of one prefix would stop this node
 // learning any new origin anywhere, including a peer that restarted and drew a
-// new router id as RFC 8966 section 3.2.2 requires.
+// new router id, which is what a node that lost its sequence number state
+// does.
 //
 // A prefix legitimately has a handful of origins, so thirty-two is far above
 // anycast and far below what a flood needs.

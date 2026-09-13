@@ -126,8 +126,8 @@ const (
 )
 
 // Hash algorithm IDs for the SIGNATURE_HASH_ALGORITHMS notify data (RFC 7427
-// §3). HashIdentity (RFC 8420) means "no hash, the signature algorithm does
-// its own" — how EdDSA is advertised.
+// §3). HashIdentity is RFC 8420's addition for signature algorithms that hash
+// the message themselves, which is how EdDSA is advertised.
 const (
 	HashSHA2_256 uint16 = 2
 	HashSHA2_384 uint16 = 3

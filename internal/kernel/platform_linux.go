@@ -220,6 +220,9 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 	return body
 }
 
+// where is the routing table this reconciler owns.
+func (p *netlinkPlatform) where(cfg Config) string { return fmt.Sprintf("table %d", cfg.Table) }
+
 func (p *netlinkPlatform) AddRoute(route Route) error {
 	// EXCL rather than REPLACE. A replace takes over whatever sits first at the
 	// same prefix, tos and priority no matter who wrote it: fib_table_insert

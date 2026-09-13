@@ -106,7 +106,7 @@ func (s *Session) rekeyDelay(interval time.Duration) (time.Duration, error) {
 // both ends of a collision fail at the same instant and reset the same
 // deterministic backoff, so an unjittered retry reproduces the phase
 // difference that caused the collision and collides again, forever. RFC 7296
-// section 2.8 asks for the jitter for that reason.
+// section 2.8.1 asks for the jitter for that reason.
 func (s *Session) rekeyRetryDelay(failures uint) time.Duration {
 	delay := s.rekeyRetryInitial
 	for failures > 1 {
@@ -329,53 +329,51 @@ func (s *Session) Run(ctx context.Context) error {
 			continue
 		case <-timer.C:
 		}
-		{
-			// An exchange whose IKE SA has gone can never be answered, and
-			// leaving it pending blocks every later local request for the life
-			// of the session, since IKEv2 permits one at a time.
-			if pending != nil && s.contextRetired(pending.context) {
-				pending.result <- requestResult{err: fmt.Errorf("ike: the IKE SA carrying this exchange was replaced")}
-				pending = nil
-				continue
+		// An exchange whose IKE SA has gone can never be answered, and
+		// leaving it pending blocks every later local request for the life
+		// of the session, since IKEv2 permits one at a time.
+		if pending != nil && s.contextRetired(pending.context) {
+			pending.result <- requestResult{err: fmt.Errorf("ike: the IKE SA carrying this exchange was replaced")}
+			pending = nil
+			continue
+		}
+		if pending != nil && !time.Now().Before(pending.deadline) {
+			if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
+				s.mux.Close()
+				return fmt.Errorf("ike: peer unresponsive after %d attempts", pending.sent)
 			}
-			if pending != nil && !time.Now().Before(pending.deadline) {
-				if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
-					s.mux.Close()
-					return fmt.Errorf("ike: peer unresponsive after %d attempts", pending.sent)
-				}
-				// RFC 7296 §2.1 requires retaining and retransmitting the
-				// bitwise-identical request until a response arrives or the IKE SA
-				// is declared failed. Other authenticated traffic can keep an
-				// ordinary exchange alive; a silent peer must still time out.
-				if err := s.sendPending(pending); err != nil {
-					if pending.dpd {
-						s.mux.Close()
-						return fmt.Errorf("ike: DPD failed: %w", err)
-					}
-					slog.Warn("ike request retransmission failed; retrying", "exchange", pending.exchange, "message_id", pending.msgID, "err", err)
-				}
-				continue
-			}
-			// Re-read the traffic edge here rather than relying on the one at
-			// the top of the loop. ESP arrives without waking this select, so
-			// the timer fires exactly at the deadline with the flag still
-			// unconsumed, and a peer sending continuously would be probed every
-			// interval forever. RFC 7296 section 2.4 asks for a check only "if
-			// no cryptographically protected messages have been received".
-			if s.trafficSeen.Swap(false) {
-				lastAuthenticated = time.Now()
-				s.noteActive()
-			}
-			if pending == nil && !time.Now().Before(lastAuthenticated.Add(dpdInterval)) {
-				started, err := s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})
-				if err != nil {
+			// RFC 7296 §2.1 requires retaining and retransmitting the
+			// bitwise-identical request until a response arrives or the IKE SA
+			// is declared failed. Other authenticated traffic can keep an
+			// ordinary exchange alive; a silent peer must still time out.
+			if err := s.sendPending(pending); err != nil {
+				if pending.dpd {
 					s.mux.Close()
 					return fmt.Errorf("ike: DPD failed: %w", err)
 				}
-				pending = started
+				slog.Warn("ike request retransmission failed; retrying", "exchange", pending.exchange, "message_id", pending.msgID, "err", err)
 			}
 			continue
 		}
+		// Re-read the traffic edge here rather than relying on the one at
+		// the top of the loop. ESP arrives without waking this select, so
+		// the timer fires exactly at the deadline with the flag still
+		// unconsumed, and a peer sending continuously would be probed every
+		// interval forever. RFC 7296 section 2.4 asks for a check only "if
+		// no cryptographically protected messages have been received".
+		if s.trafficSeen.Swap(false) {
+			lastAuthenticated = time.Now()
+			s.noteActive()
+		}
+		if pending == nil && !time.Now().Before(lastAuthenticated.Add(dpdInterval)) {
+			started, err := s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})
+			if err != nil {
+				s.mux.Close()
+				return fmt.Errorf("ike: DPD failed: %w", err)
+			}
+			pending = started
+		}
+		continue
 	}
 }
 
@@ -738,7 +736,7 @@ func (s *Session) responseNotifySA(ctx *ikeContext, msgID uint32, exchange Excha
 }
 
 // DeleteIKE tells the peer this IKE SA and every Child SA under it are gone,
-// which is the Delete of RFC 7296 section 1.4. Without it the far end keeps
+// which is the Delete of RFC 7296 section 1.4.1. Without it the far end keeps
 // its half, keeps sending ESP into an SPI we no longer accept, and only
 // notices when its own dead peer detection expires, which is over a minute.
 //

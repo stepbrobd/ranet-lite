@@ -734,5 +734,8 @@ func (p *routePlatform) Enslave(master string) error {
 // Enslave never succeeds.
 func (p *routePlatform) Release() error { return nil }
 
+// where is the interface itself: darwin has one FIB and no routing tables.
+func (p *routePlatform) where(cfg Config) string { return "interface " + cfg.Interface }
+
 // scopes is scopeOnDarwin as the diff reads it.
 func (p *routePlatform) scopes(r Route) bool { return scopeOnDarwin(r) }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -317,5 +318,31 @@ babel:
 				t.Error("the config loaded, so nothing says this cannot mean what it looks like")
 			}
 		})
+	}
+}
+
+// An exit originates a default from its transit prefix, so assign_originated
+// must not try to put that default on the tun: AddAddr would be called with
+// "::/0" on every pass and fail on every one.
+func TestAssignOriginatedSkipsADefault(t *testing.T) {
+	cfg := &Config{
+		Originate: []string{"0.0.0.0/0", "10.66.0.5/32"},
+		Babel: Babel{Originate: []OriginatePrefix{
+			{Prefix: netip.MustParsePrefix("::/0"), From: netip.MustParsePrefix("2001:db8::/48")},
+			{Prefix: netip.MustParsePrefix("2001:db8::5/128")},
+		}},
+		Kernel: Kernel{AssignOriginated: true},
+	}
+	got, err := cfg.KernelAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range got {
+		if prefix.Bits() == 0 {
+			t.Errorf("a default reached the addresses assigned to the tun: %v", got)
+		}
+	}
+	if len(got) != 2 {
+		t.Errorf("assigned %v, want only the two host prefixes", got)
 	}
 }

@@ -33,7 +33,7 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	// requestRekey owns the goroutine and the one-at-a-time guard, so this
 	// runs on its own and may block.
 	//
-	// A rekey that fails is reported and left alone. RFC 7296 section 1.4.1:
+	// A rekey that fails is reported and left alone. RFC 7296 section 1.3.1:
 	// "A failed attempt to create a Child SA SHOULD NOT tear down the IKE SA:
 	// there is no reason to lose the work done to set up the IKE SA." Every
 	// notify below 16384 arrives here as an error, TEMPORARY_FAILURE and

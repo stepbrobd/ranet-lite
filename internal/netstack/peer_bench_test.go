@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 )
 
@@ -20,29 +19,26 @@ func benchSealer(raw [][]byte, _ []byte, storage [][]byte) ([][]byte, error) {
 	return storage, nil
 }
 
-func benchPeer(b *testing.B) (*Peer, *atomic.Uint64) {
+func benchPeer(b *testing.B) *Peer {
 	b.Helper()
-	var sent atomic.Uint64
 	peer := NewPeerReserved("bench",
 		func(int) (BatchSealer, error) { return benchSealer, nil },
-		func(sealed [][]byte) error {
-			sent.Add(uint64(len(sealed)))
-			return nil
-		})
+		func([][]byte) error { return nil })
 	b.Cleanup(peer.Close)
-	return peer, &sent
+	return peer
 }
 
 // The send pipeline's own cost on the path routed traffic takes, with the
 // crypto and the syscall replaced by nothing. What remains is exactly what
 // ordered transmission buys and charges for: the slot semaphore, the ticket
-// and sequence-range allocation under one lock, four allocations, the handoff
+// and sequence-range allocation under one lock, the allocations ReportAllocs
+// counts, the handoff
 // to the ordered sender, and its reorder map.
 //
 // enqueue is the data path and does not wait for the send; transmit is the
 // control path, measured separately below, and does.
 func benchmarkPeerEnqueue(b *testing.B, workers, batch int) {
-	peer, _ := benchPeer(b)
+	peer := benchPeer(b)
 	payload := make([]byte, 1400)
 	// Deliberately no SetBytes. append stores the slice header and the stand-in
 	// sealer never reads it, so no payload byte is touched; reporting MB/s over
@@ -91,7 +87,7 @@ func BenchmarkPeerEnqueueParallelBatched(b *testing.B) {
 // result. Babel no longer waits, but the compatibility peers do, and this is
 // what that costs.
 func BenchmarkPeerTransmitSerial(b *testing.B) {
-	peer, _ := benchPeer(b)
+	peer := benchPeer(b)
 	payload := make([]byte, 1400)
 	b.ReportAllocs()
 	b.ResetTimer()

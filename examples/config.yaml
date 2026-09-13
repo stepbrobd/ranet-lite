@@ -63,6 +63,7 @@ babel:
   # Optional link costs use the BIRD interface option names.
   # rxcost: 96
   # rtt_cost: 1024
+  # rtt_min: 0s
   # rtt_max: 1024ms
 
   # Optional announcements also support a source prefix, which the top-level
@@ -92,7 +93,7 @@ babel:
 #   enabled: true
 #   table: 200
 #   protocol: 155
-#   metric: 32
+#   metric: 64                    # BIRD's kbabel uses 32, so not 32 while it shares this table
 #   prefsrc4: 10.66.0.5
 #   addresses: ["10.66.0.5/32"]
 #   assign_originated: false

@@ -515,7 +515,8 @@ func TestStalledNeighborDoesNotHoldOthers(t *testing.T) {
 
 // Three things reach the route table only through New, and each can be nulled
 // out with the rest of the suite green: dropping a forwarding entry, and the
-// two RFC 8966 Appendix A.3 hysteresis parameters the config decides.
+// smoothing time constant of RFC 8966 Appendix A.3 and the triggered-update
+// threshold of section 3.7.2, both of which the config decides.
 func TestNewSpeakerCarriesItsConfigurationIntoTheRouteTable(t *testing.T) {
 	cfg := Config{HelloInterval: 4 * time.Second, UpdateInterval: 16 * time.Second}
 	cfg.Cost = DefaultCostParams()

@@ -61,9 +61,12 @@ func DecodeHello(body []byte) (Hello, error) {
 	return h, nil
 }
 
-// IHU ("I Heard You") is RFC 8966 §4.6.5. AE=Wildcard omits the address
-// entirely, valid "only on point-to-point links" per spec — exactly our
-// per-peer tunnel model, so we always use it.
+// IHU ("I Heard You") is RFC 8966 §4.6.6. AE=Wildcard omits the address
+// entirely, which that section permits as an optimisation: the AE "MAY be 0 if
+// the TLV is sent to a unicast address, if the association is over a
+// point-to-point link, or when bidirectional reachability is ascertained by
+// means outside of the Babel protocol." Every association here is a
+// point-to-point ESP tunnel, so this node always uses it.
 type IHU struct {
 	RxCost   uint16
 	Interval uint16 // centiseconds

@@ -59,7 +59,8 @@ type Config struct {
 }
 
 // Kernel configures the optional kernel route reconciler in internal/kernel,
-// which mirrors the mesh forwarding table into a Linux routing table. It is
+// which mirrors the mesh forwarding table into the routing table on linux and
+// into the single FIB on darwin. It is
 // off unless enabled, so a deployment that configures routes externally is
 // unaffected. Every field is validated by kernel.New at startup.
 type Kernel struct {
@@ -73,8 +74,9 @@ type Kernel struct {
 	// Metric is RTA_PRIORITY, and omitting it leaves the kernel default, 0 for
 	// IPv4 and 1024 for IPv6. Do not set it to BIRD's 32 while BIRD is still
 	// exporting to the same table: both daemons would then key on the same
-	// prefix and priority, each install would displace the other's route, and
-	// every displacement wakes the other's scan.
+	// prefix and priority, and since an install refuses a key another writer
+	// holds rather than taking it over, whichever daemon got there first keeps
+	// the prefix and the other loses it quietly.
 	Metric uint32 `yaml:"metric"`
 	// PrefSrc4 is RTA_PREFSRC on every installed IPv4 route, taking over from
 	// krt_prefsrc on BIRD's kbabel4. IPv6 source-specific routes carry
@@ -103,20 +105,34 @@ func (c *Config) KernelAddresses() ([]netip.Prefix, error) {
 	}
 	var addresses []netip.Prefix
 	seen := make(map[netip.Prefix]bool)
+	// A default is announced, never assigned: an exit originates "::/0" from
+	// its transit prefix, and assign_originated would otherwise try to put
+	// "::/0" on the tun on every pass and fail on every one. The test is the
+	// address rather than the prefix length, because "2001:db8::1/0" carries
+	// host bits and is an address the operator could have meant, while a
+	// prefix length says nothing about that.
 	add := func(prefix netip.Prefix) {
-		if !seen[prefix] {
-			seen[prefix] = true
-			addresses = append(addresses, prefix)
+		if prefix.Addr().IsUnspecified() || seen[prefix] {
+			return
 		}
+		seen[prefix] = true
+		addresses = append(addresses, prefix)
 	}
-	for _, list := range [][]string{c.Kernel.Addresses, originated} {
-		for _, raw := range list {
-			prefix, err := netip.ParsePrefix(raw)
-			if err != nil {
-				return nil, fmt.Errorf("config: kernel.addresses %q: %w", raw, err)
-			}
-			add(prefix)
+	for _, raw := range c.Kernel.Addresses {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			return nil, fmt.Errorf("config: kernel.addresses %q: %w", raw, err)
 		}
+		add(prefix)
+	}
+	// The originated lists are the same prefixes babel announces, so an entry
+	// here is reported as what it is written as rather than as an address.
+	for _, raw := range originated {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			return nil, fmt.Errorf("config: originate %q: %w", raw, err)
+		}
+		add(prefix)
 	}
 	if c.Kernel.AssignOriginated {
 		for _, entry := range c.Babel.Originate {
@@ -404,8 +420,20 @@ func (c *Config) validate() error {
 		peers[key] = struct{}{}
 	}
 	for _, raw := range c.Originate {
-		if _, err := netip.ParsePrefix(raw); err != nil {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
 			return fmt.Errorf("config: originate %q: %w", raw, err)
+		}
+		// "2001:db8::1/0" is a default carrying host bits, which is always a
+		// typo: originatedKey masks it, so the node announces "::/0" to the
+		// whole mesh and claims to be its exit. A real default is written
+		// "::/0" and is refused nothing.
+		if prefix.Bits() == 0 && !prefix.Addr().IsUnspecified() {
+			unspecified := "::"
+			if prefix.Addr().Is4() {
+				unspecified = "0.0.0.0"
+			}
+			return fmt.Errorf("config: originate %q announces a default route, write %s/0 if that is what you mean", raw, unspecified)
 		}
 	}
 	return nil

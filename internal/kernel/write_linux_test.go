@@ -216,3 +216,12 @@ func TestForeignWriterReportNamesAnUnclaimedProtocolByNumber(t *testing.T) {
 		t.Errorf("babel printed as %q, want %q", got, want)
 	}
 }
+
+// On linux the space this reconciler owns is a routing table, which is what an
+// operator reads in the startup line and what the policy rules look up.
+func TestLinuxOwnsATable(t *testing.T) {
+	plat, _ := writePlatform(t)
+	if got := plat.where(plat.cfg); got != "table 200" {
+		t.Errorf("linux reports %q, want the table it owns", got)
+	}
+}
