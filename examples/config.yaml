@@ -42,9 +42,26 @@ originate:
 # rekey_retry_initial: 5s
 # rekey_retry_max: 5m
 
+# Mark the one UDP socket carrying IKE and ESP, linux only, so a policy rule
+# can keep the underlay in a table of your choosing. Set it on a node whose
+# mesh address is the only global address of its family: the kernel sources
+# this socket from that address, a "from <mesh address>" rule sends it to the
+# mesh table, and an exit-announced default there routes the underlay into the
+# tun carrying it. ranet-lite writes no rules, so add the matching one with the
+# rest of the deployment's, e.g. ip rule add fwmark 0x726c lookup main.
+# fwmark: 0x726c
+
 # Answer peers that dial us as well as dialing. Off by default; required for a
 # full mesh, where every node both dials and answers.
 # responder: true
+
+# Dial every node the registry names, the N-to-N reconciliation ranet does.
+# Needed for reach against a fleet whose BIRD exports only its own directly
+# connected routes: a node hears about a prefix from the node that originates
+# it or not at all, so dialing a few exits reaches those exits and nothing
+# behind them. The peers below still apply and win for their node, which is the
+# only way to pin a serial_number.
+# full_mesh: true
 
 # One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
 # endpoint only dials remote endpoints with the same address family.
@@ -65,6 +82,12 @@ babel:
   # rtt_cost: 1024
   # rtt_min: 10ms
   # rtt_max: 1024ms
+
+  # Advertise only this node's own prefixes and never relay a route learned
+  # from a peer. Off by default, because a converted fleet needs the relaying.
+  # Turn it on for a leaf: a node that redistributes is offering to carry the
+  # mesh, and a laptop on a home or cellular uplink should not.
+  # no_transit: true
 
   # Optional announcements also support a source prefix, which the top-level
   # originate list cannot express. Enable the list and its entries together.

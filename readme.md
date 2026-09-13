@@ -53,6 +53,30 @@ kernel table the node actually consults, which the `kernel` block below is for,
 and the TUN has to be allowed to forward back out of itself. Advertising transit
 without them means announced paths blackhole.
 
+`full_mesh` dials every node the registry names, the N-to-N reconciliation ranet
+performs. Entries in `peers` still apply and win for their node, which is the
+only way to pin a `serial_number`. Reach against a fleet running BIRD requires
+it, because that Babel channel exports only its own directly connected routes: a
+node learns a prefix from the node that originates it or not at all, so dialing
+a few exits reaches those exits and nothing behind them.
+
+A node whose mesh address is the only global address of its family should also
+set `fwmark`, on linux. The transport binds the wildcard and lets the kernel
+pick the source by route, and where the mesh address is the only candidate the
+kernel picks it, a `from <mesh address>` policy rule sends the datagram to the
+mesh table, and an exit-announced default there routes the ESP underlay into the
+tun that is carrying it. `SO_MARK` plus a rule of your own keeps it out. This
+package writes no policy rules, so the rule belongs with the ones the deployment
+already owns. darwin needs none: an announced default is installed
+interface-scoped there, so an unbound socket never sees it.
+
+A leaf should set `babel.no_transit`, which advertises only the prefixes this
+node originates and never relays one it learned. Redistribution serves a
+converted fleet and turns a laptop into a transit router for everybody else. The
+BIRD side of a ranet fleet draws the same line with
+`export where proto = "dbabel0"`. Refusing to advertise cannot close a loop, so
+this only narrows what the feasibility condition already bounds.
+
 It implements genuine source-specific routing
 ([SADR, RFC 9079](https://www.rfc-editor.org/rfc/rfc9079)): the mesh's route
 table is keyed by `(source, destination)` prefix pairs, resolved per RFC
@@ -302,10 +326,22 @@ babel:
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
-`endpoints` entry, `private_key`, `registry`, and, unless `responder` is set, at
-least one entry in `peers`. Everything else has a default
-(`peers[].organization` defaults to the top-level `organization`, and the babel
-intervals default to 4s/16s).
+`endpoints` entry, `private_key`, `registry`, and, unless `responder` or
+`full_mesh` is set, at least one entry in `peers`.
+
+ranet's own `config.json` runs here unchanged, since valid JSON is valid YAML,
+given the three flags below that supply what the file never names. Its
+per-endpoint `port` and `fwmark` satisfy the top-level fields when those are
+absent, every endpoint having to agree; `address` and `updown` are named so the
+file is not rejected over them and reported once as having no effect, because
+this binds every interface and carries the whole mesh on one tun; and
+`-registry`, `-key` and `-full-mesh` supply what that file has no field for:
+ranet takes the first two on its own command line and always behaves as the
+third asks. `experimental.iptfs` parses and is refused if set, since there is no
+IP-TFS here. What that file cannot carry is everything replacing BIRD, so
+`originate`, `kernel` and the babel costs still have to be added to it.
+Everything else has a default (`peers[].organization` defaults to the top-level
+`organization`, and the babel intervals default to 4s/16s).
 
 **Your `registry.json` and private key are sensitive.** They identify and
 authenticate a real node in a real mesh. Never commit real copies of either;
