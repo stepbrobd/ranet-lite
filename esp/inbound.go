@@ -148,6 +148,13 @@ func parseTrailer(plain []byte) ([]byte, byte, error) {
 	if len(plain) < 2 {
 		return nil, 0, fmt.Errorf("esp: plaintext too short")
 	}
+	// RFC 4303 section 2.4 right-aligns the Pad Length and Next Header octets
+	// in a four-byte word, so a conformant sender's plaintext is always a
+	// multiple of four. Accepting anything else would take a payload whose
+	// length no sender should have produced.
+	if len(plain)%4 != 0 {
+		return nil, 0, fmt.Errorf("esp: plaintext length %d is not four-byte aligned", len(plain))
+	}
 	padLen := int(plain[len(plain)-2])
 	nextHeader := plain[len(plain)-1]
 	if padLen+2 > len(plain) {

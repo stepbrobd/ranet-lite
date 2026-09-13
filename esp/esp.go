@@ -103,10 +103,18 @@ type AuthenticatedPacket struct {
 // InboundOption configures inbound ESP processing.
 type InboundOption func(*InboundSA)
 
-// WithReplayWindow sets the anti-replay window. A zero value disables replay
-// checking, matching strongSwan's replay_window = 0 behavior.
+// MaxReplayWindow is the widest anti-replay window this implementation will
+// build. The circular index arithmetic adds a window to a position, so a
+// window above half the sequence space would overflow the 32-bit counter it
+// is computed in. Config refuses anything above this too; the cap is here as
+// well because this option is exported and takes any uint32.
+const MaxReplayWindow uint32 = 1 << 20
+
+// WithReplayWindow sets the anti-replay window, clamped to MaxReplayWindow. A
+// zero value disables replay checking, matching strongSwan's
+// replay_window = 0 behavior.
 func WithReplayWindow(window uint32) InboundOption {
-	return func(in *InboundSA) { in.window = newReplayWindow(window) }
+	return func(in *InboundSA) { in.window = newReplayWindow(min(window, MaxReplayWindow)) }
 }
 
 func NewOutbound(child ChildSA) (*OutboundSA, error) {
