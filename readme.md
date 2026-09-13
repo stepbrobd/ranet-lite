@@ -388,10 +388,16 @@ than retried in silence, since darwin has no replace and the collision does not
 resolve itself.
 
 Addresses are narrower still: only an address this process added is ever
-removed, and one already on the link belongs to whoever put it there. The TUN is
-enslaved to a VRF only while it has no master at all, so systemd-networkd keeps
-whatever it already claimed. The device itself is created by asking for the next
-free unit, so it never takes a name another tunnel is using.
+removed, and one already on the link belongs to whoever put it there. That rule
+has one consequence worth knowing about on a TUN the operator created rather
+than one ranet-lite made, which is the only kind that outlives the process. An
+instance killed outright leaves its addresses on the device, and the next one
+finds them already there, so it never adds them, never records them as its own,
+and never removes them, even on a clean shutdown. Its routes do come back, since
+they carry the protocol marker that identifies them. The TUN is enslaved to a
+VRF only while it has no master at all, so systemd-networkd keeps whatever it
+already claimed. The device itself is created by asking for the next free unit,
+so it never takes a name another tunnel is using.
 
 ## Reloading
 
