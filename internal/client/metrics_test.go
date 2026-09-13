@@ -59,7 +59,7 @@ func TestRefusedESPPacketsAreCountedExactlyAndSaidRarely(t *testing.T) {
 // metric is the only way an operator tells that from silence. It is its own
 // series because the queue-full one means something else entirely.
 func TestMetricsRendersWhatTheHubRefused(t *testing.T) {
-	hub, err := transport.NewHub("127.0.0.1:0")
+	hub, err := transport.NewHub("127.0.0.1:0", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

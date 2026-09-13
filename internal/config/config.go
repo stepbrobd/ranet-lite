@@ -53,6 +53,17 @@ type Config struct {
 	// A full mesh needs it on, since every node both dials and answers.
 	Responder bool `yaml:"responder"`
 
+	// FWMark is set with SO_MARK on the one UDP socket carrying IKE and ESP,
+	// linux only, so a policy rule can keep the underlay in a table of the
+	// operator's choosing. Needed on a node whose mesh address is the only
+	// global address of its family: the kernel then sources this socket from
+	// it, the fleet's "from <mesh address>" rule sends it to the mesh table,
+	// and an exit-announced default there routes the underlay into the tun
+	// carrying it. ranet-lite writes no rules, so the matching rule, such as
+	// "ip rule add fwmark <mark> lookup main", belongs with the ones the
+	// deployment already owns. Pick a mark nothing else on the host uses.
+	FWMark uint32 `yaml:"fwmark"`
+
 	Peers  []Peer `yaml:"peers"`
 	Babel  Babel  `yaml:"babel"`
 	Kernel Kernel `yaml:"kernel"`

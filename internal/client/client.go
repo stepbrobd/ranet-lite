@@ -85,7 +85,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 // newClient is New with the loading done, so a test can stand up a client
 // around a mesh it built itself rather than a privileged TUN.
 func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.Registry, mesh *netstack.Mesh) (_ *Client, err error) {
-	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Port))
+	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Port), cfg.FWMark)
 	if err != nil {
 		return nil, err
 	}

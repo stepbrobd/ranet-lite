@@ -3,6 +3,7 @@
 package transport
 
 import (
+	"errors"
 	"net/netip"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -31,7 +32,16 @@ func (b *portableBind) Send(packets [][]byte, endpoint Endpoint) error {
 	return b.Bind.Send(packets, endpoint.(*portableEndpoint).Endpoint)
 }
 
-func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
+func openPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint16, error) {
+	if fwmark != 0 {
+		// Refused rather than ignored: a mark this platform cannot set is a
+		// rule somewhere that will never match, and the configuration that
+		// asked for it was written to keep the underlay out of the overlay.
+		// darwin has no fwmark and does not need one, because an announced
+		// default is installed interface-scoped there and an unbound socket
+		// never sees it.
+		return nil, nil, 0, errors.New("fwmark is a linux facility and is set on no other platform")
+	}
 	b := &portableBind{conn.NewStdNetBind()}
 	fns, port, err := b.Open(port)
 	if err != nil {

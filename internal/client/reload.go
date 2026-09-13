@@ -145,6 +145,10 @@ func reloadable(old, next *config.Config) error {
 	switch {
 	case old.Organization != next.Organization || old.CommonName != next.CommonName:
 		return fmt.Errorf("config: identity changed, restart to apply")
+	case old.FWMark != next.FWMark:
+		// The mark is set on the one socket when it is opened, so a change
+		// here would be read back from the file and reach nothing.
+		return fmt.Errorf("config: fwmark changed, restart to apply")
 	case old.Port != next.Port:
 		return fmt.Errorf("config: port changed, restart to apply")
 	case old.TUN != next.TUN:

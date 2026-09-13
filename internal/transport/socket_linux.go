@@ -67,7 +67,7 @@ func (b *udpBind) Close() error {
 	return errors.Join(errs...)
 }
 
-func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
+func openPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint16, error) {
 	// The port selected by the IPv4 bind may already be occupied on IPv6.
 	// Retry ephemeral allocation; an explicitly requested port still fails.
 	var err error
@@ -75,7 +75,7 @@ func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
 		var bind packetBind
 		var receivers []receiveFunc
 		var bound uint16
-		bind, receivers, bound, err = listenPacketBind(port)
+		bind, receivers, bound, err = listenPacketBind(port, fwmark)
 		if port != 0 || !errors.Is(err, unix.EADDRINUSE) {
 			return bind, receivers, bound, err
 		}
@@ -83,17 +83,29 @@ func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
 	return nil, nil, 0, err
 }
 
-func listenPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
+func listenPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint16, error) {
 	b := new(udpBind)
 	var receivers []receiveFunc
 	for i, network := range []string{"udp4", "udp6"} {
+		var markErr error
 		lc := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
-			return raw.Control(func(fd uintptr) {
+			if err := raw.Control(func(fd uintptr) {
 				for _, option := range []int{unix.SO_RCVBUF, unix.SO_SNDBUF, unix.SO_RCVBUFFORCE, unix.SO_SNDBUFFORCE} {
 					_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, option, 7<<20)
 				}
 				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
-			})
+				if fwmark != 0 {
+					// Reported rather than ignored like the tuning above. The
+					// mark exists to keep this socket's datagrams out of a
+					// table that would route them into our own tun, so a
+					// silent failure here is an underlay that disappears into
+					// the overlay carrying it.
+					markErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, int(fwmark))
+				}
+			}); err != nil {
+				return err
+			}
+			return markErr
 		}}
 		pc, err := lc.ListenPacket(context.Background(), network, fmt.Sprintf(":%d", port))
 		if err != nil {

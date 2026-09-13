@@ -184,7 +184,15 @@ type espDatagramBatch struct {
 }
 
 // NewHub binds localAddr's port on all local IPv4 and IPv6 interfaces.
-func NewHub(localAddr string) (*Hub, error) {
+// NewHub binds the one UDP socket every session shares. fwmark, linux only and
+// zero for none, is set with SO_MARK on that socket so a policy rule can keep
+// its datagrams in a table of the operator's choosing. A leaf needs it: where
+// the mesh address is the only global address of its family, the kernel picks
+// that address as the source for this socket, a "from <mesh address>" rule
+// sends it to the mesh table, and an exit-announced default there carries the
+// underlay into the tun it is supposed to be running under. The rule matching
+// the mark is the operator's to install, since this package writes no rules.
+func NewHub(localAddr string, fwmark uint32) (*Hub, error) {
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: resolve local addr: %w", err)
@@ -192,7 +200,7 @@ func NewHub(localAddr string) (*Hub, error) {
 	if laddr.IP != nil && !laddr.IP.IsUnspecified() {
 		log.Printf("transport: binding to a specific local address (%s) is not supported, binding all interfaces on port %d instead", laddr.IP, laddr.Port)
 	}
-	bind, fns, port, err := openPacketBind(uint16(laddr.Port))
+	bind, fns, port, err := openPacketBind(uint16(laddr.Port), fwmark)
 	if err != nil {
 		return nil, fmt.Errorf("transport: open bind: %w", err)
 	}
@@ -515,7 +523,7 @@ func (m *Mux) takeESP(batch espDatagramBatch) [][]byte {
 // Dial preserves the one-peer convenience path. The returned mux owns its
 // newly-created hub and closes it when closed.
 func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
-	h, err := NewHub(localAddr)
+	h, err := NewHub(localAddr, 0)
 	if err != nil {
 		return nil, err
 	}
