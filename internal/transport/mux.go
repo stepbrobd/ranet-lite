@@ -369,9 +369,13 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 				h.noteDrop(1, "an IKE SA's receive queue")
 			}
 		}
+		// Counted as refused rather than dropped, on a responder as much as
+		// anywhere: this queue holds messages from peers that have not dialed
+		// us, so anyone who can reach the port fills it, and dropped is the
+		// one signal that says this node is behind on receive.
 		for _, i := range unclaimed {
 			if len(h.listen) == cap(h.listen) {
-				h.noteDrop(1, "the queue of IKE messages from peers that have not dialed us")
+				h.refused.Add(1)
 				continue
 			}
 			raw := bufs[i][:sizes[i]]
@@ -382,7 +386,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			select {
 			case h.listen <- datagram:
 			default:
-				h.noteDrop(1, "the queue of IKE messages from peers that have not dialed us")
+				h.refused.Add(1)
 			}
 		}
 		for m, packets := range espBatches {

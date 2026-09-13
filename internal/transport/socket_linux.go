@@ -167,10 +167,11 @@ func (s *udpSocket) receiver() receiveFunc {
 		for index < count && n < len(bufs) {
 			m := &messages[index]
 			if offset == 0 {
+				// A zero-length datagram is refused too. It arrived, it goes
+				// nowhere, and leaving it out is the "a flood reads as
+				// silence" case on the one platform this is deployed on.
 				if m.Flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || m.N == 0 {
-					if m.N != 0 {
-						refused++
-					}
+					refused++
 					index++
 					continue
 				}

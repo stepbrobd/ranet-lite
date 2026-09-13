@@ -817,6 +817,11 @@ func TestDatagramsWithNowhereToGoAreCounted(t *testing.T) {
 				}
 				time.Sleep(5 * time.Millisecond)
 			}
+			// One datagram, one count: a counter that moves is not the same
+			// as a counter that is right, and the HELP text says datagrams.
+			if got := hub.Refused() - before; got != 1 {
+				t.Errorf("one datagram raised the counter by %d", got)
+			}
 			if hub.Dropped() != 0 {
 				t.Errorf("it also raised the queue-full counter to %d, which means something else", hub.Dropped())
 			}
@@ -860,3 +865,45 @@ type closedBind struct{}
 func (closedBind) ParseEndpoint(string) (Endpoint, error) { return nil, errors.New("no bind") }
 func (closedBind) Send([][]byte, Endpoint) error          { return errors.New("no bind") }
 func (closedBind) Close() error                           { return nil }
+
+// A node with responder enabled keeps a queue for IKE messages from peers that
+// have not dialed it, and anyone who can reach the port fills it. Overflowing
+// it is not this node falling behind on receive, which is the one thing the
+// other counter says, so it has to land on the refused one.
+func TestAnUnclaimedFloodDoesNotReadAsBeingBehind(t *testing.T) {
+	hub, err := NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	hub.Listen()
+	sender, err := net.Dial("udp", net.JoinHostPort("127.0.0.1",
+		strconv.Itoa(hub.LocalAddr().(*net.UDPAddr).Port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	// An IKE SPI no Mux holds, far more of them than the unclaimed queue can
+	// take, so the overflow path is the one under test.
+	datagram := []byte{0, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0, 0x20, 0x22, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 28}
+	for range 4096 {
+		if _, err := sender.Write(datagram); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for hub.Refused() == 0 && hub.Dropped() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the flood raised neither counter, so nothing here is being exercised")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := hub.Dropped(); got != 0 {
+		t.Errorf("the flood raised the queue-full counter to %d, which an operator reads as this node falling behind", got)
+	}
+	if hub.Refused() == 0 {
+		t.Error("the flood raised nothing an operator can see")
+	}
+}

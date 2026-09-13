@@ -399,9 +399,11 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	if _, err := peer.ReserveRawOrDrop([]byte("one more"), 41); err == nil {
 		t.Fatal("the peer took a packet past its budget, so its drop counter proves nothing")
 	}
-	// A real hub with its unclaimed queue filled, so the inbound drop counter
-	// reads something: nothing else in this test would give it a value other
-	// than the zero it has with the counting deleted.
+	// A real hub with its unclaimed queue filled, so the refused counter reads
+	// something: nothing else in this test would give it a value other than
+	// the zero it has with the counting deleted. Overflowing that queue is not
+	// this node falling behind on receive, which is what the other counter
+	// says, so it is the refused one this drives.
 	hub, err := transport.NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -419,9 +421,9 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	hub.Close()
 	var refused uint64
 	for deadline := time.Now().Add(20 * time.Second); refused == 0; {
-		settled := hub.Dropped()
+		settled := hub.Refused()
 		time.Sleep(10 * time.Millisecond)
-		if hub.Dropped() == settled {
+		if hub.Refused() == settled {
 			refused = settled
 			break
 		}
@@ -460,7 +462,10 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	for _, want := range []string{
 		"ranet_lite_babel_routes_originated 1",
 		fmt.Sprintf("ranet_lite_babel_routes_selected %d", stats.Selected),
-		fmt.Sprintf("ranet_lite_receive_dropped_total %d", refused),
+		fmt.Sprintf("ranet_lite_receive_refused_total %d", refused),
+		// Nothing here fills a receive queue, which is the only thing that
+		// raises the other one, so it reads zero and says so.
+		"ranet_lite_receive_dropped_total 0",
 		"ranet_lite_sessions 1",
 		"ranet_lite_esp_inbound_packets_total 7",
 		"ranet_lite_esp_inbound_dropped_total 2",
@@ -1202,9 +1207,9 @@ func fillUnclaimedQueue(t *testing.T, hub *transport.Hub) uint64 {
 	binary.BigEndian.PutUint32(header[24:28], uint32(len(header)))
 
 	deadline := time.Now().Add(20 * time.Second)
-	for hub.Dropped() < 64 {
+	for hub.Refused() < 64 {
 		if time.Now().After(deadline) {
-			t.Fatal("the unclaimed queue never filled, so the drop counter proves nothing")
+			t.Fatal("the unclaimed queue never filled, so the refused counter proves nothing")
 		}
 		for range 64 {
 			if _, err := peer.WriteToUDP(datagram, dst); err != nil {
@@ -1213,7 +1218,7 @@ func fillUnclaimedQueue(t *testing.T, hub *transport.Hub) uint64 {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return hub.Dropped()
+	return hub.Refused()
 }
 
 // The Prometheus text exposition format defines three escape sequences inside
