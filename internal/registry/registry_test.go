@@ -1,6 +1,10 @@
 package registry
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
 
 // TestLoadRegistry exercises the real-world edge cases a production ranet
 // registry actually contains (verified against one during development,
@@ -129,5 +133,38 @@ func TestFindNodeContinuesAcrossDuplicateOrganizations(t *testing.T) {
 	organization, node, ok := duplicate.FindNode(first.Organization, first.Nodes[3].CommonName)
 	if !ok || node.CommonName != first.Nodes[3].CommonName || organization.PublicKey != right.PublicKey {
 		t.Fatalf("FindNode did not continue to the second organization block: %+v, %+v, %v", organization, node, ok)
+	}
+}
+
+// Resolution has to be cancellable, because Client.Run waits for every dialer
+// before it returns and a dialer resolving a hostname whose resolver is
+// unreachable would otherwise hold SIGTERM for the resolver's own timeout.
+func TestResolveRemoteStopsWhenTheContextDoes(t *testing.T) {
+	address := "a-name-no-resolver-should-answer.invalid"
+	ep := Endpoint{SerialNumber: "0", AddressFamily: "ip4", Address: &address}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	start := time.Now()
+	if _, err := ep.ResolveRemote(ctx); err == nil {
+		t.Fatal("a cancelled lookup reported an address")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("a cancelled lookup took %s, so shutdown waits on the resolver", elapsed)
+	}
+}
+
+// The lookup is narrowed to the family the endpoint declares, so a name that
+// has only the other family's records fails at the resolver rather than after
+// it, and a dual-stack name costs one query rather than two.
+func TestResolverNetworkFollowsTheDeclaredFamily(t *testing.T) {
+	for family, want := range map[string]string{
+		"ip4": "ip4",
+		"ip6": "ip6",
+		"":    "ip",
+		"ip":  "ip",
+	} {
+		if got := resolverNetwork(family); got != want {
+			t.Errorf("family %q resolves over %q, want %q", family, got, want)
+		}
 	}
 }

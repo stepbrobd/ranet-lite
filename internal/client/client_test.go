@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -398,7 +399,16 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	if _, err := peer.ReserveRawOrDrop([]byte("one more"), 41); err == nil {
 		t.Fatal("the peer took a packet past its budget, so its drop counter proves nothing")
 	}
-	c := &Client{speaker: speaker, sessions: newSessionSet()}
+	// A real hub with its unclaimed queue filled, so the inbound drop counter
+	// reads something: nothing else in this test would give it a value other
+	// than the zero it has with the counting deleted.
+	hub, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	c := &Client{speaker: speaker, sessions: newSessionSet(), hub: hub}
+	refused := fillUnclaimedQueue(t, hub)
 	c.sessions.close = func(*ike.Session) {}
 	c.sessions.active = func(*ike.Session) bool { return true }
 	release, adopted := c.sessions.adoptPreferred("example/gateway/1@0", &ike.Session{}, true, nil)
@@ -408,8 +418,19 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	defer release()
 	c.countInbound(7, 2)
 
+	// A hello, an IHU and one route, so every per-neighbor line below reads
+	// something other than the zero it would read with the counting deleted.
+	speaker.Receive(peer, babelPacket(t,
+		babel.EncodeHello(babel.Hello{Seqno: 1, Interval: 1000}),
+		babel.EncodeIHU(babel.IHU{RxCost: 96, Interval: 1000}),
+		babel.EncodeRouterID([8]byte{1}),
+		babel.EncodeUpdate(babel.Update{AE: 2, Plen: 64, Prefix: netip.MustParseAddr("fd00:1::").AsSlice(),
+			Seqno: 1, Metric: 20, Interval: 1000}),
+	))
+
 	stats := speaker.Stats()
-	if len(stats.Neighbors) != 1 || stats.Neighbors[0].Cost == 0 || stats.Neighbors[0].Dropped == 0 {
+	if len(stats.Neighbors) != 1 || stats.Neighbors[0].Cost == 0 || stats.Neighbors[0].Dropped == 0 ||
+		stats.Neighbors[0].Routes == 0 || !stats.Neighbors[0].Alive {
 		t.Fatalf("the fixture leaves %+v, so asserting the per-neighbor lines proves nothing", stats.Neighbors)
 	}
 	var out bytes.Buffer
@@ -417,13 +438,14 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	text := out.String()
 	for _, want := range []string{
 		"ranet_lite_babel_routes_originated 1",
-		"ranet_lite_babel_routes_selected 0",
+		fmt.Sprintf("ranet_lite_babel_routes_selected %d", stats.Selected),
+		fmt.Sprintf("ranet_lite_receive_dropped_total %d", refused),
 		"ranet_lite_sessions 1",
 		"ranet_lite_esp_inbound_packets_total 7",
 		"ranet_lite_esp_inbound_dropped_total 2",
 		`ranet_lite_session_up{path="example/gateway/1@0"} 1`,
-		`ranet_lite_babel_neighbor_up{peer="gateway"} 0`,
-		`ranet_lite_babel_routes_received{peer="gateway"} 0`,
+		fmt.Sprintf(`ranet_lite_babel_neighbor_up{peer="gateway"} %d`, boolValue(stats.Neighbors[0].Alive)),
+		fmt.Sprintf(`ranet_lite_babel_routes_received{peer="gateway"} %d`, stats.Neighbors[0].Routes),
 		// A neighbor that has said nothing costs infinity, and the peer above
 		// refused at least one packet, so neither line is zero either way.
 		fmt.Sprintf(`ranet_lite_babel_neighbor_cost{peer="gateway"} %d`, stats.Neighbors[0].Cost),
@@ -1065,4 +1087,91 @@ func TestDialerGivesUpOnAPeerItCannotReach(t *testing.T) {
 			}
 		})
 	}
+}
+
+// babelPacket frames TLVs the way the speaker's own senders do: an IPv6
+// link-local source, the multicast group, and the UDP checksum IPv6 makes
+// mandatory. The framing lives in internal/babel and is not exported, so a
+// test outside that package builds it here.
+func babelPacket(t *testing.T, tlvs ...babel.RawTLV) []byte {
+	t.Helper()
+	src := netip.MustParseAddr("fe80::2")
+	dst := netip.MustParseAddr("ff02::1:6")
+	payload := babel.EncodePacket(tlvs)
+	raw := make([]byte, 40+8+len(payload))
+	raw[0] = 0x60
+	binary.BigEndian.PutUint16(raw[4:6], uint16(8+len(payload)))
+	raw[6], raw[7] = 17, 1
+	copy(raw[8:24], src.AsSlice())
+	copy(raw[24:40], dst.AsSlice())
+	udp := raw[40:]
+	binary.BigEndian.PutUint16(udp[0:2], babel.Port)
+	binary.BigEndian.PutUint16(udp[2:4], babel.Port)
+	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
+	copy(udp[8:], payload)
+
+	var sum uint32
+	add := func(b []byte) {
+		for i := 0; i+1 < len(b); i += 2 {
+			sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+		}
+		if len(b)%2 == 1 {
+			sum += uint32(b[len(b)-1]) << 8
+		}
+	}
+	add(raw[8:40])
+	var meta [8]byte
+	binary.BigEndian.PutUint32(meta[0:4], uint32(len(udp)))
+	meta[7] = 17
+	add(meta[:])
+	add(udp)
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	if checksum := ^uint16(sum); checksum == 0 {
+		binary.BigEndian.PutUint16(udp[6:8], 0xffff)
+	} else {
+		binary.BigEndian.PutUint16(udp[6:8], checksum)
+	}
+	return raw
+}
+
+// fillUnclaimedQueue sends IKE_SA_INIT-shaped datagrams at a hub nobody is
+// listening on until its queue refuses one, which is the ordinary way an
+// inbound receive queue fills: the SPIs belong to no Mux, so every datagram
+// lands in the queue Listen drains and nothing drains it.
+func fillUnclaimedQueue(t *testing.T, hub *transport.Hub) uint64 {
+	t.Helper()
+	// The queue exists only once somebody asks to listen, and nothing drains
+	// it here, which is what a responder under load looks like from the
+	// receive loop's side.
+	_ = hub.Listen()
+	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: hub.LocalAddr().(*net.UDPAddr).Port}
+	const marker = 4
+	datagram := make([]byte, marker+28)
+	header := datagram[marker:]
+	binary.BigEndian.PutUint64(header[0:8], 1) // an initiator SPI no Mux has registered
+	header[17] = 0x20                          // version 2.0
+	header[18] = 34                            // IKE_SA_INIT
+	header[19] = 0x08                          // initiator
+	binary.BigEndian.PutUint32(header[24:28], uint32(len(header)))
+
+	deadline := time.Now().Add(20 * time.Second)
+	for hub.Dropped() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the unclaimed queue never filled, so the drop counter proves nothing")
+		}
+		for range 64 {
+			if _, err := peer.WriteToUDP(datagram, dst); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return hub.Dropped()
 }

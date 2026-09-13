@@ -311,18 +311,29 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 // into an SPI we no longer accept until its own dead peer detection expires,
 // which is over a minute. closeAll and the Delete inside closeSession are both
 // unreachable from anything else in this package.
+//
+// closeAll is driven directly rather than through the whole client stop,
+// because a node that is cancelled while it is dialing leaves the other end
+// holding a session it was never told about: the responder commits at
+// IKE_AUTH and the initiator confirms a message later, so an initiator that
+// goes between the two has nothing to send a Delete on. That is the exchange's
+// own shape, not this sweep's, and the peer clears it on liveness. Driving the
+// sweep is what makes this deterministic; the redial that follows a resolved
+// simultaneous open is otherwise in flight whenever the machine is slow.
 func TestShutdownTellsPeerBeforeGoing(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
 	run(t, bravo)
 	_, stopAlpha := run(t, alpha)
+	t.Cleanup(stopAlpha)
 
 	waitFor(t, 20*time.Second, "both ends established", func() bool {
 		return len(alpha.client.sessions.paths()) == 1 && len(bravo.client.sessions.paths()) == 1
 	})
 
-	// Only alpha goes. bravo has to notice through the Delete rather than
-	// through its own liveness timer, which is far slower than this.
-	stopAlpha()
+	// Only alpha's sessions go, while its hub is still open to carry the
+	// Delete. bravo has to notice through that rather than through its own
+	// liveness timer, which is far slower than this.
+	alpha.client.sessions.closeAll()
 	deadline := time.Now().Add(15 * time.Second)
 	for len(bravo.client.sessions.paths()) != 0 {
 		if time.Now().After(deadline) {
