@@ -648,3 +648,30 @@ func TestDroppedRetractionIsSentAgain(t *testing.T) {
 		t.Error("the next dump did not carry the retraction the dropped packet lost")
 	}
 }
+
+// RFC 8966 section 3.4.1 lets a node send an unscheduled Hello "for any
+// reason", and it carries no interval, so it promises nothing about the next
+// one. Treating it as proof of life makes the neighbor up and immediately down
+// again, which costs a reselection and a pair of log lines per Hello.
+func TestUnscheduledHelloDoesNotFlapANeighbor(t *testing.T) {
+	s, neighbor, _ := captureSpeaker(t, Config{})
+	now := time.Now()
+	unscheduled := EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 1})})
+	for range 5 {
+		s.handlePacket(neighbor, unscheduled)
+	}
+	if neighbor.alive {
+		t.Error("an unscheduled Hello alone brought the neighbor up, with nothing to keep it there")
+	}
+
+	// A scheduled one does, and an unscheduled one then keeps it up rather
+	// than being ignored.
+	s.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 2, Interval: 100})}))
+	if !neighbor.alive || !neighbor.isAlive(now) {
+		t.Fatal("a scheduled Hello did not bring the neighbor up")
+	}
+	s.handlePacket(neighbor, unscheduled)
+	if !neighbor.isAlive(now) {
+		t.Error("an unscheduled Hello took a live neighbor down")
+	}
+}

@@ -258,7 +258,12 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 func (p *netlinkPlatform) DelRoute(route Route) error {
 	_, err := p.conn.execute(unix.RTM_DELROUTE, unix.NLM_F_ACK, p.routeMessage(route, true))
 	if gone(err) {
-		return nil
+		err = nil
+	}
+	if err == nil {
+		// A route that left the desired set takes its warn-once record with
+		// it, or the map keeps an entry for a key nothing asks about again.
+		delete(p.occupied, route.String())
 	}
 	return err
 }

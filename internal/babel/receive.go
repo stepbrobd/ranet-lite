@@ -53,6 +53,14 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			if err != nil {
 				continue
 			}
+			// An unscheduled Hello, which RFC 8966 section 3.4.1 permits a node
+			// to send "for any reason", carries no interval and so promises
+			// nothing about the next one. Marking the neighbor up on one with
+			// no promise outstanding makes it up and immediately down again,
+			// which costs a pair of log lines and a full reselection per Hello.
+			if h.Interval == 0 && n.helloExpiry().IsZero() {
+				continue
+			}
 			if !n.alive {
 				slog.Info("babel neighbor up", "peer", n.peer.ID)
 			}
