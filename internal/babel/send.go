@@ -1,6 +1,7 @@
 package babel
 
 import (
+	"bytes"
 	"errors"
 	"log/slog"
 	"maps"
@@ -191,21 +192,47 @@ func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlv
 	}
 	var batch []RawTLV
 	size := headerLen
+	// inEffect is the router-id the packet being built has already set, RFC
+	// 8966 section 4.6.7: the TLV "establishes a router-id that is implied by
+	// subsequent Update TLVs", within one packet. Every Update here is built
+	// with an id of its own, and repeating one that is already in effect costs
+	// twelve bytes against the twenty an IPv6 /64 Update takes. It repeats
+	// most in the answer a neighbor can ask for: a Route Request for a prefix
+	// this node has no route to draws a retraction carrying this node's own
+	// id, and three hundred and thirty seven four byte requests fit in one
+	// packet at the default size, the figure routeReply uses for the same TLV.
+	// Cleared with the batch, because the state does not cross the boundary.
+	var inEffect []byte
+	encoded := func(group []RawTLV) int {
+		n := 0
+		for _, tlv := range group {
+			n += 2 + len(tlv.Body)
+		}
+		return n
+	}
 	for i := 0; i < len(tlvs); {
 		end := i + 1
 		// Router-Id parser state is packet-local; keep each ID with its Update.
 		if tlvs[i].Type == TLVRouterID && end < len(tlvs) && tlvs[end].Type == TLVUpdate {
 			end++
 		}
-		groupSize := 0
-		for _, tlv := range tlvs[i:end] {
-			groupSize += 2 + len(tlv.Body)
+		group := tlvs[i:end]
+		// Decided against what this packet has already set, and decided again
+		// after a split, because a split starts a packet that has set nothing.
+		trimmed := group
+		if group[0].Type == TLVRouterID && bytes.Equal(group[0].Body, inEffect) {
+			trimmed = group[1:]
 		}
+		groupSize := encoded(trimmed)
 		if len(batch) > 0 && size+groupSize > s.cfg.PacketSize {
 			take(batch)
-			batch, size = nil, headerLen
+			batch, size, inEffect = nil, headerLen, nil
+			trimmed, groupSize = group, encoded(group)
 		}
-		batch = append(batch, tlvs[i:end]...)
+		if group[0].Type == TLVRouterID {
+			inEffect = group[0].Body
+		}
+		batch = append(batch, trimmed...)
 		size += groupSize
 		i = end
 	}

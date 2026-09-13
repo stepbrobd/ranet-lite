@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -412,6 +413,9 @@ func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 	second := netip.MustParsePrefix("2001:db8::1/128")
 	speaker.Originate(first)
 	speaker.Originate(second)
+	// A third, because every Update in this dump carries the same origin and
+	// only the first spells its id out: two of them now fit in one packet.
+	speaker.Originate(netip.MustParsePrefix("2001:db8::2/128"))
 	*packets = nil
 	speaker.flushUpdates()
 	if len(*packets) < 2 {
@@ -1523,6 +1527,98 @@ func TestARefreshingHelloDoesNotWakeTheRunLoop(t *testing.T) {
 	}
 }
 
+// RFC 8966 section 4.6.7 has a Router-Id TLV set the id "implied by subsequent
+// Update TLVs" for the rest of its own packet, so the id belongs in a packet
+// once rather than in front of every Update. It repeats most in what a
+// neighbor can ask for: a Route Request for a prefix this node has no route to
+// is answered with a retraction carrying this node's own id, and a packet of
+// requests draws a packet of those. The state is packet-local, so a split has
+// to put the id back at the head of the next one.
+func TestARepeatedRouterIDIsSentOncePerPacket(t *testing.T) {
+	speaker, neighbor, packets := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	mine, theirs := [8]byte{1}, [8]byte{2}
+	update := func(id [8]byte, prefix string) []RawTLV {
+		p := netip.MustParsePrefix(prefix)
+		return []RawTLV{EncodeRouterID(id), EncodeUpdate(Update{AE: AEIPv6, Plen: p.Bits(),
+			Prefix: p.Addr().AsSlice(), Interval: 6000, Seqno: 1, Metric: 60})}
+	}
+	var tlvs []RawTLV
+	for _, spell := range []struct {
+		id     [8]byte
+		prefix string
+	}{{mine, "fd00:1::/64"}, {mine, "fd00:2::/64"}, {theirs, "fd00:3::/64"}, {mine, "fd00:4::/64"}} {
+		tlvs = append(tlvs, update(spell.id, spell.prefix)...)
+	}
+	speaker.mu.Lock()
+	send := speaker.emitLocked([]sendAction{{neighbor: neighbor, dest: neighbor.addr, priority: priorityDump, tlvs: tlvs}})
+	speaker.mu.Unlock()
+	send()
+	if len(*packets) != 1 {
+		t.Fatalf("the batch left as %d packets", len(*packets))
+	}
+	sent, err := DecodePacket((*packets)[0][ipv6HeaderLen+udpHeaderLen:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape []TLVType
+	for _, tlv := range sent {
+		shape = append(shape, tlv.Type)
+	}
+	want := []TLVType{TLVRouterID, TLVUpdate, TLVUpdate, TLVRouterID, TLVUpdate, TLVRouterID, TLVUpdate}
+	if !slices.Equal(shape, want) {
+		t.Errorf("the packet carries %v, want %v", shape, want)
+	}
+
+	// A neighbor has to read it back the same way, or the saving is a wrong
+	// origin on every Update that followed the one it dropped.
+	reader, peer, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(peer)
+	reader.handlePacket(peer, (*packets)[0][ipv6HeaderLen+udpHeaderLen:])
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	for prefix, want := range map[string][8]byte{
+		"fd00:1::/64": mine, "fd00:2::/64": mine, "fd00:3::/64": theirs, "fd00:4::/64": mine,
+	} {
+		entry := reader.routes.entries[routeKey{dest: netip.MustParsePrefix(prefix)}]
+		if entry == nil {
+			t.Fatalf("%s was not learned at all", prefix)
+		}
+		if got := entry.routes[peer].routerID; got != want {
+			t.Errorf("%s was learned from origin %v, want %v", prefix, got, want)
+		}
+	}
+}
+
+// The id in effect does not cross a packet boundary, so a run the assembler
+// splits has to spell it out again at the head of the piece that follows.
+func TestASplitPacketCarriesTheRouterIDAgain(t *testing.T) {
+	speaker, neighbor, packets := captureSpeaker(t, Config{PacketSize: 96})
+	makeNeighborReachable(neighbor)
+	var tlvs []RawTLV
+	for i := range 8 {
+		p := netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i))
+		tlvs = append(tlvs, EncodeRouterID([8]byte{1}), EncodeUpdate(Update{AE: AEIPv6, Plen: p.Bits(),
+			Prefix: p.Addr().AsSlice(), Interval: 6000, Seqno: 1, Metric: 60}))
+	}
+	speaker.mu.Lock()
+	send := speaker.emitLocked([]sendAction{{neighbor: neighbor, dest: neighbor.addr, priority: priorityDump, tlvs: tlvs}})
+	speaker.mu.Unlock()
+	send()
+	if len(*packets) < 2 {
+		t.Fatalf("the batch left as %d packets, so nothing was split", len(*packets))
+	}
+	for i, raw := range *packets {
+		sent, err := DecodePacket(raw[ipv6HeaderLen+udpHeaderLen:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sent) == 0 || sent[0].Type != TLVRouterID {
+			t.Errorf("packet %d opens with %v, so every Update in it takes an origin from nowhere", i, sent)
+		}
+	}
+}
+
 // The kept minimum stands in for a walk of up to maxStarveRetries entries that
 // the receive path would otherwise do per packet. It is allowed to be early,
 // which costs one pass that finds nothing due, and never late: a late one is a
@@ -1904,5 +2000,34 @@ func TestAPendingDumpIsWorkTheNextPassOwes(t *testing.T) {
 	speaker.updatePending = true
 	if !speaker.pendingWorkLocked() {
 		t.Error("a pending dump is not work, so it waits for whatever wakes the loop next")
+	}
+}
+
+// The saving has to reach the packet count, not only the wire: the suppressed
+// id has to come out of the size the run is packed to, or the assembler splits
+// as if it were still there and the packets stay as many as before.
+func TestASuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
+	speaker, neighbor, packets := captureSpeaker(t, Config{PacketSize: 96})
+	makeNeighborReachable(neighbor)
+	var run []RawTLV
+	for i := range 4 {
+		p := netip.MustParsePrefix(fmt.Sprintf("fd00:a%x::/64", i))
+		run = append(run, EncodeRouterID([8]byte{1}), EncodeUpdate(Update{AE: AEIPv6, Plen: p.Bits(),
+			Prefix: p.Addr().AsSlice(), Interval: 6000, Seqno: 1, Metric: 60}))
+	}
+	speaker.mu.Lock()
+	send := speaker.emitLocked([]sendAction{{neighbor: neighbor, dest: neighbor.addr,
+		priority: priorityDump, tlvs: run}})
+	speaker.mu.Unlock()
+	send()
+	// Four bytes of header, twelve for the one id and twenty an Update, which
+	// is ninety-six exactly. With the id charged four times it is two packets.
+	if got := len(*packets); got != 1 {
+		t.Errorf("four Updates sharing one id left as %d packets, the shape they have with the id repeated", got)
+	}
+	for _, raw := range *packets {
+		if got := len(raw) - ipv6HeaderLen - udpHeaderLen; got > speaker.cfg.PacketSize {
+			t.Errorf("a packet came out %d bytes, past the %d configured", got, speaker.cfg.PacketSize)
+		}
 	}
 }
