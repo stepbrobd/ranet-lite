@@ -98,27 +98,53 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		return fmt.Errorf("ike: Child SA negotiation request: %w", err)
 	}
 
+	// The exchange completed, so RFC 7296 section 2.8 has the responder
+	// holding a Child SA whatever this end then makes of the answer, and
+	// RekeyChild retries on a capped backoff: every way out from here that is
+	// not success has to tell the peer, or each attempt leaves one more
+	// behind. The Delete names the SPI this end chose, because section 1.4.1
+	// lists "the SPIs (as they would be expected in the headers of inbound
+	// packets) of the SAs to be deleted" and those are the sender's own;
+	// deleteChildren matches an arriving Delete against RemoteSPI to the same
+	// rule. That SPI was drawn before the request went out, so even a response
+	// this end cannot parse at all is one it can still withdraw from.
+	orphaned := func(cause error) error {
+		if _, delErr := s.requestLocked(INFORMATIONAL, []RawPayload{{Type: PayloadD,
+			Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{spi}})}}); delErr != nil {
+			slog.Warn("ike could not delete the Child SA a failed rekey left at the peer",
+				"spi", localSPI, "err", delErr)
+		}
+		return cause
+	}
+
 	payloads, err := decodeChildNegotiationResponse(response, context.suite.PRFID)
 	if err != nil {
-		return err
-	}
-	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
-		return err
+		// A rejection is the one answer that installs nothing at the peer, and
+		// rekeyChild reads it to recover from CHILD_SA_NOT_FOUND, so it passes
+		// through whole.
+		var rejected *childNegotiationRejectedError
+		if errors.As(err, &rejected) {
+			return err
+		}
+		return orphaned(err)
 	}
 	_, encr, remoteSPI, err := decodeChildProposal(payloads.sa.Body, old)
 	if err != nil {
-		return fmt.Errorf("ike: invalid Child SA response proposal: %w", err)
+		return orphaned(fmt.Errorf("ike: invalid Child SA response proposal: %w", err))
+	}
+	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
+		return orphaned(err)
 	}
 	initKey, respKey, err := ChildSAKeymat(context.suite.PRFID, context.skD, nonce, payloads.nonce.Body, encr.ID, encr.KeyLengthBits)
 	if err != nil {
-		return err
+		return orphaned(err)
 	}
 	if err := s.replaceChild(ChildSA{
 		EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits,
 		LocalSPI: localSPI, RemoteSPI: remoteSPI,
 		InboundKey: respKey, OutboundKey: initKey,
 	}); err != nil {
-		return err
+		return orphaned(err)
 	}
 	if old == nil {
 		return nil

@@ -498,6 +498,102 @@ func TestReplacedChildSAThePeerNeverDeletesIsRetiredAnyway(t *testing.T) {
 	}
 }
 
+// The exchange completed, so RFC 7296 section 2.8 has the responder holding a
+// Child SA whatever this end then makes of the answer. RekeyChild retries on a
+// capped backoff, so a rekey this end refuses after the response has to tell
+// the peer: without that, every attempt leaves one more SA behind at a peer
+// that believes it is carrying traffic.
+func TestARefusedRekeyResponseDeletesTheSAItLeftAtThePeer(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	old := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 1, RemoteSPI: 2}
+	s := &Session{mux: mux, current: &ikeContext{suite: SASuite{PRFID: PRF_HMAC_SHA2_256}},
+		requests: make(chan *localRequest), Child: old, childRetireDelay: time.Second}
+	if err := mux.RegisterESP(old.LocalSPI); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.RekeyChild() }()
+
+	rekey := <-s.requests
+	// The Delete has to name the SPI this end drew for the replacement, which
+	// only the request it just sent carries.
+	localSPI := offeredChildSPI(t, rekey.inner)
+	remoteSPI := make([]byte, 4)
+	binary.BigEndian.PutUint32(remoteSPI, old.RemoteSPI+1)
+	// A well-formed proposal, so the SPI the peer installed is known, with
+	// selectors this end will not take.
+	rekey.result <- requestResult{inner: []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{
+			Number: 1, Protocol: ProtoESP, SPI: remoteSPI,
+			Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}},
+		}})},
+		{Type: PayloadNonce, Body: EncodeNonce(make([]byte, 32))},
+		{Type: PayloadTSi, Body: narrowSelectors()},
+		{Type: PayloadTSr, Body: narrowSelectors()},
+	}}
+
+	var deleted *localRequest
+	select {
+	case deleted = <-s.requests:
+	case err := <-done:
+		t.Fatalf("the rekey returned %v without telling the peer about the SA it installed", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no exchange followed the refusal")
+	}
+	if deleted.exchange != INFORMATIONAL {
+		t.Fatalf("the exchange after the refusal is %d, want the INFORMATIONAL that deletes what the peer installed", deleted.exchange)
+	}
+	var named []uint32
+	for _, p := range deleted.inner {
+		if p.Type != PayloadD {
+			continue
+		}
+		d, err := DecodeDelete(p.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, spi := range d.SPIs {
+			named = append(named, binary.BigEndian.Uint32(spi))
+		}
+	}
+	// RFC 7296 section 1.4.1 sends "the SPIs (as they would be expected in the
+	// headers of inbound packets) of the SAs to be deleted", so the sender
+	// names its own half. Naming the peer's matches nothing at the far end and
+	// deletes nothing, which is the whole point of the exchange.
+	if len(named) != 1 || named[0] != localSPI {
+		t.Errorf("the Delete names %v, want %d, the inbound SPI this end offered", named, localSPI)
+	}
+	if len(named) == 1 && named[0] == old.RemoteSPI+1 {
+		t.Error("the Delete names the peer's inbound SPI, which its own deleteChildren matches against RemoteSPI")
+	}
+	deleted.result <- requestResult{}
+	if err := <-done; err == nil {
+		t.Error("the rekey reported success after refusing the answer")
+	}
+}
+
+// narrowSelectors is a traffic selector pair this end refuses, which is what
+// makes the response above one it turns down after the exchange completed.
+func narrowSelectors() []byte {
+	return EncodeTS([]TrafficSelector{{Type: TS_IPV4_ADDR_RANGE, EndPort: 0xffff,
+		StartAddr: net.IPv4(10, 0, 0, 1).To4(), EndAddr: net.IPv4(10, 0, 0, 1).To4()}})
+}
+
+// offeredChildSPI reads the SPI a Child SA request proposes for this end's
+// inbound half.
+func offeredChildSPI(t *testing.T, inner []RawPayload) uint32 {
+	t.Helper()
+	payloads, err := decodeChildExchangePayloads(inner, PRF_HMAC_SHA2_256)
+	if err != nil {
+		t.Fatalf("invalid Child SA request: %v", err)
+	}
+	proposals, err := DecodeSA(payloads.sa.Body)
+	if err != nil || len(proposals) != 1 || len(proposals[0].SPI) != 4 {
+		t.Fatalf("invalid Child SA proposal: %#v, %v", proposals, err)
+	}
+	return binary.BigEndian.Uint32(proposals[0].SPI)
+}
+
 // Both ends may decide to close one Child SA at once, and RFC 7296 section
 // 1.4.1 describes the crossing: "If a node receives a delete request for SAs
 // for which it has already issued a delete request, it MUST delete the
