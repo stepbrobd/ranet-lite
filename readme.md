@@ -155,6 +155,18 @@ which is the jitter
 [RFC 7296 section 2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)
 asks for.
 
+A responder switches its outbound Child SA to the replacement just before it
+sends the rekey response rather than just after.
+[RFC 7296 section 2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)
+permits sending on the new SA "as soon as it sends its response", so the
+difference is the time to encrypt one message. What the same section also offers
+is the conservative option, continuing on the old SA until the peer proves it
+has the new one, and that is what would close the gap outright: either way the
+peer cannot decrypt until the response reaches it, so a peer-initiated rekey
+costs the response's flight time of outbound traffic. Since the end with the
+shorter lifetime drives rekeying, on a mixed fleet that is strongSwan, hourly,
+per peer, and babel's own traffic is periodic enough not to notice.
+
 The remaining narrow feature set is not counted as RFC non-compliance.
 Raw-public-key authentication without certificates or EAP and refusal to create
 additional Child SAs are both within the
