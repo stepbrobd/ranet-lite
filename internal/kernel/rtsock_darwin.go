@@ -309,34 +309,61 @@ func (m *routeMonitor) run() {
 	}
 }
 
+// Offsets into darwin's rt_msghdr, from net/route.h. The fixed header is
+// decoded here rather than through x/net because that package reads the errno
+// from bytes 28 to 32, where darwin puts rtm_use: a refused write arrives with
+// Err nil and a live dump invents errnos out of route usage counts. Only the
+// header is needed, since the addresses that follow say what changed and the
+// monitor has to know only that something did.
+const (
+	rtmTypeOffset  = 3
+	rtmIndexOffset = 4
+	rtmPIDOffset   = 16
+	rtmErrnoOffset = 24
+	// rtmDecodedLen covers the fields below, not sizeof(struct rt_msghdr),
+	// which is larger and carries metrics nothing here asks about.
+	rtmDecodedLen = 28
+)
+
 // interesting reports whether one routing socket datagram changed a route out
 // of the monitored interface. A message that will not parse still counts:
 // something changed, and a reconcile pass is cheap next to missing it.
 func (m *routeMonitor) interesting(buf []byte) bool {
-	messages, err := route.ParseRIB(route.RIBTypeRoute, buf)
-	if err != nil {
-		return true
-	}
-	for _, message := range messages {
-		rm, ok := message.(*route.RouteMessage)
-		if !ok || rm.Index != m.index {
-			continue
-		}
-		// Our own writes come back to us, results and all, and a failed one
-		// would otherwise drive the reconciler in a circle: an install the
-		// kernel refuses stays in the diff on purpose, so waking on its echo
-		// means installing, failing, waking and installing again, four times a
-		// second for as long as the other writer holds the key. A successful
-		// one still wakes, which converges: the next pass has nothing to do.
-		if rm.ID == m.self && rm.Err != nil {
-			continue
-		}
-		switch rm.Type {
-		case unix.RTM_ADD, unix.RTM_DELETE, unix.RTM_CHANGE:
+	for len(buf) > 0 {
+		if len(buf) < rtmDecodedLen {
 			return true
 		}
+		length := int(binary.NativeEndian.Uint16(buf[:2]))
+		if length < rtmDecodedLen || length > len(buf) {
+			return true
+		}
+		if m.wakesOn(buf[:length]) {
+			return true
+		}
+		buf = buf[length:]
 	}
 	return false
+}
+
+// wakesOn reports whether one complete routing message needs a reconcile pass.
+// Our own writes come back to us, results and all, and a failed one would
+// otherwise drive the reconciler in a circle: an install the kernel refuses
+// stays in the diff on purpose, so waking on its echo means installing,
+// failing, waking and installing again, four times a second for as long as the
+// other writer holds the key. A successful one still wakes, which converges:
+// the next pass has nothing to do.
+func (m *routeMonitor) wakesOn(message []byte) bool {
+	switch int(message[rtmTypeOffset]) {
+	case unix.RTM_ADD, unix.RTM_DELETE, unix.RTM_CHANGE:
+	default:
+		return false
+	}
+	if int(binary.NativeEndian.Uint16(message[rtmIndexOffset:])) != m.index {
+		return false
+	}
+	ours := uintptr(binary.NativeEndian.Uint32(message[rtmPIDOffset:])) == m.self
+	refused := binary.NativeEndian.Uint32(message[rtmErrnoOffset:]) != 0
+	return !ours || !refused
 }
 
 // wake never blocks: a reader that misses one coalesced signal sees the change

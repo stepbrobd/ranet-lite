@@ -132,6 +132,12 @@ type Config struct {
 	// ReconcileInterval is the periodic sweep. Zero uses
 	// DefaultReconcileInterval.
 	ReconcileInterval time.Duration
+	// Underlay names the addresses this node's own transport has to keep
+	// reaching. The darwin backend asks once per pass and scopes a route that
+	// covers one, see coversAny there; linux reads it never, and keeps the
+	// underlay out with a socket mark instead. Nil decides scope on the
+	// destination alone.
+	Underlay func() []netip.Addr
 }
 
 // RouteSource is the seam onto internal/netstack: one coalesced wake-up per
@@ -479,10 +485,11 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 			warned[key] = true
 			continue
 		}
+		unreachable := entry.Value == netstack.Unreachable
 		route := Route{
 			Destination: destination,
-			Metric:      r.metric(destination),
-			Unreachable: entry.Value == netstack.Unreachable,
+			Metric:      routeMetric(r.cfg.Metric, destination, unreachable),
+			Unreachable: unreachable,
 		}
 		// A source covering every address is not a source-specific route, and
 		// installing it as one is beyond what the linux encoder can express: it
@@ -529,7 +536,7 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 
 // limitedBroadcast is the one entry the darwin kernel installs that carries no
 // flag separating it from a route of ours: scoped, RTF_STATIC, and leaving
-// through the interface itself, which is exactly what that backend writes. It
+// through the interface itself, the same shape that backend writes. It
 // is not created for a tun configured the way this backend configures one
 // (measured on a throwaway utun carrying a /24 and a /48, where every entry
 // the kernel added named an address as its gateway and so was already
@@ -558,14 +565,28 @@ func unroutable(destination netip.Prefix) string {
 	return ""
 }
 
-// metric is the value the kernel will actually hold, so a dump compares equal
-// to what was installed. An unset metric means the kernel's own default,
-// which differs by family.
-func (r *Reconciler) metric(destination netip.Prefix) uint32 {
-	if r.cfg.Metric == 0 && !destination.Addr().Is4() {
+// holdMetric is where a retraction sits among the routes to the same prefix:
+// last. A lookup is longest prefix first and only then by metric, so a hold
+// still outranks the covering route it exists to keep a packet away from,
+// while anything else holding that exact prefix wins. On a converted fleet
+// node that anything else is the gravity VRF's connected route for the /60 the
+// node itself originates, in the same table.
+const holdMetric = ^uint32(0)
+
+// routeMetric is the value the kernel will actually hold, so a dump compares
+// equal to what was installed. An unset configured metric means the kernel's
+// own default, which differs by family. Both the reconciler and the darwin
+// backend answer through here, because darwin's FIB keeps no metric and
+// mirrors this onto every route it decodes: two answers to the same question
+// make a diff that adds and deletes the same route on every pass.
+func routeMetric(configured uint32, destination netip.Prefix, unreachable bool) uint32 {
+	switch {
+	case unreachable:
+		return holdMetric
+	case configured == 0 && !destination.Addr().Is4():
 		return defaultIPv6Metric
 	}
-	return r.cfg.Metric
+	return configured
 }
 
 // diffRoutes reports the routes the kernel is missing and the reconciler's
@@ -755,15 +776,19 @@ func (r *Reconciler) withdraw() error {
 	// writer that rewrote ours under a different prefix length, which its
 	// SIOCAIFADDR upsert lets it do, would otherwise have its entry taken away
 	// by this shutdown. applyAddresses reads the link back rather than
-	// trusting the record for the same reason.
+	// trusting the record for the same reason, and refuses on the same
+	// failure: a readback that did not happen is not one that said yes.
 	held, err := r.plat.Addrs()
-	if err != nil {
-		errs = append(errs, fmt.Errorf("list addresses: %w", err))
-	}
 	addresses := slices.SortedFunc(maps.Keys(r.owned), comparePrefixes)
 	removed := 0
+	if err != nil {
+		errs = append(errs, fmt.Errorf("list addresses: %w", err))
+		slog.Warn("kernel is leaving every address it installed, the link would not read back",
+			"interface", r.cfg.Interface, "addresses", len(addresses))
+		addresses = nil
+	}
 	for _, prefix := range addresses {
-		if err == nil && !slices.Contains(held, prefix) {
+		if !slices.Contains(held, prefix) {
 			slog.Warn("kernel is leaving an address it no longer holds as it installed it",
 				"interface", r.cfg.Interface, "address", prefix)
 			delete(r.owned, prefix)

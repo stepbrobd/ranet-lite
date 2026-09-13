@@ -194,7 +194,7 @@ func TestDarwinScopesPlainDefaults(t *testing.T) {
 		t.Run(destination, func(t *testing.T) {
 			plat, sock := testPlatform(t, Config{})
 			announced := Route{Destination: prefix(destination)}
-			announced.Metric = plat.metric(announced.Destination)
+			announced.Metric = routeMetric(plat.cfg.Metric, announced.Destination, false)
 			if err := plat.AddRoute(announced); err != nil {
 				t.Fatal(err)
 			}
@@ -883,7 +883,11 @@ func TestDarwinReportsOccupiedRouteAsSkipped(t *testing.T) {
 // no more be visible to an unbound socket than a real one.
 func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
-	held := Route{Destination: prefix("2001:db8:1::/48"), Unreachable: true, Metric: defaultIPv6Metric}
+	held := Route{Destination: prefix("2001:db8:1::/48"), Unreachable: true}
+	// Through the same function the dump answers with. A hold sits last among
+	// the routes to its prefix, and a darwin FIB keeps no metric, so the two
+	// sides of the diff disagree the moment either takes its own answer.
+	held.Metric = routeMetric(plat.cfg.Metric, held.Destination, held.Unreachable)
 	if err := plat.AddRoute(held); err != nil {
 		t.Fatal(err)
 	}
@@ -943,7 +947,7 @@ func TestDarwinAdoptsScopedRouteItDidNotInstall(t *testing.T) {
 	}
 	want := []Route{
 		{Destination: prefix("::/0"), Metric: defaultIPv6Metric, Scoped: true},
-		{Destination: prefix("2001:db8:1::/48"), Metric: defaultIPv6Metric, Scoped: true, Unreachable: true},
+		{Destination: prefix("2001:db8:1::/48"), Metric: holdMetric, Scoped: true, Unreachable: true},
 		{Destination: prefix("2001:db8:2::/48"), Metric: defaultIPv6Metric, Scoped: true},
 	}
 	slices.SortFunc(got, compareRoutes)
@@ -1270,10 +1274,12 @@ func TestDarwinKnowsItsOwnRouteFromOneAnotherProgramHolds(t *testing.T) {
 // has a route for.
 func TestDarwinMonitorIgnoresItsOwnRefusedWrites(t *testing.T) {
 	monitor := &routeMonitor{index: testIndex, self: uintptr(unix.Getpid())}
-	// Marshal writes the pid but not the errno, which is the field that says
-	// the write failed, so it goes in by hand at the offset the parser reads.
-	const errnoOffset = 28
-	echo := func(kind int, id uintptr, errno unix.Errno) []byte {
+	// Marshal writes the pid but neither rtm_errno nor rtm_use, so both go in
+	// by hand at the offsets darwin's net/route.h gives them. Spelled out here
+	// rather than taken from the parser, so a parser reading the wrong one is
+	// a failure rather than an agreement. See rtmErrnoOffset.
+	const kernelErrnoOffset, kernelUseOffset = 24, 28
+	echo := func(kind int, id uintptr, errno unix.Errno, use uint32) []byte {
 		t.Helper()
 		message := &route.RouteMessage{
 			Version: unix.RTM_VERSION, Type: kind, Index: testIndex, ID: id,
@@ -1283,24 +1289,31 @@ func TestDarwinMonitorIgnoresItsOwnRefusedWrites(t *testing.T) {
 		if marshalErr != nil {
 			t.Fatalf("marshal a route message: %v", marshalErr)
 		}
-		binary.NativeEndian.PutUint32(raw[errnoOffset:errnoOffset+4], uint32(errno))
+		binary.NativeEndian.PutUint32(raw[kernelErrnoOffset:], uint32(errno))
+		binary.NativeEndian.PutUint32(raw[kernelUseOffset:], use)
 		return raw
 	}
-	if monitor.interesting(echo(unix.RTM_ADD, monitor.self, unix.EEXIST)) {
+	if monitor.interesting(echo(unix.RTM_ADD, monitor.self, unix.EEXIST, 0)) {
 		t.Error("the monitor woke on this reconciler's own refused install")
 	}
-	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self, 0)) {
+	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self, 0, 0)) {
 		t.Error("a write of ours that landed did not wake the pass that has to see it")
 	}
-	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self+1, unix.EEXIST)) {
+	// The live shape: rtm_use is a route's usage count and says nothing about
+	// the result, so a write of ours that landed on a route the machine has
+	// been forwarding through must still wake the pass that has to see it.
+	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self, 0, 234661)) {
+		t.Error("a usage count was read as an errno, so a write of ours that landed did not wake the reconciler")
+	}
+	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self+1, unix.EEXIST, 0)) {
 		t.Error("another program's failed write did not wake the reconciler")
 	}
-	if !monitor.interesting(echo(unix.RTM_DELETE, monitor.self+1, 0)) {
+	if !monitor.interesting(echo(unix.RTM_DELETE, monitor.self+1, 0, 0)) {
 		t.Error("another program deleting a route out of this interface did not wake the reconciler")
 	}
 	// A message whose declared length runs past the buffer. Something changed
 	// and a pass is cheap next to missing it.
-	truncated := echo(unix.RTM_ADD, monitor.self+1, 0)
+	truncated := echo(unix.RTM_ADD, monitor.self+1, 0, 0)
 	if !monitor.interesting(truncated[:len(truncated)-4]) {
 		t.Error("a message that will not parse must wake rather than be dropped")
 	}
@@ -1347,7 +1360,7 @@ func TestDarwinKeepsTheMoreSpecificSourceAtOneDestination(t *testing.T) {
 	wide := Route{Destination: prefix("::/0"), Source: prefix("2602:f590::/36")}
 	narrow := Route{Destination: prefix("::/0"), Source: prefix("2602:f590::/48")}
 	for _, r := range []*Route{&wide, &narrow} {
-		r.Metric = plat.metric(r.Destination)
+		r.Metric = routeMetric(plat.cfg.Metric, r.Destination, false)
 	}
 
 	// diffRoutes orders the installs, so the preference has to survive it
@@ -1390,7 +1403,7 @@ func TestDarwinNamesTheTwoSourceRefusalsApart(t *testing.T) {
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
 
 	foreign := Route{Destination: prefix("::/0"), Source: prefix("2602:f590:a::/48")}
-	foreign.Metric = plat.metric(foreign.Destination)
+	foreign.Metric = routeMetric(plat.cfg.Metric, foreign.Destination, foreign.Unreachable)
 	if err := plat.AddRoute(foreign); !errors.Is(err, errRouteSkipped) {
 		t.Fatalf("a source holding none of our addresses reported %v", err)
 	}

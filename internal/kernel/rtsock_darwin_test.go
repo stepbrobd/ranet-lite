@@ -120,12 +120,21 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 		t.Fatalf("the kernel's own entries for an address were read as routes we own: %v (err %v)", routes, err)
 	}
 
-	// IPv6 carries the kernel's own default metric explicitly, the same way
-	// the linux backend does, so a dump compares equal to what was installed.
+	// Every metric comes from routeMetric, and so does every metric the dump
+	// answers with, because this FIB keeps none of its own. A hold takes a
+	// different one, and a second answer for it makes the diff disagree in the
+	// direction that never converges: the pass deletes and reinstalls the same
+	// route forever, with a window on each one where the prefix is not held.
+	hold := Route{Destination: prefix("2001:db8:dead::/48"), Unreachable: true}
 	want := []Route{
 		{Destination: netTestRoute4},
 		{Destination: netTestHost4},
-		{Destination: netTestRoute6, Metric: defaultIPv6Metric},
+		{Destination: netTestRoute6},
+		hold,
+	}
+	for i := range want {
+		want[i].Metric = routeMetric(cfg.Metric, want[i].Destination, want[i].Unreachable)
+		want[i].Scoped = plat.scopes(want[i])
 	}
 	slices.SortFunc(want, compareRoutes)
 	for _, r := range want {
@@ -171,6 +180,22 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("installing a route did not wake the route monitor")
 	}
+
+	// The same route again, which the kernel refuses with EEXIST and echoes
+	// with rtm_errno set. A refusal stays in the diff on purpose, so waking on
+	// its own echo means installing, failing, waking and installing again,
+	// measured at four times a second on a live machine. Only the kernel
+	// writes that field where the kernel puts it, see rtmErrnoOffset.
+	drain(plat.Notify())
+	if err := plat.AddRoute(extra); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("reinstalling our own route reported %v, want it skipped", err)
+	}
+	select {
+	case <-plat.Notify():
+		t.Error("the monitor woke on this reconciler's own refused install, so a pass that cannot install spins")
+	case <-time.After(2 * time.Second):
+	}
+
 	if err := plat.DelRoute(extra); err != nil {
 		t.Fatalf("withdraw %s: %v", extra, err)
 	}

@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin && !ios
 
 package kernel
 
@@ -148,8 +148,31 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 	})
 }
 
+// A prefix that covers a peer's own endpoint takes the ESP into the tun it is
+// carrying, and a default is not the only one that can: nothing bounds what a
+// mesh member announces, and the guarantee the readme and the fwmark refusal
+// both state rested on the destination's own length alone.
+func TestDarwinScopesARouteThatCoversTheUnderlay(t *testing.T) {
+	peer := netip.MustParseAddr("2001:db8:beef::1")
+	plat, _ := testPlatform(t, Config{Underlay: func() []netip.Addr { return []netip.Addr{peer} }})
+	capturing := Route{Destination: prefix("2000::/3")}
+	elsewhere := Route{Destination: prefix("2a0c:b641::/32")}
+	if plat.scopeRoute(capturing) {
+		t.Fatal("the underlay was consulted before Routes took it, so a pass would decide scope two ways")
+	}
+	if _, err := plat.Routes(); err != nil {
+		t.Fatal(err)
+	}
+	if !plat.scopeRoute(capturing) {
+		t.Error("a /3 holding a peer's endpoint installs unscoped, so an unbound socket routes the ESP into the tun")
+	}
+	if plat.scopeRoute(elsewhere) {
+		t.Error("a mesh prefix holding no endpoint was scoped, so the mesh is reachable only from a bound socket")
+	}
+}
+
 // addScopedRoute and delScopedRoute install and withdraw a scoped route the
-// reconciler would not: a plain destination, which scopeOnDarwin leaves
+// reconciler would not: a plain destination, which scopeRoute leaves
 // unscoped. The pair exists to isolate what RTF_IFSCOPE does to a lookup from
 // what the reconciler chooses to do with it, so neither touches the
 // bookkeeping. The kernel keys a scoped route separately, so the withdrawal

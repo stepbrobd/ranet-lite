@@ -39,9 +39,10 @@ type fakeKernel struct {
 	adds    int
 	dels    int
 
-	failAdd  map[Route]error
-	failDel  map[Route]error
-	failList error
+	failAdd   map[Route]error
+	failDel   map[Route]error
+	failList  error
+	failAddrs error
 
 	signal chan struct{}
 }
@@ -100,6 +101,9 @@ func (f *fakeKernel) DelRoute(route Route) error {
 func (f *fakeKernel) Addrs() ([]netip.Prefix, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failAddrs != nil {
+		return nil, f.failAddrs
+	}
 	out := make([]netip.Prefix, 0, len(f.addrs))
 	for address := range f.addrs {
 		out = append(out, address)
@@ -279,7 +283,7 @@ func TestReconcileLeavesUnchangedRoutesAlone(t *testing.T) {
 }
 
 // A source-specific route and an ordinary route to the same destination are
-// two kernel routes, not one, which is the whole point of RTA_SRC.
+// two kernel routes, not one, which is the distinction RTA_SRC carries.
 func TestReconcileKeepsSourceSpecificAndOrdinaryApart(t *testing.T) {
 	reconciler, table, fake := harness(t, Config{})
 	table.Set(netip.Prefix{}, prefix("2602:f590::/36"), nil)
@@ -609,8 +613,8 @@ func TestNewRejectsReservedTable(t *testing.T) {
 			t.Errorf("table %d was refused with %v, and the kernel keeps it for itself", table, err)
 		}
 	}
-	// A table the kernel does not reserve is not what this refuses, and the
-	// reservation is three byte-sized ids rather than everything above 252:
+	// A table the kernel does not reserve goes through, and the reservation is
+	// three byte-sized ids rather than everything above 252:
 	// the linux backend sends RT_TABLE_UNSPEC plus a 32-bit RTA_TABLE for a
 	// table above 255, which is how ids like 51820 reach the kernel at all.
 	// New still fails here, because there is no such interface on the machine
@@ -733,17 +737,31 @@ func TestRetractedPrefixIsHeldInKernelTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	var held, carried bool
+	var heldAt, carriedAt uint32
 	for _, route := range routes {
-		if route.Destination != retracted {
-			continue
+		switch route.Destination {
+		case retracted:
+			held, carried = route.Unreachable, !route.Unreachable
+			heldAt = route.Metric
+		case covering:
+			carriedAt = route.Metric
 		}
-		held, carried = route.Unreachable, !route.Unreachable
 	}
 	if carried {
 		t.Error("the retracted prefix is still a unicast route, so the mesh and the kernel disagree")
 	}
 	if !held {
 		t.Errorf("the retracted prefix left the kernel table, so a packet for it follows %s instead", covering)
+	}
+	// A lookup is longest prefix first and only then by metric, so the hold
+	// keeps its job while losing to anything else holding that exact prefix.
+	// A converted fleet node has one: its gravity /60 is a connected route in
+	// the table this reconciler owns, and the node has to originate that same
+	// /60, so a hold that wins there rejects every packet for the node's own
+	// prefix.
+	if heldAt <= carriedAt {
+		t.Errorf("the hold sits at metric %d against %d for a carried route, so it outranks a connected route to the same prefix",
+			heldAt, carriedAt)
 	}
 
 	// And it goes when the hold is flushed, rather than staying an error route
@@ -874,6 +892,32 @@ func TestWithdrawLeavesAnAddressAnotherWriterRewrote(t *testing.T) {
 	}
 	if kernel.addrs[kept] {
 		t.Error("shutdown left an address it did install")
+	}
+}
+
+// The same rule when the link will not say what it holds. A readback that did
+// not happen is not one that said yes, and treating it as one deletes exactly
+// the address the guard above exists to protect. applyAddresses refuses the
+// whole pass on the identical failure.
+func TestWithdrawLeavesEveryAddressWhenTheLinkWillNotReadBack(t *testing.T) {
+	ours := prefix("2001:db8::1/128")
+	r, _, kernel := harness(t, Config{Addresses: []netip.Prefix{ours}})
+	if err := r.applyAddresses(); err != nil {
+		t.Fatal(err)
+	}
+	if !r.owned[ours] {
+		t.Fatal("the reconciler did not record what it assigned, so this proves nothing")
+	}
+
+	kernel.failAddrs = errors.New("link is gone")
+	if err := r.withdraw(); err == nil {
+		t.Error("a shutdown that could not read the link back reported success")
+	}
+	if !kernel.addrs[ours] {
+		t.Error("shutdown removed an address it could not confirm it still held as it installed it")
+	}
+	if !r.owned[ours] {
+		t.Error("shutdown forgot an address it did not withdraw")
 	}
 }
 

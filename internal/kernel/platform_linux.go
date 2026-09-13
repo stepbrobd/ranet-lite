@@ -625,8 +625,8 @@ func collectForeignWriters(replies []nlMessage, table uint32, ours uint8, seen m
 		// RTPROT_KERNEL is excluded only in the main table, where it is the
 		// kernel's own plumbing for the machine's addresses. In any other
 		// table, and a VRF table is the case that matters, those same entries
-		// belong to whoever put the interface in the VRF and are exactly what
-		// an install must not take over.
+		// belong to whoever put the interface in the VRF, which an install must
+		// not take over.
 		if routeTable != table {
 			continue
 		}

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !android
 
 package kernel
 
@@ -119,7 +119,7 @@ func TestLinuxReportsOccupiedRouteAsSkipped(t *testing.T) {
 }
 
 // Withdrawing matches on this reconciler's own protocol, so a route another
-// writer put at the same prefix is not what goes away.
+// writer put at the same prefix stays.
 func TestLinuxWithdrawalNamesOurOwnProtocol(t *testing.T) {
 	plat, conn := writePlatform(t)
 	if err := plat.DelRoute(Route{Destination: netip.MustParsePrefix("2001:db8:3::/48")}); err != nil {

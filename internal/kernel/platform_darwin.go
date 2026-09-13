@@ -38,7 +38,7 @@ import (
 //
 // There is no source-address-dependent lookup. A source prefix covering one of
 // this interface's own addresses is installed as an interface-scoped route,
-// see scopeOnDarwin; any other source prefix is reported once and skipped,
+// see scopeRoute; any other source prefix is reported once and skipped,
 // because flattening it would turn an exit's "::/0 from <prefix>" into a plain
 // default route out of the tun. An announced default is scoped for a different
 // reason, that it would otherwise capture the ESP underlay, and the two share
@@ -94,6 +94,12 @@ type routePlatform struct {
 	addrs func() ([]netip.Prefix, error)
 
 	pending map[Route]bool
+
+	// underlay is Config.Underlay as of the current pass. Taken once in
+	// Routes, so every scope decision of a pass reads the same list: a route
+	// installed scoped under one answer and deleted under another leaves the
+	// kernel holding a key nothing will name again.
+	underlay []netip.Addr
 }
 
 func newPlatform(cfg Config) (platform, error) {
@@ -195,17 +201,10 @@ func (p *routePlatform) Close() error {
 	return errors.Join(errs...)
 }
 
-// metric mirrors (*Reconciler).metric and prefSrc mirrors what desired puts on
-// an IPv4 route. Neither is a property of a darwin route, so both are taken
-// from the configuration on the way out of a dump: the diff key then matches
-// what the reconciler asked for, instead of differing on every pass.
-func (p *routePlatform) metric(destination netip.Prefix) uint32 {
-	if p.cfg.Metric == 0 && !destination.Addr().Is4() {
-		return defaultIPv6Metric
-	}
-	return p.cfg.Metric
-}
-
+// prefSrc mirrors what desired puts on an IPv4 route. It is not a property of
+// a darwin route, so a dump takes it from the configuration, the way
+// routeMetric answers for the metric. Without that the diff key differs from
+// what the reconciler asked for on every pass.
 func (p *routePlatform) prefSrc(destination netip.Prefix) netip.Addr {
 	if destination.Addr().Is4() && p.cfg.PrefSrc4.IsValid() {
 		return p.cfg.PrefSrc4
@@ -236,6 +235,9 @@ func (p *routePlatform) rotateWarnings() {
 }
 
 func (p *routePlatform) Routes() ([]Route, error) {
+	if p.cfg.Underlay != nil {
+		p.underlay = p.cfg.Underlay()
+	}
 	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the routing table: %w", err)
@@ -399,9 +401,8 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	// withdraw them nor install over them, because darwin has no replace.
 	//
 	// It does mean taking over a scoped route out of this interface that
-	// belongs to somebody else, which is already what happens to an unscoped
-	// one. The interface is this process's, and another overlay scopes to its
-	// own. The source does not survive, so an inherited source-specific route
+	// belongs to somebody else, which already happens to an unscoped one. The
+	// interface is this process's, and another overlay scopes to its own. The source does not survive, so an inherited source-specific route
 	// is withdrawn and reinstalled rather than recognized.
 	return Route{
 		Destination: prefix,
@@ -409,7 +410,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// from what this process installed for that destination.
 		Source:  source,
 		PrefSrc: p.prefSrc(prefix),
-		Metric:  p.metric(prefix),
+		Metric:  routeMetric(p.cfg.Metric, prefix, rm.Flags&unix.RTF_REJECT != 0),
 		// Read back rather than re-derived, because the kernel keys on it: an
 		// unscoped default and a scoped one are two routes, and a withdrawal
 		// that guessed from the destination would take out the wrong one and
@@ -444,7 +445,7 @@ func (p *routePlatform) sourceIsOurs(source netip.Prefix) (bool, error) {
 // picks the peer after the kernel hands over the packet, so there is no next
 // hop to name.
 //
-// RTF_IFSCOPE is set by the caller, for the routes scopeOnDarwin names. A
+// RTF_IFSCOPE is set by the caller, for the routes scopeRoute names. A
 // scoped route is invisible to an ordinary lookup and visible to a socket
 // bound to an address on this interface.
 //
@@ -502,7 +503,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 			return p.skipRoute(r, "no address of ours falls inside the source prefix")
 		}
 	}
-	if scopeOnDarwin(r) {
+	if p.scopeRoute(r) {
 		if held, ok := p.scoped[r.Destination]; ok && held != r.Source {
 			// Interface scope is one route per destination per interface, so a
 			// second scoped route for the same destination has nowhere to go.
@@ -521,7 +522,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 	if err != nil {
 		return err
 	}
-	if scopeOnDarwin(r) {
+	if p.scopeRoute(r) {
 		message.Flags |= unix.RTF_IFSCOPE
 	}
 	if r.Unreachable {
@@ -540,7 +541,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 		if !errors.Is(err, unix.EEXIST) {
 			return err
 		}
-		key := occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)}
+		key := occupiedKey{destination: r.Destination, scoped: p.scopeRoute(r)}
 		if p.ours[key] {
 			// Already installed out of this interface, so the key is taken by
 			// this reconciler and nothing is wrong. It is still reported as
@@ -557,55 +558,66 @@ func (p *routePlatform) AddRoute(r Route) error {
 		}
 		return errRouteSkipped
 	}
-	installed := occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)}
+	installed := occupiedKey{destination: r.Destination, scoped: p.scopeRoute(r)}
 	delete(p.occupied, installed)
 	p.ours[installed] = true
 	// Recorded only after the write lands, and only for a route that actually
 	// carries the scope. An entry for a route that was never installed would
 	// make decodeRoute report an unscoped route as carrying a source it does
 	// not have, and the diff would then leave a plain route in place forever.
-	if scopeOnDarwin(r) {
+	if p.scopeRoute(r) {
 		p.scoped[r.Destination] = r.Source
 	}
 	return nil
 }
 
-// scopeOnDarwin decides whether a route is installed with RTF_IFSCOPE, which
+// scopeRoute decides whether a route is installed with RTF_IFSCOPE, which
 // hides it from an ordinary lookup and shows it to a socket bound to an
-// address on this interface.
-//
-// A source-specific route is scoped because interface scope is the only thing
-// on this platform that draws the distinction a source prefix draws.
-//
-// A default is scoped because otherwise it captures the machine. There is one
+// address on this interface. Anything it leaves unscoped is reachable from the
+// Mac without every program binding first, which is the split tailscale makes
+// on the same machine: its exit-node default is scoped to its utun, its
+// 100.64/10 is not.
+func (p *routePlatform) scopeRoute(r Route) bool {
+	return standsInForASource(r) || capturesTheMachine(r) || holdsAgainstTheFIB(r) ||
+		coversAny(r.Destination, p.underlay)
+}
+
+// interface scope is the only thing on this platform that draws the
+// distinction a source prefix draws.
+func standsInForASource(r Route) bool { return r.Source.IsValid() }
+
+// a default unscoped takes the peers' own endpoints with it, and there is one
 // FIB and no equivalent of the fleet's table plus "ipproto udp sport <port>
-// lookup main", so nothing keeps the peers' own endpoints out of an announced
-// default and the ESP underlay would route into the tun carrying it. On IPv4
-// an unscoped mesh default survives only by colliding with the box's own, and
-// AddRoute retries every pass, so the first moment the Mac has no v4 default
-// the next pass takes the machine. On IPv6 there is no collision to rely on:
-// every default row on a Mac is already scoped.
+// lookup main" to keep them out. On IPv4 it survives only by colliding with
+// the box's own, which AddRoute retries past the first moment the Mac has
+// none; on IPv6 there is no collision to rely on, since every default row on a
+// Mac is already scoped.
 //
-// A half of the address space counts as a default, because that is how a
-// default that does not replace the host's is written: 0.0.0.0/1 with
-// 128.0.0.0/1, or ::/1 with 8000::/1, which is the spelling wg-quick and the
-// tunnels on this platform use. The pair covers every destination at a longer
-// prefix than the box's own /0, so unscoped it wins the lookup outright
-// instead of merely colliding, and it takes the underlay with it. A neighbor
-// can announce one: the Update decoder bounds a prefix length only at 32 and
-// 128.
-//
-// A hold is scoped because it answers with an error rather than carrying the
-// packet, and this FIB is the only one the machine has. Unscoped, a retracted
-// route shadows whatever else could still reach the prefix, and one this node
-// originates does so for the life of the process.
-//
-// Anything more specific stays unscoped, so the mesh is reachable from the Mac
-// without every program binding first. That is the split tailscale makes on
-// the same machine: its exit-node default is scoped to its utun, its 100.64/10
-// is not.
-func scopeOnDarwin(r Route) bool {
-	return r.Source.IsValid() || r.Destination.Bits() <= 1 || r.Unreachable
+// Half the address space counts, because that is how a default that does not
+// replace the host's is written: 0.0.0.0/1 with 128.0.0.0/1, or ::/1 with
+// 8000::/1, the spelling wg-quick and the tunnels on this platform use. The
+// pair wins the lookup outright rather than colliding, and a neighbor can
+// announce one: the Update decoder bounds a prefix length only at 32 and 128.
+func capturesTheMachine(r Route) bool { return r.Destination.Bits() <= 1 }
+
+// a hold answers with an error rather than carrying the packet, and this FIB
+// is the only one the machine has, so unscoped it shadows whatever else could
+// still reach the prefix, for the life of the process if this node originates
+// it.
+func holdsAgainstTheFIB(r Route) bool { return r.Unreachable }
+
+// coversAny reports a prefix that takes an address the transport needs into
+// the tun it is carrying. A default is not the only one that can: nothing
+// bounds what a mesh member announces, and 2000::/3 or a provider aggregate
+// holding a peer's endpoint does it as surely as ::/0. An empty list falls
+// back to the destination's own length.
+func coversAny(prefix netip.Prefix, addresses []netip.Addr) bool {
+	for _, address := range addresses {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *routePlatform) DelRoute(r Route) error {
@@ -780,5 +792,5 @@ func (p *routePlatform) Release() error { return nil }
 // where is the interface itself: darwin has one FIB and no routing tables.
 func (p *routePlatform) where(cfg Config) string { return "interface " + cfg.Interface }
 
-// scopes is scopeOnDarwin as the diff reads it.
-func (p *routePlatform) scopes(r Route) bool { return scopeOnDarwin(r) }
+// scopes is scopeRoute as the diff reads it.
+func (p *routePlatform) scopes(r Route) bool { return p.scopeRoute(r) }
