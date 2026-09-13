@@ -193,7 +193,7 @@ func TestInvalidKEErrorNamesGroup(t *testing.T) {
 // non-AEAD ciphers offers its integrity algorithms alongside NONE in the one
 // proposal, and refusing the proposal for the algorithm this end has no key
 // for would refuse a suite both ends can run.
-func TestAnUnusableIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.T) {
+func TestUnusableIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.T) {
 	base := []Transform{
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
 		{Type: TransPRF, ID: PRF_HMAC_SHA2_256},

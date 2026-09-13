@@ -183,7 +183,7 @@ func TestIPv4UpdateWithNoNextHopIsIgnored(t *testing.T) {
 // TLV then retracts everything the neighbor carries, and the retraction goes
 // on to the rest of the mesh. PrefixDecoder refuses the identical rule on the
 // Update TLV; this is the other half of it.
-func TestAZeroIHUIntervalIsIgnoredRatherThanHonored(t *testing.T) {
+func TestZeroIHUIntervalIsIgnoredRatherThanHonored(t *testing.T) {
 	dest := netip.MustParsePrefix("10.5.0.0/16")
 	src := netip.MustParseAddr("192.0.2.1")
 	s, _, _ := captureSpeaker(t, Config{})

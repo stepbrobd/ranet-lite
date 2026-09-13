@@ -870,7 +870,7 @@ func (closedBind) Close() error                           { return nil }
 // have not dialed it, and anyone who can reach the port fills it. Overflowing
 // it is not this node falling behind on receive, which is the one thing the
 // other counter says, so it has to land on the refused one.
-func TestAnUnclaimedFloodDoesNotReadAsBeingBehind(t *testing.T) {
+func TestUnclaimedFloodDoesNotReadAsBeingBehind(t *testing.T) {
 	hub, err := NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -919,7 +919,7 @@ func TestAnUnclaimedFloodDoesNotReadAsBeingBehind(t *testing.T) {
 // GRO, up to forty iterations per read, so they go on a counter of their own:
 // an arm that reaches no Mux and raises nothing leaves an operator with an
 // accounting that does not add up.
-func TestANATKeepaliveIsIgnoredRatherThanCounted(t *testing.T) {
+func TestNATKeepaliveIsIgnoredRatherThanCounted(t *testing.T) {
 	hub, err := NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

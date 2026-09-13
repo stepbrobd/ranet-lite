@@ -13,7 +13,7 @@ import (
 // the change. The integration test's own spelling, which is sub-second, is
 // checked the same way: both are durations written as Go duration strings,
 // which is the one spelling this file accepts.
-func TestTheShippedExampleParses(t *testing.T) {
+func TestShippedExampleParses(t *testing.T) {
 	const example = "../../examples/config.yaml"
 	cfg, err := Load(example)
 	if err != nil {

@@ -1392,7 +1392,7 @@ func TestResponderChecksTheNonceAgainstTheNegotiatedPRF(t *testing.T) {
 // cheapest way to stop every session a node opens. Nothing unauthenticated
 // changes state (RFC 7296 section 2.21, RFC 7815 section 2.1); the deadline is
 // what ends the wait.
-func TestAnUndecryptableDatagramDoesNotEndTheHandshake(t *testing.T) {
+func TestUndecryptableDatagramDoesNotEndTheHandshake(t *testing.T) {
 	hub, err := transport.NewHub(":0")
 	if err != nil {
 		t.Fatal(err)
@@ -1456,7 +1456,7 @@ func TestAnUndecryptableDatagramDoesNotEndTheHandshake(t *testing.T) {
 // looking at "that peer cannot connect" had nothing on this side to read. Both
 // halves matter: the first failure in an interval is said at warn, and the
 // ones behind it drop to debug rather than being repeated.
-func TestAFailedInboundHandshakeIsSaidOnceAtWarn(t *testing.T) {
+func TestFailedInboundHandshakeIsSaidOnceAtWarn(t *testing.T) {
 	var levels []slog.Level
 	previous := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(previous) })

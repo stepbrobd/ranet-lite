@@ -453,7 +453,7 @@ func TestSealFailureOnAnOpenPeerIsCounted(t *testing.T) {
 // the same as one this peer refused: the first says the link or the socket is
 // failing and the second says this node is out of room. Neither reached a
 // counter at all before, so a link losing everything read as a quiet node.
-func TestATransportFailureIsCountedApartFromARefusal(t *testing.T) {
+func TestTransportFailureIsCountedApartFromARefusal(t *testing.T) {
 	sending := errors.New("no route to host")
 	peer := NewPeerReserved("peer",
 		func(int) (BatchSealer, error) {
@@ -485,7 +485,7 @@ func TestATransportFailureIsCountedApartFromARefusal(t *testing.T) {
 // A peer whose Child SA the other end deleted fails every reservation from
 // then on, so a line per failed batch is a line per TUN batch for as long as
 // that lasts. The count is exact; only the saying of it is bounded.
-func TestATransportFailureIsSaidRarely(t *testing.T) {
+func TestTransportFailureIsSaidRarely(t *testing.T) {
 	var lines atomic.Int64
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(countingWriter{&lines}, nil)))
@@ -604,7 +604,7 @@ func TestNoBatchIsLostBetweenTheStopCheckAndTheQueue(t *testing.T) {
 // exported with a Dropped that was structurally zero. A partial failure is the
 // case that shows it, because the batch reports an error for the whole of
 // itself while some of its packets did leave.
-func TestACompatibilityPeerCountsWhatItLoses(t *testing.T) {
+func TestCompatibilityPeerCountsWhatItLoses(t *testing.T) {
 	refused := errors.New("no key")
 	var seen int
 	peer := NewPeerBatched("peer",

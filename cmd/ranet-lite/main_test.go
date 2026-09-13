@@ -65,7 +65,7 @@ func TestKernelConfigAddresses(t *testing.T) {
 // shutdown. Registering up front instead delivered the first signal to both
 // readers, so the first Ctrl-C forced an exit rather than shutting down. One
 // channel read in order has neither, and a burst is held by the buffer.
-func TestTheFirstSignalShutsDownAndTheSecondGivesUp(t *testing.T) {
+func TestFirstSignalShutsDownAndTheSecondGivesUp(t *testing.T) {
 	for name, gap := range map[string]bool{"a burst of two": false, "one then another": true} {
 		t.Run(name, func(t *testing.T) {
 			signals := make(chan os.Signal, 2)
@@ -103,7 +103,7 @@ func TestTheFirstSignalShutsDownAndTheSecondGivesUp(t *testing.T) {
 // `ranet-lite config.yaml`, one missing dash, otherwise starts against the
 // default path and reports nothing: the node comes up with a configuration
 // nobody asked for. An unreadable -log-level is the same shape.
-func TestTheCommandLineRefusesWhatItCannotActOn(t *testing.T) {
+func TestCommandLineRefusesWhatItCannotActOn(t *testing.T) {
 	for name, args := range map[string][]string{
 		"a positional argument": {"config.yaml"},
 		"one after a flag":      {"-config", "/etc/x.yaml", "extra"},

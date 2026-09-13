@@ -351,7 +351,7 @@ func TestPeerIKERekeyIsRateLimited(t *testing.T) {
 // and every route through it. RFC 7296 section 1.3.1: "A failed attempt to
 // create a Child SA SHOULD NOT tear down the IKE SA: there is no reason to
 // lose the work done to set up the IKE SA."
-func TestALocalFailureAnsweringARekeyIsTemporary(t *testing.T) {
+func TestLocalFailureAnsweringARekeyIsTemporary(t *testing.T) {
 	const spiI, spiR = 0x0102030405060708, 0x1112131415161718
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	dh, err := GenerateDH(DH_CURVE25519)

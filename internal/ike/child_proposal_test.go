@@ -172,7 +172,7 @@ func TestIntegNoneIsTakenAndEchoedOnEveryProposal(t *testing.T) {
 // makes an integrity algorithm this end has no key for one unacceptable
 // transform, and "other transforms with the same Transform Type are processed
 // as usual", so an offer naming one alongside NONE still has an answer.
-func TestAnUnusableChildIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.T) {
+func TestUnusableChildIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.T) {
 	spi := []byte{0, 0, 0, 7}
 	base := []Transform{
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
@@ -213,7 +213,7 @@ func TestAnUnusableChildIntegrityAlternativeDoesNotRefuseTheProposal(t *testing.
 // espProposal carries, and an unoffered DH transform is the dangerous case:
 // the responder would mean perfect forward secrecy, this end derives without
 // it, and the Child SA it installs carries nothing.
-func TestTheChildAnswerIsCheckedAgainstWhatThisEndOffered(t *testing.T) {
+func TestChildAnswerIsCheckedAgainstWhatThisEndOffered(t *testing.T) {
 	spi := []byte{0, 0, 0, 9}
 	base := []Transform{
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
@@ -272,7 +272,7 @@ func TestEspProposalOffersNoTypeTheAnswerReaderRefuses(t *testing.T) {
 // does echo a type it was offered: a peer that names DH or INTEG gets it back,
 // RFC 7296 section 2.7. selectChildRequestProposal builds that, and it is not
 // what decodeChildProposal above reads.
-func TestTheResponderEchoesEveryTypeTheOfferNamed(t *testing.T) {
+func TestResponderEchoesEveryTypeTheOfferNamed(t *testing.T) {
 	spi := []byte{0, 0, 0, 9}
 	base := []Transform{
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
@@ -316,7 +316,7 @@ func TestTheResponderEchoesEveryTypeTheOfferNamed(t *testing.T) {
 // lets the responder take any transform in the proposal, and a peer whose
 // preference order changed between the initial exchange and the rekey answers
 // within the offer and is turned down.
-func TestARekeyOffersOnlyTheCipherItsAnswerReaderWillTake(t *testing.T) {
+func TestRekeyOffersOnlyTheCipherItsAnswerReaderWillTake(t *testing.T) {
 	spi := []byte{0, 0, 0, 5}
 	for _, old := range []ChildSA{
 		{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 256},

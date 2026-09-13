@@ -276,7 +276,7 @@ func TestUDPReceiveDropsDatagramWithNoUsableSource(t *testing.T) {
 // One GRO buffer is up to forty datagrams, and the counter says datagrams.
 // Counting the message instead undercounts a truncated coalesced read by that
 // much, from an arm adjacent to one that counts them individually.
-func TestATruncatedGROReadIsCountedInDatagrams(t *testing.T) {
+func TestTruncatedGROReadIsCountedInDatagrams(t *testing.T) {
 	const segment, total = 8, 40
 	socket := &udpSocket{pc: scriptedUDP{read: func(messages []ipv4.Message) (int, error) {
 		m := &messages[0]

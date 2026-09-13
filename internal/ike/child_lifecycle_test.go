@@ -504,7 +504,7 @@ func TestReplacedChildSAThePeerNeverDeletesIsRetiredAnyway(t *testing.T) {
 // capped backoff, so a rekey this end refuses after the response has to tell
 // the peer: without that, every attempt leaves one more SA behind at a peer
 // that believes it is carrying traffic.
-func TestARefusedRekeyResponseDeletesTheSAItLeftAtThePeer(t *testing.T) {
+func TestRefusedRekeyResponseDeletesTheSAItLeftAtThePeer(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
 	old := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 1, RemoteSPI: 2}
 	s := &Session{mux: mux, current: &ikeContext{suite: SASuite{PRFID: PRF_HMAC_SHA2_256}},
@@ -602,7 +602,7 @@ func offeredChildSPI(t *testing.T, inner []RawPayload) uint32 {
 // ChaCha20-Poly1305 is 256 here and absent on the wire, which RFC 7296 section
 // 3.3.5 requires of a fixed-length-key transform. Comparing the two spellings
 // raw drops every cipher and offers ESN alone.
-func TestTheRekeyOnTheWireOffersOneCipher(t *testing.T) {
+func TestRekeyOnTheWireOffersOneCipher(t *testing.T) {
 	for _, installed := range []ChildSA{
 		{EncrID: ENCR_CHACHA20_POLY1305, EncrKeyBits: 256, LocalSPI: 1, RemoteSPI: 2},
 		{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 256, LocalSPI: 1, RemoteSPI: 2},

@@ -1489,7 +1489,7 @@ func settleRunLoop(s *Speaker) {
 // neighbor charge this node a sweep for a sixty byte Hello, as fast as the
 // link carries them. The wake is owed to what a packet left behind, and a
 // Hello that only pushes its own deadline further out leaves nothing.
-func TestARefreshingHelloDoesNotWakeTheRunLoop(t *testing.T) {
+func TestRefreshingHelloDoesNotWakeTheRunLoop(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	hello := func(seqno uint16, interval uint16) []byte {
 		return EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: seqno, Interval: interval})})
@@ -1534,7 +1534,7 @@ func TestARefreshingHelloDoesNotWakeTheRunLoop(t *testing.T) {
 // is answered with a retraction carrying this node's own id, and a packet of
 // requests draws a packet of those. The state is packet-local, so a split has
 // to put the id back at the head of the next one.
-func TestARepeatedRouterIDIsSentOncePerPacket(t *testing.T) {
+func TestRepeatedRouterIDIsSentOncePerPacket(t *testing.T) {
 	speaker, neighbor, packets := captureSpeaker(t, Config{})
 	makeNeighborReachable(neighbor)
 	mine, theirs := [8]byte{1}, [8]byte{2}
@@ -1592,7 +1592,7 @@ func TestARepeatedRouterIDIsSentOncePerPacket(t *testing.T) {
 
 // The id in effect does not cross a packet boundary, so a run the assembler
 // splits has to spell it out again at the head of the piece that follows.
-func TestASplitPacketCarriesTheRouterIDAgain(t *testing.T) {
+func TestSplitPacketCarriesTheRouterIDAgain(t *testing.T) {
 	speaker, neighbor, packets := captureSpeaker(t, Config{PacketSize: 96})
 	makeNeighborReachable(neighbor)
 	var tlvs []RawTLV
@@ -1625,7 +1625,7 @@ func TestASplitPacketCarriesTheRouterIDAgain(t *testing.T) {
 // seqno request that waits for whatever wakes the loop next, which on a quiet
 // link is nothing. Every write of a deadline has to fold into it, and the pass
 // that reads them all has to rebuild it.
-func TestTheStarveRetryDeadlineIsNeverLate(t *testing.T) {
+func TestStarveRetryDeadlineIsNeverLate(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(neighbor)
 	now := time.Now()
@@ -1721,7 +1721,7 @@ func TestTheStarveRetryDeadlineIsNeverLate(t *testing.T) {
 // a peer whose Child SA the other end deleted refuses every reservation, and
 // RFC 7296 section 1.4.1 lets it stay that way, so "a pass is owed something"
 // is true from then on. The work is put on a timer instead.
-func TestACongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
+func TestCongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
 	speaker, healthy, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(healthy)
 	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
@@ -1783,7 +1783,7 @@ func TestACongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
 // they hold -- maxPendingSeqnoPerNeighbor of them per neighbor -- stay held by
 // entries that suppress nothing for as long as a hello interval, which
 // Validate allows to be minutes.
-func TestTheSuppressionWindowIsADeadlineOfItsOwn(t *testing.T) {
+func TestSuppressionWindowIsADeadlineOfItsOwn(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute})
 	makeNeighborReachable(neighbor)
 	now := time.Now()
@@ -1920,7 +1920,7 @@ func wildcardRetraction() RawTLV {
 // the moment the neighbor advertises a finite metric again, or its next
 // wildcard retraction is a no-op and the route it should have withdrawn stays
 // selected for as long as the neighbor keeps sending them.
-func TestARetractionAfterANewUpdateIsNotMemoized(t *testing.T) {
+func TestRetractionAfterANewUpdateIsNotMemoized(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(neighbor)
 	prefix := netip.MustParsePrefix("fd00:6::/64")
@@ -1958,7 +1958,7 @@ func TestARetractionAfterANewUpdateIsNotMemoized(t *testing.T) {
 // A neighbor that goes away takes its memo with it. The map is keyed by the
 // neighbor's state pointer, so an entry left behind pins a retired one and
 // everything it held for the life of the speaker.
-func TestARetiredNeighborLeavesNoRetractionMemo(t *testing.T) {
+func TestRetiredNeighborLeavesNoRetractionMemo(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(neighbor)
 	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{wildcardRetraction()}))
@@ -1981,7 +1981,7 @@ func TestARetiredNeighborLeavesNoRetractionMemo(t *testing.T) {
 // reads every route. Without the clear it only ever moves earlier, so the
 // first route to leave the table leaves a deadline permanently in the past and
 // the run loop spins on it.
-func TestTheExpiryMinimumIsRebuiltByTheSweep(t *testing.T) {
+func TestExpiryMinimumIsRebuiltByTheSweep(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(neighbor)
 	prefix := netip.MustParsePrefix("fd00:8::/64")
@@ -2014,7 +2014,7 @@ func TestTheExpiryMinimumIsRebuiltByTheSweep(t *testing.T) {
 
 // The loop's own two timers are terms of the deadline, or it never sends a
 // periodic Hello or a periodic dump again.
-func TestTheLoopsOwnTimersAreTermsOfItsDeadline(t *testing.T) {
+func TestLoopsOwnTimersAreTermsOfItsDeadline(t *testing.T) {
 	speaker, _, _ := captureSpeaker(t, Config{})
 	speaker.mu.Lock()
 	defer speaker.mu.Unlock()
@@ -2045,7 +2045,7 @@ func TestTheLoopsOwnTimersAreTermsOfItsDeadline(t *testing.T) {
 
 // A dump a reload or an origination asked for is work the next pass owes, and
 // nothing else records it.
-func TestAPendingDumpIsWorkTheNextPassOwes(t *testing.T) {
+func TestPendingDumpIsWorkTheNextPassOwes(t *testing.T) {
 	speaker, _, _ := captureSpeaker(t, Config{})
 	speaker.mu.Lock()
 	defer speaker.mu.Unlock()
@@ -2075,7 +2075,7 @@ func TestAPendingDumpIsWorkTheNextPassOwes(t *testing.T) {
 // A speaker whose loop has not run yet is asleep on no deadline at all, and
 // every arriving packet has to wake it: the comparison below it is against a
 // zero time, which nothing is before.
-func TestAPacketWakesALoopThatHasNotRunYet(t *testing.T) {
+func TestPacketWakesALoopThatHasNotRunYet(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	speaker.mu.Lock()
 	speaker.updatePending = false
@@ -2101,7 +2101,7 @@ func TestAPacketWakesALoopThatHasNotRunYet(t *testing.T) {
 // The saving has to reach the packet count, not only the wire: the suppressed
 // id has to come out of the size the run is packed to, or the assembler splits
 // as if it were still there and the packets stay as many as before.
-func TestASuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
+func TestSuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
 	speaker, neighbor, packets := captureSpeaker(t, Config{PacketSize: 96})
 	makeNeighborReachable(neighbor)
 	var run []RawTLV
@@ -2133,7 +2133,7 @@ func TestASuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
 // refused pass schedules had nothing left to find: a peer that joined during a
 // congested moment black-holed everything this node originates until the next
 // periodic dump, which is an update interval away.
-func TestARefusedDumpIsStillOwed(t *testing.T) {
+func TestRefusedDumpIsStillOwed(t *testing.T) {
 	speaker, _, _ := captureSpeaker(t, Config{HelloInterval: time.Minute, UpdateInterval: time.Minute})
 	speaker.Originate(netip.MustParsePrefix("fd00:1::/64"))
 	speaker.Originate(netip.MustParsePrefix("fd00:2::/64"))
@@ -2202,7 +2202,7 @@ func TestARefusedDumpIsStillOwed(t *testing.T) {
 // packet from every other neighbor wakes a full sweep -- and takes the
 // updateActions branch, so each of those wakes rebuilds and resends the whole
 // dump to the healthy neighbors as well.
-func TestACongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
+func TestCongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
 	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
 	speaker, healthy, packets := captureSpeaker(t, long)
 	makeNeighborReachable(healthy)
@@ -2271,7 +2271,7 @@ func TestACongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
 // node; the retry has to fit several attempts inside that. A fifty millisecond
 // floor, the value this replaced, puts the first attempt after the remote
 // has already given up.
-func TestTheSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
+func TestSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
 	const shortest = 10 * time.Millisecond
 	speaker, _, _ := captureSpeaker(t, Config{HelloInterval: shortest, UpdateInterval: time.Minute})
 	now := time.Now()
@@ -2301,7 +2301,7 @@ func TestTheSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
 // stale measurement waits for whatever pass comes next, which at the hello
 // interval Validate accepts is minutes, and the advertised rxcost keeps
 // following a measurement that has already expired.
-func TestAStaleRTTHasADeadlineOfItsOwn(t *testing.T) {
+func TestStaleRTTHasADeadlineOfItsOwn(t *testing.T) {
 	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
 	speaker, neighbor, _ := captureSpeaker(t, long)
 	makeNeighborReachable(neighbor)

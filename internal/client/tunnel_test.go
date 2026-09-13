@@ -256,7 +256,7 @@ func TestReplacementChildSARequestsDoNotPileUp(t *testing.T) {
 // ProactiveRekeySequence leaves exists precisely for the case where a rekey
 // has already failed once. Closing the mux there loses the session at the one
 // moment a replacement matters most.
-func TestASpentSequenceSpaceAsksForAReplacementAndKeepsTheSession(t *testing.T) {
+func TestSpentSequenceSpaceAsksForAReplacementAndKeepsTheSession(t *testing.T) {
 	child := tunnelChild(1)
 	tunnel := &tunnel{}
 	asked := make(chan struct{}, 4)

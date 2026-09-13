@@ -297,7 +297,7 @@ func TestChaChaChildRekeyResponseEchoesNoKeyLength(t *testing.T) {
 // carried the exchange; RFC 7296 section 1.3.1 is explicit that "A failed
 // attempt to create a Child SA SHOULD NOT tear down the IKE SA". Returning an
 // error instead sends Run down the teardown path.
-func TestALocalFailureAnsweringAChildRekeyIsTemporary(t *testing.T) {
+func TestLocalFailureAnsweringAChildRekeyIsTemporary(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	ctx := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: bytes.Repeat([]byte{1}, 32),

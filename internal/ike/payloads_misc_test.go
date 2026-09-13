@@ -93,7 +93,7 @@ func TestTrafficSelectorAddressWidthMustMatchItsType(t *testing.T) {
 // process that names them, and To4 returns a window into the first rather than
 // a new one. A selector is handed to callers that encode it and may hold it,
 // so it must not be either of those slices.
-func TestTheFullRangeSelectorsAreNotThePackagesOwnZeroes(t *testing.T) {
+func TestFullRangeSelectorsAreNotThePackagesOwnZeroes(t *testing.T) {
 	if v4 := FullRangeV4(); len(v4.StartAddr) != 0 && len(net.IPv4zero) != 0 &&
 		&v4.StartAddr[0] == &net.IPv4zero[12] {
 		t.Error("the IPv4 selector starts inside net.IPv4zero")

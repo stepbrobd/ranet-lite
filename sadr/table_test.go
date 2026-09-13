@@ -115,7 +115,7 @@ func TestSourcesAreGroupedByLengthNotByEntry(t *testing.T) {
 // shape a neighbor can force and the one the maps exist for; the same number
 // spread one to a length is slower indexed than scanned, and the edit path
 // would pay to build it either way.
-func TestTheSourceIndexIsBuiltOnlyWhereItPays(t *testing.T) {
+func TestSourceIndexIsBuiltOnlyWhereItPays(t *testing.T) {
 	dst := prefix("fd00::/16")
 	nodeFor := func(table *Table[int]) *trieNode[int] {
 		root := table.roots.Load().ipv6

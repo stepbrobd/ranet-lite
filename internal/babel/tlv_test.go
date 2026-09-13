@@ -319,7 +319,7 @@ func TestDecodePacketRejectsUnsupportedVersion(t *testing.T) {
 // A decoded prefix is handed to a caller with no reason to treat it as
 // read-only, so handing back that slice puts what the net package compares
 // against one write away from any of them.
-func TestADecodedWildcardPrefixIsNotThePackagesOwnZero(t *testing.T) {
+func TestDecodedWildcardPrefixIsNotThePackagesOwnZero(t *testing.T) {
 	var decoder PrefixDecoder
 	update, err := decoder.Decode([]byte{AEWildcard, 0, 0, 0, 0x00, 0x64, 0, 0, 0xff, 0xff})
 	if err != nil {
