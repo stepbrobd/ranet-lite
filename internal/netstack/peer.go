@@ -22,6 +22,14 @@ type Peer struct {
 	reserveMu sync.Mutex
 	reserved  uint64
 	dropped   atomic.Uint64
+	// sendFailed counts packets that were sealed, handed to the transport and
+	// lost in the syscall. Separate from dropped, which is what this peer
+	// refused on purpose: one says the link or the socket is failing and the
+	// other says this node is out of room, and an operator reading the second
+	// needs it not to move for the first. The sender merges several batches
+	// into one call, so an error covers every packet in it -- how many of them
+	// actually left is not knowable from here.
+	sendFailed atomic.Uint64
 	// sendErrReported is nanoseconds since started, read through time.Since so
 	// it comes off the monotonic clock, and primed one interval in the past so
 	// the first failure is still said out loud. A peer that deleted its Child
@@ -259,6 +267,10 @@ func (p *Peer) reserveNow(budget chan struct{}, count int, control bool) *peerBa
 // Child SA looks like from here. A peer whose path is congested or whose SA is
 // gone shows up as a rising counter rather than as latency somewhere else.
 func (p *Peer) Dropped() uint64 { return p.dropped.Load() }
+
+// SendFailed is how many packets this peer sealed and could not put on the
+// wire. See Peer.sendFailed.
+func (p *Peer) SendFailed() uint64 { return p.sendFailed.Load() }
 
 func (p *Peer) reserveBatchWithSlot(count int, hasSlot, control bool) *peerBatch {
 	p.reserveMu.Lock()
@@ -517,11 +529,15 @@ func (p *Peer) senderLoop() {
 				b.err = sendErr
 			}
 			// A batch that sealed nothing never reached the transport at all,
-			// so its packets are gone and nothing else counts them. One that
-			// sealed and then failed in the syscall was attempted, which is a
-			// different thing and stays a log line.
-			if b.err != nil && len(b.sealed) == 0 && !b.counted {
-				p.dropped.Add(uint64(len(b.raw)))
+			// so its packets are gone and this peer refused them. One that
+			// sealed and then lost the syscall was attempted, which is a
+			// different number.
+			if b.err != nil && !b.counted {
+				if len(b.sealed) == 0 {
+					p.dropped.Add(uint64(len(b.raw)))
+				} else {
+					p.sendFailed.Add(uint64(len(b.raw)))
+				}
 				b.counted = true
 			}
 			b.releaseStorage()

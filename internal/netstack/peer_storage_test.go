@@ -449,6 +449,39 @@ func TestSealFailureOnAnOpenPeerIsCounted(t *testing.T) {
 	}
 }
 
+// A batch that sealed and then lost the syscall was attempted, which is not
+// the same as one this peer refused: the first says the link or the socket is
+// failing and the second says this node is out of room. Neither reached a
+// counter at all before, so a link losing everything read as a quiet node.
+func TestATransportFailureIsCountedApartFromARefusal(t *testing.T) {
+	sending := errors.New("no route to host")
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return sending })
+	defer peer.Close()
+
+	b := peer.reserveBatchNow(3)
+	if b == nil {
+		t.Fatal("the peer refused a reservation while it was open")
+	}
+	for range 3 {
+		b.append([]byte{1}, 0)
+	}
+	if err := b.transmit(); !errors.Is(err, sending) {
+		t.Fatalf("transmit reported %v, want the transport's own error", err)
+	}
+	if got := peer.SendFailed(); got != 3 {
+		t.Errorf("the peer counted %d of the 3 packets the transport lost", got)
+	}
+	if got := peer.Dropped(); got != 0 {
+		t.Errorf("it also counted %d as refused, which means this node ran out of room", got)
+	}
+}
+
 // A peer whose Child SA the other end deleted fails every reservation from
 // then on, so a line per failed batch is a line per TUN batch for as long as
 // that lasts. The count is exact; only the saying of it is bounded.

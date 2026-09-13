@@ -735,6 +735,9 @@ type NeighborStat struct {
 	// Dropped is what the dataplane refused to queue for this neighbor, both
 	// its control traffic and whatever the mesh was forwarding through it.
 	Dropped uint64
+	// SendFailed is what the transport lost after this node had sealed it,
+	// which is the link failing rather than this node running out of room.
+	SendFailed uint64
 }
 
 // Stats is a consistent snapshot of the speaker for a metrics endpoint. It
@@ -765,11 +768,12 @@ func (s *Speaker) Stats() Stats {
 	}
 	for _, neighbor := range s.neighbors {
 		stats.Neighbors = append(stats.Neighbors, NeighborStat{
-			Peer:    neighbor.peer.ID,
-			Alive:   neighbor.isAlive(now),
-			Cost:    neighbor.linkCost(now),
-			Routes:  received[neighbor],
-			Dropped: neighbor.peer.Dropped(),
+			Peer:       neighbor.peer.ID,
+			Alive:      neighbor.isAlive(now),
+			Cost:       neighbor.linkCost(now),
+			Routes:     received[neighbor],
+			Dropped:    neighbor.peer.Dropped(),
+			SendFailed: neighbor.peer.SendFailed(),
 		})
 	}
 	sort.Slice(stats.Neighbors, func(i, j int) bool { return stats.Neighbors[i].Peer < stats.Neighbors[j].Peer })
