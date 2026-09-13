@@ -666,13 +666,19 @@ func TestDeleteIKEReachesPeerWithoutRunLoop(t *testing.T) {
 	<-h.identities
 
 	// Deliberately no Run on either side, which is the state adopt closes a
-	// session in.
-	start := time.Now()
-	if err := initiator.DeleteIKE(); err != nil {
-		t.Fatalf("DeleteIKE: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("DeleteIKE took %s with nothing to wait for", elapsed)
+	// session in. DeleteIKE has to notice that and send directly; routing the
+	// Delete through the run loop's request queue would block here forever, so
+	// the deadline is its own goroutine rather than an elapsed-time check that
+	// is only reached if the call returns at all.
+	deleted := make(chan error, 1)
+	go func() { deleted <- initiator.DeleteIKE() }()
+	select {
+	case err := <-deleted:
+		if err != nil {
+			t.Fatalf("DeleteIKE: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteIKE never returned, so it is waiting on a run loop that does not exist")
 	}
 
 	raw, err := responder.Mux().RecvIKEUntil(time.Now().Add(5 * time.Second))

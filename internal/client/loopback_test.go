@@ -179,7 +179,33 @@ func TestTwoNodesConvergeOverLoopback(t *testing.T) {
 		return reaches(alpha, bravo) && reaches(bravo, alpha)
 	})
 
+	// One session at each end is not the same thing as the same session at
+	// both ends. Two nodes evicting each other hold one apiece and still carry
+	// traffic, so neither check above can tell that apart from convergence.
+	// The preference bit is a property of the SA rather than of the node that
+	// holds it, so the two ends agree on it exactly when they are holding the
+	// same SA.
+	waitFor(t, 20*time.Second, "both ends holding the same session", func() bool {
+		a, aok := preferenceOf(alpha)
+		b, bok := preferenceOf(bravo)
+		return aok && bok && a == b
+	})
+
 	stop()
+}
+
+// preferenceOf reads the preference bit of the one session a node is holding.
+func preferenceOf(node *loopbackNode) (bool, bool) {
+	set := node.client.sessions
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	if len(set.live) != 1 {
+		return false, false
+	}
+	for _, live := range set.live {
+		return live.preferred, true
+	}
+	return false, false
 }
 
 func isCanceled(err error) bool {

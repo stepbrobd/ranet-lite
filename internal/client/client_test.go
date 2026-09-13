@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -341,7 +342,20 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	speaker.Originate(netip.MustParsePrefix("10.66.0.5/32"))
+	// A neighbor and a session, or every per-peer and per-path line below is
+	// a loop over nothing and only the scalars are ever written.
+	peer := netstack.NewPeer("gateway", func(raw []byte, _ byte) ([]byte, error) { return raw, nil },
+		func([]byte) error { return nil })
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
 	c := &Client{speaker: speaker, sessions: newSessionSet()}
+	c.sessions.close = func(*ike.Session) {}
+	c.sessions.active = func(*ike.Session) bool { return true }
+	release, adopted := c.sessions.adoptPreferred("example/gateway/1@0", &ike.Session{}, true, nil)
+	if !adopted {
+		t.Fatal("the session was not adopted, so the per-path lines would be empty")
+	}
+	defer release()
 	c.countInbound(7, 2)
 
 	var out bytes.Buffer
@@ -350,19 +364,39 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	for _, want := range []string{
 		"ranet_lite_babel_routes_originated 1",
 		"ranet_lite_babel_routes_selected 0",
-		"ranet_lite_sessions 0",
+		"ranet_lite_sessions 1",
 		"ranet_lite_esp_inbound_packets_total 7",
 		"ranet_lite_esp_inbound_dropped_total 2",
+		`ranet_lite_session_up{path="example/gateway/1@0"} 1`,
+		`ranet_lite_babel_neighbor_up{peer="gateway"} 0`,
+		`ranet_lite_babel_routes_received{peer="gateway"} 0`,
+		`ranet_lite_peer_send_dropped_total{peer="gateway"} 0`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("metrics output is missing %q:\n%s", want, text)
 		}
 	}
 	// Every series needs its HELP and TYPE, or a scrape rejects the sample.
-	for _, name := range []string{"ranet_lite_sessions", "ranet_lite_esp_inbound_packets_total"} {
+	for _, name := range []string{
+		"ranet_lite_sessions", "ranet_lite_esp_inbound_packets_total",
+		"ranet_lite_session_up", "ranet_lite_babel_neighbor_up",
+		"ranet_lite_babel_neighbor_cost", "ranet_lite_babel_routes_received",
+		"ranet_lite_peer_send_dropped_total",
+	} {
 		if !strings.Contains(text, "# HELP "+name+" ") || !strings.Contains(text, "# TYPE "+name+" ") {
 			t.Errorf("metric %s has no HELP or TYPE", name)
 		}
+	}
+
+	// The handler is what a scrape actually reaches, and it is the only place
+	// the content type is set.
+	recorder := httptest.NewRecorder()
+	c.MetricsHandler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("the handler served %q, which prometheus will not parse", got)
+	}
+	if recorder.Body.String() != text {
+		t.Error("the handler served something other than what Metrics writes")
 	}
 }
 
