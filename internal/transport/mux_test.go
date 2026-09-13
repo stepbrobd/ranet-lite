@@ -613,3 +613,98 @@ func TestFloodOfUnclaimedIKEDatagramsIsNotCopied(t *testing.T) {
 			2000, allocated, budget)
 	}
 }
+
+// The same contract one layer in. A peer that has completed a handshake has a
+// mux, so its datagrams are demultiplexed onto that mux's own queue and never
+// reach Hub.Listen: the flood that costs something is aimed at ikeCh, which
+// holds sixteen. The copy has to come after the queue is tested there too.
+func TestFloodOnAMuxsOwnIKEQueueIsNotCopied(t *testing.T) {
+	hub, err := NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	mux, err := hub.NewMux(net.ParseIP("127.0.0.1"), 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	const spi = uint64(0x1122334455667788)
+	if err := mux.RegisterIKE(spi); err != nil {
+		t.Fatal(err)
+	}
+
+	peer := listenPeer(t, "udp4", "127.0.0.1")
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: hub.LocalAddr().(*net.UDPAddr).Port}
+	datagram := withMarker(make([]byte, 8192))
+	binary.BigEndian.PutUint64(datagram[nonESPMarkerLen:], spi)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for range 2000 {
+		if _, err := peer.WriteToUDP(datagram, dst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(mux.IKE()) < cap(mux.IKE()) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+
+	// ikeCh holds sixteen, so everything past that costs nothing but the
+	// receive buffer the loop already had. Copying every datagram would be
+	// 2000 * 8192 bytes; half of that separates the two outcomes widely in
+	// both directions.
+	if budget := uint64(2000*len(datagram)) / 2; allocated > budget {
+		t.Errorf("a flood of %d dropped datagrams allocated %d bytes, want well under %d",
+			2000, allocated, budget)
+	}
+}
+
+// The byte bound is enforced twice and the two are not interchangeable.
+// dispatchESP decides, under the same lock the receive-order ticket is taken
+// with, which is what makes it right when a hub's IPv4 and IPv6 receive loops
+// arrive at once. hasRoomForESP is consulted before packReceivedBatch copies,
+// so a batch that is about to be dropped is never paid for. A test that calls
+// the two in sequence and stops on whichever refuses first cannot say which
+// one is enforcing, so each is driven alone here.
+func TestEachESPByteBoundRefusesOnItsOwn(t *testing.T) {
+	packet := make([]byte, 1<<16)
+	t.Run("dispatchESP", func(t *testing.T) {
+		m := &Mux{espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
+		accepted := 0
+		// Deliberately not consulting hasRoomForESP: this is the check that
+		// has to hold on its own.
+		for range espChanSize {
+			if !m.dispatchESP([][]byte{packet}, len(packet)) {
+				break
+			}
+			accepted++
+		}
+		if accepted == espChanSize {
+			t.Fatal("the queue filled to its batch count, so dispatchESP bounded no bytes")
+		}
+		if got := m.espQueued.Load(); got > espQueueBytes {
+			t.Fatalf("the queue holds %d bytes, want at most %d", got, espQueueBytes)
+		}
+	})
+	t.Run("hasRoomForESP", func(t *testing.T) {
+		m := &Mux{espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
+		// Charged the way a queued batch charges it, without going through
+		// dispatchESP, so only the pre-copy check can notice.
+		m.espQueued.Store(espQueueBytes - int64(len(packet)))
+		if !m.hasRoomForESP(len(packet)) {
+			t.Error("a batch that exactly fits was refused")
+		}
+		if m.hasRoomForESP(len(packet) + 1) {
+			t.Error("a batch one byte past the budget was accepted")
+		}
+		m.espQueued.Store(espQueueBytes)
+		if m.hasRoomForESP(1) {
+			t.Error("a full queue accepted another byte")
+		}
+	})
+}

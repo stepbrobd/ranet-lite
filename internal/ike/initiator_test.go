@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -1421,5 +1422,59 @@ func TestSessionRunUsesOldIKEContext(t *testing.T) {
 	_ = mux.Close()
 	if err := <-runDone; err == nil {
 		t.Fatal("Run returned nil after mux close")
+	}
+}
+
+// Both notifies here arrive before anything is authenticated, so anyone who
+// can see our SPI can send them and what is acted on has to be narrower than
+// what arrives. A cookie is echoed in the retry, so taking one of any length
+// turns a single spoofed datagram into as many oversized ones as we
+// retransmit, aimed at whoever we are dialing; RFC 7296 section 2.6 bounds it
+// to 1..64 octets. A Diffie-Hellman group we cannot generate ends the dial
+// with no retry, so acting on one aborts the handshake for free.
+func TestOnlyUsableUnauthenticatedInitNotifiesAreActedOn(t *testing.T) {
+	message := func(notify Notify) *Message {
+		return &Message{Payloads: []RawPayload{{Type: PayloadN, Body: EncodeNotify(notify)}}}
+	}
+	group := func(id uint16) []byte {
+		data := make([]byte, 2)
+		binary.BigEndian.PutUint16(data, id)
+		return data
+	}
+	for name, tc := range map[string]struct {
+		notify Notify
+		usable bool
+	}{
+		"a cookie of the smallest allowed length":   {Notify{Type: N_COOKIE, Data: bytes.Repeat([]byte{1}, 1)}, true},
+		"a cookie of the largest allowed length":    {Notify{Type: N_COOKIE, Data: bytes.Repeat([]byte{1}, maxCookieLength)}, true},
+		"an empty cookie":                           {Notify{Type: N_COOKIE, Data: nil}, false},
+		"a cookie one octet past the bound":         {Notify{Type: N_COOKIE, Data: bytes.Repeat([]byte{1}, maxCookieLength+1)}, false},
+		"a cookie far past the bound":               {Notify{Type: N_COOKIE, Data: bytes.Repeat([]byte{1}, 4096)}, false},
+		"a group we offer":                          {Notify{Type: N_INVALID_KE_PAYLOAD, Data: group(DH_CURVE25519)}, true},
+		"a group we cannot generate":                {Notify{Type: N_INVALID_KE_PAYLOAD, Data: group(1)}, false},
+		"a group name too short to read":            {Notify{Type: N_INVALID_KE_PAYLOAD, Data: []byte{0}}, false},
+		"anything else unauthenticated":             {Notify{Type: N_NO_PROPOSAL_CHOSEN}, false},
+		"an authentication failure we cannot trust": {Notify{Type: N_AUTHENTICATION_FAILED}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, ok := usefulInitNotify(message(tc.notify), false, false)
+			if ok != tc.usable {
+				t.Fatalf("acted on = %v, want %v", ok, tc.usable)
+			}
+			if ok && got.Type != tc.notify.Type {
+				t.Fatalf("acted on notify %d, want %d", got.Type, tc.notify.Type)
+			}
+		})
+	}
+
+	// Each is worth acting on once. A peer that keeps sending them would
+	// otherwise keep the exchange restarting instead of finishing.
+	cookie := message(Notify{Type: N_COOKIE, Data: []byte{1}})
+	if _, ok := usefulInitNotify(cookie, true, false); ok {
+		t.Error("a second cookie was acted on, so the exchange can be restarted indefinitely")
+	}
+	wrongGroup := message(Notify{Type: N_INVALID_KE_PAYLOAD, Data: group(DH_CURVE25519)})
+	if _, ok := usefulInitNotify(wrongGroup, false, true); ok {
+		t.Error("a second group correction was acted on")
 	}
 }

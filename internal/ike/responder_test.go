@@ -534,6 +534,82 @@ func firstTestNotify(t *testing.T, raw []byte) Notify {
 }
 
 // buildTestSAInit produces a well-formed IKE_SA_INIT request, which is what
+// RFC 7296 section 2.5: a payload this profile does not implement, marked
+// critical, changes what the message means, so it has to be refused by type
+// rather than skipped. The answer is stateless and costs nothing, which is the
+// only reason it can be given before anything about the peer is known.
+func TestResponderRefusesACriticalPayloadItDoesNotImplement(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	mux, err := h.initiator.NewMux(net.ParseIP("127.0.0.1"), h.remotePort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mux.Close() })
+
+	spiI := randUint64Nonzero()
+	ni := make([]byte, 32)
+	rand.Read(ni)
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	// PayloadCERTREQ is a type this profile does not implement, and nothing
+	// else about the request is wrong.
+	critical := []RawPayload{{Type: PayloadCERTREQ, Critical: true, Body: []byte{0}}}
+	if err := mux.SendIKE(encodeTestSAInit(t, spiI, ni, ikeProposal(), critical)); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := mux.RecvIKEUntil(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("a critical payload we do not implement drew no answer: %v", err)
+	}
+	notify := firstTestNotify(t, reply)
+	if notify.Type != N_UNSUPPORTED_CRITICAL_PAYLOAD {
+		t.Fatalf("the responder answered notify %d, want UNSUPPORTED_CRITICAL_PAYLOAD", notify.Type)
+	}
+	if len(notify.Data) != 1 || PayloadType(notify.Data[0]) != PayloadCERTREQ {
+		t.Errorf("the notify named %v, want the payload type that was refused", notify.Data)
+	}
+	select {
+	case sess := <-h.sessions:
+		sess.Mux().Close()
+		t.Error("the responder carried the exchange forward anyway")
+	default:
+	}
+}
+
+// Our AUTH signs the IDr we send. Answering under a name we do not own would
+// hand the initiator a signature over an identity of its choosing, made with
+// this node's key, which is the whole of what authentication here rests on.
+func TestResponderRefusesAnIdentityItDoesNotAnswerTo(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Everything is as the working dial except the name asked for, which this
+	// responder is not configured with.
+	session, err := InitiateContext(ctx, PeerConfig{
+		Organization:     "testorg",
+		LocalCommonName:  "client",
+		LocalSerial:      "2",
+		LocalPrivateKey:  h.private,
+		RemoteCommonName: "someone-else",
+		RemoteSerial:     "1",
+		RemotePublicKey:  h.public,
+		RemoteAddr:       net.ParseIP("127.0.0.1"),
+		RemotePort:       h.remotePort,
+		Hub:              h.initiator,
+	})
+	if err == nil {
+		session.Mux().Close()
+		t.Fatal("the responder authenticated under a name it does not answer to")
+	}
+	select {
+	case sess := <-h.sessions:
+		sess.Mux().Close()
+		t.Error("the responder produced a session for an identity it does not own")
+	case <-time.After(time.Second):
+	}
+}
+
 // buildTestSAInit produces a well-formed IKE_SA_INIT request, the shape
 // the responder needs before it will park in awaitAuthRequest.
 func buildTestSAInit(t *testing.T) ([]byte, uint64) {
