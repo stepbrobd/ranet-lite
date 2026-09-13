@@ -44,8 +44,8 @@ type options struct {
 
 // parseOptions reads the command line and refuses what it cannot act on. It
 // takes the arguments rather than reading them from the process, and returns
-// an error rather than calling log.Fatal, so that both refusals are reachable
-// from a test: log.Fatal is os.Exit, which a test cannot observe.
+// an error rather than exiting, so that every refusal is reachable from a
+// test and so that -h can be told from a mistake.
 func parseOptions(args []string, usage io.Writer) (options, error) {
 	fs := flag.NewFlagSet("ranet-lite", flag.ContinueOnError)
 	fs.SetOutput(usage)
@@ -72,21 +72,40 @@ func parseOptions(args []string, usage io.Writer) (options, error) {
 	return o, nil
 }
 
+// refuseToStart reports a startup this node will not attempt, at the level an
+// operator filters for. The standard logger writes through slog at INFO, which
+// -log-level warn and above drop, so every refusal below was a process that
+// exited 1 having written nothing at all.
+func refuseToStart(err error) int {
+	slog.Error("ranet-lite is not starting", "err", err)
+	return 1
+}
+
 // run is main's body so that every deferred close runs before the process
 // exits with a status. A failure reported only in the log and then exited zero
 // tells a supervisor the node stopped cleanly when it did not, and the route
 // withdrawal at shutdown is one of the things that reports this way.
 func run() int {
+	// Before slog.SetDefault below, so this one refusal reaches stderr through
+	// the standard logger's own writer rather than through a handler that has
+	// not been installed. Every later one goes through refuseToStart.
 	opts, err := parseOptions(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		// The flag package has already written the usage that was asked for.
+		// Reporting the sentinel as a failure prints "flag: help requested"
+		// under it and exits 1 on a request that was answered.
+		return 0
+	}
 	if err != nil {
-		log.Fatal(err)
+		log.Print(err)
+		return 1
 	}
 	configPath, pprofAddr := &opts.configPath, &opts.pprofAddr
 	metricsAddr, contentionProfiles := &opts.metricsAddr, &opts.contentionProfiles
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: opts.level})))
 
-	// Set by anything that fails after the point where log.Fatal would skip
-	// the deferred cleanup. run returns nonzero if any of them did.
+	// Set by anything that fails on a goroutine or after run has committed to
+	// a clean shutdown. run returns nonzero if any of them did.
 	var failed atomic.Bool
 
 	if *pprofAddr != "" {
@@ -105,11 +124,11 @@ func run() int {
 
 	cfg, err := config.Load(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh)
 	if err != nil {
-		log.Fatal(err)
+		return refuseToStart(err)
 	}
 	node, err := client.New(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return refuseToStart(err)
 	}
 	defer node.Close()
 	mesh := node.Mesh
@@ -176,20 +195,13 @@ func run() int {
 	// the device externally.
 	var reconciler sync.WaitGroup
 	if cfg.Kernel.Enabled {
-		// log.Fatal is os.Exit, which runs no deferred function, so the node
-		// opened above is closed by hand here. These two are the failures a
-		// misconfigured node actually hits.
-		fatal := func(err error) {
-			node.Close()
-			log.Fatal(err)
-		}
-		kernelCfg, err := kernelConfig(cfg, mesh.Name)
+		kernelCfg, err := kernelConfig(cfg, mesh.Name, node.Underlay)
 		if err != nil {
-			fatal(err)
+			return refuseToStart(err)
 		}
 		routes, err := kernel.New(kernelCfg, mesh.Routes)
 		if err != nil {
-			fatal(err)
+			return refuseToStart(err)
 		}
 		reconciler.Go(func() {
 			// This error is the withdrawal failing as often as it is the
@@ -277,9 +289,10 @@ func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force fun
 // mesh actually got and the prefixes this node originates. The addresses are
 // parsed here rather than in config.Load, so the reconciler's own validation
 // in kernel.New stays the single place that decides what it accepts.
-func kernelConfig(cfg *config.Config, device string) (kernel.Config, error) {
+func kernelConfig(cfg *config.Config, device string, underlay func() []netip.Addr) (kernel.Config, error) {
 	out := kernel.Config{
 		Interface: device,
+		Underlay:  underlay,
 		Table:     cfg.Kernel.Table,
 		Protocol:  cfg.Kernel.Protocol,
 		Metric:    cfg.Kernel.Metric,

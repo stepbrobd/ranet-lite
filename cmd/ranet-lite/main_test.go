@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,7 +51,7 @@ func TestKernelConfigAddresses(t *testing.T) {
 					{Prefix: sourceSpecific, From: netip.MustParsePrefix("2001:db8:5::/64")},
 				}},
 			}
-			got, err := kernelConfig(cfg, "ranet0")
+			got, err := kernelConfig(cfg, "ranet0", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -121,5 +125,45 @@ func TestCommandLineRefusesWhatItCannotActOn(t *testing.T) {
 	}
 	if opts.configPath != "/etc/x.yaml" || opts.level != slog.LevelDebug {
 		t.Errorf("parsed %+v, want the config path and level given", opts)
+	}
+
+	// -h is a request the flag package has already answered by writing the
+	// usage. Reported as a failure it prints "flag: help requested" under the
+	// usage and exits 1.
+	usage := &strings.Builder{}
+	if _, err := parseOptions([]string{"-h"}, usage); !errors.Is(err, flag.ErrHelp) {
+		t.Errorf("asking for help returned %v, want flag.ErrHelp so run can tell it from a refusal", err)
+	}
+	if !strings.Contains(usage.String(), "-config") {
+		t.Errorf("the usage does not name the flags: %q", usage.String())
+	}
+}
+
+// log.Fatal is os.Exit, which a test cannot observe, so this reads the source.
+// The helper existing is not the fix: a call site that still reports through
+// the standard logger exits 1 saying nothing at a production level.
+func TestStartupRefusalsAvoidTheStandardLogger(t *testing.T) {
+	body, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(body, []byte("log.Fatal")) {
+		t.Error("main.go still exits through log.Fatal, which writes at INFO and vanishes at -log-level warn")
+	}
+}
+
+// The same rule from the other side: a refusal at -log-level error is written.
+// See refuseToStart.
+func TestStartupRefusalsSurviveAProductionLogLevel(t *testing.T) {
+	var written strings.Builder
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&written, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	if code := refuseToStart(errors.New("config: read /nonexistent.yaml")); code == 0 {
+		t.Error("a refusal reported success")
+	}
+	if !strings.Contains(written.String(), "/nonexistent.yaml") {
+		t.Errorf("a refusal at -log-level error wrote %q", written.String())
 	}
 }
