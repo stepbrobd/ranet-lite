@@ -107,9 +107,18 @@ func (f *fakeKernel) Addrs() ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// AddAddr and DelAddr model what both platforms do rather than what a map
+// does: assignment is an upsert keyed on the address, and darwin's SIOCDIFADDR
+// matches on the address alone, so a delete takes whatever length the link is
+// carrying it under. That asymmetry is what the ownership checks exist for.
 func (f *fakeKernel) AddAddr(address netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for held := range f.addrs {
+		if held.Addr() == address.Addr() {
+			delete(f.addrs, held)
+		}
+	}
 	f.addrs[address] = true
 	return nil
 }
@@ -117,7 +126,11 @@ func (f *fakeKernel) AddAddr(address netip.Prefix) error {
 func (f *fakeKernel) DelAddr(address netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.addrs, address)
+	for held := range f.addrs {
+		if held.Addr() == address.Addr() {
+			delete(f.addrs, held)
+		}
+	}
 	return nil
 }
 
@@ -565,8 +578,9 @@ func TestRunWithdrawsOnCancel(t *testing.T) {
 }
 
 func TestNewRejectsReservedProtocol(t *testing.T) {
-	if _, err := New(Config{Interface: "ranet0", Protocol: 2}, netstack.NewRouteTable()); err == nil {
-		t.Fatal("RTPROT_KERNEL must be rejected")
+	_, err := New(Config{Interface: "ranet0", Protocol: 2}, netstack.NewRouteTable())
+	if err == nil || !strings.Contains(err.Error(), "is reserved") {
+		t.Fatalf("RTPROT_KERNEL was refused with %v, want it named as reserved", err)
 	}
 }
 
@@ -575,17 +589,25 @@ func TestNewRejectsReservedProtocol(t *testing.T) {
 // the ESP underlay with it. Nothing else refuses a route in main, and the one
 // warning that would have said so is off outside it.
 func TestNewRejectsReservedTable(t *testing.T) {
+	// On the reason, not on failure: New never succeeds here, because there is
+	// no such interface on the machine running the suite.
 	for _, table := range []uint32{253, 254, 255} {
-		if _, err := New(Config{Interface: "ranet0", Table: table}, netstack.NewRouteTable()); err == nil {
-			t.Errorf("table %d was accepted, and the kernel keeps it for itself", table)
+		_, err := New(Config{Interface: "ranet0", Table: table}, netstack.NewRouteTable())
+		if err == nil || !strings.Contains(err.Error(), "is reserved") {
+			t.Errorf("table %d was refused with %v, and the kernel keeps it for itself", table, err)
 		}
 	}
-	// A table the kernel does not reserve is not what this refuses. New still
-	// fails here, because there is no such interface on the machine running
-	// the suite, so the check is on the reason rather than on success.
-	_, err := New(Config{Interface: "ranet0", Table: 252}, netstack.NewRouteTable())
-	if err != nil && strings.Contains(err.Error(), "is reserved") {
-		t.Errorf("a table the kernel does not reserve was refused: %v", err)
+	// A table the kernel does not reserve is not what this refuses, and the
+	// reservation is three byte-sized ids rather than everything above 252:
+	// the linux backend sends RT_TABLE_UNSPEC plus a 32-bit RTA_TABLE for a
+	// table above 255, which is how ids like 51820 reach the kernel at all.
+	// New still fails here, because there is no such interface on the machine
+	// running the suite, so the check is on the reason rather than on success.
+	for _, table := range []uint32{1, 52, 200, 252, 256, 1000, 51820, ^uint32(0)} {
+		_, err := New(Config{Interface: "ranet0", Table: table}, netstack.NewRouteTable())
+		if err != nil && strings.Contains(err.Error(), "is reserved") {
+			t.Errorf("table %d was refused as reserved: %v", table, err)
+		}
 	}
 }
 
@@ -808,5 +830,58 @@ func TestAddressAnotherWriterHoldsIsLeftAlone(t *testing.T) {
 	}
 	if !r.owned[free] || !kernel.addrs[free] {
 		t.Error("a free address was not assigned")
+	}
+}
+
+// darwin's SIOCDIFADDR matches on the address alone, so another writer that
+// rewrote this reconciler's address under a different prefix length, which its
+// SIOCAIFADDR upsert lets it do, would have its entry taken away by shutdown.
+// The rule is that only an address this reconciler added itself is ever
+// removed, and an address that no longer looks the way it was installed is no
+// longer that address.
+func TestWithdrawLeavesAnAddressAnotherWriterRewrote(t *testing.T) {
+	ours := prefix("2001:db8::1/128")
+	kept := prefix("2001:db8::2/128")
+	r, _, kernel := harness(t, Config{Addresses: []netip.Prefix{ours, kept}})
+	if err := r.applyAddresses(); err != nil {
+		t.Fatal(err)
+	}
+	if !r.owned[ours] || !r.owned[kept] {
+		t.Fatal("the reconciler did not record what it assigned, so this proves nothing")
+	}
+
+	// Somebody rewrites one of them under a different length.
+	delete(kernel.addrs, ours)
+	kernel.addrs[prefix("2001:db8::1/64")] = true
+
+	if err := r.withdraw(); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	if !kernel.addrs[prefix("2001:db8::1/64")] {
+		t.Error("shutdown removed an address this reconciler no longer held as it installed it")
+	}
+	if kernel.addrs[kept] {
+		t.Error("shutdown left an address it did install")
+	}
+}
+
+// An address another writer holds is reported once, not once per pass: the
+// record rotates the way the route warning set does, so a report costs one log
+// line for as long as the situation lasts rather than one every reconcile
+// interval for the life of the process.
+func TestAddressReportIsNotRepeatedEveryPass(t *testing.T) {
+	logs := captureKernelLogs(t)
+	wanted := prefix("2001:db8::1/128")
+	r, _, kernel := harness(t, Config{Addresses: []netip.Prefix{wanted}})
+	kernel.addrs[prefix("2001:db8::1/64")] = true
+
+	const passes = 4
+	for pass := range passes {
+		if err := r.applyAddresses(); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if got := bytes.Count(logs.Bytes(), []byte("another writer holds")); got != 1 {
+		t.Errorf("the address was reported %d times across %d passes, want once", got, passes)
 	}
 }

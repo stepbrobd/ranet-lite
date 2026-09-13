@@ -214,15 +214,21 @@ func (p *routePlatform) rotateWarnings() {
 	// Without this a node that meets a hundred foreign keys over its life
 	// holds a hundred records forever, and a stale one hides a route from the
 	// dump.
+	//
+	// Rotated only for a pass that will go on to install: a failed dump
+	// returns before any AddRoute refills the record, and two such passes
+	// would empty it. On this platform that also clears the exception
+	// decodeRoute reads, so a foreign key could be adopted and reach a delete
+	// list.
 	p.occupied, p.refused = p.refused, make(map[occupiedKey]bool, len(p.refused))
 }
 
 func (p *routePlatform) Routes() ([]Route, error) {
-	p.rotateWarnings()
 	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the routing table: %w", err)
 	}
+	p.rotateWarnings()
 	return p.ownedRoutes(rib)
 }
 
@@ -350,10 +356,14 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// destination, which it then reinstalled and warned about on every
 		// pass and never withdrew.
 		//
-		// Reachable only for a key whose row changed shape between two passes:
-		// p.ours is rebuilt from each dump and every pass dumps before it
-		// installs, so a key refused in this pass is one the last dump did not
-		// report. What this then catches is the foreign route moving onto this
+		// The p.scoped escape is keyed by destination alone, because that is
+		// how the source record is keyed, so a scoped route of ours at a
+		// destination also lets the unscoped row at that destination through.
+		// That is deliberate: the alternative is losing the source. What
+		// reaches here at all is narrow, because p.ours is rebuilt from each
+		// dump and every pass dumps before it installs, so a key refused in
+		// this pass is one the last dump did not report. What this then
+		// catches is the foreign route moving onto this
 		// interface, under this gateway, after the refusal.
 		return Route{}, false
 	}

@@ -82,10 +82,12 @@ const (
 	// notifications the reconciler's own writes generate, so one batch of
 	// babel updates costs one kernel dump rather than one per route.
 	settleDelay = 250 * time.Millisecond
-	// reservedTable is the lowest rtnetlink table number the kernel keeps for
-	// itself: 253 default, 254 main, 255 local. Named here rather than taken
-	// from unix.RT_TABLE_DEFAULT because this file builds on darwin too.
+	// reservedTable and lastByteTable bracket the rtnetlink table numbers the
+	// kernel keeps for itself: 253 default, 254 main, 255 local. Named here
+	// rather than taken from unix.RT_TABLE_DEFAULT because this file builds on
+	// darwin too.
 	reservedTable = 253
+	lastByteTable = 255
 	// defaultIPv6Metric is IP6_RT_PRIO_USER, what the kernel stamps on an
 	// IPv6 route that arrives without RTA_PRIORITY. The reconciler sends it
 	// explicitly instead, so a dump reports back exactly what it installed.
@@ -266,15 +268,17 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 		// indistinguishable from the kernel's own.
 		return nil, fmt.Errorf("kernel: protocol %d is reserved, use 4 through 255", cfg.Protocol)
 	}
-	if cfg.Table >= reservedTable {
-		// rtnetlink reserves 253, 254 and 255 for default, main and local.
-		// Nothing else here would refuse a route in main, and an announced
-		// default is installed unscoped on linux, so the reconciler would put
-		// the whole machine's default out of the tun and take the ESP underlay
-		// with it. collectForeignWriters also stops reporting the kernel's own
-		// entries outside main, which is the one warning that would have said
-		// so.
-		return nil, fmt.Errorf("kernel: table %d is reserved, use 1 through %d", cfg.Table, reservedTable-1)
+	if cfg.Table >= reservedTable && cfg.Table <= lastByteTable {
+		// rtnetlink reserves 253, 254 and 255 for default, main and local, and
+		// nothing above 255 at all: the linux backend sends RT_TABLE_UNSPEC
+		// plus a 32-bit RTA_TABLE for those, which is how a table id like
+		// 51820 reaches the kernel. Nothing else here would refuse a route in
+		// main, and an announced default is installed unscoped on linux, so
+		// the reconciler would put the whole machine's default out of the tun
+		// and take the ESP underlay with it. collectForeignWriters also stops
+		// reporting the kernel's own entries outside main, which is the one
+		// warning that would have said so.
+		return nil, fmt.Errorf("kernel: table %d is reserved, use anything else from 1 to %d", cfg.Table, ^uint32(0))
 	}
 	if cfg.PrefSrc4.IsValid() {
 		if address := cfg.PrefSrc4.Unmap(); address.Is4() {
@@ -480,14 +484,19 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 			Metric:      r.metric(destination),
 			Unreachable: entry.Value == netstack.Unreachable,
 		}
+		// A source covering every address is not a source-specific route, and
+		// installing it as one is what the linux encoder cannot express: it
+		// derives rtm_src_len from the length and omits RTA_SRC at zero, so
+		// the route would install as a plain one, read back with no source,
+		// never match the diff, and be withdrawn and reinstalled on every pass
+		// for the life of the process. Dropping the source says the same thing
+		// and installs.
+		if entry.Source.IsValid() && entry.Source.Bits() == 0 {
+			entry.Source = netip.Prefix{}
+		}
 		if entry.Source.IsValid() {
 			source, ok := canonicalPrefix(entry.Source)
-			// A source covering every address is not a source-specific route.
-			// The linux encoder derives rtm_src_len from its length and omits
-			// RTA_SRC at zero, so the route installs as a plain one, reads
-			// back with no source, never matches the diff, and is withdrawn
-			// and reinstalled on every pass for the life of the process.
-			if !ok || source.Bits() == 0 || source.Addr().Is4() || destination.Addr().Is4() {
+			if !ok || source.Addr().Is4() || destination.Addr().Is4() {
 				// the IPv4 FIB has no source-specific lookup, and installing
 				// such a route as an ordinary one would steal traffic from
 				// every other source. Report it and leave it to the mesh's
@@ -717,13 +726,31 @@ func (r *Reconciler) withdraw() error {
 			errs = append(errs, fmt.Errorf("delete route %s: %w", route, err))
 		}
 	}
+	// An address is removed only while the link still carries exactly what was
+	// installed. darwin's SIOCDIFADDR matches on the address alone, so another
+	// writer that rewrote ours under a different prefix length, which its
+	// SIOCAIFADDR upsert lets it do, would otherwise have its entry taken away
+	// by this shutdown. Reading the link back rather than trusting the record
+	// is what applyAddresses does for the same reason.
+	held, err := r.plat.Addrs()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("list addresses: %w", err))
+	}
 	addresses := slices.SortedFunc(maps.Keys(r.owned), comparePrefixes)
+	removed := 0
 	for _, prefix := range addresses {
+		if err == nil && !slices.Contains(held, prefix) {
+			slog.Warn("kernel is leaving an address it no longer holds as it installed it",
+				"interface", r.cfg.Interface, "address", prefix)
+			delete(r.owned, prefix)
+			continue
+		}
 		if err := r.plat.DelAddr(prefix); err != nil {
 			errs = append(errs, fmt.Errorf("delete address %s: %w", prefix, err))
 			continue
 		}
 		delete(r.owned, prefix)
+		removed++
 	}
 	if r.enslaved {
 		if err := r.plat.Release(); err != nil {
@@ -732,7 +759,7 @@ func (r *Reconciler) withdraw() error {
 			r.enslaved = false
 		}
 	}
-	slog.Info("kernel reconciler withdrawn", "routes", len(routes), "addresses", len(addresses))
+	slog.Info("kernel reconciler withdrawn", "routes", len(routes), "addresses", removed)
 	return errors.Join(errs...)
 }
 

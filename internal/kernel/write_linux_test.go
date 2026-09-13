@@ -225,3 +225,30 @@ func TestLinuxOwnsATable(t *testing.T) {
 		t.Errorf("linux reports %q, want the table it owns", got)
 	}
 }
+
+// The warn-once record is rebuilt by the passes that refuse, so it may only
+// rotate for a pass that goes on to install. A dump that fails returns before
+// any AddRoute refills it, and two such passes would empty it, so the warning
+// a foreign route draws would repeat once a pass for as long as the dump is
+// broken, which is exactly when an operator has least use for it.
+func TestLinuxKeepsTheRefusalRecordThroughAFailedDump(t *testing.T) {
+	plat, conn := writePlatform(t)
+	held := Route{Destination: netip.MustParsePrefix("2001:db8:2::/48")}
+	conn.err = unix.EEXIST
+	if err := plat.AddRoute(held); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("the refused install reported %v", err)
+	}
+	if !plat.occupied[held] {
+		t.Fatal("the refusal was not recorded, so this proves nothing")
+	}
+
+	conn.err = errors.New("netlink says no")
+	for pass := range 2 {
+		if _, err := plat.Routes(); err == nil {
+			t.Fatalf("pass %d: a failed dump reported success", pass)
+		}
+	}
+	if !plat.occupied[held] {
+		t.Error("two passes that never dumped emptied the record, so the warning repeats once a pass")
+	}
+}

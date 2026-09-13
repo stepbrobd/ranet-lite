@@ -81,9 +81,6 @@ func (p *netlinkPlatform) Close() error {
 }
 
 func (p *netlinkPlatform) Routes() ([]Route, error) {
-	// Routes starts every reconcile pass, so it is where the warn-once record
-	// rotates, the same way the darwin backend rotates its own.
-	p.occupied, p.refused = p.refused, make(map[Route]bool, len(p.refused))
 	var out []Route
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
 		body := make([]byte, unix.SizeofRtMsg)
@@ -100,6 +97,12 @@ func (p *netlinkPlatform) Routes() ([]Route, error) {
 			}
 		}
 	}
+	// Rotated here rather than first, so a failed dump leaves the record
+	// alone: it returns above without any AddRoute refilling it, and two such
+	// passes would empty it and repeat every warning it exists to silence.
+	// Routes starts every reconcile pass, the same way the darwin backend
+	// rotates its own.
+	p.occupied, p.refused = p.refused, make(map[Route]bool, len(p.refused))
 	return out, nil
 }
 
