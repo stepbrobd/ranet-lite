@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"slices"
 	"testing"
 	"time"
@@ -525,7 +526,7 @@ func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 	// Filled from enough distinct addresses that the global cap is what runs
 	// out rather than any one source's share.
 	for i := range halfOpenLimit {
-		if !h.responder.enterHalfOpen(fmt.Sprintf("198.51.100.%d:500", i/halfOpenPerSource)) {
+		if !h.responder.enterHalfOpen(netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", i/halfOpenPerSource))) {
 			t.Fatal("the responder refused a slot below its own limit")
 		}
 	}
@@ -904,13 +905,13 @@ func TestResponderRefusesCookieItDidNotIssue(t *testing.T) {
 // prove an address, the cap bounds what one proven address can hold.
 func TestResponderCapsHalfOpenExchanges(t *testing.T) {
 	r := &Responder{}
-	source := func(i int) string { return fmt.Sprintf("198.51.100.%d:500", i/halfOpenPerSource) }
+	source := func(i int) netip.Addr { return netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", i/halfOpenPerSource)) }
 	for i := range halfOpenLimit {
 		if !r.enterHalfOpen(source(i)) {
 			t.Fatalf("the responder refused half-open exchange %d, below its own limit", i)
 		}
 	}
-	if r.enterHalfOpen("203.0.113.1:500") {
+	if r.enterHalfOpen(netip.MustParseAddr("203.0.113.1")) {
 		t.Fatal("the responder allocated past its half-open limit, so a flood is bounded by nothing")
 	}
 	r.leaveHalfOpen(source(0))
@@ -925,7 +926,7 @@ func TestResponderCapsHalfOpenExchanges(t *testing.T) {
 // refused after answering its cookie correctly.
 func TestOneAddressCannotHoldEveryHalfOpenSlot(t *testing.T) {
 	r := &Responder{}
-	const flood = "198.51.100.1:500"
+	flood := netip.MustParseAddr("198.51.100.1")
 	for i := range halfOpenPerSource {
 		if !r.enterHalfOpen(flood) {
 			t.Fatalf("one address was refused its %dth exchange, below its own share", i)
@@ -934,7 +935,7 @@ func TestOneAddressCannotHoldEveryHalfOpenSlot(t *testing.T) {
 	if r.enterHalfOpen(flood) {
 		t.Error("one address took more than its share, so it can park every slot")
 	}
-	if !r.enterHalfOpen("203.0.113.1:500") {
+	if !r.enterHalfOpen(netip.MustParseAddr("203.0.113.1")) {
 		t.Fatal("a peer at another address was refused while the node was nowhere near its limit")
 	}
 	// And the share is given back, or an address that once flooded is locked
@@ -1064,4 +1065,96 @@ func TestTrafficPostponesDeadPeerDetection(t *testing.T) {
 			t.Error("a session carrying traffic was probed anyway, so the traffic edge reaches nothing")
 		}
 	})
+}
+
+// The share is per address, not per flow. Keyed by the whole endpoint it
+// bounds one UDP flow instead, and a second source port from the same address
+// takes another sixteen slots, which is the partition the share exists to
+// prevent: sixteen ports from one address hold all 256.
+func TestHalfOpenShareIsPerAddressNotPerFlow(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	loopback := netip.MustParseAddr("127.0.0.1")
+	// Everything one address is allowed, spent before either dial.
+	for range halfOpenPerSource {
+		if !h.responder.enterHalfOpen(loopback) {
+			t.Fatal("the responder refused a slot below one address's share")
+		}
+	}
+
+	dial := func(hub *transport.Hub) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cfg := h.peerConfig()
+		cfg.Hub = hub
+		session, err := InitiateContext(ctx, cfg)
+		if err == nil {
+			session.Mux().Close()
+		}
+		return err
+	}
+	if err := dial(h.initiator); err == nil {
+		t.Error("a dial from an address that had spent its share was answered")
+	}
+	// A second hub on the same machine is the same address and a different
+	// source port, which is all an attacker has to vary.
+	other, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := dial(other); err == nil {
+		t.Error("a second source port from the same address took another share, so sixteen ports hold every slot")
+	}
+	h.responder.mu.Lock()
+	defer h.responder.mu.Unlock()
+	if got := len(h.responder.halfOpenBySource); got != 1 {
+		t.Errorf("the responder is tracking %d sources for one address", got)
+	}
+}
+
+// A spoofer must not be able to spend a named peer's share while the node is
+// idle. With the cookie demanded on the global count alone, an off-path source
+// forging a victim's address takes the victim's whole share below the
+// threshold, at sixteen packets every thirty seconds, and the victim is then
+// refused in silence for as long as the attacker keeps it up.
+func TestOneAddressCannotSpendItsShareWithoutACookie(t *testing.T) {
+	hub, err := transport.NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	r := &Responder{}
+	r.cfg.Hub = hub
+	if _, err := rand.Read(r.cookieSecret[:]); err != nil {
+		t.Fatal(err)
+	}
+	r.cookieRotated = time.Now()
+
+	victim := observedEndpoint(t, hub, randUint64Nonzero())
+	source := victim.AddrPort().Addr()
+	nonce := bytes.Repeat([]byte{7}, 32)
+	empty := &Message{}
+	// The node is idle, so the global threshold is nowhere near.
+	for i := range halfOpenPerSourceWithoutCookie {
+		required, err := r.cookieRequired(empty, nonce, uint64(i+1), victim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if required {
+			t.Fatalf("an idle responder demanded a cookie for slot %d, which costs every handshake a round trip", i)
+		}
+		if !r.enterHalfOpen(source) {
+			t.Fatal("the responder refused a slot below one address's share")
+		}
+	}
+	required, err := r.cookieRequired(empty, nonce, 99, victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !required {
+		t.Error("one address took more of its share without proving it can receive, so a spoofer can spend a named peer's")
+	}
+	if r.halfOpen >= cookieThreshold {
+		t.Fatalf("the global threshold was reached at %d, so this proves nothing about the per-address one", r.halfOpen)
+	}
 }

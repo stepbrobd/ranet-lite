@@ -963,3 +963,78 @@ func TestDroppedDumpDoesNotRefundTheRateLimit(t *testing.T) {
 		t.Error("a second wildcard request drew another whole dump, so the rate limit is off while congested")
 	}
 }
+
+// A place is taken for every packet of a pass before any is sent, so a pass
+// that fills the peer's budget drops whatever it reached last. The periodic
+// dump is both the largest action and the one that can wait for the next
+// interval; a seqno request cannot, because allowAsk and rememberStarved have
+// already recorded it as asked and nothing rolls that back, so a dropped
+// request is a prefix that stops being asked about at all.
+func TestADumpDoesNotStarveTheRequestsDecidedWithIt(t *testing.T) {
+	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := make(chan struct{})
+	var arrived sync.Once
+	blocked := make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(blocked) }) }
+	peer := netstack.NewPeerReserved("peer",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func(sealed [][]byte) error {
+			<-blocked
+			for _, raw := range sealed {
+				tlvs, err := DecodePacket(raw[ipv6HeaderLen+udpHeaderLen:])
+				if err != nil {
+					return err
+				}
+				for _, tlv := range tlvs {
+					if tlv.Type == TLVSeqnoRequest {
+						arrived.Do(func() { close(asked) })
+					}
+				}
+			}
+			return nil
+		})
+	defer func() { unblock(); peer.Close() }()
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	neighbor := speaker.neighbors[peer.ID]
+	neighbor.addr = netip.MustParseAddr("fe80::2")
+
+	// More dump packets than the peer can hold, decided in the same pass as
+	// one request. The updates coalesce into full packets, so the count is
+	// what it takes to overrun the control budget several times over.
+	var actions []sendAction
+	for i := range 1 << 15 {
+		prefix := netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i))
+		actions = append(actions, sendAction{neighbor: neighbor, dest: multicastGroup, tlvs: []RawTLV{
+			EncodeRouterID([8]byte{1}),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: 64}),
+		}})
+	}
+	actions = append(actions, sendAction{neighbor: neighbor, dest: neighbor.destination(), tlvs: []RawTLV{
+		EncodeSeqnoRequest(SeqnoRequest{AE: AEIPv6, Prefix: netip.MustParsePrefix("fd00:ffff::/64"),
+			Seqno: 9, HopCount: 8, RouterID: [8]byte{1}}),
+	}})
+	speaker.mu.Lock()
+	send := speaker.emitLocked(actions)
+	speaker.mu.Unlock()
+	send()
+	if dropped := peer.Dropped(); dropped == 0 {
+		t.Fatal("the whole pass fit inside the peer's budget, so nothing had to be given up and this proves nothing")
+	}
+	unblock()
+
+	select {
+	case <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request decided with the dump never left, so the prefix it asks about stops being asked about")
+	}
+}

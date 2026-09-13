@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/config"
@@ -30,6 +32,14 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 		log.Printf("peer %s: node not found", name)
 		return
 	}
+	// And a node with no endpoint in this local endpoint's address family is
+	// not dialable from it, whether or not the peer pins a serial number.
+	// syncPeers starts one dialer per (local endpoint, peer) pair while the
+	// startup check only asks whether some endpoint of the node matches some
+	// local family, so a dual-stack node with single-stack peers is the
+	// ordinary configuration: without this the v4 dialer for a v6-only peer
+	// logs the same resolution failure every reconnect delay for the life of
+	// the process.
 	if p.SerialNumber != "" {
 		ep, ok := node.FindEndpoint(p.SerialNumber)
 		if !ok {
@@ -37,8 +47,14 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 			return
 		}
 		if ep.AddressFamily != local.AddressFamily {
+			log.Printf("peer %s: endpoint serial %q is %s, not %s", name, p.SerialNumber, ep.AddressFamily, local.AddressFamily)
 			return
 		}
+	} else if !slices.ContainsFunc(node.Endpoints, func(ep registry.Endpoint) bool {
+		return ep.AddressFamily == local.AddressFamily
+	}) {
+		slog.Debug("peer has no endpoint in this address family", "peer", name, "family", local.AddressFamily)
+		return
 	}
 	for {
 		if ctx.Err() != nil {

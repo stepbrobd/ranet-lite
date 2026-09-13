@@ -983,12 +983,12 @@ func TestDialerStandsDownForSessionPeerOpened(t *testing.T) {
 	}
 }
 
-// A peer the registry no longer names must not be dialed, whether or not it
-// pins an endpoint serial. Without the check a peer that pins none enters the
-// retry loop and logs the same lookup failure every reconnect delay for the
-// life of the process, which is exactly the decommissioned entry a reload was
-// just told to leave alone.
-func TestDialerGivesUpOnANodeTheRegistryDoesNotName(t *testing.T) {
+// A peer this local endpoint cannot reach must not be dialed, whether that is
+// because the registry no longer names the node or because the node has no
+// endpoint in this address family, and whether or not the peer pins a serial.
+// Without the check the dialer enters the retry loop and logs the same failure
+// every reconnect delay for the life of the process.
+func TestDialerGivesUpOnAPeerItCannotReach(t *testing.T) {
 	cfg, privateKey, reg := runtimeFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -996,9 +996,18 @@ func TestDialerGivesUpOnANodeTheRegistryDoesNotName(t *testing.T) {
 	c.cfg.Store(cfg)
 	c.reg.Store(&reg)
 
+	// "wrong family" is a node that exists and simply cannot be reached from
+	// this local endpoint, which on a dual-stack node with single-stack peers
+	// is the ordinary configuration rather than a mistake.
+	reg[0].Nodes = append(reg[0].Nodes, registry.Node{
+		CommonName: "v6only",
+		Endpoints:  []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip6", Port: 13000}},
+	})
 	for name, peer := range map[string]config.Peer{
-		"pinned to a serial": {Organization: "example", CommonName: "gone", SerialNumber: "1"},
-		"pinned to none":     {Organization: "example", CommonName: "gone"},
+		"pinned to a serial":  {Organization: "example", CommonName: "gone", SerialNumber: "1"},
+		"pinned to none":      {Organization: "example", CommonName: "gone"},
+		"wrong family":        {Organization: "example", CommonName: "v6only"},
+		"wrong family pinned": {Organization: "example", CommonName: "v6only", SerialNumber: "1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			done := make(chan struct{})

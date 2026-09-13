@@ -78,6 +78,14 @@ type routePlatform struct {
 	// refused is what this pass has seen refused, which becomes occupied at
 	// the start of the next one.
 	refused map[occupiedKey]bool
+	// ours is the keys the kernel holds for this interface: what the last dump
+	// reported as ours, plus what has installed since. EEXIST says only that
+	// the key is taken, not by whom, and a pass that repairs a partial apply
+	// re-adds a route this process installed moments earlier, so without this
+	// the reconciler recorded its own route as another program's, stopped
+	// reporting it in the dump, re-added it on every pass and could never
+	// withdraw it.
+	ours map[occupiedKey]bool
 
 	// addrs replaces the interface dump when set. The write side already goes
 	// through the rtSocket seam; without the read side a test cannot reach the
@@ -118,6 +126,7 @@ func newPlatform(cfg Config) (platform, error) {
 		warned:   make(map[Route]bool),
 		occupied: make(map[occupiedKey]bool),
 		refused:  make(map[occupiedKey]bool),
+		ours:     make(map[occupiedKey]bool),
 		pending:  make(map[Route]bool),
 	}
 	if err := plat.open(); err != nil {
@@ -224,12 +233,17 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 	}
 	var out []Route
 	stillScoped := make(map[netip.Prefix]bool, len(p.scoped))
+	// Rebuilt rather than added to, so a route another program took over
+	// between two passes stops being claimed as ours and is reported as held
+	// the next time an install of it is refused.
+	p.ours = make(map[occupiedKey]bool, len(p.ours))
 	for _, message := range messages {
 		decoded, ok := p.decodeRoute(message)
 		if !ok {
 			continue
 		}
 		out = append(out, decoded)
+		p.ours[occupiedKey{destination: decoded.Destination, scoped: decoded.Scoped}] = true
 		if decoded.Scoped {
 			stillScoped[decoded.Destination] = true
 		}
@@ -338,14 +352,19 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if prefix == limitedBroadcast {
 		return Route{}, false
 	}
-	if _, tracked := p.scoped[prefix]; !tracked && p.occupied[occupiedKey{destination: prefix, scoped: true}] {
+	scoped := rm.Flags&unix.RTF_IFSCOPE != 0
+	if _, tracked := p.scoped[prefix]; !tracked && p.occupied[occupiedKey{destination: prefix, scoped: scoped}] {
 		// An install this process watched the kernel refuse, so another writer
-		// holds that scoped key and reporting it as ours would withdraw it on
-		// the next pass. Everything else scoped is adopted below.
+		// holds this key and reporting the route as ours would withdraw it on
+		// the next pass. The row's own scope is what is checked, because that
+		// is what the kernel keys on: asking about the scoped key for every
+		// row hid this reconciler's own unscoped route to the same
+		// destination, which it then reinstalled and warned about on every
+		// pass and never withdrew.
 		return Route{}, false
 	}
 	source := p.scoped[prefix]
-	if rm.Flags&unix.RTF_IFSCOPE == 0 {
+	if !scoped {
 		// The kernel keys a scoped route separately from the unscoped route to
 		// the same destination, so both can exist at once. Only the scoped one
 		// carries a source; reporting the source on both would collapse them
@@ -375,7 +394,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// unscoped default and a scoped one are two routes, and a withdrawal
 		// that guessed from the destination would take out the wrong one and
 		// leave the one it was asked for.
-		Scoped:      rm.Flags&unix.RTF_IFSCOPE != 0,
+		Scoped:      scoped,
 		Unreachable: rm.Flags&unix.RTF_REJECT != 0,
 	}, true
 }
@@ -493,6 +512,13 @@ func (p *routePlatform) AddRoute(r Route) error {
 			return err
 		}
 		key := occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)}
+		if p.ours[key] {
+			// Already installed out of this interface, so the key is taken by
+			// this reconciler and nothing is wrong. It is still reported as
+			// skipped, because this call installed nothing and a pass that
+			// counted it would claim to have repaired what it did not touch.
+			return errRouteSkipped
+		}
 		p.refused[key] = true
 		if !p.occupied[key] {
 			p.occupied[key] = true
@@ -502,7 +528,9 @@ func (p *routePlatform) AddRoute(r Route) error {
 		}
 		return errRouteSkipped
 	}
-	delete(p.occupied, occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)})
+	installed := occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)}
+	delete(p.occupied, installed)
+	p.ours[installed] = true
 	// Recorded only after the write lands, and only for a route that actually
 	// carries the scope. An entry for a route that was never installed would
 	// make decodeRoute report an unscoped route as carrying a source it does
@@ -581,11 +609,17 @@ func (p *routePlatform) DelRoute(r Route) error {
 		return err
 	}
 	// Dropped only once the route is gone, so a failed delete leaves the entry
-	// and the next pass decodes the route and tries again.
-	if scopeOnDarwin(r) {
+	// and the next pass decodes the route and tries again. The record follows
+	// the scope of the route that was withdrawn rather than the scope this
+	// backend would have chosen for it: an unscoped route to a destination
+	// that also holds a scoped one would otherwise wipe the scoped route's
+	// source, and the next pass would tear that route down and reinstall it.
+	if r.Scoped {
 		delete(p.scoped, r.Destination)
 	}
-	delete(p.occupied, occupiedKey{destination: r.Destination, scoped: r.Scoped})
+	withdrawn := occupiedKey{destination: r.Destination, scoped: r.Scoped}
+	delete(p.occupied, withdrawn)
+	delete(p.ours, withdrawn)
 	return nil
 }
 

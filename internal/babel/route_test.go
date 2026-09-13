@@ -110,9 +110,9 @@ func TestFeasibilityCondition(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			rt := newRouteTable(func(routeKey, routeSelection) {})
 			if test.advertised != nil {
-				rt.observe(key, *test.advertised, time.Now())
+				rt.observe(key, *test.advertised, "peer", time.Now())
 			}
-			if got := rt.feasible(key, test.received); got != test.want {
+			if got := rt.feasible(key, test.received, "peer"); got != test.want {
 				t.Fatalf("feasible = %v, want %v: selecting an unfeasible route is what closes a forwarding loop", got, test.want)
 			}
 		})
@@ -126,7 +126,7 @@ func TestUnfeasibleUpdateIsNeverSelected(t *testing.T) {
 	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
 	makeNeighborReachable(n)
 	rt := newRouteTable(func(routeKey, routeSelection) {})
-	rt.observe(key, advertisement{routerID: origin, seqno: 1, metric: 40}, now)
+	rt.observe(key, advertisement{routerID: origin, seqno: 1, metric: 40}, "peer", now)
 
 	rt.update(n, key, advertisement{routerID: origin, seqno: 1, metric: 40}, time.Minute, now)
 	if len(rt.entries) != 0 {
@@ -165,7 +165,7 @@ func TestSelectionRechecksFeasibility(t *testing.T) {
 		t.Fatal("the only route was not selected")
 	}
 
-	rt.observe(key, advertisement{routerID: origin, seqno: 1, metric: 20}, now)
+	rt.observe(key, advertisement{routerID: origin, seqno: 1, metric: 20}, "peer", now)
 	rt.sweepExpired(now)
 	if sel := rt.entries[key].selected; sel.neighbor != nil {
 		t.Fatalf("a route that is no longer feasible stayed selected via %q", sel.neighbor.peer.ID)

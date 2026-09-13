@@ -23,12 +23,20 @@ type Peer struct {
 	// Reserved peers hand completed crypto batches to one sender. slots bounds
 	// the total number of batches that may be encrypting, queued out of order,
 	// or in the transport syscall at once.
-	completed  chan *peerBatch
-	slots      chan struct{}
-	stop       chan struct{}
-	senderDone chan struct{}
-	closeOnce  sync.Once
-	sealedPool sync.Pool // *[][]byte, returned only after the transport finishes
+	//
+	// controlSlots is the same bound for babel, kept separate on purpose. The
+	// data budget is sized by the core count and is entirely consumed by a
+	// bulk transfer, so sharing it dropped 98 of every 100 control packets
+	// under load, measured; three lost hellos withdraw every route through the
+	// peer and the transfer then has nowhere to go. Control traffic is small
+	// and rare enough that a budget of its own costs a few hundred kilobytes.
+	completed    chan *peerBatch
+	slots        chan struct{}
+	controlSlots chan struct{}
+	stop         chan struct{}
+	senderDone   chan struct{}
+	closeOnce    sync.Once
+	sealedPool   sync.Pool // *[][]byte, returned only after the transport finishes
 
 	// Compatibility peers allocate their sequence number during encryption,
 	// so their complete encrypt/send operation remains synchronously ordered.
@@ -76,8 +84,9 @@ func newPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, err
 		p.sendCond = sync.NewCond(&p.sendMu)
 	} else {
 		queueSize := max(2, 2*runtime.GOMAXPROCS(0))
-		p.completed = make(chan *peerBatch, queueSize)
+		p.completed = make(chan *peerBatch, queueSize+controlQueueSize)
 		p.slots = make(chan struct{}, queueSize)
+		p.controlSlots = make(chan struct{}, controlQueueSize)
 		p.stop = make(chan struct{})
 		p.senderDone = make(chan struct{})
 		go p.senderLoop()
@@ -117,9 +126,17 @@ type Place struct{ batch *peerBatch }
 // under that lock, after which nothing can invert them. Every place taken has
 // to be sent, because one that is never used stalls everything behind it.
 func (p *Peer) ReserveRawOrDrop(raw []byte, nextHeader byte) (*Place, error) {
-	b := p.reserveBatchNow(1)
+	b := p.reserveNow(p.controlSlots, 1, true)
 	if b == nil {
 		return nil, ErrSendQueueFull
+	}
+	if b.err != nil {
+		// The place was taken and has to be sent, so the sender is not
+		// stranded, but nothing in it will leave. Telling the caller now is
+		// what lets it give back the bookkeeping the packet consumed.
+		place := &Place{batch: b}
+		_ = place.Send()
+		return nil, b.err
 	}
 	b.append(raw, nextHeader)
 	return &Place{batch: b}, nil
@@ -142,6 +159,9 @@ type peerBatch struct {
 	err       error
 	done      chan error
 	hasSlot   bool
+	// control says which budget the place came from, so it goes back where it
+	// was taken from.
+	control bool
 }
 
 // reserveBatchNow takes a transmission slot only if one is free. A caller that
@@ -158,12 +178,41 @@ type peerBatch struct {
 // one, Receive runs on the sending peer's own decrypt path, and Mesh dispatches
 // under a lock every TUN reader takes.
 func (p *Peer) reserveBatchNow(count int) *peerBatch {
-	if p.slots == nil {
-		return p.reserveBatchWithSlot(count, false)
+	return p.reserveNow(p.slots, count, false)
+}
+
+// controlQueueSize is how many control packets one peer may have in flight.
+// It has to hold a whole periodic dump, which is one packet per forty plain
+// prefixes or thirty-four source-specific ones, or the dump is truncated and
+// the rest waits for the next interval. Two hundred and fifty-six covers about
+// ten thousand plain prefixes and costs under a megabyte per peer at the link
+// MTU, counting the packet and the sealer's copy of it.
+//
+// That is below maxRouteKeys, so a table at its own limit still truncates, and
+// because the dump walks maps each one carries a different subset: a prefix
+// missed four dumps running expires at the neighbor. A table that large needs
+// the dump to resume where the last one stopped rather than resample, which is
+// not what this does.
+const controlQueueSize = 256
+
+// reserveNow takes one place from budget if a place is free, and otherwise
+// reports the packets dropped.
+func (p *Peer) reserveNow(budget chan struct{}, count int, control bool) *peerBatch {
+	if budget == nil {
+		return p.reserveBatchWithSlot(count, false, control)
+	}
+	// Checked before the budget, not beside it: a select with both ready picks
+	// uniformly, so half of what a closed peer was offered would be accepted,
+	// reported as sent, never transmitted and never counted.
+	select {
+	case <-p.stop:
+		p.dropped.Add(uint64(count))
+		return nil
+	default:
 	}
 	select {
-	case p.slots <- struct{}{}:
-		return p.reserveBatchWithSlot(count, true)
+	case budget <- struct{}{}:
+		return p.reserveBatchWithSlot(count, true, control)
 	case <-p.stop:
 		p.dropped.Add(uint64(count))
 		return nil
@@ -180,11 +229,11 @@ func (p *Peer) reserveBatchNow(count int) *peerBatch {
 // gone shows up as a rising counter rather than as latency somewhere else.
 func (p *Peer) Dropped() uint64 { return p.dropped.Load() }
 
-func (p *Peer) reserveBatchWithSlot(count int, hasSlot bool) *peerBatch {
+func (p *Peer) reserveBatchWithSlot(count int, hasSlot, control bool) *peerBatch {
 	p.reserveMu.Lock()
 	ticket := p.reserved
 	p.reserved++
-	b := &peerBatch{peer: p, ticket: ticket, reserved: p.reserveFn != nil, hasSlot: hasSlot}
+	b := &peerBatch{peer: p, ticket: ticket, reserved: p.reserveFn != nil, hasSlot: hasSlot, control: control}
 	if p.reserveFn != nil {
 		b.sealer, b.err = p.reserveFn(count)
 	}
@@ -299,10 +348,15 @@ func (b *peerBatch) send() error {
 }
 
 func (b *peerBatch) releaseSlot() {
-	if b.hasSlot {
-		<-b.peer.slots
-		b.hasSlot = false
+	if !b.hasSlot {
+		return
 	}
+	if b.control {
+		<-b.peer.controlSlots
+	} else {
+		<-b.peer.slots
+	}
+	b.hasSlot = false
 }
 
 func (b *peerBatch) releaseStorage() {

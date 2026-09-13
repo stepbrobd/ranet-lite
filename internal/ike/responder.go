@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -109,13 +110,29 @@ const (
 	// correctly and is refused anyway. That partition costs one real address
 	// and about seventeen packets a second.
 	//
+	// The unit is the address alone. Keyed by the whole endpoint it bounds a
+	// UDP flow instead, and sixteen source ports from one address take all 256
+	// slots again, which was measured end to end before this was fixed. Both
+	// backends unmap, so a v4-mapped source and a plain v4 source are one key,
+	// and linux's zone for a link-local source drops out with the port.
+	//
 	// A refusal is silent because RFC 7296 section 2.21.1 does not give
 	// IKE_SA_INIT a notify for it, and inventing one is worse than the retry.
 	// The bound is well above what one peer produces: it opens one exchange
-	// per endpoint pair, and a retransmission that arrives before the response
+	// per endpoint pair and a retransmission that arrives before the response
 	// is registered starts another, so the ceiling is the retransmission
-	// budget rather than the number of SAs.
+	// budget rather than the number of SAs. A NAT with more than sixteen mesh
+	// nodes behind one address restarting at once is the case it costs.
 	halfOpenPerSource = 16
+
+	// halfOpenPerSourceWithoutCookie is how many of one address's share it may
+	// take before it has to prove return routability, whatever the global
+	// pressure is. One is too few: a peer with two local endpoints dials the
+	// same address twice, and a retransmission that arrives before the
+	// response is registered starts another exchange, so a small number keeps
+	// the ordinary cases free of a round trip while a spoofer can burn only
+	// that many of a victim's slots.
+	halfOpenPerSourceWithoutCookie = 2
 
 	cookieLifetime = 2 * time.Minute
 )
@@ -139,7 +156,7 @@ type Responder struct {
 	mu       sync.Mutex
 	halfOpen int
 	// halfOpenBySource is how many of those one address is holding.
-	halfOpenBySource map[string]int
+	halfOpenBySource map[netip.Addr]int
 	cookieSecret     [32]byte
 	cookieVersion    uint8
 	cookieRotated    time.Time
@@ -256,7 +273,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	// gives cookieThreshold something real to read: a handshake still in its
 	// key exchange is exactly the pressure the challenge of RFC 7296 section
 	// 2.6 exists to answer.
-	source := fmt.Sprint(datagram.Endpoint)
+	source := datagram.Endpoint.AddrPort().Addr()
 	if !r.enterHalfOpen(source) {
 		return nil, Accepted{}, fmt.Errorf("ike: too many half-open SAs")
 	}
@@ -688,23 +705,27 @@ func firstUnsupportedCritical(payloads []RawPayload) (PayloadType, bool) {
 	return 0, false
 }
 
-func (r *Responder) enterHalfOpen(source string) bool {
+func (r *Responder) enterHalfOpen(source netip.Addr) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.halfOpen >= halfOpenLimit || r.halfOpenBySource[source] >= halfOpenPerSource {
 		return false
 	}
 	if r.halfOpenBySource == nil {
-		r.halfOpenBySource = make(map[string]int)
+		r.halfOpenBySource = make(map[netip.Addr]int)
 	}
 	r.halfOpen++
 	r.halfOpenBySource[source]++
 	return true
 }
 
-func (r *Responder) leaveHalfOpen(source string) {
+func (r *Responder) leaveHalfOpen(source netip.Addr) {
 	r.mu.Lock()
-	r.halfOpen--
+	// Floored, because a count that went negative would disable the cookie
+	// threshold and the cap together and nothing would ever bring it back.
+	if r.halfOpen > 0 {
+		r.halfOpen--
+	}
 	if r.halfOpenBySource[source] <= 1 {
 		delete(r.halfOpenBySource, source)
 	} else {
@@ -718,8 +739,16 @@ func (r *Responder) leaveHalfOpen(source string) {
 // with one and reports true so the caller stops without allocating; the
 // initiator retries with the cookie echoed as its first payload.
 func (r *Responder) cookieRequired(request *Message, ni []byte, spiI uint64, endpoint transport.Endpoint) (bool, error) {
+	source := endpoint.AddrPort().Addr()
 	r.mu.Lock()
-	pressure := r.halfOpen >= cookieThreshold
+	// Under pressure globally, or past what one address may hold without
+	// having proved it can receive. The second is what stops a spoofer
+	// spending a named peer's whole share while the node is idle: with the
+	// global threshold alone, floor(cookieThreshold/halfOpenPerSource)
+	// addresses can be locked out by an off-path source, for sixteen packets
+	// every thirty seconds each, and the victim is then refused in silence.
+	pressure := r.halfOpen >= cookieThreshold ||
+		r.halfOpenBySource[source] >= halfOpenPerSourceWithoutCookie
 	if pressure && time.Since(r.cookieRotated) > cookieLifetime {
 		if _, err := rand.Read(r.cookieSecret[:]); err != nil {
 			r.mu.Unlock()

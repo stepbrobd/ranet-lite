@@ -471,7 +471,7 @@ func TestSourceTableGarbageCollection(t *testing.T) {
 	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
 	adv := advertisement{routerID: [8]byte{1}, seqno: 1, metric: 10}
 	now := time.Now()
-	rt.observe(key, adv, now)
+	rt.observe(key, adv, "peer", now)
 
 	rt.sweepSources(now.Add(sourceGCTime - time.Second))
 	if len(rt.sources) != 1 {
@@ -652,37 +652,56 @@ func TestSourceTableRefusesUnknownOriginWhenFull(t *testing.T) {
 	for i := range maxSources {
 		var id [8]byte
 		binary.BigEndian.PutUint64(id[:], uint64(i))
-		rt.observe(key, advertisement{routerID: id, seqno: 1, metric: 64}, now)
+		rt.observe(key, advertisement{routerID: id, seqno: 1, metric: 64}, "peer", now)
 	}
 	var fresh [8]byte
 	binary.BigEndian.PutUint64(fresh[:], uint64(maxSources))
-	if rt.feasible(key, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
+	if rt.feasible(key, advertisement{routerID: fresh, seqno: 1, metric: 64}, "peer") {
 		t.Fatal("a full source table still admitted an origin it had never advertised")
 	}
 
 	// And a prefix cannot spend the whole table on its own, or one neighbor
 	// churning the origin of one prefix stops this node learning any new
 	// origin anywhere, a restarted peer's new router id included.
-	elsewhere := routeTable{sources: map[sourceKey]*sourceEntry{}, originsPerKey: map[routeKey]int{}}
+	elsewhere := newRouteTable(func(routeKey, routeSelection) {})
 	crowded := routeKey{dest: netip.MustParsePrefix("fd00:2::/64")}
+	// Spread across enough neighbors that the prefix's own budget is what runs
+	// out rather than any one neighbor's share of it.
 	for i := range maxOriginsPerPrefix {
 		var id [8]byte
 		binary.BigEndian.PutUint64(id[:], uint64(i))
-		elsewhere.observe(crowded, advertisement{routerID: id, seqno: 1, metric: 64}, now)
+		elsewhere.observe(crowded, advertisement{routerID: id, seqno: 1, metric: 64},
+			fmt.Sprintf("peer%d", i/maxOriginsPerPrefixPerNeighbor), now)
 	}
-	if elsewhere.feasible(crowded, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
+	if elsewhere.feasible(crowded, advertisement{routerID: fresh, seqno: 1, metric: 64}, "newcomer") {
 		t.Error("one prefix took more origins than its share, so it can spend the whole table")
 	}
 	quiet := routeKey{dest: netip.MustParsePrefix("fd00:3::/64")}
-	if !elsewhere.feasible(quiet, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
+	if !elsewhere.feasible(quiet, advertisement{routerID: fresh, seqno: 1, metric: 64}, "newcomer") {
 		t.Error("another prefix was refused an origin because a crowded one had spent its own share")
+	}
+
+	// And one neighbor cannot spend a prefix's whole budget either, or a peer
+	// that restarted and drew a new router id is refused by the node that
+	// should learn it.
+	flooded := newRouteTable(func(routeKey, routeSelection) {})
+	for i := range maxOriginsPerPrefixPerNeighbor {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i))
+		flooded.observe(crowded, advertisement{routerID: id, seqno: 1, metric: 64}, "flooder", now)
+	}
+	if flooded.feasible(crowded, advertisement{routerID: fresh, seqno: 1, metric: 64}, "flooder") {
+		t.Error("one neighbor took more than its share of a prefix's origins")
+	}
+	if !flooded.feasible(crowded, advertisement{routerID: fresh, seqno: 1, metric: 64}, "newcomer") {
+		t.Error("a neighbor announcing its own origin was refused because another had flooded the prefix")
 	}
 	// The cap refuses origins it has no room to record, not the ones it holds,
 	// and never a retraction: neither of those can close a loop.
-	if !rt.feasible(key, advertisement{routerID: [8]byte{}, seqno: 2, metric: 64}) {
+	if !rt.feasible(key, advertisement{routerID: [8]byte{}, seqno: 2, metric: 64}, "peer") {
 		t.Error("a full source table refused a better distance for an origin it holds")
 	}
-	if !rt.feasible(key, advertisement{routerID: fresh, metric: MetricInfinity}) {
+	if !rt.feasible(key, advertisement{routerID: fresh, metric: MetricInfinity}, "peer") {
 		t.Error("a full source table refused a retraction")
 	}
 }
@@ -1098,4 +1117,80 @@ func TestRunLoopWakesForStarvationRetry(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("the run loop never woke for the retry, so the prefix stays starved until something else happens to wake it")
+}
+
+// Both of these tables are indexed by a router id a neighbor writes into a
+// packet, so a neighbor that alternates a feasible update on a recorded origin
+// with an unfeasible one on an origin this node has never advertised starves a
+// new entry on every packet. Twenty-one fit in a packet and each lives through
+// four retries, and retryStarvedLocked walks the whole map on every wake of
+// the run loop, under the lock that also carries hellos and retractions.
+func TestStarvationBookkeepingIsBounded(t *testing.T) {
+	speaker, _, _ := captureSpeaker(t, Config{})
+	dest := netip.MustParsePrefix("fd00:1::/64")
+	key := routeKey{dest: dest}
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	// One neighbor floods, spending its share and no more.
+	for i := range maxStarveRetries + 512 {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i))
+		speaker.rememberStarved(key, id, 1, "flooder", now)
+	}
+	switch got := len(speaker.starveRetries); {
+	case got > maxStarveRetriesPerNeighbor:
+		t.Errorf("one neighbor is holding %d repeats, past its share of %d", got, maxStarveRetriesPerNeighbor)
+	case got < maxStarveRetriesPerNeighbor:
+		t.Fatalf("only %d entries were recorded, so the flood never reached the table", got)
+	}
+	// And another neighbor's prefix can still be repeated, or a lost request
+	// or reply behind this node stops being covered at all.
+	var fresh [8]byte
+	binary.BigEndian.PutUint64(fresh[:], uint64(1)<<40)
+	speaker.rememberStarved(key, fresh, 1, "peer", now)
+	if speaker.starveBy["peer"] == 0 {
+		t.Error("a neighbor that starved one prefix was refused because another had flooded the table")
+	}
+
+	// This node's own requests are charged to a bucket of their own rather
+	// than recorded without a cap: the router-id half of their index still
+	// comes from a neighbor's packet.
+	for i := range maxPendingSeqnoPerNeighbor + 512 {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i))
+		speaker.seqnoRequestTo(speaker.neighbors["peer"], key, id, 1, now)
+	}
+	if got := len(speaker.pendingSeqno); got > maxPendingSeqnoPerNeighbor {
+		t.Errorf("this node recorded %d of its own requests, past the share of %d", got, maxPendingSeqnoPerNeighbor)
+	}
+}
+
+// A node draws a new router id every time it starts, so every restart is a new
+// origin for every prefix it announces, charged to whichever neighbor this
+// node reaches it through. A cap that refuses an origin refuses a route, and
+// selectRoute rechecks feasibility for stored routes, so a cap below the
+// restart rate does not merely stop this node learning something new: it drops
+// the route it already had and holds the prefix unreachable until the source
+// table collects, three minutes after the churn stops.
+func TestRestartChurnDoesNotBlackholeThePrefix(t *testing.T) {
+	// b learns the prefix through a and has c to advertise it to, which is
+	// what records the distance: split horizon makes the dump back to a a
+	// retraction, so a lone neighbor never spends the budget at all.
+	fabric := newMeshFabric(t, Config{}, "b-a", "b-c")
+	dest := netip.MustParsePrefix("fd00:1::/64")
+	key := routeKey{dest: dest}
+	// Far more restarts than any supervisor produces inside sourceGCTime.
+	for i := range 64 {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i)+1)
+		fabric.inject("b", "a",
+			EncodeRouterID(id),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: 64}))
+		fabric.flush("b")
+		if got := fabric.nextHop("b", key); got != "a" {
+			t.Fatalf("restart %d left the prefix with next hop %q, so the cap dropped a route this node already had", i+1, got)
+		}
+	}
 }

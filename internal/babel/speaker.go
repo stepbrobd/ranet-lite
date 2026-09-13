@@ -78,6 +78,19 @@ const (
 	maxPendingSeqnoPerNeighbor = 1 << 10
 )
 
+// maxStarveRetries bounds the prefixes this node is repeating a seqno request
+// for, and maxStarveRetriesPerNeighbor is one neighbor's share of that. The
+// index carries a router id a neighbor writes into a packet, so nothing else
+// bounds it, and every entry is walked under s.mu on each wake of the run
+// loop. Without the share one neighbor fills the table from the ordinary route
+// acquisition path, and RFC 8966 section 3.8.2.1's "repeat such a request a
+// small number of times" then stops happening for every other neighbor, which
+// is exactly what covers a lost request or a lost reply.
+const (
+	maxStarveRetries            = 1 << 12
+	maxStarveRetriesPerNeighbor = 1 << 10
+)
+
 // Hop count for locally originated seqno requests: "64 is a suitable default
 // value", RFC 8966 section 3.8.2.1.
 const seqnoRequestHopCount = 64
@@ -107,6 +120,10 @@ type starveRetry struct {
 	seqno    uint16
 	attempts int
 	nextAt   time.Time
+	// asker is the neighbor whose route starved, so the share it spent can be
+	// given back. It is the peer's name rather than its state, so an entry
+	// left behind cannot pin a retired neighbor.
+	asker string
 }
 
 // Speaker.mu serializes all protocol state and forwarding-table changes.
@@ -131,7 +148,9 @@ type Speaker struct {
 	// "already asked somebody".
 	askedSeqno    map[askedKey]time.Time
 	starveRetries map[sourceKey]*starveRetry
-	originSeqno   uint16
+	// starveBy is how much of that each neighbor is holding.
+	starveBy    map[string]int
+	originSeqno uint16
 	// raisedSeqno bounds originSeqno to one raise per received packet.
 	raisedSeqno   bool
 	updatePending bool
@@ -171,6 +190,7 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 		pendingByAsker: make(map[string]int),
 		askedSeqno:     make(map[askedKey]time.Time),
 		starveRetries:  make(map[sourceKey]*starveRetry),
+		starveBy:       make(map[string]int),
 		originSeqno:    1,
 		changed:        make(chan struct{}, 1),
 	}

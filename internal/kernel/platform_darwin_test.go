@@ -78,6 +78,7 @@ func testPlatform(t *testing.T, cfg Config) (*routePlatform, *fakeRouteSocket) {
 		scoped:   make(map[netip.Prefix]netip.Prefix),
 		occupied: make(map[occupiedKey]bool),
 		refused:  make(map[occupiedKey]bool),
+		ours:     make(map[occupiedKey]bool),
 		// No address belongs to this interface unless a test says so, which
 		// makes "the source is not ours" the default rather than an accident
 		// of whatever the host running the suite happens to have configured.
@@ -1150,5 +1151,109 @@ func TestDarwinForgetsAnOccupiedKeyTheMeshStoppedAsking(t *testing.T) {
 	plat.rotateWarnings()
 	if len(plat.occupied) != 0 {
 		t.Errorf("the record outlived the destination the mesh stopped asking for: %v", plat.occupied)
+	}
+}
+
+// The record of a refused install is per key, and the kernel's key is the
+// destination and its scope, so it has to be read with the scope of the row
+// being decoded. Read with the scoped key for every row, one refused scoped
+// add hid this reconciler's own unscoped route to the same destination: it
+// installed it, could not see it on any later pass, re-added it, warned that
+// another program held its own route, and never withdrew it. On a default or
+// a hold that is a permanent black hole.
+func TestDarwinOccupiedRecordIsReadWithTheRowsOwnScope(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	dest := prefix("2001:db8:1::/48")
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
+
+	// A scoped install the kernel refuses, which is somebody else holding the
+	// scoped key at this destination.
+	sock.err = unix.EEXIST
+	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("the refused install reported %v", err)
+	}
+	sock.err = nil
+
+	// The plain route to the same destination is a different key. It installs,
+	// and every later dump has to report it, or nothing can ever withdraw it.
+	plain, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC,
+		dst: dest, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain) != 1 || plain[0].Scoped {
+		t.Fatalf("the dump reported %v for a route this reconciler installed unscoped", plain)
+	}
+	// And the scoped key is still somebody else's.
+	foreign, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+		dst: dest, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreign) != 0 {
+		t.Errorf("the dump claims %v, which another program holds", foreign)
+	}
+}
+
+// p.scoped is keyed by destination alone while the kernel keys by destination
+// and scope, so withdrawing the unscoped route to a destination must not wipe
+// the scoped route's source. It did, and the next pass then tore the scoped
+// route down and reinstalled it.
+func TestDarwinWithdrawingUnscopedKeepsTheScopedSource(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
+	announced := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
+	if err := plat.AddRoute(announced); err != nil {
+		t.Fatalf("install the announced default: %v", err)
+	}
+	if _, recorded := plat.scoped[announced.Destination]; !recorded {
+		t.Fatal("the install did not record the scope, so this proves nothing")
+	}
+
+	// An unscoped route to the same destination goes away, which is a
+	// different key in the kernel.
+	if err := plat.DelRoute(Route{Destination: announced.Destination, Metric: defaultIPv6Metric}); err != nil {
+		t.Fatalf("withdraw the unscoped route: %v", err)
+	}
+	if _, recorded := plat.scoped[announced.Destination]; !recorded {
+		t.Error("withdrawing the unscoped route forgot the scoped route's source, so the next pass replaces it")
+	}
+}
+
+// EEXIST says that the key is taken, not by whom, and a pass that repairs a
+// partial apply re-adds a route this process installed moments earlier. Read
+// as another program's, the reconciler's own route stopped being reported by
+// the dump, so every later pass saw it missing, re-added it, was refused
+// again, and could never withdraw it: the route is in the kernel and the mesh
+// believes it is not, for the life of the process.
+func TestDarwinKnowsItsOwnRouteFromOneAnotherProgramHolds(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	dest := prefix("2001:db8:1::/48")
+	installed := Route{Destination: dest, Metric: defaultIPv6Metric}
+	if err := plat.AddRoute(installed); err != nil {
+		t.Fatalf("install %s: %v", dest, err)
+	}
+
+	// The same route again, which is what a repair pass does. The kernel
+	// refuses it because this reconciler already installed it.
+	sock.err = unix.EEXIST
+	if err := plat.AddRoute(installed); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("reinstalling our own route reported %v", err)
+	}
+	sock.err = nil
+
+	got, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC,
+		dst: dest, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("the dump reports %v, so this reconciler disowned the route it installed itself", got)
 	}
 }

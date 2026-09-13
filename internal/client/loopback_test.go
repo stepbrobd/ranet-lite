@@ -52,7 +52,34 @@ func freeUDPPort(t *testing.T) uint16 {
 // newLoopbackMesh builds two clients that know about each other, each on its
 // own UDP port, sharing one organization key. Neither owns a TUN: babel
 // intercepts its own traffic before delivery, so nothing reaches one.
+//
+// It retries. freeUDPPort asks the kernel for a port and gives it straight
+// back, because naming one in a config file is the only way these nodes can
+// find each other, so anything else on the machine can take it in the gap.
+// Retrying with fresh ports is the difference between a rare unexplained
+// failure somewhere in this package and none.
+// newLoopbackMesh retries, because the ports are chosen by binding to zero,
+// reading the port back and binding it again: anything else on the machine can
+// take it in between, and on a loaded one several tests are doing this at
+// once. The wait between attempts is what makes a run of losses unlikely
+// rather than merely improbable; without it a busy machine lost every attempt
+// in the same handful of microseconds.
 func newLoopbackMesh(t *testing.T) (*loopbackNode, *loopbackNode) {
+	t.Helper()
+	const attempts = 10
+	for attempt := range attempts {
+		alpha, bravo, err := tryLoopbackMesh(t)
+		if err == nil {
+			return alpha, bravo
+		}
+		t.Logf("attempt %d could not bind the ports it was given: %v", attempt, err)
+		time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+	}
+	t.Fatalf("%d attempts in a row could not bind a port the kernel had just handed back", attempts)
+	return nil, nil
+}
+
+func tryLoopbackMesh(t *testing.T) (_, _ *loopbackNode, err error) {
 	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -111,11 +138,14 @@ func newLoopbackMesh(t *testing.T) (*loopbackNode, *loopbackNode) {
 		node.cfg = writeLoopbackConfig(t, node, peer, keyPath, registryPath, []string{node.prefix.String()})
 		client, err := newClient(node.cfg, private, reg, netstack.NewRoutesOnly())
 		if err != nil {
-			t.Fatalf("%s: %v", node.name, err)
+			for _, built := range nodes[:i] {
+				built.client.Close()
+			}
+			return nil, nil, fmt.Errorf("%s: %w", node.name, err)
 		}
 		node.client = client
 	}
-	return nodes[0], nodes[1]
+	return nodes[0], nodes[1], nil
 }
 
 // writeLoopbackConfig writes one node's config file and loads it back, so the

@@ -296,7 +296,7 @@ func (s *Speaker) forwardTarget(key routeKey, from *neighborState) *neighborStat
 			continue
 		}
 		// Break ties by peer ID: a request must not follow map iteration order.
-		if s.routes.feasible(key, route.advertised()) {
+		if s.routes.feasible(key, route.advertised(), n.peer.ID) {
 			if feasible == nil || n.peer.ID < feasible.peer.ID {
 				feasible = n
 			}

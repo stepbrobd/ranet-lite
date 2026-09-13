@@ -24,6 +24,14 @@ type sendAction struct {
 	rollback []func()
 }
 
+// boolOrder sorts false before true.
+func boolOrder(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // emitLocked fixes the transmission order of everything the caller decided
 // under s.mu and returns the function that sends it, which runs after the lock
 // is released. It must be called with s.mu held.
@@ -41,7 +49,18 @@ type sendAction struct {
 // it consumed is rolled back while the lock is still held.
 func (s *Speaker) emitLocked(actions []sendAction) func() {
 	var packets []*netstack.Place
-	for _, action := range coalesce(actions) {
+	// Unicast first. A place is taken for every packet before any is sent, so
+	// a pass that fills the peer's budget drops whatever it reached last, and
+	// the periodic dump is both the largest action and the one that can wait
+	// for the next interval. A seqno request cannot: allowAsk and
+	// rememberStarved have already recorded it as asked, and nothing rolls
+	// that back, so a dropped request is a prefix that stops being asked
+	// about. The dump is the only multicast action babel sends.
+	merged := coalesce(actions)
+	slices.SortStableFunc(merged, func(a, b sendAction) int {
+		return boolOrder(a.dest == multicastGroup) - boolOrder(b.dest == multicastGroup)
+	})
+	for _, action := range merged {
 		reserved, whole := s.reserveBatchesTo(action.neighbor, action.dest, action.tlvs)
 		packets = append(packets, reserved...)
 		if whole {
@@ -244,11 +263,23 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 	} else {
 		// observe records the feasibility distance this advertisement commits
 		// to, and is not rolled back: having promised a distance and then not
-		// sent it is safe, while sending one we did not record is not.
-		s.routes.observe(key, adv, now)
+		// sent it is safe, while sending one we did not record is not. The
+		// neighbor it is charged to is the one whose route this node selected,
+		// or nobody for a prefix this node originates.
+		s.routes.observe(key, adv, s.selectedPeer(key), now)
 		n.advertised[key] = struct{}{}
 	}
 	return updateTLVs(key, adv, s.cfg.UpdateInterval), rollback
+}
+
+// selectedPeer names the neighbor whose route this node has chosen for a
+// prefix, or nothing for one it originates itself.
+func (s *Speaker) selectedPeer(key routeKey) string {
+	entry := s.routes.entries[key]
+	if entry == nil || entry.selected.neighbor == nil {
+		return ""
+	}
+	return entry.selected.neighbor.peer.ID
 }
 
 func updateTLVs(key routeKey, adv advertisement, interval time.Duration) []RawTLV {
@@ -367,7 +398,7 @@ func (s *Speaker) starvedActions(now time.Time) []sendAction {
 		// Recorded whether or not this particular packet went out, so a prefix
 		// starved inside the window of a request we forwarded moments earlier
 		// still gets a retry rather than never being asked about again.
-		s.rememberStarved(request.key, request.routerID, request.seqno, now)
+		s.rememberStarved(request.key, request.routerID, request.seqno, request.neighbor.peer.ID, now)
 	}
 	return actions
 }
@@ -375,10 +406,12 @@ func (s *Speaker) starvedActions(now time.Time) []sendAction {
 // seqnoRequestTo builds one unicast seqno request, bypassing the forwarding
 // suppression table.
 func (s *Speaker) seqnoRequestTo(n *neighborState, key routeKey, routerID [8]byte, seqno uint16, now time.Time) sendAction {
-	// Recorded without a cap: this node's own requests come from its own route
-	// table, and refusing to record one only costs the suppression that stops
-	// it being relayed twice.
-	s.recordSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, "", now)
+	// Charged to this node's own bucket under the same cap as a forwarded
+	// request. The router-id half of the index still comes from a neighbor's
+	// packet, so "this node's own requests come from its own route table" was
+	// only half true; refusing to record one costs the suppression that stops
+	// it being relayed twice, not the request itself, which still goes out.
+	s.allowSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, "", now)
 	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
 		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
 		Seqno: seqno, HopCount: seqnoRequestHopCount, RouterID: routerID,
@@ -412,15 +445,36 @@ func aeFor(p netip.Prefix) uint8 {
 
 // rememberStarved records a prefix whose seqno request has just gone out, so
 // it can be repeated if no feasible route appears. RFC 8966 section 3.8.2.1.
-func (s *Speaker) rememberStarved(key routeKey, routerID [8]byte, seqno uint16, now time.Time) {
+//
+// It is bounded by maxStarveRetries. The index carries a router id a neighbor
+// writes into a packet, so a neighbor that alternates a feasible update with
+// an unfeasible one on an origin this node has not recorded starves a new
+// entry every packet; each lives through four retries, and retryStarvedLocked
+// walks the whole map on every wake of the run loop, under the lock that also
+// carries hellos and retractions.
+func (s *Speaker) rememberStarved(key routeKey, routerID [8]byte, seqno uint16, asker string, now time.Time) {
 	id := sourceKey{route: key, routerID: routerID}
 	if retry, ok := s.starveRetries[id]; ok {
 		retry.seqno, retry.nextAt = seqno, now.Add(seqnoRetryInitial)
 		return
 	}
-	s.starveRetries[id] = &starveRetry{
-		key: key, routerID: routerID, seqno: seqno, nextAt: now.Add(seqnoRetryInitial),
+	if len(s.starveRetries) >= maxStarveRetries || s.starveBy[asker] >= maxStarveRetriesPerNeighbor {
+		return
 	}
+	s.starveRetries[id] = &starveRetry{
+		key: key, routerID: routerID, seqno: seqno, asker: asker, nextAt: now.Add(seqnoRetryInitial),
+	}
+	s.starveBy[asker]++
+}
+
+// forgetStarved drops one repeat and gives its neighbor the slot back.
+func (s *Speaker) forgetStarved(id sourceKey, retry *starveRetry) {
+	delete(s.starveRetries, id)
+	if s.starveBy[retry.asker] <= 1 {
+		delete(s.starveBy, retry.asker)
+		return
+	}
+	s.starveBy[retry.asker]--
 }
 
 // retryStarvedLocked repeats the seqno requests for prefixes that are still
@@ -430,14 +484,14 @@ func (s *Speaker) retryStarvedLocked(now time.Time) []sendAction {
 	var actions []sendAction
 	for id, retry := range s.starveRetries {
 		if entry := s.routes.entries[retry.key]; entry != nil && entry.selected.neighbor != nil {
-			delete(s.starveRetries, id)
+			s.forgetStarved(id, retry)
 			continue
 		}
 		if now.Before(retry.nextAt) {
 			continue
 		}
 		if retry.attempts >= seqnoRequestRetries {
-			delete(s.starveRetries, id)
+			s.forgetStarved(id, retry)
 			continue
 		}
 		retry.attempts++

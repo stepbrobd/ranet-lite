@@ -19,6 +19,10 @@ type sourceEntry struct {
 	seqno  uint16
 	metric uint16
 	gcAt   time.Time
+	// owner is the neighbor whose route caused this node to advertise the
+	// distance, or empty for a prefix this node originates. It is the peer's
+	// name rather than its state, so an entry cannot pin a retired neighbor.
+	owner string
 }
 
 // Source GC time, RFC 8966 Appendix B.
@@ -42,8 +46,32 @@ const sourceGCTime = 3 * time.Minute
 // anycast and far below what a flood needs.
 const (
 	maxSources          = 1 << 16
-	maxOriginsPerPrefix = 32
+	maxOriginsPerPrefix = 1 << 10
+	// maxOriginsPerPrefixPerNeighbor is one neighbor's share of one prefix's
+	// budget, and maxSourcesPerNeighbor is its share of the whole table. The
+	// first stops one neighbor denying another the same prefix; the second
+	// stops one neighbor spending the global budget and denying every other
+	// neighbor every prefix.
+	//
+	// Both are far above what a restart produces, which is what the first
+	// version of this bound got wrong. A node draws a new router id every time
+	// it starts, so every restart is a new origin for every prefix it
+	// announces, charged to whichever neighbor this node reaches it through.
+	// At eight, nine restarts inside sourceGCTime made the prefix unfeasible,
+	// and since selectRoute rechecks feasibility for stored routes that
+	// dropped the route already selected: the prefix was held unreachable,
+	// mesh-wide, for three minutes after the churn stopped. A cap that refuses
+	// an origin refuses a route, so it has to sit above anything a supervisor
+	// restarting a peer can produce.
+	maxOriginsPerPrefixPerNeighbor = 1 << 8
+	maxSourcesPerNeighbor          = 1 << 13
 )
+
+// originShare indexes what one neighbor has spent of one prefix's budget.
+type originShare struct {
+	route routeKey
+	peer  string
+}
 
 // better reports whether (seqno, metric) is strictly better than the stored
 // distance, the lexicographic order of RFC 8966 section 3.5.1 with the
@@ -54,7 +82,7 @@ func (e *sourceEntry) better(seqno, metric uint16) bool {
 
 // feasible applies the feasibility condition of RFC 8966 section 3.5.1.
 // Retractions are always feasible: they cannot close a loop.
-func (rt *routeTable) feasible(key routeKey, adv advertisement) bool {
+func (rt *routeTable) feasible(key routeKey, adv advertisement, from string) bool {
 	if adv.metric == MetricInfinity {
 		return true
 	}
@@ -63,8 +91,18 @@ func (rt *routeTable) feasible(key routeKey, adv advertisement) bool {
 		// A distance we have never recorded is feasible by definition, but
 		// recording it is what selecting the route would cost, so this is
 		// also where the table is bounded. See maxSources.
-		if len(rt.sources) >= maxSources || rt.originsPerKey[key] >= maxOriginsPerPrefix {
-			rt.tooManyOrigins(key, adv.routerID)
+		switch {
+		case len(rt.sources) >= maxSources:
+			rt.tooManyOrigins(key, adv.routerID, "the source table is full", maxSources)
+			return false
+		case rt.originsPerKey[key] >= maxOriginsPerPrefix:
+			rt.tooManyOrigins(key, adv.routerID, "this prefix has too many origins", maxOriginsPerPrefix)
+			return false
+		case rt.sourcesByPeer[from] >= maxSourcesPerNeighbor:
+			rt.tooManyOrigins(key, adv.routerID, "this neighbor has spent its share of the source table", maxSourcesPerNeighbor)
+			return false
+		case rt.originsBy[originShare{route: key, peer: from}] >= maxOriginsPerPrefixPerNeighbor:
+			rt.tooManyOrigins(key, adv.routerID, "this neighbor has spent its share of this prefix", maxOriginsPerPrefixPerNeighbor)
 			return false
 		}
 		return true
@@ -77,16 +115,18 @@ func (rt *routeTable) feasible(key routeKey, adv advertisement) bool {
 // loop freedom rests on the source table bounding what we have already told
 // our neighbors. Retractions neither update the distance nor reset the
 // garbage-collection timer.
-func (rt *routeTable) observe(key routeKey, adv advertisement, now time.Time) {
+func (rt *routeTable) observe(key routeKey, adv advertisement, from string, now time.Time) {
 	if adv.metric == MetricInfinity {
 		return
 	}
 	index := sourceKey{route: key, routerID: adv.routerID}
 	entry := rt.sources[index]
 	if entry == nil {
-		entry = &sourceEntry{seqno: adv.seqno, metric: adv.metric}
+		entry = &sourceEntry{seqno: adv.seqno, metric: adv.metric, owner: from}
 		rt.sources[index] = entry
 		rt.originsPerKey[key]++
+		rt.originsBy[originShare{route: key, peer: from}]++
+		rt.sourcesByPeer[from]++
 	} else if entry.better(adv.seqno, adv.metric) {
 		entry.seqno, entry.metric = adv.seqno, adv.metric
 	}
@@ -128,6 +168,17 @@ func (rt *routeTable) sweepSources(now time.Time) {
 			delete(rt.originsPerKey, index.route)
 		} else {
 			rt.originsPerKey[index.route]--
+		}
+		share := originShare{route: index.route, peer: entry.owner}
+		if rt.originsBy[share] <= 1 {
+			delete(rt.originsBy, share)
+		} else {
+			rt.originsBy[share]--
+		}
+		if rt.sourcesByPeer[entry.owner] <= 1 {
+			delete(rt.sourcesByPeer, entry.owner)
+		} else {
+			rt.sourcesByPeer[entry.owner]--
 		}
 	}
 }

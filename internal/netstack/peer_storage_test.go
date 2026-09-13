@@ -98,13 +98,11 @@ func TestSendRawOrDropDoesNotWaitForBackedUpPeer(t *testing.T) {
 	defer func() { unblock(); peer.Close() }()
 
 	// Fill the queue, then keep going against a transport that never returns.
-	// Each attempt gives up after controlSendWait rather than waiting for a
-	// slot that is never coming, so the whole run is bounded. The sends are on
-	// their own goroutine so a blocking one is reported rather than hanging.
-	// Enough to fill the queue and then keep pushing at a transport that has
-	// stopped, which is the case the drop exists for.
+	// Each attempt gives up rather than waiting for a place that is never
+	// coming, so the whole run is bounded. The sends are on their own
+	// goroutine so a blocking one is reported rather than hanging.
 	const beyond = 20
-	attempts := cap(peer.slots) + beyond
+	attempts := cap(peer.controlSlots) + beyond
 	dropped := make(chan int, 1)
 	go func() {
 		n := 0
@@ -156,7 +154,7 @@ func TestControlPacketDropsAreReported(t *testing.T) {
 	defer func() { unblock(); peer.Close() }()
 
 	var dropped int
-	for range cap(peer.slots) + 50 {
+	for range cap(peer.controlSlots) + 50 {
 		if err := sendOrDrop(peer, []byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
 			dropped++
 		}
@@ -190,14 +188,81 @@ func TestReservationFailureCountsAsADrop(t *testing.T) {
 		func([][]byte) error { return nil })
 	defer peer.Close()
 
-	place, err := peer.ReserveRawOrDrop([]byte("packet"), 41)
-	if err != nil {
-		t.Fatalf("the reservation was refused outright: %v", err)
+	// The caller is told, so it can give back whatever the packet consumed,
+	// and the place is sent anyway so the sender is not left waiting for it.
+	if _, err := peer.ReserveRawOrDrop([]byte("packet"), 41); !errors.Is(err, refused) {
+		t.Errorf("reserving reported %v, want the reservation's own error", err)
 	}
-	// The sender reports the failure where it discards the batch, not here, so
-	// the counter is the only thing a scrape can see.
-	place.Send()
 	if got := peer.Dropped(); got != 1 {
 		t.Errorf("the peer counted %d drops, want the one packet it could not send", got)
+	}
+}
+
+// Babel and the dataplane must not share one budget. The data budget is sized
+// by the core count, a bulk transfer consumes all of it, and sharing dropped
+// 98 of every 100 control packets under load. Three lost hellos withdraw every
+// route through the peer, so the transfer then has nowhere to go: the loss
+// feeds itself.
+func TestControlTrafficHasItsOwnBudget(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { <-release; return nil })
+	defer func() { unblock(); peer.Close() }()
+
+	// The dataplane takes everything it is allowed, which is what a bulk
+	// transfer through a backpressured socket looks like from here.
+	for i := range cap(peer.slots) {
+		if peer.reserveBatchNow(1) == nil {
+			t.Fatalf("the dataplane was refused place %d below its own budget", i)
+		}
+	}
+	if peer.reserveBatchNow(1) != nil {
+		t.Fatal("the dataplane took more than its budget, so this proves nothing")
+	}
+
+	// Babel still gets through, for as many packets as a periodic dump needs.
+	for i := range cap(peer.controlSlots) {
+		if _, err := peer.ReserveRawOrDrop([]byte("hello"), 41); err != nil {
+			t.Fatalf("control packet %d was dropped because the dataplane had filled its own budget: %v", i, err)
+		}
+	}
+	if _, err := peer.ReserveRawOrDrop([]byte("hello"), 41); err == nil {
+		t.Error("control traffic is bounded by nothing of its own")
+	}
+}
+
+// A closed peer must refuse everything it is offered. A select with both the
+// budget and the stop channel ready picks uniformly, so half of what a closed
+// peer was offered was accepted, reported as sent, never transmitted, and
+// never counted as dropped, which is the one counter that would have shown it.
+func TestAClosedPeerRefusesAndCountsEverything(t *testing.T) {
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return nil })
+	peer.Close()
+
+	const offered = 64
+	for range offered {
+		if place, err := peer.ReserveRawOrDrop([]byte("packet"), 41); err == nil {
+			place.Send()
+			t.Fatal("a closed peer took a control packet")
+		}
+		if peer.reserveBatchNow(1) != nil {
+			t.Fatal("a closed peer took a data batch")
+		}
+	}
+	if got := peer.Dropped(); got != 2*offered {
+		t.Errorf("the peer counted %d of %d packets it refused", got, 2*offered)
 	}
 }

@@ -18,7 +18,7 @@ func (p *Peer) reserveBatch(count int) *peerBatch {
 			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: peer %s closed", p.ID)}
 		}
 	}
-	return p.reserveBatchWithSlot(count, hasSlot)
+	return p.reserveBatchWithSlot(count, hasSlot, false)
 }
 
 // sendOrDrop takes a place and sends it in one step, which is what a caller

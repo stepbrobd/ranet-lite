@@ -86,6 +86,10 @@ type routeTable struct {
 	// originsPerKey is how many distinct origins each prefix has spent of
 	// maxOriginsPerPrefix, so one prefix cannot fill the whole source table.
 	originsPerKey map[routeKey]int
+	// originsBy is one neighbor's share of that, and sourcesByPeer its share
+	// of the whole table. See maxOriginsPerPrefixPerNeighbor.
+	originsBy     map[originShare]int
+	sourcesByPeer map[string]int
 	// dirty collects keys whose advertisement changed, for the triggered
 	// updates of RFC 8966 section 3.7.2; starved collects seqno requests.
 	// Both are drained by the Speaker, which owns all transmission.
@@ -111,6 +115,8 @@ func newRouteTable(install func(routeKey, routeSelection)) *routeTable {
 		entries:       make(map[routeKey]*keyEntry),
 		sources:       make(map[sourceKey]*sourceEntry),
 		originsPerKey: make(map[routeKey]int),
+		originsBy:     make(map[originShare]int),
+		sourcesByPeer: make(map[string]int),
 		dirty:         make(map[routeKey]struct{}),
 		install:       install,
 	}
@@ -119,7 +125,7 @@ func newRouteTable(install func(routeKey, routeSelection)) *routeTable {
 // update applies the route acquisition procedure of RFC 8966 section 3.5.3 to
 // one advertised route and reruns selection.
 func (rt *routeTable) update(n *neighborState, key routeKey, adv advertisement, hold time.Duration, now time.Time) {
-	feasible := rt.feasible(key, adv)
+	feasible := rt.feasible(key, adv, n.peer.ID)
 	entry := rt.entries[key]
 	var route *routeInfo
 	if entry != nil {
@@ -191,7 +197,7 @@ func (rt *routeTable) selectRoute(key routeKey, entry *keyEntry, now time.Time) 
 			continue // retain the candidate until its Update expires
 		}
 		route.smooth(cost, now, rt.tau)
-		if !rt.feasible(key, route.advertised()) {
+		if !rt.feasible(key, route.advertised(), n.peer.ID) {
 			// Section 3.6: an unfeasible route is never selected. A stored
 			// route can turn unfeasible after the fact, either through a
 			// metric fluctuation or because this node has since advertised a
@@ -424,13 +430,13 @@ func (rt *routeTable) overfull(key routeKey) {
 
 // tooManyOrigins reports a refused origin once rather than once per update,
 // for the same reason overfull does.
-func (rt *routeTable) tooManyOrigins(key routeKey, routerID [8]byte) {
+func (rt *routeTable) tooManyOrigins(key routeKey, routerID [8]byte, why string, limit int) {
 	if rt.warnedOrigins {
 		return
 	}
 	rt.warnedOrigins = true
-	slog.Warn("babel prefix has too many origins, refusing new ones",
-		"limit", maxOriginsPerPrefix, "prefix", key.dest, "refused", fmt.Sprintf("%x", routerID))
+	slog.Warn("babel is refusing a new origin: "+why,
+		"limit", limit, "prefix", key.dest, "refused", fmt.Sprintf("%x", routerID))
 }
 
 func (rt *routeTable) flush(key routeKey) {
