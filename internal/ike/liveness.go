@@ -15,8 +15,12 @@ import (
 )
 
 const (
-	dpdInterval  = 10 * time.Second
-	maxMessageID = ^uint32(0)
+	defaultDPDInterval = 10 * time.Second
+	// dpdRetryDelay is how long a liveness probe that could not be sent at all
+	// waits before it is tried again. Short, because nothing is outstanding
+	// and the peer may well be there.
+	dpdRetryDelay = time.Second
+	maxMessageID  = ^uint32(0)
 )
 
 var errMessageIDExhausted = errors.New("ike: Message ID space exhausted")
@@ -169,6 +173,16 @@ func nextDueRekey(schedules []*rekeySchedule, running *rekeySchedule) *rekeySche
 
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
+// dpdInterval is how long a session goes without an authenticated message
+// before it probes. A test that has to reach the probe overrides it; zero
+// means the default.
+func (s *Session) dpdInterval() time.Duration {
+	if s.dpdEvery > 0 {
+		return s.dpdEvery
+	}
+	return defaultDPDInterval
+}
+
 func (s *Session) Run(ctx context.Context) error {
 	var rekeys sync.WaitGroup
 	defer func() {
@@ -268,7 +282,7 @@ func (s *Session) Run(ctx context.Context) error {
 			}
 		}
 
-		deadline := lastAuthenticated.Add(dpdInterval)
+		deadline := lastAuthenticated.Add(s.dpdInterval())
 		if pending != nil {
 			deadline = pending.deadline
 		}
@@ -342,7 +356,7 @@ func (s *Session) Run(ctx context.Context) error {
 			continue
 		}
 		if pending != nil && !time.Now().Before(pending.deadline) {
-			if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
+			if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < s.dpdInterval()) {
 				s.mux.Close()
 				return fmt.Errorf("ike: peer unresponsive after %d attempts", pending.sent)
 			}
@@ -350,12 +364,20 @@ func (s *Session) Run(ctx context.Context) error {
 			// bitwise-identical request until a response arrives or the IKE SA
 			// is declared failed. Other authenticated traffic can keep an
 			// ordinary exchange alive; a silent peer must still time out.
+			// A send that failed locally is a transmission that did not
+			// happen, not a peer that has gone. RFC 7296 section 2.4: "an
+			// endpoint MUST NOT conclude that the other endpoint has failed
+			// based on any routing information (e.g., ICMP messages) ... An
+			// endpoint MUST conclude that the other endpoint has failed only
+			// when repeated attempts to contact it have gone unanswered for a
+			// timeout period." The syscall returns ENETUNREACH while a route
+			// is being rewritten, which on a node running this reconciler and
+			// a routing daemon is an ordinary moment, and tearing the SA down
+			// for it takes every route through the peer with it. The attempt
+			// counter is what declares the peer dead, above.
 			if err := s.sendPending(pending); err != nil {
-				if pending.dpd {
-					s.mux.Close()
-					return fmt.Errorf("ike: DPD failed: %w", err)
-				}
-				slog.Warn("ike request retransmission failed; retrying", "exchange", pending.exchange, "message_id", pending.msgID, "err", err)
+				slog.Warn("ike request retransmission failed; retrying", "exchange", pending.exchange,
+					"message_id", pending.msgID, "dpd", pending.dpd, "err", err)
 			}
 			continue
 		}
@@ -369,11 +391,16 @@ func (s *Session) Run(ctx context.Context) error {
 			lastAuthenticated = time.Now()
 			s.noteActive()
 		}
-		if pending == nil && !time.Now().Before(lastAuthenticated.Add(dpdInterval)) {
+		if pending == nil && !time.Now().Before(lastAuthenticated.Add(s.dpdInterval())) {
 			started, err := s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})
 			if err != nil {
-				s.mux.Close()
-				return fmt.Errorf("ike: DPD failed: %w", err)
+				// The probe was not sent, which is the retransmission case
+				// above rather than a dead peer: startRequest fails on the
+				// same local errors, and a pending it did build carries its
+				// own attempt budget. Nothing is pending, so the next pass
+				// tries again at the next deadline.
+				slog.Warn("ike liveness probe not sent; retrying", "err", err)
+				lastAuthenticated = time.Now().Add(-s.dpdInterval()).Add(dpdRetryDelay)
 			}
 			pending = started
 		}
@@ -643,8 +670,11 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				if err != nil {
 					return nil, err
 				}
-				if s.removeRetainedContext(ctx) || s.adoptCollisionOnPeerDelete(ctx) {
-					s.mux.UnregisterIKE(ctx.spiI)
+				removed, releaseSPI := s.removeRetainedContext(ctx)
+				if removed || s.adoptCollisionOnPeerDelete(ctx) {
+					if !removed || releaseSPI {
+						s.mux.UnregisterIKE(ctx.spiI)
+					}
 					return response, nil
 				}
 				return response, fmt.Errorf("peer deleted IKE SA")

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -390,7 +391,7 @@ func TestLocalRequestIsPickedUpWithoutPolling(t *testing.T) {
 			t.Fatalf("informational exchange: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("local request was not picked up within 2s, dpd interval is %s", dpdInterval)
+		t.Fatalf("local request was not picked up within 2s, dpd interval is %s", defaultDPDInterval)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("local request took %s", elapsed)
@@ -1081,7 +1082,7 @@ func TestTrafficPostponesDeadPeerDetection(t *testing.T) {
 		}
 		// Nothing runs the responder's own loop, so whatever arrives here is
 		// what the initiator sent unprompted.
-		_, err = peer.Mux().RecvIKEUntil(time.Now().Add(dpdInterval + 3*time.Second))
+		_, err = peer.Mux().RecvIKEUntil(time.Now().Add(defaultDPDInterval + 3*time.Second))
 		return err == nil
 	}
 	// The quiet session is the positive control: without it, a busy session
@@ -1384,3 +1385,110 @@ func TestResponderChecksTheNonceAgainstTheNegotiatedPRF(t *testing.T) {
 		t.Error("a 16 byte nonce under HMAC-SHA2-256 was refused, which is the length rule rather than the PRF one")
 	}
 }
+
+// Anyone who can see the responder SPI can send a datagram carrying the right
+// IKE_AUTH header and contents this end cannot decrypt. Acting on one would
+// end a handshake this end has already paid a key exchange for, which is the
+// cheapest way to stop every session a node opens. Nothing unauthenticated
+// changes state (RFC 7296 section 2.21, RFC 7815 section 2.1); the deadline is
+// what ends the wait.
+func TestAnUndecryptableDatagramDoesNotEndTheHandshake(t *testing.T) {
+	hub, err := transport.NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	peerHub, err := transport.NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerHub.Close()
+	port := func(h *transport.Hub) int { return h.LocalAddr().(*net.UDPAddr).Port }
+	mux, err := hub.NewMux(net.IPv4(127, 0, 0, 1), port(peerHub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := peerHub.NewMux(net.IPv4(127, 0, 0, 1), port(hub))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const spiI, spiR = 0x0102030405060708, 0x1112131415161718
+	key := bytes.Repeat([]byte{9}, 20)
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ctx := &ikeContext{suite: suite, spiI: spiI, spiR: spiR, skei: key, sker: key, responder: true}
+	s := &Session{mux: mux, current: ctx}
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+
+	header := Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: IKE_AUTH,
+		Flags: FlagInitiator, MessageID: 1}
+	good, err := EncryptMessage(suite, key, header, nil, []RawPayload{{Type: PayloadN,
+		Body: EncodeNotify(Notify{Type: N_INITIAL_CONTACT})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same header, with the ciphertext replaced. It decodes and fails the
+	// AEAD, which is the arm under test.
+	bad := append([]byte(nil), good...)
+	for i := len(bad) - 16; i < len(bad); i++ {
+		bad[i] ^= 0xff
+	}
+	if err := peer.SendIKE(bad); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SendIKE(good); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.awaitAuthRequest(nil, nil, time.Now().Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("an undecryptable datagram ended the handshake: %v", err)
+	}
+	if !bytes.Equal(got.raw, good) {
+		t.Error("the request returned is not the one that authenticated")
+	}
+}
+
+// Anyone who can reach the port can make a handshake fail, so the line has to
+// be rare; but at debug it was invisible at the default level, and an operator
+// looking at "that peer cannot connect" had nothing on this side to read. Both
+// halves matter: the first failure in an interval is said at warn, and the
+// ones behind it drop to debug rather than being repeated.
+func TestAFailedInboundHandshakeIsSaidOnceAtWarn(t *testing.T) {
+	var levels []slog.Level
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	slog.SetDefault(slog.New(&levelRecorder{levels: &levels}))
+
+	r := &Responder{started: time.Now()}
+	// What NewResponder does: primed one interval in the past so the first
+	// failure is not swallowed by the limiter that exists for the repeats.
+	r.failureReported.Store(-int64(handshakeFailureInterval))
+	for range 4 {
+		r.noteHandshakeFailure(nil, errors.New("no registry entry"))
+	}
+	if len(levels) != 4 {
+		t.Fatalf("four failures wrote %d lines", len(levels))
+	}
+	if levels[0] != slog.LevelWarn {
+		t.Errorf("the first failure in an interval is at %v, want warn: at debug an operator sees nothing", levels[0])
+	}
+	for _, level := range levels[1:] {
+		if level != slog.LevelDebug {
+			t.Errorf("a repeat inside the interval is at %v, want debug: anyone who can reach the port can drive these", level)
+		}
+	}
+}
+
+// levelRecorder keeps the level of every record and discards the rest.
+type levelRecorder struct{ levels *[]slog.Level }
+
+func (h *levelRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (h *levelRecorder) Handle(_ context.Context, r slog.Record) error {
+	*h.levels = append(*h.levels, r.Level)
+	return nil
+}
+func (h *levelRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *levelRecorder) WithGroup(string) slog.Handler      { return h }

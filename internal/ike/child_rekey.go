@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 // RekeyChild replaces the current Child SA without a new Diffie-Hellman
@@ -247,11 +248,20 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 		}
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
+	// A local failure from here on answers TEMPORARY_FAILURE rather than
+	// returning an error, which Run turns into a teardown of the IKE SA. RFC
+	// 7296 section 1.3.1: "A failed attempt to create a Child SA SHOULD NOT
+	// tear down the IKE SA: there is no reason to lose the work done to set up
+	// the IKE SA."
+	fail := func(err error) ([]byte, error) {
+		slog.Warn("ike cannot answer a peer Child SA rekey", "err", err)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+	}
 	var sharedSecret, localPublic []byte
 	if selected.dh.ID != 0 {
 		dh, err := GenerateDH(selected.dh.ID)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		sharedSecret, err = dh.SharedSecret(peerPublic)
 		if err != nil {
@@ -263,20 +273,20 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	var spi [4]byte
 	for binary.BigEndian.Uint32(spi[:]) == 0 {
 		if _, err := rand.Read(spi[:]); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 	nr := make([]byte, 32)
 	if _, err := rand.Read(nr); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	initKey, respKey, err := childSAKeymat(ctx.suite.PRFID, ctx.skD, sharedSecret, payloads.nonce.Body, nr, encr.ID, encr.KeyLengthBits)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	replacement := ChildSA{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, LocalSPI: binary.BigEndian.Uint32(spi[:]), RemoteSPI: selected.remoteSPI, InboundKey: initKey, OutboundKey: respKey}
 	if err := s.replaceChild(replacement); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	responseEncr := encr
 	if responseEncr.ID == ENCR_CHACHA20_POLY1305 {

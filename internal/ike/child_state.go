@@ -100,6 +100,13 @@ func (s *Session) retireChild(remoteSPI uint32) error {
 	s.childMu.Lock()
 	defer s.childMu.Unlock()
 	retiring := s.retiring
+	if retiring.LocalSPI == 0 {
+		// Already retired, which is what the peer's own Delete for this SA
+		// crossing ours looks like from here: deleteChildren cleared it before
+		// our exchange came back. RFC 7296 section 1.4.1 describes the
+		// crossing; there is nothing left to do and nothing wrong.
+		return nil
+	}
 	if retiring.RemoteSPI != remoteSPI {
 		return fmt.Errorf("ike: no retiring Child SA with remote SPI %08x", remoteSPI)
 	}

@@ -136,6 +136,8 @@ type Session struct {
 	// lastPeerChildRekey is when the last peer-initiated Child SA rekey was
 	// accepted, on the same clock and with the same plus-one as lastActive.
 	lastPeerChildRekey atomic.Int64
+	// lastPeerIKERekey is the same for the IKE SA. See minPeerIKERekeyInterval.
+	lastPeerIKERekey atomic.Int64
 
 	childRekeyInterval time.Duration
 	ikeRekeyInterval   time.Duration
@@ -144,10 +146,16 @@ type Session struct {
 	rekeyRetryInitial  time.Duration
 	rekeyRetryMax      time.Duration
 	rekeyJitterSource  func(time.Duration) (time.Duration, error)
+	// dpdEvery overrides defaultDPDInterval; zero means the default.
+	dpdEvery time.Duration
 }
 
 type ikeRekey struct {
-	old               *ikeContext
+	old *ikeContext
+	// spiI is the SPI this end drew for the SA it is creating. It goes out in
+	// the request, so a peer that answers with a rekey of its own has seen it;
+	// handleIKERekey refuses it for the reason given there.
+	spiI              uint64
 	nonce             []byte
 	peerNonce         []byte
 	peerResponseNonce []byte
@@ -184,15 +192,42 @@ func (s *Session) nextPeerMessageID(ctx *ikeContext) uint32 {
 const retainedContextDeadline = 2 * time.Minute
 
 // retainOldLocked keeps the SA a rekey replaced reachable for the peer's
-// Delete. It must be called with stateMu held.
+// Delete. It must be called with stateMu held. Whatever it displaces is
+// released rather than dropped: a context held nowhere is one
+// expireRetainedContexts can never reach, and its SPI stays in the hub's map
+// for the life of the session.
 func (s *Session) retainOldLocked(ctx *ikeContext) {
+	s.releaseDisplacedLocked(s.old, ctx)
 	s.old, s.oldBy = ctx, time.Now().Add(retainedContextDeadline)
 }
 
 // retainCollisionLocked does the same for the candidate a simultaneous rekey
 // decided against. It must be called with stateMu held.
 func (s *Session) retainCollisionLocked(ctx *ikeContext) {
+	s.releaseDisplacedLocked(s.collision, ctx)
 	s.collision, s.collisionBy = ctx, time.Now().Add(retainedContextDeadline)
+}
+
+// releaseDisplacedLocked gives back the SPI of a context that is about to stop
+// being held, unless something else still holds it.
+func (s *Session) releaseDisplacedLocked(displaced, replacement *ikeContext) {
+	if displaced == nil || displaced == replacement || s.stillHeldLocked(displaced, replacement) {
+		return
+	}
+	slog.Warn("ike dropping an IKE SA a second rekey displaced", "spi", displaced.spiI)
+	s.mux.UnregisterIKE(displaced.spiI)
+}
+
+// stillHeldLocked reports whether any context other than the one being
+// displaced is routed by the same SPI, which is what makes unregistering it
+// unsafe. It must be called with stateMu held.
+func (s *Session) stillHeldLocked(displaced, replacement *ikeContext) bool {
+	for _, held := range []*ikeContext{s.current, s.old, s.collision, replacement} {
+		if held != nil && held != displaced && held.spiI == displaced.spiI {
+			return true
+		}
+	}
+	return false
 }
 
 // expireRetainedContexts drops a retained IKE SA whose Delete never arrived.
@@ -239,18 +274,22 @@ func (s *Session) nextRetainedExpiry() (time.Time, bool) {
 	return earliest, !earliest.IsZero()
 }
 
-func (s *Session) removeRetainedContext(ctx *ikeContext) bool {
+// removeRetainedContext drops a retained SA the peer has deleted, and reports
+// whether its SPI may be unregistered: another context routed by the same SPI
+// would be made deaf by that, which is a session that keeps sending ESP into a
+// peer that answers nothing until its own liveness check expires.
+func (s *Session) removeRetainedContext(ctx *ikeContext) (removed, releaseSPI bool) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if s.old == ctx {
+	switch {
+	case s.old == ctx:
 		s.old = nil
-		return true
-	}
-	if s.collision == ctx {
+	case s.collision == ctx:
 		s.collision = nil
-		return true
+	default:
+		return false, false
 	}
-	return false
+	return true, !s.stillHeldLocked(ctx, nil)
 }
 
 // adoptCollisionOnPeerDelete is the second half of RFC 7296 section 2.8.2:
@@ -953,7 +992,7 @@ func usefulInitNotify(m *Message, cookieUsed, groupUsed bool) (Notify, bool) {
 // in that window could keep different sessions.
 func (s *Session) Active() bool {
 	last := s.lastActive.Load()
-	return last != 0 && time.Since(s.started)-time.Duration(last-1) < 2*dpdInterval
+	return last != 0 && time.Since(s.started)-time.Duration(last-1) < 2*s.dpdInterval()
 }
 
 // noteActive records that the peer has just proved it is still there.
@@ -971,11 +1010,34 @@ const minPeerChildRekeyInterval = time.Second
 // allowPeerChildRekey reports whether to take on another peer-initiated Child
 // SA rekey, and records it when it does.
 func (s *Session) allowPeerChildRekey() bool {
-	now := int64(time.Since(s.started))
-	if last := s.lastPeerChildRekey.Load(); last != 0 && now-(last-1) < int64(minPeerChildRekeyInterval) {
+	return allowPeerRekey(&s.lastPeerChildRekey, s.started, minPeerChildRekeyInterval)
+}
+
+// minPeerIKERekeyInterval is the shortest gap between accepted peer-initiated
+// IKE SA rekeys. One costs more than a Child rekey, not less: a key exchange,
+// a shared secret, a full key derivation and a registration in the hub's SPI
+// map, 78 us measured, on the goroutine that also runs this session's dead
+// peer detection, its scheduled rekeys and its Delete handling. The request
+// and the Delete that lets the peer ask again are 282 bytes between them, so
+// without this a peer buys the whole of that goroutine for about 33 Mbit/s.
+// A legitimate IKE rekey is an interval apart, and that is minutes.
+const minPeerIKERekeyInterval = time.Second
+
+// allowPeerIKERekey is allowPeerChildRekey for the IKE SA.
+func (s *Session) allowPeerIKERekey() bool {
+	return allowPeerRekey(&s.lastPeerIKERekey, s.started, minPeerIKERekeyInterval)
+}
+
+// allowPeerRekey is the shared body. The stored value is nanoseconds since the
+// session started plus one, so zero still means "never", and it comes off the
+// monotonic clock: on the wall clock a step backwards turns the limit off for
+// the length of the step.
+func allowPeerRekey(last *atomic.Int64, started time.Time, interval time.Duration) bool {
+	now := int64(time.Since(started))
+	if previous := last.Load(); previous != 0 && now-(previous-1) < int64(interval) {
 		return false
 	}
-	s.lastPeerChildRekey.Store(now + 1)
+	last.Store(now + 1)
 	return true
 }
 

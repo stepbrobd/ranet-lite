@@ -773,3 +773,40 @@ func TestRunLoopWakesForRetainedIKESA(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// A liveness probe this end cannot send is not evidence about the peer, and
+// tearing the SA down for it takes every route through that peer with it. The
+// attempt counter above declares a peer dead; a send that never left this node
+// says nothing either way, so the loop retries on dpdRetryDelay and keeps
+// serving. Reverting this closed the mux on the first probe that failed.
+func TestProbeThisEndCannotSendDoesNotEndTheSession(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	// A key the AEAD will not take, so every startRequest fails inside
+	// encrypt: a probe that never reaches the wire, which is the shape a
+	// transport failure has from the loop's side.
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ctx := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: make([]byte, 32),
+		skei: []byte{1, 2, 3}, sker: []byte{1, 2, 3}}
+	// The interval shortened so the probe is reached in milliseconds rather
+	// than in the ten seconds a session uses.
+	s := &Session{mux: mux, current: ctx, requests: make(chan *localRequest),
+		dpdEvery: 50 * time.Millisecond}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(runCtx) }()
+
+	// Past the first probe and the retries behind it. dpdRetryDelay is a
+	// second, so this is the first failure and two more after it.
+	select {
+	case err := <-done:
+		t.Fatalf("a probe that could not be sent ended the session: %v", err)
+	case <-time.After(s.dpdInterval() + 2*dpdRetryDelay):
+	}
+	if mux.IsClosed() {
+		t.Error("a probe that could not be sent closed the mux, which drops every route through this peer")
+	}
+	cancel()
+	<-done
+}

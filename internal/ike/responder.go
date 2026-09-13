@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/transport"
@@ -155,6 +156,12 @@ type Responder struct {
 	cfg   ResponderConfig
 	local map[Identity]struct{}
 
+	// started and failureReported bound how often a failed inbound handshake
+	// is said out loud, on the monotonic clock, primed one interval in the
+	// past so the first one is not swallowed. See noteHandshakeFailure.
+	started         time.Time
+	failureReported atomic.Int64
+
 	mu       sync.Mutex
 	halfOpen int
 	// halfOpenBySource is how many of those one address is holding.
@@ -186,7 +193,8 @@ func NewResponder(cfg ResponderConfig) (*Responder, error) {
 	if cfg.Lookup == nil {
 		return nil, fmt.Errorf("ike: responder needs a peer lookup")
 	}
-	r := &Responder{cfg: cfg, local: make(map[Identity]struct{}, len(cfg.Local))}
+	r := &Responder{cfg: cfg, local: make(map[Identity]struct{}, len(cfg.Local)), started: time.Now()}
+	r.failureReported.Store(-int64(handshakeFailureInterval))
 	for _, id := range cfg.Local {
 		r.local[id] = struct{}{}
 	}
@@ -217,7 +225,11 @@ func (r *Responder) Serve(ctx context.Context, onSession func(*Session, Accepted
 			running.Go(func() {
 				session, accepted, err := r.handshake(ctx, datagram)
 				if err != nil {
-					slog.Debug("ike responder handshake failed", "peer", datagram.Endpoint, "err", err)
+					// Warn rather than debug: this is the whole responder side
+					// of "that peer cannot connect", and at the default level
+					// it said nothing at all. Anyone who can reach the port
+					// can drive it, so it is rate limited rather than free.
+					r.noteHandshakeFailure(datagram.Endpoint, err)
 					return
 				}
 				onSession(session, accepted)
@@ -473,19 +485,12 @@ func (r *Responder) buildSAInitResponse(spiI, spiR uint64, proposal Proposal, su
 // IKE_SA_INIT while waiting is answered with the identical response.
 func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2, ni, nr []byte, deadline time.Time) (Accepted, error) {
 	ctx := s.current
-	raw, source, err := s.awaitAuthRequest(realMessage1, realMessage2, deadline)
+	got, err := s.awaitAuthRequest(realMessage1, realMessage2, deadline)
 	if err != nil {
 		return Accepted{}, err
 	}
-	outer, err := DecodeMessage(raw)
-	if err != nil {
-		return Accepted{}, fmt.Errorf("ike: decode IKE_AUTH request: %w", err)
-	}
-	innerFirst, plaintext, err := decryptMessagePlaintext(ctx.suite, ctx.peerEncryptionKey(), raw, outer)
-	if err != nil {
-		return Accepted{}, fmt.Errorf("ike: decrypt IKE_AUTH request: %w", err)
-	}
-	inner, err := decodeMessagePlaintext(innerFirst, plaintext)
+	outer, source := got.outer, got.source
+	inner, err := decodeMessagePlaintext(got.innerFirst, got.plaintext)
 	if err != nil {
 		return Accepted{}, fmt.Errorf("ike: malformed IKE_AUTH request: %w", err)
 	}
@@ -576,6 +581,16 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 	return Accepted{Peer: peerID, Local: localID}, nil
 }
 
+// authRequest is the first IKE_AUTH request that decrypted under this
+// half-open SA's keys, with the pieces that proved it.
+type authRequest struct {
+	raw        []byte
+	outer      *Message
+	innerFirst PayloadType
+	plaintext  []byte
+	source     transport.Endpoint
+}
+
 // awaitAuthRequest waits for the initiator's IKE_AUTH, answering a repeat of
 // the IKE_SA_INIT request with the identical response we already sent.
 //
@@ -586,12 +601,12 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 // reflector: a bare header naming a live SPIi, which anyone who opened one
 // knows, would otherwise draw the full response at whatever source address it
 // claimed.
-func (s *Session) awaitAuthRequest(saInitRequest, saInitResponse []byte, deadline time.Time) ([]byte, transport.Endpoint, error) {
+func (s *Session) awaitAuthRequest(saInitRequest, saInitResponse []byte, deadline time.Time) (*authRequest, error) {
 	ctx := s.current
 	for {
 		raw, source, err := s.mux.RecvIKEFromUntil(deadline)
 		if err != nil {
-			return nil, nil, fmt.Errorf("ike: waiting for IKE_AUTH: %w", err)
+			return nil, fmt.Errorf("ike: waiting for IKE_AUTH: %w", err)
 		}
 		header, err := decodeHeader(raw)
 		if err != nil || header.MajorVersion != 2 || header.Length != uint32(len(raw)) ||
@@ -603,15 +618,47 @@ func (s *Session) awaitAuthRequest(saInitRequest, saInitResponse []byte, deadlin
 				continue
 			}
 			if err := s.mux.SendIKETo(saInitResponse, source); err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			continue
 		}
 		if header.ExchangeType != IKE_AUTH || header.MessageID != 1 || header.SPIResponder != ctx.spiR {
 			continue
 		}
-		return raw, source, nil
+		// Decoded and decrypted here rather than by the caller, so that a
+		// datagram carrying the right header and the wrong contents is one
+		// more thing to keep waiting past. Anyone who can see the responder
+		// SPI can send one, and acting on it would end a handshake this end
+		// has already paid for. It is the rule sendRecv follows for the rest
+		// of the session, RFC 7296 section 2.21 and RFC 7815 section 2.1:
+		// nothing unauthenticated changes state. The deadline is what ends
+		// the wait.
+		outer, err := DecodeMessage(raw)
+		if err != nil {
+			continue
+		}
+		innerFirst, plaintext, err := decryptMessagePlaintext(ctx.suite, ctx.peerEncryptionKey(), raw, outer)
+		if err != nil {
+			continue
+		}
+		return &authRequest{raw: raw, outer: outer, innerFirst: innerFirst, plaintext: plaintext, source: source}, nil
 	}
+}
+
+// handshakeFailureInterval bounds how often a failed inbound handshake is
+// logged. Anyone who can reach the port can cause one, so the line has to be
+// rare; but at debug it was invisible at the default level, and an operator
+// looking at "that peer cannot connect" had nothing on this side to read.
+const handshakeFailureInterval = 10 * time.Second
+
+func (r *Responder) noteHandshakeFailure(endpoint transport.Endpoint, err error) {
+	now := int64(time.Since(r.started))
+	previous := r.failureReported.Load()
+	if now-previous < int64(handshakeFailureInterval) || !r.failureReported.CompareAndSwap(previous, now) {
+		slog.Debug("ike responder handshake failed", "peer", endpoint, "err", err)
+		return
+	}
+	slog.Warn("ike responder handshake failed", "peer", endpoint, "err", err)
 }
 
 // rejectAuth answers a failed authentication inside the SK payload, which the

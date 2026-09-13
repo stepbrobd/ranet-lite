@@ -15,8 +15,11 @@ func (s *Session) RekeyIKE() error {
 	defer s.requestMu.Unlock()
 
 	old := s.currentContext()
+	// Neither SPI of the SA being replaced, for the reason handleIKERekey
+	// gives about the peer's choice: the replaced SA stays routed by both
+	// until its Delete completes, and the Delete unregisters what it named.
 	spiI := randUint64Nonzero()
-	for spiI == old.spiI {
+	for spiI == old.spiI || spiI == old.spiR {
 		spiI = randUint64Nonzero()
 	}
 	group := uint16(DH_CURVE25519)
@@ -25,7 +28,7 @@ func (s *Session) RekeyIKE() error {
 		return fmt.Errorf("ike: generate IKE SA rekey nonce: %w", err)
 	}
 	s.stateMu.Lock()
-	s.localRekey = &ikeRekey{old: old, nonce: ni}
+	s.localRekey = &ikeRekey{old: old, spiI: spiI, nonce: ni}
 	s.stateMu.Unlock()
 	defer func() {
 		s.stateMu.Lock()
@@ -185,12 +188,22 @@ func (s *Session) RekeyIKE() error {
 				_, err := s.requestOnLocked(newContext, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}})
 				return err
 			}()
-			s.mux.UnregisterIKE(spiI)
+			// Only if nothing else is routed by it, the rule the three sites
+			// around removeRetainedContext and releaseDisplacedLocked already
+			// follow. handleIKERekey refuses a peer that names this SPI back,
+			// so the two contexts should never share one; the guard is here
+			// because being wrong about that unregisters the SA the session is
+			// now current on and leaves the control channel deaf while ESP
+			// keeps flowing, and because the peer chooses when to try.
 			s.stateMu.Lock()
+			release := !s.stillHeldLocked(newContext, nil)
 			if s.collision == newContext {
 				s.collision = nil
 			}
 			s.stateMu.Unlock()
+			if release {
+				s.mux.UnregisterIKE(spiI)
+			}
 			if deleteErr != nil {
 				return fmt.Errorf("ike: delete redundant local IKE SA: %w", deleteErr)
 			}
@@ -218,8 +231,16 @@ func (s *Session) RekeyIKE() error {
 	s.current = newContext
 	s.stateMu.Unlock()
 
+	// The replacement is current from here, so the rekey has taken effect
+	// whatever this exchange does. A peer whose own Delete for the old SA
+	// arrives first retires it under us, and Run then fails this exchange with
+	// "the IKE SA carrying this exchange was replaced" -- reporting that as a
+	// failed rekey costs a backoff and a second rekey that is not needed. The
+	// Delete is best effort; RFC 7296 section 2.8 has the initiator of the
+	// rekey delete the old SA, and the peer doing it first is the same
+	// outcome.
 	if _, err := s.requestOnLocked(old, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
-		return fmt.Errorf("ike: retire replaced IKE SA: %w", err)
+		slog.Info("ike replaced IKE SA was not deleted by this end", "spi", old.spiI, "err", err)
 	}
 	s.mux.UnregisterIKE(old.spiI)
 	s.stateMu.Lock()
@@ -238,6 +259,11 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	accept := ctx == s.current && (s.old == nil || s.localRekey != nil) && s.collision == nil
 	s.stateMu.RUnlock()
 	if !accept || s.childRekeying.Load() || s.retiringChild().LocalSPI != 0 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+	}
+	// Checked before the key exchange and the derivation, which is the work
+	// the peer is really asking for. See minPeerIKERekeyInterval.
+	if !s.allowPeerIKERekey() {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
 	}
 	var sa, nonce, ke *RawPayload
@@ -313,9 +339,36 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	spiI := binary.BigEndian.Uint64(selectedProposal.SPI)
+	// The peer names the SPI for the SA it is creating, and the one this
+	// session already holds is not available: registering it succeeds, because
+	// the owner is this same mux, and the Delete that retires the replaced SA
+	// then unregisters an SPI the current one is still routed by, leaving the
+	// control channel deaf while ESP keeps flowing. RFC 7296 section 2.6 has
+	// the initiator choose its SPI; a conforming peer never picks this one.
+	//
+	// An in-flight local rekey's SPI is refused for the same reason and is the
+	// easier one to hit, because this end published it in its own request
+	// rather than the peer having to guess it. Naming it back makes the two
+	// candidates share an SPI, and the losing branch of RekeyIKE then
+	// unregisters the SPI the winning context was just installed under.
+	s.stateMu.RLock()
+	inFlight := uint64(0)
+	if s.localRekey != nil {
+		inFlight = s.localRekey.spiI
+	}
+	s.stateMu.RUnlock()
+	if spiI == ctx.spiI || spiI == ctx.spiR || spiI == inFlight {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	// A local failure from here on answers TEMPORARY_FAILURE rather than
+	// returning an error, which Run turns into a teardown. RFC 7296 section
+	// 1.3.1: "A failed attempt to create a Child SA SHOULD NOT tear down the
+	// IKE SA: there is no reason to lose the work done to set up the IKE SA."
+	// The same reasoning holds for the IKE SA this is replacing.
 	dh, err := GenerateDH(group)
 	if err != nil {
-		return nil, fmt.Errorf("ike: generate peer IKE rekey DH key: %w", err)
+		slog.Warn("ike cannot answer a peer IKE rekey", "err", err)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
 	}
 	shared, err := dh.SharedSecret(peerPublic)
 	if err != nil {
@@ -323,15 +376,20 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	}
 	nr := make([]byte, 32)
 	if err := s.fillIKERekeyNonce(nr); err != nil {
-		return nil, fmt.Errorf("ike: generate peer IKE rekey nonce: %w", err)
+		slog.Warn("ike cannot answer a peer IKE rekey", "err", err)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
 	}
 	spiR := randUint64Nonzero()
 	keys, err := DeriveRekeyedIKEKeys(ctx.suite.PRFID, ctx.skD, suite, shared, nonce.Body, nr, spiI, spiR)
 	if err != nil {
-		return nil, fmt.Errorf("ike: derive peer IKE rekey keys: %w", err)
+		slog.Warn("ike cannot answer a peer IKE rekey", "err", err)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
 	}
 	if err := s.mux.RegisterIKE(spiI); err != nil {
-		return nil, fmt.Errorf("ike: register peer rekeyed IKE SA: %w", err)
+		// The SPI map is shared by every mux on the hub, so a peer that holds
+		// two sessions with this node knows an SPI that is already taken.
+		slog.Warn("ike cannot answer a peer IKE rekey", "err", err)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
 	}
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR, responder: true}
 	s.stateMu.Lock()

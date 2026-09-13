@@ -497,3 +497,34 @@ func TestReplacedChildSAThePeerNeverDeletesIsRetiredAnyway(t *testing.T) {
 		t.Error("the replaced SA's inbound keys were never dropped")
 	}
 }
+
+// Both ends may decide to close one Child SA at once, and RFC 7296 section
+// 1.4.1 describes the crossing: "If a node receives a delete request for SAs
+// for which it has already issued a delete request, it MUST delete the
+// outgoing SAs while processing the request and the incoming SAs while
+// processing the response." The peer's Delete arriving first clears the
+// retiring entry through deleteChildren, so this end's own exchange comes back
+// to nothing left to retire. Reporting that as an error fails the rekey that
+// had already succeeded, and the caller then retries a replacement it has.
+func TestRetiringAChildTwiceIsNotAFailure(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	retiring := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 7, RemoteSPI: 8}
+	s := &Session{mux: mux, retiring: retiring, childRetireDelay: time.Millisecond}
+	if err := mux.RegisterESP(retiring.LocalSPI); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.retireChild(retiring.RemoteSPI); err != nil {
+		t.Fatalf("the first retirement failed: %v", err)
+	}
+	if err := s.retireChild(retiring.RemoteSPI); err != nil {
+		t.Errorf("retiring an SA the peer's crossing Delete already took reported %v", err)
+	}
+	// A remote SPI that was never retiring is still an error: the idempotence
+	// is about the crossing, not about accepting any SPI at all.
+	s.childMu.Lock()
+	s.retiring = ChildSA{LocalSPI: 9, RemoteSPI: 10}
+	s.childMu.Unlock()
+	if err := s.retireChild(99); err == nil {
+		t.Error("retiring an SPI no SA is retiring under was accepted")
+	}
+}

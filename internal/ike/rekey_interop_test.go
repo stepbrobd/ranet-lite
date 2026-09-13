@@ -291,3 +291,51 @@ func TestChaChaChildRekeyResponseEchoesNoKeyLength(t *testing.T) {
 		}
 	}
 }
+
+// The Child path's half of the same rule. A local failure installing the
+// replacement is not the peer's fault and not a reason to lose the IKE SA that
+// carried the exchange; RFC 7296 section 1.3.1 is explicit that "A failed
+// attempt to create a Child SA SHOULD NOT tear down the IKE SA". Returning an
+// error instead sends Run down the teardown path.
+func TestALocalFailureAnsweringAChildRekeyIsTemporary(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ctx := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: bytes.Repeat([]byte{1}, 32),
+		skei: bytes.Repeat([]byte{2}, 20), sker: bytes.Repeat([]byte{3}, 20)}
+	old := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 21, RemoteSPI: 22}
+	s := &Session{mux: mux, current: ctx, Child: old, started: time.Now()}
+	// The dataplane refusing the replacement is the shape this actually takes:
+	// the SA is negotiated and cannot be installed here.
+	s.SetChildHandler(func(ChildSA) error { return errors.New("the dataplane is gone") })
+
+	raw, err := s.handleChildRekey(ctx, 0, []RawPayload{
+		{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_REKEY_SA, Protocol: ProtoESP,
+			SPI: binary.BigEndian.AppendUint32(nil, old.RemoteSPI)})},
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{espProposal(binary.BigEndian.AppendUint32(nil, 32))})},
+		{Type: PayloadNonce, Body: bytes.Repeat([]byte{4}, 32)},
+		{Type: PayloadTSi, Body: fullRangeSelectors()},
+		{Type: PayloadTSr, Body: fullRangeSelectors()},
+	})
+	if err != nil {
+		t.Fatalf("a local failure was returned as an error, which Run turns into a teardown: %v", err)
+	}
+	message, err := DecodeMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := DecryptMessage(suite, ctx.localEncryptionKey(), raw, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := findType(inner, PayloadN)
+	if payload == nil {
+		t.Fatal("a local failure answered with a whole SA")
+	}
+	notify, err := DecodeNotify(payload.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notify.Type != N_TEMPORARY_FAILURE {
+		t.Errorf("the answer is notify type %d, want TEMPORARY_FAILURE", notify.Type)
+	}
+}
