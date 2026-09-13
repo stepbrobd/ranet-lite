@@ -170,7 +170,7 @@ func TestResponderCompletesHandshakeWithInitiator(t *testing.T) {
 		t.Error("the two sides selected different child encryption")
 	}
 	if !responder.current.responder || initiator.current.responder {
-		t.Error("session roles are not what each side played")
+		t.Error("session roles do not match the part each side played")
 	}
 	if responder.current.nextPeerMID != 2 || responder.current.nextLocalMID != 0 {
 		t.Errorf("responder message ids = peer %d, local %d; want 2 and 0",
@@ -525,7 +525,7 @@ func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 	}
 	// offer sends the request and answers a cookie challenge if one comes,
 	// which it does above cookieThreshold and may do at any time, so whether
-	// the responder demanded return routability is not what is under test. It
+	// the responder demanded return routability is outside this test. It
 	// retries, because these are datagrams on a loopback socket shared with
 	// every other test in this package and one of them can be dropped.
 	offer := func(wait time.Duration, attempts int) (Notify, bool) {
@@ -580,6 +580,26 @@ func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 }
 
 // firstTestNotify reads the single notify out of a stateless answer.
+// statelessAnswer sends one request and returns the answer, retrying the send.
+// These are datagrams on a loopback socket shared with every other test in the
+// package, and one of them can be dropped; the answers reached this way are
+// stateless or retransmission-safe, so a repeat draws another. Without it a
+// loaded machine turns them into false reds, which the VM arm of the flake
+// check has done twice.
+func statelessAnswer(t *testing.T, mux *transport.Mux, request []byte, why string) []byte {
+	t.Helper()
+	for range 4 {
+		if err := mux.SendIKE(request); err != nil {
+			t.Fatal(err)
+		}
+		if reply, err := mux.RecvIKEUntil(time.Now().Add(answerBudget)); err == nil {
+			return reply
+		}
+	}
+	t.Fatalf("%s after four attempts", why)
+	return nil
+}
+
 func firstTestNotify(t *testing.T, raw []byte) Notify {
 	t.Helper()
 	message, err := DecodeMessage(raw)
@@ -618,13 +638,8 @@ func TestResponderRefusesCriticalPayloadItDoesNotImplement(t *testing.T) {
 	// PayloadCERTREQ is a type this profile does not implement, and nothing
 	// else about the request is wrong.
 	critical := []RawPayload{{Type: PayloadCERTREQ, Critical: true, Body: []byte{0}}}
-	if err := mux.SendIKE(encodeTestSAInit(t, spiI, ni, ikeProposal(), critical)); err != nil {
-		t.Fatal(err)
-	}
-	reply, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
-	if err != nil {
-		t.Fatalf("a critical payload we do not implement drew no answer: %v", err)
-	}
+	reply := statelessAnswer(t, mux, encodeTestSAInit(t, spiI, ni, ikeProposal(), critical),
+		"a critical payload we do not implement drew no answer")
 	notify := firstTestNotify(t, reply)
 	if notify.Type != N_UNSUPPORTED_CRITICAL_PAYLOAD {
 		t.Fatalf("the responder answered notify %d, want UNSUPPORTED_CRITICAL_PAYLOAD", notify.Type)
@@ -816,22 +831,44 @@ func TestAnsweredExchangeRefreshesLivenessClock(t *testing.T) {
 	}
 }
 
+func listenHub(t *testing.T) *transport.Hub {
+	t.Helper()
+	hub, err := transport.NewHub("127.0.0.1:0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { hub.Close() })
+	return hub
+}
+
 // observedEndpoint returns the endpoint a hub reports for a datagram from one
 // UDP socket. transport.Endpoint cannot be implemented outside its package, so
 // a test that needs two distinct peer addresses has to observe two.
 func observedEndpoint(t *testing.T, hub *transport.Hub, spi uint64) transport.Endpoint {
+	return observedEndpointFrom(t, hub, spi, net.IPv4(127, 0, 0, 1))
+}
+
+// observedEndpointFrom is the same with the peer's own source address chosen,
+// so a test can put two addresses rather than two ports through a record keyed
+// on the address. Both loopback addresses exist on both platforms, while
+// 127.0.0.2 is assigned on linux and not on darwin.
+func observedEndpointFrom(t *testing.T, hub *transport.Hub, spi uint64, source net.IP) transport.Endpoint {
 	t.Helper()
-	mux, err := hub.NewMux(net.IPv4(127, 0, 0, 1), 4500)
+	mux, err := hub.NewMux(source, 4500)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := mux.RegisterIKE(spi); err != nil {
 		t.Fatal(err)
 	}
-	peer := listenPeer(t)
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { peer.Close() })
 	request := make([]byte, 28)
 	binary.BigEndian.PutUint64(request[:8], spi)
-	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: hub.LocalAddr().(*net.UDPAddr).Port}
+	dst := &net.UDPAddr{IP: source, Port: hub.LocalAddr().(*net.UDPAddr).Port}
 	if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
 		t.Fatal(err)
 	}
@@ -843,9 +880,9 @@ func observedEndpoint(t *testing.T, hub *transport.Hub, spi uint64) transport.En
 }
 
 // Under pressure a request without a currently valid cookie must be answered
-// with one and dropped. RFC 7296 section 2.6 is the whole point of the
-// mechanism: without it an off-path source can make the responder allocate for
-// an address it never has to receive at.
+// with one and dropped. RFC 7296 section 2.6 asks for exactly that: without
+// it an off-path source can make the responder allocate for an address it
+// never has to receive at.
 func TestResponderDemandsCookieUnderPressure(t *testing.T) {
 	hub, err := transport.NewHub("127.0.0.1:0", 0)
 	if err != nil {
@@ -1188,13 +1225,7 @@ func TestResponderRefusesOfferItCannotAuthenticate(t *testing.T) {
 			{Type: PayloadNonce, Body: EncodeNonce(ni)},
 		},
 	}).Encode()
-	if err := mux.SendIKE(request); err != nil {
-		t.Fatal(err)
-	}
-	reply, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
-	if err != nil {
-		t.Fatalf("an offer this responder cannot authenticate drew no answer: %v", err)
-	}
+	reply := statelessAnswer(t, mux, request, "an offer this responder cannot authenticate drew no answer")
 	if got := firstTestNotify(t, reply).Type; got != N_NO_PROPOSAL_CHOSEN {
 		t.Errorf("the responder answered notify %d, want NO_PROPOSAL_CHOSEN", got)
 	}
@@ -1462,32 +1493,121 @@ func TestUndecryptableDatagramDoesNotEndTheHandshake(t *testing.T) {
 // Anyone who can reach the port can make a handshake fail, so the line has to
 // be rare; but at debug it was invisible at the default level, and an operator
 // looking at "that peer cannot connect" had nothing on this side to read. Both
-// halves matter: the first failure in an interval is said at warn, and the
-// ones behind it drop to debug rather than being repeated.
-func TestFailedInboundHandshakeIsSaidOnceAtWarn(t *testing.T) {
+// halves matter: the first failure from a source is said at warn, and the ones
+// behind it drop to debug rather than being repeated.
+//
+// The limit is per source. See handshakeFailureInterval for the measurement
+// that decides the shape.
+func TestFailedInboundHandshakeIsSaidOncePerSource(t *testing.T) {
+	hub := listenHub(t)
+	first := observedEndpoint(t, hub, 0x11)
+	samePort := observedEndpoint(t, hub, 0x22)
+	other := observedEndpointFrom(t, hub, 0x33, net.IPv6loopback)
+
 	var levels []slog.Level
 	previous := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	slog.SetDefault(slog.New(&levelRecorder{levels: &levels}))
-
-	r := &Responder{started: time.Now()}
-	// What NewResponder does: primed one interval in the past so the first
-	// failure is not swallowed by the limiter that exists for the repeats.
-	r.failureReported.Store(-int64(handshakeFailureInterval))
+	r := newFailureRecorder()
 	for range 4 {
-		r.noteHandshakeFailure(nil, errors.New("no registry entry"))
+		r.noteHandshakeFailure(first, errors.New("no registry entry"))
 	}
 	if len(levels) != 4 {
 		t.Fatalf("four failures wrote %d lines", len(levels))
 	}
 	if levels[0] != slog.LevelWarn {
-		t.Errorf("the first failure in an interval is at %v, want warn: at debug an operator sees nothing", levels[0])
+		t.Errorf("the first failure from a source is at %v, want warn: at debug an operator sees nothing", levels[0])
 	}
 	for _, level := range levels[1:] {
 		if level != slog.LevelDebug {
 			t.Errorf("a repeat inside the interval is at %v, want debug: anyone who can reach the port can drive these", level)
 		}
 	}
+
+	// Another port on the same address is the same source. The record is keyed
+	// on the address, which is the part a peer cannot change for free.
+	levels = nil
+	r.noteHandshakeFailure(samePort, errors.New("no registry entry"))
+	if len(levels) != 1 || levels[0] != slog.LevelDebug {
+		t.Errorf("a second port from one address wrote %v, want one debug line", levels)
+	}
+
+	// A different address is a different peer and is said at once, as long as
+	// the floor that bounds the lines whatever their source has passed.
+	levels = nil
+	r.noteHandshakeFailure(other, errors.New("no registry entry"))
+	if len(levels) != 1 || levels[0] != slog.LevelDebug {
+		t.Errorf("a second address inside the floor wrote %v, want one debug line", levels)
+	}
+	levels = nil
+	r.failureSaid -= handshakeFloor
+	r.noteHandshakeFailure(other, errors.New("no registry entry"))
+	if len(levels) != 1 || levels[0] != slog.LevelWarn {
+		t.Errorf("a second address past the floor wrote %v, want one warn line", levels)
+	}
+}
+
+// The record is bounded, because the sources in it are unauthenticated, and a
+// source arriving to a full one is spaced by the floor rather than silenced:
+// otherwise a host cycling addresses keeps every legitimate peer's first
+// failure at debug for as long as it likes.
+func TestHandshakeFailureRecordIsBounded(t *testing.T) {
+	r := newFailureRecorder()
+	for i := range handshakeFailureSources {
+		r.failureReported[netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})] = time.Since(r.started)
+	}
+	hub := listenHub(t)
+	if !r.failureIsDue(observedEndpoint(t, hub, 0x44)) {
+		t.Error("a full record swallowed a source it had never seen")
+	}
+	if len(r.failureReported) > handshakeFailureSources {
+		t.Errorf("the record holds %d sources, want at most %d", len(r.failureReported), handshakeFailureSources)
+	}
+}
+
+// A node that has never said anything says its first failure. The floor spaces
+// repeats against the last line written, and an unprimed zero means "at the
+// start of this process", which silences everything in the first second of a
+// node's life.
+func TestFirstHandshakeFailureOfANodesLifeIsSaid(t *testing.T) {
+	responder, err := NewResponder(ResponderConfig{
+		Hub: listenHub(t), LocalPrivateKey: make(ed25519.PrivateKey, ed25519.PrivateKeySize),
+		Local:  []Identity{{Organization: "example", CommonName: "node", SerialNumber: "0"}},
+		Lookup: func(Identity) (ed25519.PublicKey, bool) { return nil, false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !responder.failureIsDue(observedEndpoint(t, listenHub(t), 0x55)) {
+		t.Error("the first failure of this node's life was spaced against its own start")
+	}
+}
+
+// The floor bounds the lines whatever their sources, which the per-source
+// record alone does not: every address a host holds is a fresh entry.
+func TestHandshakeFailuresAreSpacedWhateverTheirSource(t *testing.T) {
+	r := newFailureRecorder()
+	hub := listenHub(t)
+	said := 0
+	for i := range 64 {
+		// One address, a fresh record entry each time, standing in for a host
+		// spending a range of them. The floor bounds that.
+		r.failureReported = make(map[netip.Addr]time.Duration, handshakeFailureSources)
+		if r.failureIsDue(observedEndpointFrom(t, hub, uint64(i)+1, net.IPv4(127, 0, 0, 1))) {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("64 fresh sources inside one floor wrote %d lines, want 1", said)
+	}
+}
+
+// newFailureRecorder builds the failure record the way NewResponder does,
+// priming included.
+func newFailureRecorder() *Responder {
+	return &Responder{started: time.Now(),
+		failureReported: make(map[netip.Addr]time.Duration, handshakeFailureSources),
+		failureSaid:     -handshakeFloor}
 }
 
 // levelRecorder keeps the level of every record and discards the rest.

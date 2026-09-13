@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/transport"
@@ -156,11 +155,14 @@ type Responder struct {
 	cfg   ResponderConfig
 	local map[Identity]struct{}
 
-	// started and failureReported bound how often a failed inbound handshake
-	// is said out loud, on the monotonic clock, primed one interval in the
-	// past so the first one is not swallowed. See noteHandshakeFailure.
-	started         time.Time
-	failureReported atomic.Int64
+	// started is the monotonic base for the failure record below.
+	started time.Time
+
+	failureMu sync.Mutex
+	// failureReported is when each source was last said out loud and
+	// failureSaid when any source was. See failureIsDue.
+	failureReported map[netip.Addr]time.Duration
+	failureSaid     time.Duration
 
 	mu       sync.Mutex
 	halfOpen int
@@ -193,8 +195,11 @@ func NewResponder(cfg ResponderConfig) (*Responder, error) {
 	if cfg.Lookup == nil {
 		return nil, fmt.Errorf("ike: responder needs a peer lookup")
 	}
-	r := &Responder{cfg: cfg, local: make(map[Identity]struct{}, len(cfg.Local)), started: time.Now()}
-	r.failureReported.Store(-int64(handshakeFailureInterval))
+	r := &Responder{cfg: cfg, local: make(map[Identity]struct{}, len(cfg.Local)), started: time.Now(),
+		failureReported: make(map[netip.Addr]time.Duration, handshakeFailureSources),
+		// One floor in the past, so the first failure of this node's life is
+		// said rather than spaced against a zero that means "never said".
+		failureSaid: -handshakeFloor}
 	for _, id := range cfg.Local {
 		r.local[id] = struct{}{}
 	}
@@ -292,10 +297,10 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	// is answered from the datagram alone; everything below costs a key
 	// exchange and a key derivation, measured at 72 microseconds and 5 KiB a
 	// packet, which is a core saturated at fourteen thousand packets a second
-	// by anyone who can reach this port. Counting the slot here is also what
-	// gives cookieThreshold something real to read: a handshake still in its
-	// key exchange is exactly the pressure the challenge of RFC 7296 section
-	// 2.6 exists to answer.
+	// by anyone who can reach this port. Counting the slot here also gives
+	// cookieThreshold something real to read: a handshake still in its key
+	// exchange is exactly the pressure the challenge of RFC 7296 section 2.6
+	// exists to answer.
 	source := datagram.Endpoint.AddrPort().Addr()
 	if !r.enterHalfOpen(source) {
 		return nil, Accepted{}, fmt.Errorf("ike: too many half-open SAs")
@@ -310,7 +315,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 		// NO_PROPOSAL_CHOSEN rather than AUTHENTICATION_FAILED: RFC 7296
 		// section 3.10.1 defines the latter as "sent in the response to an
 		// IKE_AUTH message", and an authentication method this responder
-		// cannot use is exactly what the former is for, "any case where the
+		// cannot use falls under the former, "any case where the
 		// offered proposals (including but not limited to SA payload values,
 		// USE_TRANSPORT_MODE notify, IPCOMP_SUPPORTED notify) are not
 		// acceptable for the responder". Section
@@ -328,9 +333,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	if err != nil {
 		var wrongGroup *invalidKEError
 		if errors.As(err, &wrongGroup) {
-			group := make([]byte, 2)
-			binary.BigEndian.PutUint16(group, wrongGroup.group)
-			r.sendStatelessNotify(datagram, spiI, N_INVALID_KE_PAYLOAD, group)
+			r.sendStatelessNotify(datagram, spiI, N_INVALID_KE_PAYLOAD, invalidKENotifyData(wrongGroup.group))
 			return nil, Accepted{}, err
 		}
 		r.sendStatelessNotify(datagram, spiI, N_NO_PROPOSAL_CHOSEN, nil)
@@ -605,10 +608,9 @@ type authRequest struct {
 // The repeat has to match the retained request byte for byte. RFC 7296 section 2.1
 // says the SPI and the source address are not enough to recognize a
 // retransmission and that a responder matches on the whole packet, its hash or
-// the nonce, and here that requirement is also what keeps this from being a
-// reflector: a bare header naming a live SPIi, which anyone who opened one
-// knows, would otherwise draw the full response at whatever source address it
-// claimed.
+// the nonce, and here that requirement also keeps this from being a reflector:
+// a bare header naming a live SPIi, which anyone who opened one knows, would
+// otherwise draw the full response at whatever source address it claimed.
 func (s *Session) awaitAuthRequest(saInitRequest, saInitResponse []byte, deadline time.Time) (*authRequest, error) {
 	ctx := s.current
 	for {
@@ -652,20 +654,52 @@ func (s *Session) awaitAuthRequest(saInitRequest, saInitResponse []byte, deadlin
 	}
 }
 
-// handshakeFailureInterval bounds how often a failed inbound handshake is
-// logged. Anyone who can reach the port can cause one, so the line has to be
-// rare; but at debug it was invisible at the default level, and an operator
-// looking at "that peer cannot connect" had nothing on this side to read.
-const handshakeFailureInterval = 10 * time.Second
+// Anyone who can reach the port can make an inbound handshake fail, so the
+// line has to be rare and the record of who has had one bounded. At debug it
+// was invisible at the default level, and an operator looking at "that peer
+// cannot connect" had nothing on this side to read.
+//
+// The shape comes from the live mesh: 20 community peers dial in, draw
+// INVALID_KE_PAYLOAD and never act on it, at 30 to 90 second intervals each.
+// One timer for the whole responder let whichever of them landed in the window
+// hide every other peer's first failure, and a short one per source turned
+// them into a line a second.
+const (
+	handshakeFailureInterval = 10 * time.Minute
+	handshakeFailureSources  = 256
+	handshakeFloor           = time.Second
+)
 
 func (r *Responder) noteHandshakeFailure(endpoint transport.Endpoint, err error) {
-	now := int64(time.Since(r.started))
-	previous := r.failureReported.Load()
-	if now-previous < int64(handshakeFailureInterval) || !r.failureReported.CompareAndSwap(previous, now) {
+	if !r.failureIsDue(endpoint) {
 		slog.Debug("ike responder handshake failed", "peer", endpoint, "err", err)
 		return
 	}
 	slog.Warn("ike responder handshake failed", "peer", endpoint, "err", err)
+}
+
+// failureIsDue reports whether this source's failure is the one to say out
+// loud. Both limits are needed: the per-source one alone is a line per address
+// to a host holding a range of them, and the floor alone hides every peer
+// behind whichever one is failing fastest. The record is emptied rather than
+// swept when it fills, so it cannot grow, and a source arriving to a full one
+// meets the floor rather than silence.
+func (r *Responder) failureIsDue(endpoint transport.Endpoint) bool {
+	source := endpoint.AddrPort().Addr().Unmap()
+	now := time.Since(r.started)
+	r.failureMu.Lock()
+	defer r.failureMu.Unlock()
+	if reported, seen := r.failureReported[source]; seen && now-reported < handshakeFailureInterval {
+		return false
+	}
+	if now-r.failureSaid < handshakeFloor {
+		return false
+	}
+	if len(r.failureReported) >= handshakeFailureSources {
+		clear(r.failureReported)
+	}
+	r.failureReported[source], r.failureSaid = now, now
+	return true
 }
 
 // rejectAuth answers a failed authentication inside the SK payload, which the
@@ -839,7 +873,13 @@ func (r *Responder) cookieRequired(request *Message, ni []byte, spiI uint64, end
 	// every thirty seconds each, and the victim is then refused in silence.
 	pressure := r.halfOpen >= cookieThreshold ||
 		r.halfOpenBySource[source] >= halfOpenPerSourceWithoutCookie
-	if pressure && time.Since(r.cookieRotated) > cookieLifetime {
+	// Rotated on the age of the secret rather than on pressure. The two agree
+	// while a burst lasts longer than a lifetime; asking for pressure as well
+	// left a node that takes IKE_SA_INITs without ever reaching pressure
+	// holding the secret it started with. A node nothing dials at all still
+	// does, since this is the only site that rotates, and there the secret has
+	// never been used.
+	if time.Since(r.cookieRotated) > cookieLifetime {
 		var next [32]byte
 		if _, err := rand.Read(next[:]); err != nil {
 			r.mu.Unlock()
