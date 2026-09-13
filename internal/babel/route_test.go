@@ -219,6 +219,103 @@ func TestHysteresisIgnoresFlappingChallenger(t *testing.T) {
 	}
 }
 
+// RFC 8966 section 3.5.4 holds a retracted prefix for its whole interval, so a
+// packet for it is answered rather than sent down a covering route. The hold
+// has to run from the retraction: one arriving just before the deadline of the
+// update it replaces otherwise holds for whatever is left of it, which on a
+// node carrying an exit-announced default is the difference between an error
+// and a packet bouncing until its hop limit is spent.
+func TestRetractionHoldsThePrefixForItsOwnInterval(t *testing.T) {
+	now := time.Now()
+	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(n)
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	const hold = time.Minute
+	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, hold, now)
+
+	// The retraction lands a second before the update it replaces expires.
+	retracted := now.Add(hold - time.Second)
+	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: MetricInfinity}, hold, retracted)
+	if len(rt.entries) != 1 {
+		t.Fatal("the retraction flushed the prefix instead of holding it")
+	}
+	rt.sweepExpired(retracted.Add(hold - time.Second))
+	if len(rt.entries) != 1 {
+		t.Error("the hold ran from the update the retraction replaced, so the prefix falls through to a covering route")
+	}
+	rt.sweepExpired(retracted.Add(hold + time.Second))
+	if len(rt.entries) != 0 {
+		t.Error("the hold never ran out, so a retracted prefix is held for the life of the process")
+	}
+}
+
+// The hold runs once, for the interval of the update it replaces. A neighbor
+// choosing either end of that chooses how long this node answers with an error
+// for the prefix: repeat the retraction and it never expires, and the entry
+// holds a maxRouteKeys slot with it; carry an interval of one centisecond and
+// the prefix falls through to a covering route almost at once.
+func TestRepeatedRetractionsNeitherExtendNorCutTheHold(t *testing.T) {
+	now := time.Now()
+	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(n)
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	const hold = time.Minute
+	retract := func(rt *routeTable, at time.Time, carried time.Duration) {
+		rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: MetricInfinity}, carried, at)
+	}
+
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, hold, now)
+	retract(rt, now, hold)
+	for elapsed := time.Second; elapsed < hold; elapsed += time.Second {
+		retract(rt, now.Add(elapsed), hold)
+	}
+	rt.sweepExpired(now.Add(hold + time.Second))
+	if len(rt.entries) != 0 {
+		t.Error("a retraction every second held the prefix past its own interval, so a neighbor decides when it ends")
+	}
+
+	rt = newRouteTable(func(routeKey, routeSelection) {})
+	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, hold, now)
+	retract(rt, now, 10*time.Millisecond)
+	rt.sweepExpired(now.Add(time.Second))
+	if len(rt.entries) != 1 {
+		t.Error("a retraction carrying its own short interval cut the hold, so the prefix falls through at once")
+	}
+}
+
+// A wildcard retraction takes every route from one neighbor at once, and the
+// section 3.5.4 hold runs from it for each of them. The wildcard form carries
+// no interval of its own, so each route holds for as long as the update it
+// replaces would have.
+func TestWildcardRetractionHoldsEveryPrefixItTakes(t *testing.T) {
+	now := time.Now()
+	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(n)
+	rt := newRouteTable(func(routeKey, routeSelection) {})
+	const hold = time.Minute
+	keys := []routeKey{
+		{dest: netip.MustParsePrefix("10.0.0.0/24")},
+		{dest: netip.MustParsePrefix("10.0.1.0/24")},
+	}
+	for _, key := range keys {
+		rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, hold, now)
+	}
+
+	retracted := now.Add(hold - time.Second)
+	rt.retractNeighbor(n, retracted)
+	rt.sweepExpired(retracted.Add(hold - time.Second))
+	if len(rt.entries) != len(keys) {
+		t.Errorf("the wildcard retraction held %d of %d prefixes, so the rest fall through to a covering route",
+			len(rt.entries), len(keys))
+	}
+	rt.sweepExpired(retracted.Add(hold + time.Second))
+	if len(rt.entries) != 0 {
+		t.Error("a wildcard retraction held its prefixes for the life of the process")
+	}
+}
+
 // A link that goes down and comes back must be selectable again promptly. The
 // smoothed metric follows an increase immediately, so feeding it infinity when
 // a route is retracted pins ms(R) at 65535, and the cheap path then stays

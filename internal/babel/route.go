@@ -175,9 +175,22 @@ func (rt *routeTable) update(n *neighborState, key routeKey, adv advertisement, 
 		entry.routes[n] = route
 	}
 	selected := entry.selected.neighbor == n
+	// The hold of section 3.5.4 starts when the route is retracted, and runs
+	// for the interval of the update it replaces. Reading the retraction's own
+	// would let the neighbor choose how long this node answers with an error,
+	// section 4.6.9 forbidding a zero one of a finite update only, and running
+	// it again on each retraction would let a neighbor repeating one pin the
+	// prefix for as long as it likes. Without any of it a retraction arriving
+	// a moment before the old deadline holds for that moment, and the packet
+	// falls through to the ::/0 an exit announces and bounces until its hop
+	// limit is spent.
+	retracting := adv.metric == MetricInfinity && route.rxMetric != MetricInfinity
 	route.routerID, route.seqno, route.rxMetric = adv.routerID, adv.seqno, adv.metric
-	if adv.metric != MetricInfinity {
+	switch {
+	case adv.metric != MetricInfinity:
 		route.hold, route.expiresAt = hold, now.Add(hold)
+	case retracting && route.hold > 0:
+		route.expiresAt = now.Add(route.hold)
 	}
 	// Section 3.8.2.2: an unfeasible update for the selected route unselects
 	// it, so ask its origin for a sequence number that makes it usable again
@@ -409,6 +422,11 @@ func (rt *routeTable) retractNeighbor(n *neighborState, now time.Time) {
 	rt.retracted[n] = true
 	for key, entry := range rt.entries {
 		if route, ok := entry.routes[n]; ok {
+			// The same rule as update's: the hold starts at the retraction
+			// and runs for the interval of the update it replaces.
+			if route.rxMetric != MetricInfinity && route.hold > 0 {
+				route.expiresAt = now.Add(route.hold)
+			}
 			route.rxMetric = MetricInfinity
 			rt.selectRoute(key, entry, now)
 		}
