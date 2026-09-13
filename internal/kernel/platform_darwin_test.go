@@ -76,7 +76,8 @@ func testPlatform(t *testing.T, cfg Config) (*routePlatform, *fakeRouteSocket) {
 		warned:   make(map[Route]bool),
 		pending:  make(map[Route]bool),
 		scoped:   make(map[netip.Prefix]netip.Prefix),
-		occupied: make(map[netip.Prefix]bool),
+		occupied: make(map[occupiedKey]bool),
+		refused:  make(map[occupiedKey]bool),
 		// No address belongs to this interface unless a test says so, which
 		// makes "the source is not ours" the default rather than an accident
 		// of whatever the host running the suite happens to have configured.
@@ -211,7 +212,7 @@ func TestDarwinScopesPlainDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if add, del := diffRoutes([]Route{announced}, actual); len(add) != 0 || len(del) != 0 {
+			if add, del := diffRoutes([]Route{announced}, actual, plat.scopes); len(add) != 0 || len(del) != 0 {
 				t.Fatalf("installed plain default did not converge: add %v, delete %v", add, del)
 			}
 			if err := plat.DelRoute(actual[0]); err != nil {
@@ -903,14 +904,14 @@ func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
 	if len(actual) != 1 || !actual[0].Unreachable {
 		t.Fatalf("the dump reported %v, want the hold", actual)
 	}
-	if add, del := diffRoutes([]Route{held}, actual); len(add) != 0 || len(del) != 0 {
+	if add, del := diffRoutes([]Route{held}, actual, plat.scopes); len(add) != 0 || len(del) != 0 {
 		t.Fatalf("an installed hold did not converge: add %v, delete %v", add, del)
 	}
 	// A real route to the same destination is a different route, so switching
 	// between them is an add and a delete rather than nothing at all.
 	carried := held
 	carried.Unreachable = false
-	if add, del := diffRoutes([]Route{carried}, actual); len(add) != 1 || len(del) != 1 {
+	if add, del := diffRoutes([]Route{carried}, actual, plat.scopes); len(add) != 1 || len(del) != 1 {
 		t.Fatalf("a hold and a path to one prefix compared equal: add %v, delete %v", add, del)
 	}
 }
@@ -921,7 +922,7 @@ func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
 // one this process can neither withdraw nor install over: the add comes back
 // EEXIST on every pass for the life of the process, and the destination it
 // names is wrong for just as long.
-func TestDarwinAdoptsAScopedRouteItDidNotInstall(t *testing.T) {
+func TestDarwinAdoptsScopedRouteItDidNotInstall(t *testing.T) {
 	plat, _ := testPlatform(t, Config{})
 	inherited := []dumpEntry{
 		// an announced default, which this backend always scopes
@@ -1002,5 +1003,152 @@ func TestDarwinRefusesWhatItsOwnDumpWouldNeverReport(t *testing.T) {
 	}
 	if written := sock.messages(t); len(written) != 0 {
 		t.Errorf("the install wrote %d messages for a destination the dump never reports", len(written))
+	}
+}
+
+// The record of which destinations this process scoped is what the dump reads
+// a scoped route's source back from, so it may only be dropped once the kernel
+// has actually forgotten the route. Dropping it first loses the source of a
+// route that is still installed, and the next pass withdraws and reinstalls it
+// instead of recognizing it.
+func TestDarwinKeepsScopedRecordWhenWithdrawalFails(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
+	specific := Route{Destination: prefix("2001:db8:1::/48"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
+	if err := plat.AddRoute(specific); err != nil {
+		t.Fatalf("install the source-specific route: %v", err)
+	}
+	if _, recorded := plat.scoped[specific.Destination]; !recorded {
+		t.Fatal("the install did not record the scope, so this proves nothing")
+	}
+
+	// A withdrawal the kernel refuses for a reason other than "it is already
+	// gone". The route is still there.
+	sock.err = unix.EBUSY
+	if err := plat.DelRoute(Route{Destination: specific.Destination, Source: specific.Source, Scoped: true}); err == nil {
+		t.Error("a refused withdrawal reported success")
+	}
+	if _, recorded := plat.scoped[specific.Destination]; !recorded {
+		t.Fatal("the scope was forgotten while the route was still installed, so its source is lost")
+	}
+
+	// And once the withdrawal lands, the record goes with it: keeping it would
+	// make the dump report a source on a route that no longer carries one.
+	sock.err = nil
+	if err := plat.DelRoute(Route{Destination: specific.Destination, Source: specific.Source, Scoped: true}); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	if _, recorded := plat.scoped[specific.Destination]; recorded {
+		t.Error("the scope outlived the route it belonged to")
+	}
+}
+
+// An unbound socket does not reach a scoped route, so a scoped route standing
+// where the mesh asked for an unscoped one is a black hole. The diff has to see
+// the difference: it compares a desired route under the scope it would be
+// installed with and a route read back under the scope the kernel holds, so
+// the two agree for everything this reconciler installed and disagree for an
+// inherited scoped route the mesh now wants plain. Masking scope out of the
+// comparison entirely made that pair compare equal, and no later pass could
+// ever notice.
+func TestDarwinReplacesAnInheritedScopeTheMeshDoesNotWant(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	dest := prefix("2001:db8:1::/48")
+	// What the mesh asks for: a plain route, which this backend never scopes.
+	wanted := Route{Destination: dest, Metric: defaultIPv6Metric}
+	// What the kernel holds: the same destination, scoped, left behind by an
+	// instance whose record of the source went with it.
+	inherited, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+		dst: dest, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inherited) != 1 || !inherited[0].Scoped {
+		t.Fatalf("the dump reported %v, want one scoped route", inherited)
+	}
+	add, del := diffRoutes([]Route{wanted}, inherited, plat.scopes)
+	if len(del) != 1 || !del[0].Scoped {
+		t.Fatalf("the diff withdraws %v, want the scoped route the kernel holds", del)
+	}
+	if len(add) != 1 || add[0].Scoped {
+		t.Fatalf("the diff installs %v, want the unscoped route the mesh asked for", add)
+	}
+
+	// And a route this reconciler did install still compares equal to itself,
+	// or every pass would withdraw and reinstall everything it owns.
+	announced := Route{Destination: prefix("::/0"), Metric: defaultIPv6Metric}
+	held, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+		dst: announced.Destination, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if add, del := diffRoutes([]Route{announced}, held, plat.scopes); len(add) != 0 || len(del) != 0 {
+		t.Fatalf("an announced default is not settled: add %v, delete %v", add, del)
+	}
+}
+
+// The darwin FIB keys a route by its destination and its scope, so the record
+// of what another program holds has to be keyed the same way. Keyed by
+// destination alone, an unrelated write to the other key clears it: the plain
+// route installs, the record that a foreign scoped route holds the same
+// destination is forgotten, and the next dump reports that route as ours and
+// withdraws it.
+func TestDarwinOccupiedRecordSurvivesTheOtherKey(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	dest := prefix("2001:db8:1::/48")
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
+
+	// A scoped install the kernel refuses: somebody else holds that key.
+	sock.err = unix.EEXIST
+	scoped := Route{Destination: dest, Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
+	if err := plat.AddRoute(scoped); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("the refused install reported %v, want the route reported as not installed", err)
+	}
+	// The plain route to the same destination is a different key, and it
+	// installs.
+	sock.err = nil
+	if err := plat.AddRoute(Route{Destination: dest, Metric: defaultIPv6Metric}); err != nil {
+		t.Fatalf("install the plain route: %v", err)
+	}
+
+	// The foreign scoped route is still somebody else's, so the dump must not
+	// report it as ours.
+	got, err := plat.ownedRoutes(dumpRIB(t, dumpEntry{
+		index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+		dst: dest, gateway: ourGateway(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("the dump claims %v, which another program holds and this process never installed", got)
+	}
+}
+
+// The record of a refused install is rebuilt by the passes that refuse, the
+// same way the warning set is. A node that meets a hundred foreign keys over
+// its life would otherwise carry a hundred records forever, and a stale one
+// hides a route from the dump that nothing can then withdraw.
+func TestDarwinForgetsAnOccupiedKeyTheMeshStoppedAsking(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	dest := prefix("2001:db8:1::/48")
+	sock.err = unix.EEXIST
+	if err := plat.AddRoute(Route{Destination: dest, Metric: defaultIPv6Metric}); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("the refused install reported %v", err)
+	}
+	if len(plat.occupied) != 1 {
+		t.Fatalf("the refusal recorded %d keys, want one", len(plat.occupied))
+	}
+	// The mesh stops asking for it. Two passes with no refusal at that key,
+	// and the record is gone.
+	sock.err = nil
+	plat.rotateWarnings()
+	plat.rotateWarnings()
+	if len(plat.occupied) != 0 {
+		t.Errorf("the record outlived the destination the mesh stopped asking for: %v", plat.occupied)
 	}
 }

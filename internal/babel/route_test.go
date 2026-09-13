@@ -113,7 +113,7 @@ func TestFeasibilityCondition(t *testing.T) {
 				rt.observe(key, *test.advertised, time.Now())
 			}
 			if got := rt.feasible(key, test.received); got != test.want {
-				t.Fatalf("feasible = %v, want %v", got, test.want)
+				t.Fatalf("feasible = %v, want %v: selecting an unfeasible route is what closes a forwarding loop", got, test.want)
 			}
 		})
 	}

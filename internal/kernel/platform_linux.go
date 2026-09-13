@@ -16,15 +16,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// netlinkPlatform is the rtnetlink half of the reconciler. Nothing here
-// decides what the kernel should hold; it only encodes the decision and
-// enforces the ownership marker on the way back in, so a route without the
-// reconciler's protocol, table and interface never reaches the diff.
-// netlinkConn is everything this backend asks of a netlink socket. It exists
-// for the same reason darwin's rtSocket does: without it the only way to reach
-// AddRoute, DelRoute or AddAddr is to open a real socket, which needs root, so
-// the checks skip them and a change to what this backend writes goes unnoticed
-// on the platform the fleet runs.
+// netlinkConn is everything this backend asks of a netlink socket. Reaching
+// AddRoute, DelRoute or AddAddr without it means opening a real socket, which
+// needs root, so the checks skip them and a change to what this backend writes
+// goes unnoticed on the platform the fleet runs. darwin's rtSocket is the same
+// seam.
 type netlinkConn interface {
 	execute(kind, flags uint16, body []byte) ([]nlMessage, error)
 	link(name string) (index, master uint32, err error)
@@ -32,6 +28,10 @@ type netlinkConn interface {
 	Close() error
 }
 
+// netlinkPlatform is the rtnetlink half of the reconciler. Nothing here
+// decides what the kernel should hold; it only encodes the decision and
+// enforces the ownership marker on the way back in, so a route without the
+// reconciler's protocol, table and interface never reaches the diff.
 type netlinkPlatform struct {
 	cfg     Config
 	index   uint32

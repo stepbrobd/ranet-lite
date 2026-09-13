@@ -99,15 +99,14 @@ func (c *Client) Reload(path string) error {
 		return err
 	}
 	// A peer the registry cannot support is reported and skipped rather than
-	// refused. The registry is rewritten every time any node joins the mesh
-	// while the peers list is local and edited by hand, so one entry left
-	// behind by a decommissioned node would otherwise freeze every later
-	// reload on this node: the registry every other peer needs would never be
-	// applied, over a peer that is unreachable whatever happens here. The
-	// dialer already gives up on a node the registry does not name and is
-	// started again by the next reload.
+	// refused. The two drift, so one entry left behind by a decommissioned
+	// node would otherwise freeze every later reload on this node: the
+	// registry every other peer needs would never be applied, over a peer that
+	// is unreachable whatever happens here. The dialer already gives up on a
+	// node the registry does not name and is started again by the next
+	// reload.
 	for _, problem := range validatePeers(cfg, reg, families) {
-		log.Printf("reload: %v, skipping it", problem)
+		log.Printf("reload: %v, so nothing will dial it", problem)
 	}
 
 	c.reg.Store(&reg)

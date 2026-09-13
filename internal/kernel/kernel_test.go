@@ -564,7 +564,7 @@ func TestDiffRoutesIsSorted(t *testing.T) {
 		{Destination: prefix("2001:db8:99::/48")},
 		{Destination: prefix("198.51.100.0/24")},
 	}
-	add, del := diffRoutes(desired, actual)
+	add, del := diffRoutes(desired, actual, nil)
 	if len(add) < 2 || len(del) < 2 {
 		t.Fatalf("add %v and del %v are too short to be a test of ordering", add, del)
 	}

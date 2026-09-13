@@ -3,6 +3,7 @@ package babel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -491,7 +492,10 @@ func TestStalledNeighborDoesNotHoldOthers(t *testing.T) {
 			speaker.mu.Lock()
 			actions := speaker.updateActions(time.Now())
 			speaker.mu.Unlock()
-			speaker.sendActions(actions)
+			speaker.mu.Lock()
+			send := speaker.emitLocked(actions)
+			speaker.mu.Unlock()
+			send()
 		}
 	}()
 	select {
@@ -600,7 +604,7 @@ func TestDroppedRetractionIsSentAgain(t *testing.T) {
 	speaker.mu.Lock()
 	announce := speaker.updateActions(time.Now())
 	speaker.mu.Unlock()
-	speaker.sendActions(announce)
+	emit(speaker, announce)
 	speaker.mu.Lock()
 	_, told := speaker.neighbors["peer"].advertised[key]
 	speaker.mu.Unlock()
@@ -611,15 +615,17 @@ func TestDroppedRetractionIsSentAgain(t *testing.T) {
 	// The peer's transport is stuck, so fill its queue through the same path
 	// babel uses until it starts refusing, and the retraction is then dropped.
 	for range 4096 {
-		if errors.Is(peer.SendRawOrDrop([]byte("bulk"), 41), netstack.ErrSendQueueFull) {
+		place, err := peer.ReserveRawOrDrop([]byte("bulk"), 41)
+		if errors.Is(err, netstack.ErrSendQueueFull) {
 			break
 		}
+		place.Send()
 	}
 	speaker.SetOriginated(nil)
 	speaker.mu.Lock()
 	retract := speaker.updateActions(time.Now())
 	speaker.mu.Unlock()
-	speaker.sendActions(retract)
+	emit(speaker, retract)
 
 	speaker.mu.Lock()
 	_, stillTold := speaker.neighbors["peer"].advertised[key]
@@ -684,7 +690,7 @@ func TestUnscheduledHelloDoesNotFlapANeighbor(t *testing.T) {
 // Receive. Whichever reaches the peer first would then win, so a retraction
 // decided before the update that replaces it can reach the neighbor after it,
 // and the neighbor holds the wrong answer until the next periodic dump.
-func TestTheEmittersCannotInvertWhatTheyDecided(t *testing.T) {
+func TestEmittersCannotInvertWhatTheyDecided(t *testing.T) {
 	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
@@ -762,7 +768,7 @@ func TestTheEmittersCannotInvertWhatTheyDecided(t *testing.T) {
 // half: a reload that drops one from the configuration would otherwise leave
 // it black-holed for the life of the process, with a neighbor announcing a
 // perfectly good path to it the whole time.
-func TestAPrefixNoLongerOriginatedCanBeReachedAgain(t *testing.T) {
+func TestPrefixNoLongerOriginatedCanBeReachedAgain(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(neighbor)
 	covering := netip.MustParsePrefix("fd00::/16")
@@ -784,5 +790,176 @@ func TestAPrefixNoLongerOriginatedCanBeReachedAgain(t *testing.T) {
 	speaker.SetOriginated(nil)
 	if _, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); !ok {
 		t.Fatal("the prefix stayed held after this node stopped originating it, so it is black-holed for good")
+	}
+}
+
+// These four numbers are what a node announces itself as costing and how fast
+// it notices a neighbor has gone. They are not internal tuning: the fleet this
+// replaces runs BIRD, and a ranet-lite node whose hop looks cheaper than a BIRD
+// hop pulls transit onto itself across the whole mesh, while one that takes
+// seventy seconds to notice a silent peer is a different network from the one
+// being replaced. Nothing else in the suite would notice them changing.
+func TestDefaultsMatchFleetTheyReplace(t *testing.T) {
+	cost := DefaultCostParams()
+	// RFC 8966 Appendix B's wired rxcost, which is BIRD's BABEL_RXCOST_WIRED.
+	if cost.RxCost != 96 {
+		t.Errorf("default rxcost is %d, want 96: at anything lower a hop through this node looks cheaper than a BIRD hop", cost.RxCost)
+	}
+	// RFC 9616's RTT term, weighted as babeld weights it.
+	if cost.RTTCost != 1024 {
+		t.Errorf("default rtt cost is %d, want 1024", cost.RTTCost)
+	}
+	if cost.RTTMax != 1024*time.Millisecond || cost.RTTMin != 0 {
+		t.Errorf("default rtt window is %s..%s, want 0..1024ms", cost.RTTMin, cost.RTTMax)
+	}
+
+	var cfg Config
+	cfg.setDefaults()
+	// RFC 8966 Appendix B's hello interval, which sets how long a peer that is
+	// up but silent takes to be declared dead.
+	if cfg.HelloInterval != 4*time.Second {
+		t.Errorf("default hello interval is %s, want 4s", cfg.HelloInterval)
+	}
+	if got, want := deadTimeout(cfg.HelloInterval), 14*time.Second; got > want {
+		t.Errorf("a silent peer is declared dead after %s, want no more than %s", got, want)
+	}
+	// Appendix B again: the update interval is four hellos.
+	if cfg.UpdateInterval != 4*cfg.HelloInterval {
+		t.Errorf("default update interval is %s, want four hello intervals", cfg.UpdateInterval)
+	}
+	if cfg.Cost != cost {
+		t.Error("a config with no costs configured does not get the defaults above")
+	}
+}
+
+// The route table's hysteresis and its trigger threshold are configuration,
+// not constants, and both are wired up once in New. With tau at zero the
+// smoothed metric of RFC 8966 Appendix A.3 follows the instantaneous one
+// exactly, so a flapping challenger takes the route on its first good sample;
+// with the trigger at zero every metric fluctuation earns a triggered update.
+func TestRouteTableTakesHysteresisFromConfig(t *testing.T) {
+	cfg := Config{HelloInterval: 3 * time.Second, Cost: CostParams{RxCost: 77, RTTMax: time.Second}}
+	speaker, err := New(cfg, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 3 * cfg.HelloInterval; speaker.routes.tau != want {
+		t.Errorf("the smoothing time constant is %s, want %s, three hello intervals", speaker.routes.tau, want)
+	}
+	if speaker.routes.trigger != cfg.Cost.RxCost {
+		t.Errorf("the triggered-update threshold is %d, want one link's base cost %d", speaker.routes.trigger, cfg.Cost.RxCost)
+	}
+}
+
+// A prefix flushed from the route table has to take its unreachable hold with
+// it. The hold is what RFC 8966 section 3.5.4 asks for while a retracted
+// prefix is still remembered, and it deliberately stops a covering route from
+// serving the destination. Once the entry is gone there is nothing left to
+// hold, and nothing else ever removes it: no later selection will name a
+// prefix the table no longer has, so the destination stays black-holed for the
+// life of the process with a perfectly good covering route in place.
+func TestFlushedPrefixGivesUpItsHold(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	covering := netip.MustParsePrefix("fd00::/16")
+	specific := netip.MustParsePrefix("fd00:1::/64")
+	inside := specific.Addr().Next()
+	announce := func(prefix netip.Prefix, metric uint16) {
+		speaker.handlePacket(neighbor, EncodePacket([]RawTLV{
+			EncodeRouterID([8]byte{1}),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: metric}),
+		}))
+	}
+	announce(covering, 64)
+	announce(specific, 64)
+	if _, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); !ok {
+		t.Fatal("the route never reached the forwarding table")
+	}
+
+	// Retracted: held rather than removed, so the covering route does not
+	// quietly take traffic the neighbor has just said it cannot carry.
+	announce(specific, MetricInfinity)
+	if peer, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); ok {
+		t.Fatalf("a retracted prefix fell through to %q instead of being held", peer.ID)
+	}
+
+	// Expired out of the table entirely, which is the flush. The sweep takes
+	// the covering route with it, so the neighbor announces that again: what
+	// is being tested is whether the hold left with the prefix, not whether
+	// the covering route survived.
+	speaker.mu.Lock()
+	speaker.routes.sweepExpired(time.Now().Add(time.Hour))
+	_, held := speaker.routes.entries[routeKey{dest: specific}]
+	speaker.mu.Unlock()
+	if held {
+		t.Fatal("the retracted route was not flushed, so this proves nothing")
+	}
+	announce(covering, 64)
+	if _, ok := speaker.mesh.Routes.Lookup(netip.Addr{}, inside); !ok {
+		t.Errorf("%s is still held after its prefix was flushed, so the covering route can never serve it", inside)
+	}
+}
+
+// emit is the two emitters' own sequence for a test that built its actions
+// with the lock released: take it, fix the transmission order, release, send.
+func emit(s *Speaker, actions []sendAction) {
+	s.mu.Lock()
+	send := s.emitLocked(actions)
+	s.mu.Unlock()
+	send()
+}
+
+// RFC 8966 section 3.8.1.1 asks for a full dump to be rate limited, and what
+// it costs is the table walk under the lock the whole protocol runs under, not
+// the packets. Giving the allowance back when those packets are dropped turns
+// the limit off exactly while this node is too congested to deliver, so every
+// later request walks the table again and holds the lock that also carries
+// hellos and retractions.
+func TestDroppedDumpDoesNotRefundTheRateLimit(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	for i := range 8 {
+		speaker.Originate(netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i)))
+	}
+	// A peer whose transport never returns, so every packet is refused. The
+	// transport has to be released before Close, which waits for the sender
+	// goroutine sitting inside it.
+	blocked := make(chan struct{})
+	stuck := netstack.NewPeerReserved("peer",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { <-blocked; return nil })
+	defer func() { close(blocked); stuck.Close() }()
+	speaker.mu.Lock()
+	neighbor.peer = stuck
+	speaker.mu.Unlock()
+	for {
+		place, err := stuck.ReserveRawOrDrop([]byte("bulk"), 41)
+		if errors.Is(err, netstack.ErrSendQueueFull) {
+			break
+		}
+		place.Send()
+	}
+
+	wildcard := EncodeRouteRequest(RouteRequest{AE: AEWildcard})
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{wildcard}))
+	speaker.mu.Lock()
+	charged := neighbor.lastFullDump
+	speaker.mu.Unlock()
+	if charged.IsZero() {
+		t.Fatal("the allowance was given back when the packets were dropped, so the next request walks the whole table again")
+	}
+
+	// The second request falls inside the window and has to be refused, even
+	// though nothing the first one produced reached the neighbor.
+	speaker.mu.Lock()
+	again := speaker.routeReply(neighbor, RouteRequest{AE: AEWildcard}, time.Now())
+	speaker.mu.Unlock()
+	if len(again) != 0 {
+		t.Error("a second wildcard request drew another whole dump, so the rate limit is off while congested")
 	}
 }

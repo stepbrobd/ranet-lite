@@ -1429,7 +1429,7 @@ func TestSessionRunUsesOldIKEContext(t *testing.T) {
 // can see our SPI can send them and what is acted on has to be narrower than
 // what arrives. A cookie is echoed in the retry, so taking one of any length
 // turns a single spoofed datagram into as many oversized ones as we
-// retransmit, aimed at whoever we are dialing; RFC 7296 section 2.6 bounds it
+// retransmit, aimed at whoever we are dialing. RFC 7296 section 2.6 bounds it
 // to 1..64 octets. A Diffie-Hellman group we cannot generate ends the dial
 // with no retry, so acting on one aborts the handshake for free.
 func TestOnlyUsableUnauthenticatedInitNotifiesAreActedOn(t *testing.T) {
@@ -1458,11 +1458,14 @@ func TestOnlyUsableUnauthenticatedInitNotifiesAreActedOn(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, ok := usefulInitNotify(message(tc.notify), false, false)
-			if ok != tc.usable {
-				t.Fatalf("acted on = %v, want %v", ok, tc.usable)
+			if ok && !tc.usable {
+				t.Fatal("acted on, so anyone who can see our SPI can steer this handshake")
+			}
+			if !ok && tc.usable {
+				t.Fatal("ignored, so the exchange waits for a response the peer will not send")
 			}
 			if ok && got.Type != tc.notify.Type {
-				t.Fatalf("acted on notify %d, want %d", got.Type, tc.notify.Type)
+				t.Fatalf("acted on notify %d rather than the one that arrived, %d", got.Type, tc.notify.Type)
 			}
 		})
 	}

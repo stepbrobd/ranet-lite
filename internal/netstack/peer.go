@@ -99,45 +99,35 @@ func (p *Peer) Close() {
 // can count it without treating the peer as broken.
 var ErrSendQueueFull = errors.New("netstack: peer send queue is full")
 
-// SendRawOrDrop hands one packet to the peer's ordered sender without waiting
-// for the transport to finish with it, and drops it when no transmission slot
-// is free. Babel sends this way because waiting does not stay local: the
-// speaker walks every neighbor from one goroutine, and Receive runs on the
-// sending peer's own decrypt path, so one peer whose queue is backed up would
-// stop hellos, updates and retractions to every other neighbor until it
-// drained, and two such peers would each hold the other's emitter. The caller
-// is told, and gives back whatever the dropped packet had consumed.
-func (p *Peer) SendRawOrDrop(raw []byte, nextHeader byte) error {
-	reserved, err := p.ReserveRawOrDrop(raw, nextHeader)
-	if err != nil {
-		return err
-	}
-	return reserved.Send()
-}
-
-// Reserved is one packet holding its place in a peer's transmission order. A
+// Place is one packet holding its position in a peer's transmission order. A
 // peer sends in the order places were taken, not in the order Send is called.
-type Reserved struct{ batch *peerBatch }
+type Place struct{ batch *peerBatch }
 
-// ReserveRawOrDrop takes the peer's next place for one packet and drops it
-// rather than waiting when no transmission slot is free, exactly as
-// SendRawOrDrop does. It exists for a caller that decides several packets
-// under a lock it cannot hold while sending: taking the places under that lock
-// and sending after releasing it is what keeps two such callers from inverting
-// what they decided. Every reservation has to be sent -- a place taken and
-// never used stalls everything behind it.
-func (p *Peer) ReserveRawOrDrop(raw []byte, nextHeader byte) (*Reserved, error) {
+// ReserveRawOrDrop takes the peer's next place for one packet, and drops the
+// packet rather than waiting when no transmission slot is free. Babel sends
+// this way because waiting does not stay local: the speaker walks every
+// neighbor from one goroutine, and Receive runs on the sending peer's own
+// decrypt path, so one peer whose queue is backed up would stop hellos,
+// updates and retractions to every other neighbor until it drained, and two
+// such peers would each hold the other's emitter. The caller is told, and
+// gives back whatever the dropped packet had consumed.
+//
+// Taking the place and sending are separate so a caller that decides several
+// packets under a lock it cannot hold while sending can take all the places
+// under that lock, after which nothing can invert them. Every place taken has
+// to be sent, because one that is never used stalls everything behind it.
+func (p *Peer) ReserveRawOrDrop(raw []byte, nextHeader byte) (*Place, error) {
 	b := p.reserveBatchNow(1)
 	if b == nil {
 		return nil, ErrSendQueueFull
 	}
 	b.append(raw, nextHeader)
-	return &Reserved{batch: b}, nil
+	return &Place{batch: b}, nil
 }
 
-// Send hands a reservation to the peer's sender, which emits it once
-// everything reserved ahead of it has gone.
-func (r *Reserved) Send() error { return r.batch.enqueue() }
+// Send hands the packet to the peer's sender, which emits it once everything
+// reserved ahead of it has gone.
+func (p *Place) Send() error { return p.batch.enqueue() }
 
 type peerBatch struct {
 	peer      *Peer
@@ -154,32 +144,11 @@ type peerBatch struct {
 	hasSlot   bool
 }
 
-// reserveBatch assigns both the peer's transmission ticket and, when
-// supported, its ESP sequence range under one lock. Consequently ticket order,
-// sequence-range order, and the TUN intake order established by Mesh agree.
-//
-// It waits for a transmission slot, which nothing in the dataplane does: Mesh
-// reserves through reserveBatchNow so that one backpressured peer cannot stall
-// the readers feeding every other peer. What is left here is the unthrottled
-// producer the ordering tests and the benchmarks need.
-func (p *Peer) reserveBatch(count int) *peerBatch {
-	hasSlot := false
-	if p.slots != nil {
-		select {
-		case p.slots <- struct{}{}:
-			hasSlot = true
-		case <-p.stop:
-			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: peer %s closed", p.ID)}
-		}
-	}
-	return p.reserveBatchWithSlot(count, hasSlot)
-}
-
 // reserveBatchNow takes a transmission slot only if one is free. A caller that
 // would rather drop its packets than wait gets nil, having consumed neither a
 // ticket nor a sequence range, which is why the slot is taken before either: a
 // reserved ticket that never reaches the sender stalls it forever. The count
-// is what the caller was about to send, and is what the refusal is counted in.
+// is the caller's packet count, and the refusal is counted in the same unit.
 //
 // It does not wait at all, even briefly. A slot frees when the peer's sender
 // returns from the transport, so a queue that is full is one whose socket is
@@ -204,10 +173,11 @@ func (p *Peer) reserveBatchNow(count int) *peerBatch {
 	}
 }
 
-// Dropped counts the packets this peer refused rather than queued, because no
-// transmission slot was free or because it was already closing. It is the only
-// loss this package causes on purpose, so a peer whose path is congested shows
-// up as a rising counter here rather than as latency somewhere else.
+// Dropped counts the packets this peer did not transmit on purpose: no
+// transmission slot was free, the peer was already closing, or the outbound SA
+// could not give out a sequence range, which is what a peer that deleted its
+// Child SA looks like from here. A peer whose path is congested or whose SA is
+// gone shows up as a rising counter rather than as latency somewhere else.
 func (p *Peer) Dropped() uint64 { return p.dropped.Load() }
 
 func (p *Peer) reserveBatchWithSlot(count int, hasSlot bool) *peerBatch {
@@ -219,6 +189,13 @@ func (p *Peer) reserveBatchWithSlot(count int, hasSlot bool) *peerBatch {
 		b.sealer, b.err = p.reserveFn(count)
 	}
 	p.reserveMu.Unlock()
+	if b.err != nil {
+		// The batch keeps its ticket, so the sender is not stranded, but
+		// nothing in it will be transmitted: the sequence range it needed does
+		// not exist. Counted here rather than where the sender discards it,
+		// because this is where the packet count is still known.
+		p.dropped.Add(uint64(count))
+	}
 	b.raw = make([][]byte, 0, count)
 	b.headers = make([]byte, 0, count)
 	return b

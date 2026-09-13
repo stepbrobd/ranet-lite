@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"testing"
@@ -442,17 +443,14 @@ func TestResponderDoesNotReflectOnSPIAlone(t *testing.T) {
 	}
 }
 
-// Everything before the half-open slot is answered from the datagram alone.
-// Everything after it costs a Diffie-Hellman and a key derivation, measured at
-// 72 microseconds and 5 KiB a packet, which is a core saturated at fourteen
-// thousand packets a second by anyone who can reach the port. The slot has to
-// come before that work, not after it.
+// The slot has to come before the key exchange rather than after it, for the
+// reason enterHalfOpen's call site gives.
 //
 // The observable is the last stateless answer before the key exchange: an
 // offer this responder cannot accept draws NO_PROPOSAL_CHOSEN, so receiving
 // one proves execution reached selectIKEProposal. With every slot taken that
 // answer must not come, because the refusal happens first.
-func TestResponderTakesItsSlotBeforeTheKeyExchange(t *testing.T) {
+func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	mux, err := h.initiator.NewMux(net.ParseIP("127.0.0.1"), h.remotePort)
 	if err != nil {
@@ -524,8 +522,10 @@ func TestResponderTakesItsSlotBeforeTheKeyExchange(t *testing.T) {
 		t.Fatalf("an unacceptable offer drew notify %d, want NO_PROPOSAL_CHOSEN", answer.Type)
 	}
 
-	for range halfOpenLimit {
-		if !h.responder.enterHalfOpen() {
+	// Filled from enough distinct addresses that the global cap is what runs
+	// out rather than any one source's share.
+	for i := range halfOpenLimit {
+		if !h.responder.enterHalfOpen(fmt.Sprintf("198.51.100.%d:500", i/halfOpenPerSource)) {
 			t.Fatal("the responder refused a slot below its own limit")
 		}
 	}
@@ -554,12 +554,11 @@ func firstTestNotify(t *testing.T, raw []byte) Notify {
 	return notify
 }
 
-// buildTestSAInit produces a well-formed IKE_SA_INIT request, which is what
 // RFC 7296 section 2.5: a payload this profile does not implement, marked
 // critical, changes what the message means, so it has to be refused by type
 // rather than skipped. The answer is stateless and costs nothing, which is the
 // only reason it can be given before anything about the peer is known.
-func TestResponderRefusesACriticalPayloadItDoesNotImplement(t *testing.T) {
+func TestResponderRefusesCriticalPayloadItDoesNotImplement(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	mux, err := h.initiator.NewMux(net.ParseIP("127.0.0.1"), h.remotePort)
 	if err != nil {
@@ -601,7 +600,7 @@ func TestResponderRefusesACriticalPayloadItDoesNotImplement(t *testing.T) {
 // Our AUTH signs the IDr we send. Answering under a name we do not own would
 // hand the initiator a signature over an identity of its choosing, made with
 // this node's key, which is the whole of what authentication here rests on.
-func TestResponderRefusesAnIdentityItDoesNotAnswerTo(t *testing.T) {
+func TestResponderRefusesIdentityItDoesNotAnswerTo(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -687,8 +686,8 @@ func TestDeleteIKEReachesPeerWithoutRunLoop(t *testing.T) {
 	<-h.identities
 
 	// Deliberately no Run on either side, which is the state adopt closes a
-	// session in. DeleteIKE has to notice that and send directly; routing the
-	// Delete through the run loop's request queue would block here forever, so
+	// session in. DeleteIKE has to notice that and send directly, because
+	// routing the Delete through the run loop's request queue blocks forever, so
 	// the deadline is its own goroutine rather than an elapsed-time check that
 	// is only reached if the call returns at all.
 	deleted := make(chan error, 1)
@@ -905,17 +904,51 @@ func TestResponderRefusesCookieItDidNotIssue(t *testing.T) {
 // prove an address, the cap bounds what one proven address can hold.
 func TestResponderCapsHalfOpenExchanges(t *testing.T) {
 	r := &Responder{}
+	source := func(i int) string { return fmt.Sprintf("198.51.100.%d:500", i/halfOpenPerSource) }
 	for i := range halfOpenLimit {
-		if !r.enterHalfOpen() {
+		if !r.enterHalfOpen(source(i)) {
 			t.Fatalf("the responder refused half-open exchange %d, below its own limit", i)
 		}
 	}
-	if r.enterHalfOpen() {
+	if r.enterHalfOpen("203.0.113.1:500") {
 		t.Fatal("the responder allocated past its half-open limit, so a flood is bounded by nothing")
 	}
-	r.leaveHalfOpen()
-	if !r.enterHalfOpen() {
+	r.leaveHalfOpen(source(0))
+	if !r.enterHalfOpen(source(0)) {
 		t.Error("a completed exchange did not free its slot")
+	}
+}
+
+// The cap is also per address, or it is first come from one: an initiator that
+// sends IKE_SA_INIT and never IKE_AUTH holds a slot for the whole handshake
+// timeout, so one address parks all of them and every legitimate peer is then
+// refused after answering its cookie correctly.
+func TestOneAddressCannotHoldEveryHalfOpenSlot(t *testing.T) {
+	r := &Responder{}
+	const flood = "198.51.100.1:500"
+	for i := range halfOpenPerSource {
+		if !r.enterHalfOpen(flood) {
+			t.Fatalf("one address was refused its %dth exchange, below its own share", i)
+		}
+	}
+	if r.enterHalfOpen(flood) {
+		t.Error("one address took more than its share, so it can park every slot")
+	}
+	if !r.enterHalfOpen("203.0.113.1:500") {
+		t.Fatal("a peer at another address was refused while the node was nowhere near its limit")
+	}
+	// And the share is given back, or an address that once flooded is locked
+	// out for the life of the process.
+	for range halfOpenPerSource {
+		r.leaveHalfOpen(flood)
+	}
+	if !r.enterHalfOpen(flood) {
+		t.Error("an address that finished its exchanges never got its share back")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.halfOpenBySource) != 2 {
+		t.Errorf("the responder is tracking %d addresses, want only the two still holding slots", len(r.halfOpenBySource))
 	}
 }
 
@@ -953,10 +986,10 @@ func TestChaChaChildResponseEchoesNoKeyLength(t *testing.T) {
 // carried anything. A peer that reboots leaves an SA here that looks
 // established for a full dead-peer-detection window, and the rule that sorts
 // that out asks whether a session has recently proved the peer is there. A
-// handshake that just completed is exactly that proof; without it a fresh
+// handshake that just completed is exactly that proof. Without it a fresh
 // session reads as dead, the path is reported unheld, and the dialer opens
 // another SA over a perfectly good one on every reconnect delay.
-func TestAFreshlyEstablishedSessionReadsAsLive(t *testing.T) {
+func TestFreshlyEstablishedSessionReadsAsLive(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	initiator, err := h.dial(t)
 	if err != nil {

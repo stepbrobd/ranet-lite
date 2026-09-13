@@ -109,7 +109,7 @@ func TestSendRawOrDropDoesNotWaitForBackedUpPeer(t *testing.T) {
 	go func() {
 		n := 0
 		for range attempts {
-			if err := peer.SendRawOrDrop([]byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
+			if err := sendOrDrop(peer, []byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
 				n++
 			}
 		}
@@ -157,7 +157,7 @@ func TestControlPacketDropsAreReported(t *testing.T) {
 
 	var dropped int
 	for range cap(peer.slots) + 50 {
-		if err := peer.SendRawOrDrop([]byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
+		if err := sendOrDrop(peer, []byte("control packet"), 41); errors.Is(err, ErrSendQueueFull) {
 			dropped++
 		}
 	}
@@ -169,12 +169,35 @@ func TestControlPacketDropsAreReported(t *testing.T) {
 	unblock()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if err := peer.SendRawOrDrop([]byte("control packet"), 41); err == nil {
+		if err := sendOrDrop(peer, []byte("control packet"), 41); err == nil {
 			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the peer never took a control packet again after its transport drained")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// A peer whose outbound SA cannot give out a sequence range transmits nothing,
+// which is what a peer that has just deleted its Child SA looks like from this
+// side. Counting only the slot refusals would leave the drop counter reading
+// zero through exactly that window.
+func TestReservationFailureCountsAsADrop(t *testing.T) {
+	refused := errors.New("no child sa")
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) { return nil, refused },
+		func([][]byte) error { return nil })
+	defer peer.Close()
+
+	place, err := peer.ReserveRawOrDrop([]byte("packet"), 41)
+	if err != nil {
+		t.Fatalf("the reservation was refused outright: %v", err)
+	}
+	// The sender reports the failure where it discards the batch, not here, so
+	// the counter is the only thing a scrape can see.
+	place.Send()
+	if got := peer.Dropped(); got != 1 {
+		t.Errorf("the peer counted %d drops, want the one packet it could not send", got)
 	}
 }

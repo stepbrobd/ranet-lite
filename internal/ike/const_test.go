@@ -8,7 +8,7 @@ import "testing"
 // value, which is an interoperability failure no amount of testing against
 // ourselves can see. The values are the IANA IKEv2 Notify Message Types
 // registry, RFC 7296 section 3.10.1 and RFC 7427 section 4.
-func TestNotifyTypesAreTheRegistryValues(t *testing.T) {
+func TestNotifyTypesAreRegistryValues(t *testing.T) {
 	for name, pair := range map[string]struct {
 		got  NotifyType
 		want uint16
@@ -37,7 +37,7 @@ func TestNotifyTypesAreTheRegistryValues(t *testing.T) {
 
 // The same argument for everything else that only exists as a number once it
 // leaves this process.
-func TestWireNumbersAreTheRegistryValues(t *testing.T) {
+func TestWireNumbersAreRegistryValues(t *testing.T) {
 	for name, pair := range map[string]struct{ got, want uint16 }{
 		"IKE_SA_INIT":     {uint16(IKE_SA_INIT), 34},
 		"IKE_AUTH":        {uint16(IKE_AUTH), 35},

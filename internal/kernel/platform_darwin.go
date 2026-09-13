@@ -72,9 +72,12 @@ type routePlatform struct {
 	// log line rather than one per pass and neither map outgrows a snapshot.
 	warned map[Route]bool
 
-	// occupied remembers destinations another program already holds, so a
+	// occupied remembers the keys another program already holds, so a
 	// route that can never install is reported once rather than every pass.
-	occupied map[netip.Prefix]bool
+	occupied map[occupiedKey]bool
+	// refused is what this pass has seen refused, which becomes occupied at
+	// the start of the next one.
+	refused map[occupiedKey]bool
 
 	// addrs replaces the interface dump when set. The write side already goes
 	// through the rtSocket seam; without the read side a test cannot reach the
@@ -113,7 +116,8 @@ func newPlatform(cfg Config) (platform, error) {
 		control4: -1, control6: -1,
 		scoped:   make(map[netip.Prefix]netip.Prefix),
 		warned:   make(map[Route]bool),
-		occupied: make(map[netip.Prefix]bool),
+		occupied: make(map[occupiedKey]bool),
+		refused:  make(map[occupiedKey]bool),
 		pending:  make(map[Route]bool),
 	}
 	if err := plat.open(); err != nil {
@@ -196,6 +200,12 @@ func (p *routePlatform) prefSrc(destination netip.Prefix) netip.Addr {
 // the first thing every reconcile pass calls, so that is the boundary.
 func (p *routePlatform) rotateWarnings() {
 	p.warned, p.pending = p.pending, make(map[Route]bool, len(p.pending))
+	// occupied is rebuilt by the passes that refuse, the same way warned is,
+	// so a destination the mesh has stopped asking for stops being carried.
+	// Without this a node that meets a hundred foreign keys over its life
+	// holds a hundred records forever, and a stale one hides a route from the
+	// dump.
+	p.occupied, p.refused = p.refused, make(map[occupiedKey]bool, len(p.refused))
 }
 
 func (p *routePlatform) Routes() ([]Route, error) {
@@ -259,12 +269,23 @@ const skipRouteFlags = unix.RTF_MULTICAST | unix.RTF_BROADCAST |
 	unix.RTF_LOCAL | unix.RTF_WASCLONED | unix.RTF_LLINFO |
 	unix.RTF_BLACKHOLE | unix.RTF_GATEWAY
 
+// occupiedKey is what the darwin FIB keys a route by, which is the
+// destination and whether it is scoped to an interface. Recording only the
+// destination let an unrelated write to the other key clear the record: a
+// plain route installing successfully would forget that a foreign scoped route
+// holds the same destination, and the next dump would then report that route
+// as ours and withdraw it.
+type occupiedKey struct {
+	destination netip.Prefix
+	scoped      bool
+}
+
 // limitedBroadcast is the one entry the kernel installs that carries no flag
 // separating it from a route of ours: scoped, RTF_STATIC, and leaving through
 // the interface itself, which is exactly what this backend writes. It is not
-// created for a tun configured the way this backend configures one -- measured
+// created for a tun configured the way this backend configures one (measured
 // on a throwaway utun carrying a /24 and a /48, where every entry the kernel
-// added named an address as its gateway and so was already excluded -- but it
+// added named an address as its gateway and so was already excluded), but it
 // is present on every broadcast-capable interface on this machine and on the
 // utun another overlay configures differently. Nothing here ever asks for it,
 // so naming it costs nothing and keeps an addressing change from turning it
@@ -317,7 +338,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if prefix == limitedBroadcast {
 		return Route{}, false
 	}
-	if _, tracked := p.scoped[prefix]; !tracked && p.occupied[prefix] && rm.Flags&unix.RTF_IFSCOPE != 0 {
+	if _, tracked := p.scoped[prefix]; !tracked && p.occupied[occupiedKey{destination: prefix, scoped: true}] {
 		// An install this process watched the kernel refuse, so another writer
 		// holds that scoped key and reporting it as ours would withdraw it on
 		// the next pass. Everything else scoped is adopted below.
@@ -332,26 +353,17 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// "::/0" is the whole machine's default, installed forever.
 		source = netip.Prefix{}
 	}
-	// A scoped route this process did not install is still reported, with no
+	// A scoped route this process did not install is reported anyway, with no
 	// source, so that it can be withdrawn. Requiring a record of the install
-	// instead made it invisible: an instance that attached to a tun it did not
-	// create, as ranet-lite does, inherited its predecessor's scoped routes and
-	// could neither withdraw them nor install over them, because darwin has no
-	// replace and the add came back EEXIST on every pass for the life of the
-	// process.
+	// made it invisible instead: an instance that attached to a tun it did not
+	// create inherited its predecessor's scoped routes and could neither
+	// withdraw them nor install over them, because darwin has no replace.
 	//
 	// It does mean taking over a scoped route out of this interface that
 	// belongs to somebody else, which is already what happens to an unscoped
-	// one: the interface is this process's, and another overlay sharing the
-	// machine scopes to its own. The dump runs before the install in a pass,
-	// so an inherited route is resolved before anything can record its
-	// destination as occupied.
-	//
-	// What is left of it is this: the destination survives and the source does
-	// not, so a source-specific route inherited this way is withdrawn and
-	// reinstalled rather than recognized. A destination now wanted unscoped and
-	// unsourced keeps the inherited scoped route, because the diff does not key
-	// on scope.
+	// one. The interface is this process's, and another overlay scopes to its
+	// own. The source does not survive, so an inherited source-specific route
+	// is withdrawn and reinstalled rather than recognized.
 	return Route{
 		Destination: prefix,
 		// The kernel keeps no source, so a scoped route's source comes back
@@ -480,15 +492,17 @@ func (p *routePlatform) AddRoute(r Route) error {
 		if !errors.Is(err, unix.EEXIST) {
 			return err
 		}
-		if !p.occupied[r.Destination] {
-			p.occupied[r.Destination] = true
+		key := occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)}
+		p.refused[key] = true
+		if !p.occupied[key] {
+			p.occupied[key] = true
 			slog.Warn("kernel is leaving a route that another program holds",
 				"destination", r.Destination, "interface", p.cfg.Interface,
 				"detail", "darwin cannot replace a route, so this one was not installed")
 		}
 		return errRouteSkipped
 	}
-	delete(p.occupied, r.Destination)
+	delete(p.occupied, occupiedKey{destination: r.Destination, scoped: scopeOnDarwin(r)})
 	// Recorded only after the write lands, and only for a route that actually
 	// carries the scope. An entry for a route that was never installed would
 	// make decodeRoute report an unscoped route as carrying a source it does
@@ -503,18 +517,17 @@ func (p *routePlatform) AddRoute(r Route) error {
 // hides it from an ordinary lookup and shows it to a socket bound to an
 // address on this interface.
 //
-// A source-specific route is scoped because that is the only thing on this
-// platform that draws the distinction a source prefix draws at all.
+// A source-specific route is scoped because interface scope is the only thing
+// on this platform that draws the distinction a source prefix draws.
 //
-// A default is scoped because otherwise it captures the machine. darwin has
-// one FIB and Config.Table is meaningless here, so there is no equivalent of
-// the fleet's table plus "ipproto udp sport <port> lookup main", and nothing
-// keeps the peers' own endpoints out of an announced default: the ESP underlay
-// would route into the tun carrying it. On IPv4 an unscoped mesh default
-// survives today only because it collides with the box's own, and AddRoute
-// retries every pass, so the first moment the Mac has no v4 default the next
-// pass takes the machine. On IPv6 there is no collision to rely on, since
-// every default row on a Mac is already scoped to its own interface.
+// A default is scoped because otherwise it captures the machine. There is one
+// FIB and no equivalent of the fleet's table plus "ipproto udp sport <port>
+// lookup main", so nothing keeps the peers' own endpoints out of an announced
+// default and the ESP underlay would route into the tun carrying it. On IPv4
+// an unscoped mesh default survives only by colliding with the box's own, and
+// AddRoute retries every pass, so the first moment the Mac has no v4 default
+// the next pass takes the machine. On IPv6 there is no collision to rely on:
+// every default row on a Mac is already scoped.
 //
 // A half of the address space counts as a default, because that is how a
 // default that does not replace the host's is written: 0.0.0.0/1 with
@@ -525,19 +538,15 @@ func (p *routePlatform) AddRoute(r Route) error {
 // can announce one: the Update decoder bounds a prefix length only at 32 and
 // 128.
 //
-// A hold is scoped for a third reason. It answers with an error rather than
-// carrying the packet, and this FIB is the only one the machine has, so an
-// unscoped hold makes the prefix unreachable for everything on the box: a
-// retracted route shadows whatever else could still reach it for the length of
-// the hold, and a prefix this node originates itself does so for the life of
-// the process. Scoped, it holds for a socket bound to the mesh and is
-// invisible to everything else, which is the split the mesh's own forwarding
-// table already makes.
+// A hold is scoped because it answers with an error rather than carrying the
+// packet, and this FIB is the only one the machine has. Unscoped, a retracted
+// route shadows whatever else could still reach the prefix, and one this node
+// originates does so for the life of the process.
 //
 // Anything more specific stays unscoped, so the mesh is reachable from the Mac
-// itself without every program having to bind first. That is the same split
-// tailscale makes on the same machine: its exit-node default is scoped to its
-// utun, its 100.64/10 is not.
+// without every program binding first. That is the split tailscale makes on
+// the same machine: its exit-node default is scoped to its utun, its 100.64/10
+// is not.
 func scopeOnDarwin(r Route) bool {
 	return r.Source.IsValid() || r.Destination.Bits() <= 1 || r.Unreachable
 }
@@ -576,7 +585,7 @@ func (p *routePlatform) DelRoute(r Route) error {
 	if scopeOnDarwin(r) {
 		delete(p.scoped, r.Destination)
 	}
-	delete(p.occupied, r.Destination)
+	delete(p.occupied, occupiedKey{destination: r.Destination, scoped: r.Scoped})
 	return nil
 }
 
@@ -690,3 +699,6 @@ func (p *routePlatform) Enslave(master string) error {
 // Release is unreachable: the reconciler releases only what it enslaved, and
 // Enslave never succeeds.
 func (p *routePlatform) Release() error { return nil }
+
+// scopes is scopeOnDarwin as the diff reads it.
+func (p *routePlatform) scopes(r Route) bool { return scopeOnDarwin(r) }

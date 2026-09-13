@@ -1,6 +1,7 @@
 package babel
 
 import (
+	"fmt"
 	"log/slog"
 	"math"
 	"net/netip"
@@ -82,6 +83,9 @@ type starveRequest struct {
 type routeTable struct {
 	entries map[routeKey]*keyEntry
 	sources map[sourceKey]*sourceEntry
+	// originsPerKey is how many distinct origins each prefix has spent of
+	// maxOriginsPerPrefix, so one prefix cannot fill the whole source table.
+	originsPerKey map[routeKey]int
 	// dirty collects keys whose advertisement changed, for the triggered
 	// updates of RFC 8966 section 3.7.2; starved collects seqno requests.
 	// Both are drained by the Speaker, which owns all transmission.
@@ -96,16 +100,19 @@ type routeTable struct {
 	// forget drops the forwarding entry entirely, ending the
 	// unreachable hold install leaves behind for a retracted prefix.
 	forget func(routeKey)
-	// warnedOverfull keeps a refused flood from becoming a log flood.
+	// warnedOverfull keeps a refused flood from becoming a log flood, and
+	// warnedOrigins does the same for the source table.
 	warnedOverfull bool
+	warnedOrigins  bool
 }
 
 func newRouteTable(install func(routeKey, routeSelection)) *routeTable {
 	return &routeTable{
-		entries: make(map[routeKey]*keyEntry),
-		sources: make(map[sourceKey]*sourceEntry),
-		dirty:   make(map[routeKey]struct{}),
-		install: install,
+		entries:       make(map[routeKey]*keyEntry),
+		sources:       make(map[sourceKey]*sourceEntry),
+		originsPerKey: make(map[routeKey]int),
+		dirty:         make(map[routeKey]struct{}),
+		install:       install,
 	}
 }
 
@@ -413,6 +420,17 @@ func (rt *routeTable) overfull(key routeKey) {
 	rt.warnedOverfull = true
 	slog.Warn("babel route table is full, refusing new prefixes",
 		"limit", maxRouteKeys, "refused", key.dest)
+}
+
+// tooManyOrigins reports a refused origin once rather than once per update,
+// for the same reason overfull does.
+func (rt *routeTable) tooManyOrigins(key routeKey, routerID [8]byte) {
+	if rt.warnedOrigins {
+		return
+	}
+	rt.warnedOrigins = true
+	slog.Warn("babel prefix has too many origins, refusing new ones",
+		"limit", maxOriginsPerPrefix, "prefix", key.dest, "refused", fmt.Sprintf("%x", routerID))
 }
 
 func (rt *routeTable) flush(key routeKey) {

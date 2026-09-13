@@ -137,7 +137,7 @@ func TestSingleQueueInboundSplitsLargeBatches(t *testing.T) {
 // queue carries whichever destinations the kernel hashed onto it, so a
 // reservation that waits there puts the whole dataplane behind the slowest
 // peer on the mesh.
-func TestCongestedPeerDoesNotStallTheOthers(t *testing.T) {
+func TestCongestedPeerDoesNotStallOthers(t *testing.T) {
 	sealer := func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) {
 		sealed := make([][]byte, len(raw))
 		for i := range raw {

@@ -28,19 +28,19 @@ type sendAction struct {
 // under s.mu and returns the function that sends it, which runs after the lock
 // is released. It must be called with s.mu held.
 //
-// The split is the point. Two goroutines emit: Run, and Receive on the sending
-// peer's own decrypt path. Both decide under this lock and both have to send
-// after releasing it, because an in-memory transport delivers inline and would
-// re-enter Receive. Taking each packet's place in its peer's transmission
-// order here, rather than at send time, is what keeps the second one from
-// overtaking the first: a retraction decided before the update that replaces
-// it would otherwise reach the neighbor after it, and the neighbor would hold
-// the wrong answer until the next periodic dump.
+// Two goroutines emit: Run, and Receive on the sending peer's own decrypt
+// path. Both decide under this lock and both have to send after releasing it,
+// because an in-memory transport delivers inline and would re-enter Receive.
+// Taking each packet's place in its peer's transmission order here, rather
+// than at send time, stops the second one overtaking the first: a retraction
+// decided before the update that replaces it would otherwise reach the
+// neighbor after it, and the neighbor would hold the wrong answer until the
+// next periodic dump.
 //
 // A packet with no transmission slot free is dropped here, and the bookkeeping
 // it consumed is rolled back while the lock is still held.
 func (s *Speaker) emitLocked(actions []sendAction) func() {
-	var packets []*netstack.Reserved
+	var packets []*netstack.Place
 	for _, action := range coalesce(actions) {
 		reserved, whole := s.reserveBatchesTo(action.neighbor, action.dest, action.tlvs)
 		packets = append(packets, reserved...)
@@ -61,15 +61,6 @@ func (s *Speaker) emitLocked(actions []sendAction) func() {
 			}
 		}
 	}
-}
-
-// sendActions is emitLocked for a caller that is not holding s.mu, which is
-// every caller outside the two emitters.
-func (s *Speaker) sendActions(actions []sendAction) {
-	s.mu.Lock()
-	send := s.emitLocked(actions)
-	s.mu.Unlock()
-	send()
 }
 
 // coalesce merges the actions aimed at the same neighbor and destination into
@@ -119,7 +110,7 @@ func coalesce(actions []sendAction) []sendAction {
 
 // reserveTo builds one packet and takes its place in the peer's transmission
 // order, or reports nil when the peer has no slot free.
-func (s *Speaker) reserveTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) *netstack.Reserved {
+func (s *Speaker) reserveTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) *netstack.Place {
 	// Timestamp as the packet takes its place in the queue, rather than when
 	// the timer collected actions for potentially many peers.
 	for i, tlv := range tlvs {
@@ -148,8 +139,8 @@ func (s *Speaker) reserveTo(n *neighborState, destination netip.Addr, tlvs []Raw
 
 // reserveBatchesTo splits tlvs at the configured packet size and reports the
 // pieces that took a place, and whether every piece did.
-func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) ([]*netstack.Reserved, bool) {
-	var reserved []*netstack.Reserved
+func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) ([]*netstack.Place, bool) {
+	var reserved []*netstack.Place
 	whole := true
 	take := func(batch []RawTLV) {
 		if packet := s.reserveTo(n, destination, batch); packet != nil {
@@ -384,15 +375,18 @@ func (s *Speaker) starvedActions(now time.Time) []sendAction {
 // seqnoRequestTo builds one unicast seqno request, bypassing the forwarding
 // suppression table.
 func (s *Speaker) seqnoRequestTo(n *neighborState, key routeKey, routerID [8]byte, seqno uint16, now time.Time) sendAction {
-	s.pendingSeqno[sourceKey{route: key, routerID: routerID}] = pendingSeqno{seqno: seqno, sentAt: now}
+	// Recorded without a cap: this node's own requests come from its own route
+	// table, and refusing to record one only costs the suppression that stops
+	// it being relayed twice.
+	s.recordSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, "", now)
 	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{
 		AE: aeFor(key.dest), Prefix: key.dest, SourcePrefix: key.source,
 		Seqno: seqno, HopCount: seqnoRequestHopCount, RouterID: routerID,
 	})}}
 }
 
-func (s *Speaker) seqnoRequestAction(n *neighborState, key routeKey, routerID [8]byte, seqno uint16, hops uint8, now time.Time) (sendAction, bool) {
-	if !s.allowSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, now) {
+func (s *Speaker) seqnoRequestAction(n *neighborState, asker string, key routeKey, routerID [8]byte, seqno uint16, hops uint8, now time.Time) (sendAction, bool) {
+	if !s.allowSeqnoRequest(sourceKey{route: key, routerID: routerID}, seqno, asker, now) {
 		return sendAction{}, false
 	}
 	return sendAction{neighbor: n, dest: n.destination(), tlvs: []RawTLV{EncodeSeqnoRequest(SeqnoRequest{

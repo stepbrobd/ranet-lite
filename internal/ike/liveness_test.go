@@ -709,7 +709,7 @@ func TestUnansweredExchangeStillEnds(t *testing.T) {
 // brings it around. Everything else the loop waits for on an idle session is
 // dead peer detection ten seconds out, so a replaced inbound SA would sit
 // registered until something unrelated happened to wake the loop.
-func TestTheRunLoopWakesForARetirement(t *testing.T) {
+func TestRunLoopWakesForRetirement(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
 	retired := make(chan uint32, 1)
 	s := &Session{mux: mux, current: &ikeContext{}, requests: make(chan *localRequest)}
@@ -726,7 +726,7 @@ func TestTheRunLoopWakesForARetirement(t *testing.T) {
 	select {
 	case got := <-retired:
 		if got != spi {
-			t.Fatalf("retired SPI %08x, want %08x", got, spi)
+			t.Fatalf("the sweep retired SPI %08x, which is not the one that expired, %08x", got, spi)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the loop never woke for the retirement, so the replaced keys stay installed")

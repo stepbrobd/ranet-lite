@@ -256,8 +256,8 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 // other peer as well: a single backpressured socket would take the whole
 // dataplane down with it, and a queue that is full stays full for as long as
 // the transport is behind. That peer's share of the batch is dropped instead,
-// which is what an egress queue does when it fills, and every other peer's
-// packets go out on time. The drop is counted per peer.
+// the way a full egress queue drops, and every other peer's packets go out on
+// time. The drop is counted per peer.
 func (m *Mesh) dispatchOutbound(b *outboundBatch) {
 	m.outboundDispatchMu.Lock()
 	defer m.outboundDispatchMu.Unlock()

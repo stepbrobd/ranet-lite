@@ -603,7 +603,7 @@ func TestFloodOfUnclaimedIKEDatagramsIsNotCopied(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	allocated = after.TotalAlloc - before.TotalAlloc
 
-	// The queue holds a bounded number; everything past it costs nothing but
+	// The queue holds a bounded number, and everything past it costs nothing but
 	// the receive buffer it already had. Copying every datagram would be
 	// 2000 * 8192 bytes, so half of that separates the two outcomes by a wide
 	// margin in both directions and leaves room for whatever else a sandbox
@@ -618,7 +618,7 @@ func TestFloodOfUnclaimedIKEDatagramsIsNotCopied(t *testing.T) {
 // mux, so its datagrams are demultiplexed onto that mux's own queue and never
 // reach Hub.Listen: the flood that costs something is aimed at ikeCh, which
 // holds sixteen. The copy has to come after the queue is tested there too.
-func TestFloodOnAMuxsOwnIKEQueueIsNotCopied(t *testing.T) {
+func TestFloodOnMuxIKEQueueIsNotCopied(t *testing.T) {
 	hub, err := NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -656,7 +656,7 @@ func TestFloodOnAMuxsOwnIKEQueueIsNotCopied(t *testing.T) {
 
 	// ikeCh holds sixteen, so everything past that costs nothing but the
 	// receive buffer the loop already had. Copying every datagram would be
-	// 2000 * 8192 bytes; half of that separates the two outcomes widely in
+	// 2000 * 8192 bytes, and half of that separates the two outcomes widely in
 	// both directions.
 	if budget := uint64(2000*len(datagram)) / 2; allocated > budget {
 		t.Errorf("a flood of %d dropped datagrams allocated %d bytes, want well under %d",

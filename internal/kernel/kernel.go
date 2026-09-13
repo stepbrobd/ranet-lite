@@ -402,7 +402,7 @@ func (r *Reconciler) applyRoutes() error {
 	if err != nil {
 		return fmt.Errorf("list routes: %w", err)
 	}
-	add, del := diffRoutes(r.desired(r.src.Snapshot()), actual)
+	add, del := diffRoutes(r.desired(r.src.Snapshot()), actual, r.platformScopes())
 	var errs []error
 	added, removed := 0, 0
 	// Withdraw before installing. An install refuses a key another writer
@@ -487,30 +487,40 @@ func (r *Reconciler) metric(destination netip.Prefix) uint32 {
 // diffRoutes reports the routes the kernel is missing and the reconciler's
 // own routes it still holds that the mesh no longer wants. Both results are
 // sorted so a pass is reproducible and its log lines are stable.
-func diffRoutes(desired, actual []Route) (add, del []Route) {
-	// Scoped is how darwin's kernel keys a route, not what makes it a
-	// different route, so it is not part of the comparison: the diff decides
-	// from what the mesh asked for, and a withdrawal then names the scope the
-	// dump reported for the route it is withdrawing.
-	key := func(r Route) Route { r.Scoped = false; return r }
+//
+// scopes says which routes this platform files under interface scope, which on
+// darwin is how the kernel keys them and everywhere else is nothing. A desired
+// route is compared under the scope it would be installed with, and a route
+// read back under the scope the kernel actually holds, so the two agree for
+// every route this reconciler installed. They disagree only for a scoped route
+// it did not install, and that has to be replaced rather than accepted: an
+// unbound lookup does not reach a scoped route, so leaving one in place of an
+// unscoped route the mesh asked for is a black hole the diff would never
+// notice again.
+func diffRoutes(desired, actual []Route, scopes func(Route) bool) (add, del []Route) {
+	if scopes == nil {
+		scopes = func(Route) bool { return false }
+	}
+	wanted := func(r Route) Route { r.Scoped = scopes(r); return r }
+	held := func(r Route) Route { return r }
 	want := make(map[Route]bool, len(desired))
 	for _, route := range desired {
-		want[key(route)] = true
+		want[wanted(route)] = true
 	}
 	have := make(map[Route]bool, len(actual))
 	for _, route := range actual {
-		have[key(route)] = true
+		have[held(route)] = true
 	}
 	emitted := make(map[Route]bool, len(desired)+len(actual))
 	for _, route := range desired {
-		if k := key(route); !have[k] && !emitted[k] {
+		if k := wanted(route); !have[k] && !emitted[k] {
 			emitted[k] = true
 			add = append(add, route)
 		}
 	}
 	clear(emitted)
 	for _, route := range actual {
-		if k := key(route); !want[k] && !emitted[k] {
+		if k := held(route); !want[k] && !emitted[k] {
 			emitted[k] = true
 			del = append(del, route)
 		}
@@ -652,4 +662,15 @@ func canonicalPrefix(prefix netip.Prefix) (netip.Prefix, bool) {
 		return netip.Prefix{}, false
 	}
 	return canonical.Masked(), true
+}
+
+// scoper is implemented by a platform whose kernel keys a route by interface
+// scope as well as by its destination, which is darwin alone.
+type scoper interface{ scopes(Route) bool }
+
+func (r *Reconciler) platformScopes() func(Route) bool {
+	if p, ok := r.plat.(scoper); ok {
+		return p.scopes
+	}
+	return nil
 }

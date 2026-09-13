@@ -121,7 +121,7 @@ func TestSupportsIdentitySignatureHash(t *testing.T) {
 // by this node's own offer order, which is identical on every node running
 // this code. A ranking that did not follow the offer would make two nodes
 // prefer different groups and neither exchange would complete.
-func TestIKEGroupPreferenceFollowsTheOfferOrder(t *testing.T) {
+func TestIKEGroupPreferenceFollowsOfferOrder(t *testing.T) {
 	var groups []uint16
 	for _, transform := range ikeProposal().Transforms {
 		if transform.Type == TransDH {
@@ -145,7 +145,7 @@ func TestIKEGroupPreferenceFollowsTheOfferOrder(t *testing.T) {
 
 // The error is what tells the peer which group to come back with, so it has to
 // name it.
-func TestInvalidKEErrorNamesTheGroup(t *testing.T) {
+func TestInvalidKEErrorNamesGroup(t *testing.T) {
 	message := (&invalidKEError{group: DH_CURVE25519}).Error()
 	if !strings.Contains(message, strconv.Itoa(int(DH_CURVE25519))) {
 		t.Errorf("the error reads %q and does not name group %d", message, DH_CURVE25519)

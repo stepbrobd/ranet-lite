@@ -101,6 +101,22 @@ const (
 	// A cookie proves return routability, not good behavior.
 	halfOpenLimit = 256
 
+	// halfOpenPerSource is what one address can hold of that. Without it the
+	// cap is first come from a single address: an initiator that sends
+	// IKE_SA_INIT and never IKE_AUTH holds a slot for the whole
+	// handshakeTimeout, so eight and a half packets a second park every slot
+	// forever, and from then on every legitimate peer answers its cookie
+	// correctly and is refused anyway. That partition costs one real address
+	// and about seventeen packets a second.
+	//
+	// A refusal is silent because RFC 7296 section 2.21.1 does not give
+	// IKE_SA_INIT a notify for it, and inventing one is worse than the retry.
+	// The bound is well above what one peer produces: it opens one exchange
+	// per endpoint pair, and a retransmission that arrives before the response
+	// is registered starts another, so the ceiling is the retransmission
+	// budget rather than the number of SAs.
+	halfOpenPerSource = 16
+
 	cookieLifetime = 2 * time.Minute
 )
 
@@ -120,11 +136,13 @@ type Responder struct {
 	cfg   ResponderConfig
 	local map[Identity]struct{}
 
-	mu            sync.Mutex
-	halfOpen      int
-	cookieSecret  [32]byte
-	cookieVersion uint8
-	cookieRotated time.Time
+	mu       sync.Mutex
+	halfOpen int
+	// halfOpenBySource is how many of those one address is holding.
+	halfOpenBySource map[string]int
+	cookieSecret     [32]byte
+	cookieVersion    uint8
+	cookieRotated    time.Time
 }
 
 func NewResponder(cfg ResponderConfig) (*Responder, error) {
@@ -238,10 +256,11 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	// gives cookieThreshold something real to read: a handshake still in its
 	// key exchange is exactly the pressure the challenge of RFC 7296 section
 	// 2.6 exists to answer.
-	if !r.enterHalfOpen() {
+	source := fmt.Sprint(datagram.Endpoint)
+	if !r.enterHalfOpen(source) {
 		return nil, Accepted{}, fmt.Errorf("ike: too many half-open SAs")
 	}
-	defer r.leaveHalfOpen()
+	defer r.leaveHalfOpen(source)
 
 	supportsIdentity, err := supportsSignatureHash(request.Payloads, HashIdentity)
 	if err != nil {
@@ -669,19 +688,28 @@ func firstUnsupportedCritical(payloads []RawPayload) (PayloadType, bool) {
 	return 0, false
 }
 
-func (r *Responder) enterHalfOpen() bool {
+func (r *Responder) enterHalfOpen(source string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.halfOpen >= halfOpenLimit {
+	if r.halfOpen >= halfOpenLimit || r.halfOpenBySource[source] >= halfOpenPerSource {
 		return false
 	}
+	if r.halfOpenBySource == nil {
+		r.halfOpenBySource = make(map[string]int)
+	}
 	r.halfOpen++
+	r.halfOpenBySource[source]++
 	return true
 }
 
-func (r *Responder) leaveHalfOpen() {
+func (r *Responder) leaveHalfOpen(source string) {
 	r.mu.Lock()
 	r.halfOpen--
+	if r.halfOpenBySource[source] <= 1 {
+		delete(r.halfOpenBySource, source)
+	} else {
+		r.halfOpenBySource[source]--
+	}
 	r.mu.Unlock()
 }
 

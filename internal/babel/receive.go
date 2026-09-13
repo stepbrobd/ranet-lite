@@ -206,12 +206,13 @@ func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Ti
 		if !n.lastFullDump.IsZero() && now.Sub(n.lastFullDump) < s.cfg.UpdateInterval {
 			return nil
 		}
-		// Taken now, so forty requests in one packet draw one dump, and given
-		// back if the dump is dropped, so the next request is not refused over
-		// a dump the neighbor never received.
-		previous := n.lastFullDump
+		// Taken now, so forty requests in one packet draw one dump, and not
+		// given back if the packets are dropped. The cost this limits is the
+		// table walk under the lock, which has already happened by then, so
+		// refunding it would turn off the limit exactly while this node is too
+		// congested to deliver: every later request would walk the table
+		// again, under the lock that also carries hellos and retractions.
 		n.lastFullDump = now
-		rollback = append(rollback, func() { n.lastFullDump = previous })
 		for _, key := range s.advertisableKeys() {
 			advertised, undo := s.advertiseTo(n, key, false, now)
 			tlvs = append(tlvs, advertised...)
@@ -271,7 +272,7 @@ func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Ti
 	if target == nil {
 		return nil
 	}
-	action, ok := s.seqnoRequestAction(target, key, request.RouterID, request.Seqno, request.HopCount-1, now)
+	action, ok := s.seqnoRequestAction(target, n.peer.ID, key, request.RouterID, request.Seqno, request.HopCount-1, now)
 	if !ok {
 		return nil // a recent request for the same source is still outstanding
 	}

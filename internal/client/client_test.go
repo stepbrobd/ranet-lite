@@ -219,15 +219,26 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 		Organization: "example", CommonName: "node", Port: 13000,
 		Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
 	}
-	for name, next := range map[string]*config.Config{
-		"identity": {Organization: "example", CommonName: "other", Port: 13000, Endpoints: base.Endpoints},
-		"port":     {Organization: "example", CommonName: "node", Port: 14000, Endpoints: base.Endpoints},
-		"tun":      {Organization: "example", CommonName: "node", Port: 13000, Endpoints: base.Endpoints, TUN: "ranet9"},
-		"endpoints": {Organization: "example", CommonName: "node", Port: 13000,
-			Endpoints: []config.Endpoint{{SerialNumber: "1", AddressFamily: "ip6"}}},
+	rxcost := uint16(64)
+	window := uint32(8192)
+	// Every refusal, not a sample of them. Each of these is read once at
+	// startup by something a reload cannot reach, so accepting one would
+	// report a reload that changed nothing, or leave the node running two
+	// policies at the same time.
+	for name, change := range map[string]func(*config.Config){
+		"identity":  func(c *config.Config) { c.CommonName = "other" },
+		"port":      func(c *config.Config) { c.Port = 14000 },
+		"tun":       func(c *config.Config) { c.TUN = "ranet9" },
+		"responder": func(c *config.Config) { c.Responder = !c.Responder },
+		"endpoints": func(c *config.Config) { c.Endpoints = []config.Endpoint{{SerialNumber: "1", AddressFamily: "ip6"}} },
+		"babel":     func(c *config.Config) { c.Babel.RxCost = &rxcost },
+		"kernel":    func(c *config.Config) { c.Kernel.Table = 201 },
+		"rekey":     func(c *config.Config) { c.ReplayWindow = &window },
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := reloadable(base, next); err == nil {
+			next := *base
+			change(&next)
+			if err := reloadable(base, &next); err == nil {
 				t.Fatal("a change that needs a restart was accepted")
 			}
 		})
@@ -670,6 +681,12 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	next.Peers = append(slices.Clone(cfg.Peers),
 		config.Peer{Organization: "example", CommonName: "third", SerialNumber: "1"})
 	next.Originate = []string{"fd00:1::/64", "fd00:2::/64"}
+	// A source-specific announcement too, which only the babel block can
+	// express and which reaches the speaker through its own loop.
+	next.Babel.Originate = []config.OriginatePrefix{{
+		Prefix: netip.MustParsePrefix("fd00:3::/64"),
+		From:   netip.MustParsePrefix("fd00:a::/64"),
+	}}
 	grown := slices.Clone(reg)
 	grown[0].Nodes = append(slices.Clone(reg[0].Nodes), registry.Node{
 		CommonName: "third",
@@ -687,6 +704,12 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	}
 	if _, _, ok := c.registry().FindNode("example", "third"); !ok {
 		t.Error("the reloaded registry does not have the node that just joined")
+	}
+	// And the announcements reached the speaker, rather than only the copy of
+	// the configuration the client holds. A reload that stored the new set and
+	// never applied it would report success and announce the old one forever.
+	if got := speaker.Stats().Originated; got != 3 {
+		t.Errorf("the speaker announces %d prefixes after the reload, want the two plain ones and the source-specific one", got)
 	}
 	c.dialersMu.Lock()
 	dialers := len(c.dialers)
@@ -827,13 +850,11 @@ func TestRegistrationCannotOutliveItsSession(t *testing.T) {
 	}
 }
 
-// The registry is rewritten every time any node joins the mesh, and the peers
-// list is local and edited by hand, so the two drift: a node decommissioned
-// elsewhere leaves an entry behind here. Refusing the whole reload over it
-// would mean this node never sees another registry, and every node that joins
-// afterwards is unreachable from here, over a peer that is unreachable either
-// way.
-func TestReloadSkipsAPeerTheRegistryNoLongerNames(t *testing.T) {
+// A node decommissioned elsewhere leaves an entry behind in this node's peers
+// list. Refusing the whole reload over it would mean this node never sees
+// another registry, and every node that joins afterwards is unreachable from
+// here, over a peer that is unreachable either way.
+func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	cfg, privateKey, reg := runtimeFixture(t)
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
@@ -893,7 +914,7 @@ func TestReloadSkipsAPeerTheRegistryNoLongerNames(t *testing.T) {
 // to go rather than installed with nothing left to serve it. Without the door
 // the peer carries a session this node has already forgotten until its own
 // dead peer detection expires, which is over a minute.
-func TestASessionLandingAfterTheSweepIsToldToGo(t *testing.T) {
+func TestSessionLandingAfterSweepIsToldToGo(t *testing.T) {
 	set := newSessionSet()
 	var closed []*ike.Session
 	set.close = func(sess *ike.Session) { closed = append(closed, sess) }
@@ -925,7 +946,7 @@ func TestASessionLandingAfterTheSweepIsToldToGo(t *testing.T) {
 // this same pair of endpoints, so dialing anyway opens a second SA that one end
 // has to resolve away, and doing that on every reconnect delay is how two nodes
 // spend a whole mesh replacing each other's sessions.
-func TestTheDialerStandsDownForASessionThePeerOpened(t *testing.T) {
+func TestDialerStandsDownForSessionPeerOpened(t *testing.T) {
 	cfg, privateKey, reg := runtimeFixture(t)
 	loopback := "127.0.0.1"
 	// A port nothing listens on, so a dial that happens anyway cannot succeed
@@ -959,5 +980,34 @@ func TestTheDialerStandsDownForASessionThePeerOpened(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("the stand-down took %s, so it happened after the dial rather than instead of it", elapsed)
+	}
+}
+
+// A peer the registry no longer names must not be dialed, whether or not it
+// pins an endpoint serial. Without the check a peer that pins none enters the
+// retry loop and logs the same lookup failure every reconnect delay for the
+// life of the process, which is exactly the decommissioned entry a reload was
+// just told to leave alone.
+func TestDialerGivesUpOnANodeTheRegistryDoesNotName(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{ctx: ctx, cancel: cancel, privateKey: privateKey, sessions: newSessionSet()}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+
+	for name, peer := range map[string]config.Peer{
+		"pinned to a serial": {Organization: "example", CommonName: "gone", SerialNumber: "1"},
+		"pinned to none":     {Organization: "example", CommonName: "gone"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{})
+			go func() { defer close(done); c.runPeer(ctx, cfg.Endpoints[0], peer) }()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the dialer is still retrying a node the registry does not name")
+			}
+		})
 	}
 }

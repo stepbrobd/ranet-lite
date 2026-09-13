@@ -20,12 +20,17 @@ const reconnectDelay = 10 * time.Second
 func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Peer) {
 	reg := c.registry()
 	name := fmt.Sprintf("%s/%s@%s", p.Organization, p.CommonName, local.SerialNumber)
+	// A node the registry does not name is not dialed at all. The check runs
+	// whether or not the peer pins a serial number: without it a peer that
+	// pins none enters the retry loop and logs the same lookup failure every
+	// reconnect delay for the life of the process, which is what a
+	// decommissioned entry left in peers: does.
+	_, node, ok := reg.FindNode(p.Organization, p.CommonName)
+	if !ok {
+		log.Printf("peer %s: node not found", name)
+		return
+	}
 	if p.SerialNumber != "" {
-		_, node, ok := reg.FindNode(p.Organization, p.CommonName)
-		if !ok {
-			log.Printf("peer %s: node not found", name)
-			return
-		}
 		ep, ok := node.FindEndpoint(p.SerialNumber)
 		if !ok {
 			log.Printf("peer %s: endpoint serial %q not found", name, p.SerialNumber)

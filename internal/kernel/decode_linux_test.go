@@ -56,7 +56,7 @@ func TestLinuxDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 			// The hold has to come back as a hold, or the diff sees a path
 			// where there is a hold and replaces it every pass.
 			if want := test.message.Data[7] == unix.RTN_UNREACHABLE; decoded.Unreachable != want {
-				t.Errorf("decoded unreachable = %v, want %v", decoded.Unreachable, want)
+				t.Errorf("a hold came back as a path, so the diff replaces it on every pass")
 			}
 		})
 	}

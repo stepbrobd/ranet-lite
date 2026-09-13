@@ -50,6 +50,10 @@ var multicastGroup = netip.MustParseAddr("ff02::1:6")
 type pendingSeqno struct {
 	seqno  uint16
 	sentAt time.Time
+	// asker is the peer whose request created this entry, or empty for one
+	// this node sent on its own behalf. It is the peer's name rather than its
+	// state, so an entry left behind cannot pin a retired neighbor.
+	asker string
 }
 
 // Request timeout, RFC 8966 Appendix B. A request for the same source within
@@ -57,15 +61,22 @@ type pendingSeqno struct {
 // forwarded.
 const seqnoRequestSuppress = 2 * time.Second
 
-// maxPendingSeqno bounds that table. An entry is only ever created for a
-// prefix this node has a route for, which bounds one half of the index; the
+// maxPendingSeqno bounds that table, and maxPendingSeqnoPerNeighbor bounds
+// what any one neighbor can spend of it. An entry is only ever created for a
+// prefix this node has a route for, which bounds one half of the index. The
 // other half is the router id the requester wrote into the packet, which
-// nothing bounds, and eighty seqno requests fit in a single packet. Past the
-// cap the request is not forwarded, which is what the suppression above does
-// with a redundant one and is the rate limiting RFC 8966 section 3.8.1.2 asks
-// for. Requests this node sends on its own behalf are not subject to it: they
-// come from its own route table, which is already bounded.
-const maxPendingSeqno = 1 << 12
+// nothing bounds, and eighty seqno requests fit in a single packet. Past a cap
+// the request is not forwarded, which is what the suppression above does with
+// a redundant one and is the rate limiting RFC 8966 section 3.8.1.2 asks for.
+//
+// The per-neighbor share is what keeps one of them from turning forwarding off
+// for the rest: a flood that filled a single global table would stop every
+// other neighbor's requests being relayed, and a prefix that starves behind
+// this node would stop recovering until the flood did.
+const (
+	maxPendingSeqno            = 1 << 12
+	maxPendingSeqnoPerNeighbor = 1 << 10
+)
 
 // Hop count for locally originated seqno requests: "64 is a suitable default
 // value", RFC 8966 section 3.8.2.1.
@@ -110,6 +121,9 @@ type Speaker struct {
 	originate    map[routeKey]struct{}
 	routes       *routeTable
 	pendingSeqno map[sourceKey]pendingSeqno
+	// pendingByAsker is how much of pendingSeqno each neighbor is holding, so
+	// one of them cannot spend the whole table.
+	pendingByAsker map[string]int
 	// askedSeqno is the same suppression for requests this node originates,
 	// but indexed by neighbor as well. RFC 8966 section 3.8.2.1 wants every
 	// neighbor holding an unfeasible route asked, and pendingSeqno's index has
@@ -151,13 +165,14 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 	}
 	s := &Speaker{
 		cfg: cfg, mesh: mesh,
-		neighbors:     make(map[string]*neighborState),
-		originate:     make(map[routeKey]struct{}),
-		pendingSeqno:  make(map[sourceKey]pendingSeqno),
-		askedSeqno:    make(map[askedKey]time.Time),
-		starveRetries: make(map[sourceKey]*starveRetry),
-		originSeqno:   1,
-		changed:       make(chan struct{}, 1),
+		neighbors:      make(map[string]*neighborState),
+		originate:      make(map[routeKey]struct{}),
+		pendingSeqno:   make(map[sourceKey]pendingSeqno),
+		pendingByAsker: make(map[string]int),
+		askedSeqno:     make(map[askedKey]time.Time),
+		starveRetries:  make(map[sourceKey]*starveRetry),
+		originSeqno:    1,
+		changed:        make(chan struct{}, 1),
 	}
 	s.routes = newRouteTable(s.installRoute)
 	s.routes.forget = func(key routeKey) { s.mesh.Routes.Remove(key.source, key.dest) }
@@ -452,21 +467,46 @@ func (s *Speaker) sweepExpiredLocked(now time.Time) {
 // allowSeqnoRequest applies the duplicate suppression of RFC 8966 section
 // 3.8.1.2: a request is redundant while a recent one for the same source
 // carried a sequence number that is no smaller.
-func (s *Speaker) allowSeqnoRequest(index sourceKey, seqno uint16, now time.Time) bool {
+func (s *Speaker) allowSeqnoRequest(index sourceKey, seqno uint16, asker string, now time.Time) bool {
 	pending, known := s.pendingSeqno[index]
 	if known && now.Before(pending.sentAt.Add(seqnoRequestSuppress)) && !seqnoGT(seqno, pending.seqno) {
 		return false
 	}
-	if !known && len(s.pendingSeqno) >= maxPendingSeqno {
+	// The share is checked whether or not the index already exists: taking
+	// over an entry another neighbor created would otherwise be free, and one
+	// neighbor could hold the whole table through entries it never made.
+	if s.pendingByAsker[asker] >= maxPendingSeqnoPerNeighbor && (!known || pending.asker != asker) {
 		return false // see maxPendingSeqno
 	}
-	s.pendingSeqno[index] = pendingSeqno{seqno: seqno, sentAt: now}
+	if !known && len(s.pendingSeqno) >= maxPendingSeqno {
+		return false
+	}
+	s.recordSeqnoRequest(index, seqno, asker, now)
 	return true
+}
+
+// recordSeqnoRequest replaces one entry of the suppression table, keeping the
+// per-asker counts in step with it.
+func (s *Speaker) recordSeqnoRequest(index sourceKey, seqno uint16, asker string, now time.Time) {
+	if previous, known := s.pendingSeqno[index]; known {
+		s.releaseSeqnoRequest(previous)
+	}
+	s.pendingSeqno[index] = pendingSeqno{seqno: seqno, sentAt: now, asker: asker}
+	s.pendingByAsker[asker]++
+}
+
+func (s *Speaker) releaseSeqnoRequest(entry pendingSeqno) {
+	if s.pendingByAsker[entry.asker] <= 1 {
+		delete(s.pendingByAsker, entry.asker)
+		return
+	}
+	s.pendingByAsker[entry.asker]--
 }
 
 func (s *Speaker) sweepRequestsLocked(now time.Time) {
 	for index, pending := range s.pendingSeqno {
 		if !now.Before(pending.sentAt.Add(seqnoRequestSuppress)) {
+			s.releaseSeqnoRequest(pending)
 			delete(s.pendingSeqno, index)
 		}
 	}

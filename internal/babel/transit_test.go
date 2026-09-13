@@ -610,7 +610,7 @@ func TestForwardedSeqnoRequestsAreBounded(t *testing.T) {
 	}
 
 	speaker := fabric.speakers["b"]
-	for i := range maxPendingSeqno + 64 {
+	for i := range maxPendingSeqnoPerNeighbor + 64 {
 		var id [8]byte
 		binary.BigEndian.PutUint64(id[:], uint64(i))
 		fabric.inject("b", "a", EncodeSeqnoRequest(SeqnoRequest{
@@ -618,10 +618,25 @@ func TestForwardedSeqnoRequestsAreBounded(t *testing.T) {
 		}))
 	}
 	switch got := len(speaker.pendingSeqno); {
-	case got > maxPendingSeqno:
-		t.Fatalf("b held %d forwarded seqno requests, past its cap of %d", got, maxPendingSeqno)
-	case got < maxPendingSeqno:
+	case got > maxPendingSeqnoPerNeighbor:
+		t.Fatalf("b held %d forwarded seqno requests from one neighbor, past its share of %d", got, maxPendingSeqnoPerNeighbor)
+	case got < maxPendingSeqnoPerNeighbor:
 		t.Fatalf("b held %d forwarded seqno requests, so the flood never reached the table", got)
+	}
+
+	// And another neighbor can still have one forwarded, which is the point of
+	// the share: one of them flooding must not turn forwarding off for the
+	// rest, or a prefix starving behind this node stops recovering.
+	fresh := sourceKey{route: key, routerID: [8]byte{0xff}}
+	speaker.mu.Lock()
+	allowed := speaker.allowSeqnoRequest(fresh, 9, "c", time.Now())
+	refused := speaker.allowSeqnoRequest(sourceKey{route: key, routerID: [8]byte{0xfe}}, 9, "a", time.Now())
+	speaker.mu.Unlock()
+	if !allowed {
+		t.Error("a neighbor that has asked for nothing was refused because another had spent the table")
+	}
+	if refused {
+		t.Error("the neighbor that spent its share was allowed more")
 	}
 }
 
@@ -630,7 +645,7 @@ func TestForwardedSeqnoRequestsAreBounded(t *testing.T) {
 // one prefix on every packet therefore adds an entry on every packet, and
 // RFC 8966 Appendix B keeps each one for three minutes after the last time it
 // was advertised.
-func TestSourceTableRefusesAnUnknownOriginWhenFull(t *testing.T) {
+func TestSourceTableRefusesUnknownOriginWhenFull(t *testing.T) {
 	rt := newRouteTable(func(routeKey, routeSelection) {})
 	key := routeKey{dest: netip.MustParsePrefix("fd00:1::/64")}
 	now := time.Now()
@@ -643,6 +658,24 @@ func TestSourceTableRefusesAnUnknownOriginWhenFull(t *testing.T) {
 	binary.BigEndian.PutUint64(fresh[:], uint64(maxSources))
 	if rt.feasible(key, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
 		t.Fatal("a full source table still admitted an origin it had never advertised")
+	}
+
+	// And a prefix cannot spend the whole table on its own, or one neighbor
+	// churning the origin of one prefix stops this node learning any new
+	// origin anywhere, a restarted peer's new router id included.
+	elsewhere := routeTable{sources: map[sourceKey]*sourceEntry{}, originsPerKey: map[routeKey]int{}}
+	crowded := routeKey{dest: netip.MustParsePrefix("fd00:2::/64")}
+	for i := range maxOriginsPerPrefix {
+		var id [8]byte
+		binary.BigEndian.PutUint64(id[:], uint64(i))
+		elsewhere.observe(crowded, advertisement{routerID: id, seqno: 1, metric: 64}, now)
+	}
+	if elsewhere.feasible(crowded, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
+		t.Error("one prefix took more origins than its share, so it can spend the whole table")
+	}
+	quiet := routeKey{dest: netip.MustParsePrefix("fd00:3::/64")}
+	if !elsewhere.feasible(quiet, advertisement{routerID: fresh, seqno: 1, metric: 64}) {
+		t.Error("another prefix was refused an origin because a crowded one had spent its own share")
 	}
 	// The cap refuses origins it has no room to record, not the ones it holds,
 	// and never a retraction: neither of those can close a loop.
@@ -1014,7 +1047,7 @@ func TestOriginSeqnoRisesAtMostOncePerPacket(t *testing.T) {
 // periodic dump or a route expiry, all of them minutes out on a quiet link, so
 // without the starvation retry in the deadline the repeat waits for whatever
 // happens to wake the loop next, which on the link this matters for is nothing.
-func TestTheRunLoopWakesForAStarvationRetry(t *testing.T) {
+func TestRunLoopWakesForStarvationRetry(t *testing.T) {
 	quiet := Config{HelloInterval: time.Minute, UpdateInterval: time.Minute}
 	fabric := newMeshFabric(t, quiet, "a-b", "b-c", "a-d")
 	dest := netip.MustParsePrefix("fd00:c::/64")

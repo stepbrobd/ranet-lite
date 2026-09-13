@@ -396,7 +396,7 @@ func TestNetlinkHoldsRetractedPrefix(t *testing.T) {
 		t.Fatalf("the table holds %v, want %v", got, []Route{held})
 	}
 	// It converges, so a pass does not delete and reinstall it forever.
-	if add, del := diffRoutes([]Route{held}, got); len(add) != 0 || len(del) != 0 {
+	if add, del := diffRoutes([]Route{held}, got, nil); len(add) != 0 || len(del) != 0 {
 		t.Fatalf("an installed hold did not converge: add %v, delete %v", add, del)
 	}
 	if err := plat.DelRoute(held); err != nil {

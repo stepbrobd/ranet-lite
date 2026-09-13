@@ -24,22 +24,26 @@ type sourceEntry struct {
 // Source GC time, RFC 8966 Appendix B.
 const sourceGCTime = 3 * time.Minute
 
-// maxSources bounds the source table. Its index is a prefix and a router id.
-// The prefix dimension is bounded by this node's own route table; the router
-// id dimension is bounded by nothing, because the origin of a route is chosen
-// by whoever originated it and merely relayed by the neighbor that hands it
-// over. A neighbor that names a new origin for one prefix on every packet adds
-// an entry on every packet, and each survives sourceGCTime after the last time
-// this node advertised it.
+// maxSources bounds the source table and maxOriginsPerPrefix bounds what any
+// one prefix can spend of it. The index is a prefix and a router id: this
+// node's route table bounds the prefixes, nothing bounds the router ids, and a
+// neighbor that names a new origin for one prefix on every packet adds an
+// entry on every packet that lives for sourceGCTime.
 //
-// Past the cap an origin this node has never advertised is treated as
-// unfeasible. Refusing a route can never close a loop, so the bound costs
-// nothing in correctness: routes already selected keep working, and the
-// prefixes this node originates itself still record their distance, which is
-// one entry each. A real mesh never comes near this. Its live set is one entry
-// per prefix per origin that was actually selected, and sixty-five thousand of
-// those is a mesh far larger than any this carries.
-const maxSources = 1 << 16
+// Past a cap an origin this node has never advertised is unfeasible. Refusing
+// a route can never close a loop, so routes already selected keep working and
+// the prefixes this node originates still record their distance. The
+// per-prefix share is what keeps the damage local: a global cap alone is first
+// come, so one neighbor churning the origin of one prefix would stop this node
+// learning any new origin anywhere, including a peer that restarted and drew a
+// new router id as RFC 8966 section 3.2.2 requires.
+//
+// A prefix legitimately has a handful of origins, so thirty-two is far above
+// anycast and far below what a flood needs.
+const (
+	maxSources          = 1 << 16
+	maxOriginsPerPrefix = 32
+)
 
 // better reports whether (seqno, metric) is strictly better than the stored
 // distance, the lexicographic order of RFC 8966 section 3.5.1 with the
@@ -59,7 +63,11 @@ func (rt *routeTable) feasible(key routeKey, adv advertisement) bool {
 		// A distance we have never recorded is feasible by definition, but
 		// recording it is what selecting the route would cost, so this is
 		// also where the table is bounded. See maxSources.
-		return len(rt.sources) < maxSources
+		if len(rt.sources) >= maxSources || rt.originsPerKey[key] >= maxOriginsPerPrefix {
+			rt.tooManyOrigins(key, adv.routerID)
+			return false
+		}
+		return true
 	}
 	return entry.better(adv.seqno, adv.metric)
 }
@@ -78,6 +86,7 @@ func (rt *routeTable) observe(key routeKey, adv advertisement, now time.Time) {
 	if entry == nil {
 		entry = &sourceEntry{seqno: adv.seqno, metric: adv.metric}
 		rt.sources[index] = entry
+		rt.originsPerKey[key]++
 	} else if entry.better(adv.seqno, adv.metric) {
 		entry.seqno, entry.metric = adv.seqno, adv.metric
 	}
@@ -115,5 +124,10 @@ func (rt *routeTable) sweepSources(now time.Time) {
 			continue
 		}
 		delete(rt.sources, index)
+		if rt.originsPerKey[index.route] <= 1 {
+			delete(rt.originsPerKey, index.route)
+		} else {
+			rt.originsPerKey[index.route]--
+		}
 	}
 }

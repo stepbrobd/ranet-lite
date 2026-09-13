@@ -3,8 +3,12 @@
 package kernel
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"net/netip"
+	"slices"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -18,7 +22,8 @@ type fakeNetlink struct {
 		kind, flags uint16
 		body        []byte
 	}
-	err error
+	replies []nlMessage
+	err     error
 }
 
 func (f *fakeNetlink) execute(kind, flags uint16, body []byte) ([]nlMessage, error) {
@@ -26,7 +31,7 @@ func (f *fakeNetlink) execute(kind, flags uint16, body []byte) ([]nlMessage, err
 		kind, flags uint16
 		body        []byte
 	}{kind, flags, body})
-	return nil, f.err
+	return f.replies, f.err
 }
 
 func (f *fakeNetlink) link(string) (uint32, uint32, error) { return 0, 0, nil }
@@ -48,7 +53,7 @@ func writePlatform(t *testing.T) (*netlinkPlatform, *fakeNetlink) {
 // traffic for it is answered with an error instead of following a covering
 // route somewhere else. Installing it as an ordinary path would send that
 // traffic out of the tun to a peer that no longer announces it.
-func TestLinuxInstallsAHoldAsAnUnreachableRoute(t *testing.T) {
+func TestLinuxInstallsHoldAsUnreachableRoute(t *testing.T) {
 	plat, conn := writePlatform(t)
 	held := Route{Destination: netip.MustParsePrefix("2001:db8:1::/48"), Unreachable: true}
 	if err := plat.AddRoute(held); err != nil {
@@ -88,7 +93,7 @@ func TestLinuxInstallsAHoldAsAnUnreachableRoute(t *testing.T) {
 // A prefix another writer already holds is reported as skipped rather than as
 // a failure. Reported as a failure it would put the whole pass into backoff
 // over a key no retry can free, once per pass, for the life of the process.
-func TestLinuxReportsAnOccupiedRouteAsSkipped(t *testing.T) {
+func TestLinuxReportsOccupiedRouteAsSkipped(t *testing.T) {
 	plat, conn := writePlatform(t)
 	conn.err = unix.EEXIST
 	route := Route{Destination: netip.MustParsePrefix("2001:db8:2::/48")}
@@ -132,5 +137,82 @@ func TestLinuxWithdrawalNamesOurOwnProtocol(t *testing.T) {
 	conn.err = unix.ESRCH
 	if err := plat.DelRoute(Route{Destination: netip.MustParsePrefix("2001:db8:4::/48")}); err != nil {
 		t.Errorf("withdrawing a route that was already gone reported %v", err)
+	}
+}
+
+// foreignWriters is what reports another routing daemon exporting into the
+// table this reconciler owns, which on the fleet means BIRD and this node
+// each displacing the other's routes and waking each other's scan. It dumps
+// both families and had no test of any kind: the classifier it calls was
+// covered, the dump around it was not, so it could have asked for one family,
+// or for the wrong table, unnoticed.
+func TestLinuxForeignWritersDumpsBothFamilies(t *testing.T) {
+	plat, conn := writePlatform(t)
+	const ourTable, ourProtocol = 200, DefaultProtocol
+	conn.replies = []nlMessage{
+		// Somebody else exporting into our table, which is what this reports.
+		routeDump(ourTable, 187, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.0.0/24")),
+		// Our own routes, which are not foreign.
+		routeDump(ourTable, ourProtocol, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.1.0/24")),
+		// Another daemon in another table, which is none of our business: the
+		// point of the report is a collision on one key, not a census.
+		routeDump(unix.RT_TABLE_MAIN, 42, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.2.0/24")),
+	}
+	got, err := plat.foreignWriters()
+	if err != nil {
+		t.Fatalf("dump: %v", err)
+	}
+	if len(got) != 1 || got[0] != "isis (187)" {
+		t.Errorf("reported protocols %v, want just the one writing into our table", got)
+	}
+	var families []uint8
+	for _, sent := range conn.sent {
+		if sent.kind == unix.RTM_GETROUTE && sent.flags&unix.NLM_F_DUMP != 0 {
+			families = append(families, sent.body[0])
+		}
+	}
+	if !slices.Contains(families, uint8(unix.AF_INET)) || !slices.Contains(families, uint8(unix.AF_INET6)) {
+		t.Errorf("the dump asked for families %v, want both AF_INET and AF_INET6", families)
+	}
+}
+
+// The report reaches an operator through slog, whose text handler quotes
+// anything shaped like a byte slice rather than listing it, so a []uint8 of
+// protocols 2 and 12 arrived on a live fleet node as protocols="\x02\f" and
+// told nobody anything. Rendering therefore belongs to this report rather than
+// to its caller, and this asserts the line as printed.
+func TestForeignWriterReportRendersReadably(t *testing.T) {
+	plat, conn := writePlatform(t)
+	conn.replies = []nlMessage{
+		routeDump(200, unix.RTPROT_BIRD, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.0.0/24")),
+		routeDump(200, unix.RTPROT_KERNEL, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.1.0/24")),
+	}
+	writers, err := plat.foreignWriters()
+	if err != nil {
+		t.Fatalf("dump: %v", err)
+	}
+	var out bytes.Buffer
+	slog.New(slog.NewTextHandler(&out, nil)).Warn("sharing", "protocols", strings.Join(writers, ", "))
+	line := out.String()
+	for _, want := range []string{"bird (12)", "kernel (2)"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the report printed %q, want it to name %s", line, want)
+		}
+	}
+	// The defect printed the numbers as raw bytes, and every protocol worth
+	// reporting lands on a control character under that spelling.
+	if strings.ContainsFunc(line, func(r rune) bool { return r < 0x20 && r != '\n' }) {
+		t.Errorf("the report printed %q, carrying the protocol numbers as bytes rather than as text", line)
+	}
+}
+
+// An unclaimed number has no name to print, and dropping it rather than
+// printing the number would hide the writer the report exists to name.
+func TestForeignWriterReportNamesAnUnclaimedProtocolByNumber(t *testing.T) {
+	if got, want := protocolLabel(155), "155"; got != want {
+		t.Errorf("protocol 155 printed as %q, want %q", got, want)
+	}
+	if got, want := protocolLabel(unix.RTPROT_BABEL), "babel (42)"; got != want {
+		t.Errorf("babel printed as %q, want %q", got, want)
 	}
 }
