@@ -680,18 +680,20 @@ func supportsSignatureHash(payloads []RawPayload, wanted uint16) (bool, error) {
 }
 
 func suiteFromProposal(p Proposal) (SASuite, error) {
-	// Three transforms decide keys, and a responder that took an integrity
-	// transform we offered has to return it, RFC 7296 section 2.7, so four is
-	// a shape this end has to be able to read even though it never offers one.
-	if p.Number != 1 || p.Protocol != ProtoIKE || len(p.SPI) != 0 || len(p.Transforms) < 3 || len(p.Transforms) > 4 {
+	// The answer to this end's own offer, which RFC 7296 section 2.7 makes a
+	// subset of it: "The responder MUST choose a single suite, which may be
+	// any subset of the SA proposal", with "exactly one transform of each type
+	// included in the proposal". ikeProposal names three types, so a
+	// conforming answer carries three, and section 3.3.6 has the initiator
+	// terminate an exchange whose answer is not consistent with what it
+	// proposed. See decodeChildProposal for why an unoffered type is refused
+	// even where it could not change the suite.
+	if p.Number != 1 || p.Protocol != ProtoIKE || len(p.SPI) != 0 || len(p.Transforms) != 3 {
 		return SASuite{}, fmt.Errorf("ike: invalid selected IKE proposal shape")
 	}
 	offered := ikeProposal().Transforms
 	selected := make(map[TransformType]Transform, 3)
 	for _, transform := range p.Transforms {
-		if transform.Type == TransInteg && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes {
-			continue
-		}
 		if transform.Type != TransEncr && transform.Type != TransPRF && transform.Type != TransDH {
 			return SASuite{}, fmt.Errorf("ike: unexpected selected transform type %d", transform.Type)
 		}

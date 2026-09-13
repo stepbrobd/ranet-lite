@@ -42,14 +42,15 @@ func TestSuiteFromProposalRequiresExactOfferSelection(t *testing.T) {
 			t.Fatalf("accepted invalid selected transform %+v", extra)
 		}
 	}
-	// A responder that took an integrity transform this end offered has to
-	// return it, RFC 7296 section 2.7, so the four-transform answer is a shape
-	// this end has to read even though it never offers one. The three that
-	// decide keys are still matched exactly.
+	// Section 2.7 makes the answer a subset of the offer, "any subset of the
+	// SA proposal", with one transform of each type the offer included. This
+	// end's offer names no integrity transform, so an answer that names one is
+	// not consistent with it whatever its value, and section 3.3.6 has the
+	// initiator terminate rather than take it.
 	echoed := valid
 	echoed.Transforms = append(append([]Transform(nil), valid.Transforms...), Transform{Type: TransInteg, ID: INTEG_NONE})
-	if _, err := suiteFromProposal(echoed); err != nil {
-		t.Errorf("an answer echoing INTEG NONE was refused: %v", err)
+	if _, err := suiteFromProposal(echoed); err == nil {
+		t.Error("an answer naming a transform type this end never offered was accepted")
 	}
 }
 

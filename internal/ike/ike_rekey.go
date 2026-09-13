@@ -109,7 +109,11 @@ func (s *Session) RekeyIKE() error {
 		return fmt.Errorf("ike: incomplete IKE SA rekey response")
 	}
 	props, err := DecodeSA(sa.Body)
-	if err != nil || len(props) != 1 || props[0].Number != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 || len(props[0].Transforms) != 3 {
+	// The answer to this end's own rekey offer, which names three transform
+	// types, so section 2.7 has it carry three. suiteFromProposal checks the
+	// rest of the consistency section 3.3.6 requires.
+	if err != nil || len(props) != 1 || props[0].Number != 1 || props[0].Protocol != ProtoIKE ||
+		len(props[0].SPI) != 8 || len(props[0].Transforms) != 3 {
 		return fmt.Errorf("ike: invalid IKE SA rekey proposal")
 	}
 	selectedProposal := props[0]

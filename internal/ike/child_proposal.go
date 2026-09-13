@@ -165,10 +165,28 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal")
 	}
 	p := props[0]
-	// Two transforms decide keys, and a peer that spelled out INTEG NONE gets
-	// it back, RFC 7296 section 2.7, so three is a shape this has to read.
-	if p.Number != 1 || p.Protocol != ProtoESP || len(p.SPI) != 4 ||
-		len(p.Transforms) < 2 || len(p.Transforms) > 3 {
+	// Both callers are the initiator reading the answer to its own offer, and
+	// RFC 7296 section 3.3.6 has it "check that the accepted offer is
+	// consistent with one of its proposals, and if not MUST terminate the
+	// exchange". Section 2.7 says what the responder may return: "The
+	// responder MUST choose a single suite, which may be any subset of the SA
+	// proposal", and "exactly one transform of each type included in the
+	// proposal". A subset, so the answer's types are the offer's types, and
+	// espProposal names two of them.
+	//
+	// A type the offer never named is refused whatever its value. A DH
+	// transform is the one that costs something: the responder would mean
+	// perfect forward secrecy and derive KEYMAT over g^ir, section 2.17, while
+	// both callers here derive without it, and the Child SA that installs
+	// carries nothing either way. Section 1.2 forbids it outright on the
+	// IKE_AUTH path: "the SA payloads in the IKE_AUTH exchange cannot contain
+	// Transform Type 4 (Diffie-Hellman group) with any value other than NONE."
+	// An integrity transform is harmless to the suite, NONE or not, but
+	// nothing in 7296 or RFC 5282 lets a responder add a type to the answer,
+	// and no implementation is known to. The responder half of this package
+	// echoes only what it was offered, which is the rule read from the other
+	// side.
+	if p.Number != 1 || p.Protocol != ProtoESP || len(p.SPI) != 4 || len(p.Transforms) != 2 {
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal shape")
 	}
 	remoteSPI := binary.BigEndian.Uint32(p.SPI)
@@ -177,6 +195,7 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 	}
 	var encryption Transform
 	var haveEncryption, haveESN bool
+	// One transform of each type, section 2.7, which the two flags below are.
 	for _, transform := range p.Transforms {
 		switch transform.Type {
 		case TransEncr:
@@ -193,14 +212,6 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 				return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has an unsupported ESN transform")
 			}
 			haveESN = true
-		case TransInteg:
-			// An AEAD cipher needs no integrity transform, and a peer naming
-			// NONE says the same thing as omitting it. Refusing the spelling
-			// would fail the Child SA bundled into IKE_AUTH for a peer whose
-			// IKE_SA_INIT selectIKEProposal has just accepted.
-			if transform.ID != INTEG_NONE || transform.KeyLengthBits != 0 || transform.UnsupportedAttributes {
-				return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has an integrity transform")
-			}
 		default:
 			return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has transform type %d", transform.Type)
 		}
@@ -299,7 +310,7 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 				// See decodeChildProposal: NONE alongside an AEAD cipher says
 				// what omitting the transform says, and anything else is a
 				// transform this implementation has no key for.
-				if transform.ID != INTEG_NONE || transform.KeyLengthBits != 0 || transform.UnsupportedAttributes {
+				if transform.ID != INTEG_NONE || transform.UnsupportedAttributes {
 					unacceptable = true
 					break
 				}

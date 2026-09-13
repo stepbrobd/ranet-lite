@@ -285,7 +285,7 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 		responseEncr.KeyLengthBits = 0
 	}
 	response := Proposal{Number: selected.proposal.Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{responseEncr, {Type: TransESN, ID: ESN_NO}}}
-	// One transform of every type the offer carried, RFC 7296 section 3.3.6.
+	// One transform of every type the offer carried, RFC 7296 section 2.7.
 	if selected.integ.Type != 0 {
 		response.Transforms = append(response.Transforms, selected.integ)
 	}

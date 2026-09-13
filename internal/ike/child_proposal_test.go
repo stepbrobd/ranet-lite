@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -129,7 +130,7 @@ func TestNonceLengthFollowsTheNegotiatedPRF(t *testing.T) {
 // refusing it on the Child SA bundled into IKE_AUTH kills the handshake one
 // message after the exchange that was just made to work, and refusing it on an
 // IKE rekey leaves such a peer established and unable to rekey from its own
-// side. RFC 7296 section 3.3 then requires the answer to carry it back.
+// side. RFC 7296 section 2.7 then requires the answer to carry it back.
 func TestIntegNoneIsTakenAndEchoedOnEveryProposal(t *testing.T) {
 	integ := Transform{Type: TransInteg, ID: INTEG_NONE}
 	esp := func(extra ...Transform) []byte {
@@ -146,8 +147,11 @@ func TestIntegNoneIsTakenAndEchoedOnEveryProposal(t *testing.T) {
 	if selection.integ != integ {
 		t.Errorf("the selection kept %+v, so the answer cannot carry it back", selection.integ)
 	}
-	if _, _, _, err := decodeChildProposal(esp(integ), nil); err != nil {
-		t.Errorf("decoding a Child SA proposal naming INTEG NONE failed: %v", err)
+	// The other direction is not the same rule. decodeChildProposal reads the
+	// answer to this end's own offer, which names no integrity transform, and
+	// section 2.7 makes the answer a subset of the offer. See its own doc.
+	if _, _, _, err := decodeChildProposal(esp(integ), nil); err == nil {
+		t.Error("an answer to this end's offer named a transform type the offer did not")
 	}
 
 	// And an integrity transform there is no key for is still refused, because
@@ -158,5 +162,109 @@ func TestIntegNoneIsTakenAndEchoedOnEveryProposal(t *testing.T) {
 	}
 	if _, _, _, err := decodeChildProposal(esp(unusable), nil); err == nil {
 		t.Error("decoding a Child SA proposal naming a real integrity algorithm succeeded")
+	}
+}
+
+// decodeChildProposal is the initiator reading the answer to its own offer,
+// which is espProposal. RFC 7296 section 3.3.6 has it "check that the accepted
+// offer is consistent with one of its proposals, and if not MUST terminate the
+// exchange", and section 2.7 says consistent is "exactly one transform of each
+// type included in the proposal". So a conforming answer carries the types
+// espProposal carries, and an unoffered DH transform is the dangerous case:
+// the responder would mean perfect forward secrecy, this end derives without
+// it, and the Child SA it installs carries nothing.
+func TestTheChildAnswerIsCheckedAgainstWhatThisEndOffered(t *testing.T) {
+	spi := []byte{0, 0, 0, 9}
+	base := []Transform{
+		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+		{Type: TransESN, ID: ESN_NO},
+	}
+	answer := func(extra ...Transform) []byte {
+		return EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi,
+			Transforms: append(slices.Clone(base), extra...)}})
+	}
+	for name, extra := range map[string][]Transform{
+		"the shape the offer asks for": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, err := decodeChildProposal(answer(extra...), nil); err != nil {
+				t.Errorf("a conforming answer was refused: %v", err)
+			}
+		})
+	}
+	for name, extra := range map[string][]Transform{
+		"dh none":                  {{Type: TransDH, ID: 0}},
+		"a real dh group":          {{Type: TransDH, ID: DH_CURVE25519}},
+		"integ none spelled out":   {{Type: TransInteg, ID: INTEG_NONE}},
+		"integ none with key bits": {{Type: TransInteg, ID: INTEG_NONE, KeyLengthBits: 128}},
+		"dh and integ none":        {{Type: TransDH, ID: 0}, {Type: TransInteg, ID: INTEG_NONE}},
+		"a repeated type":          {{Type: TransESN, ID: ESN_NO}},
+		"an unknown type":          {{Type: TransformType(9), ID: 1}},
+		"an integ algorithm":       {{Type: TransInteg, ID: 12}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, err := decodeChildProposal(answer(extra...), nil); err == nil {
+				t.Error("an answer naming what the offer did not was accepted")
+			}
+		})
+	}
+}
+
+// The reader above knows two transform types and the one integrity deviation.
+// A type added to espProposal has to be added to it in the same change, or
+// every answer to the new offer is refused as inconsistent and no Child SA is
+// ever established. This is that check, rather than a permissive default that
+// would accept a value the reader does nothing with.
+func TestTheChildAnswerReaderKnowsEveryTypeTheOfferNames(t *testing.T) {
+	for _, transform := range espProposal([]byte{0, 0, 0, 1}).Transforms {
+		switch transform.Type {
+		case TransEncr, TransESN:
+		default:
+			t.Fatalf("espProposal offers transform type %d, which decodeChildProposal refuses: "+
+				"an answer carries one transform of each type the offer included, RFC 7296 section 2.7",
+				transform.Type)
+		}
+	}
+}
+
+// The responder answering somebody else's offer is the other direction, and it
+// does echo a type it was offered: a peer that names DH or INTEG gets it back,
+// RFC 7296 section 2.7. That is what selectChildRequestProposal builds, and it
+// is not what decodeChildProposal above reads.
+func TestTheResponderEchoesEveryTypeTheOfferNamed(t *testing.T) {
+	spi := []byte{0, 0, 0, 9}
+	base := []Transform{
+		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+		{Type: TransESN, ID: ESN_NO},
+	}
+	none := Transform{Type: TransInteg, ID: INTEG_NONE}
+	for name, extra := range map[string][]Transform{
+		"dh none":       {{Type: TransDH, ID: 0}},
+		"pfs":           {{Type: TransDH, ID: DH_CURVE25519}},
+		"integ none":    {none},
+		"dh and integ":  {{Type: TransDH, ID: 0}, none},
+		"pfs and integ": {{Type: TransDH, ID: DH_CURVE25519}, none},
+	} {
+		t.Run(name, func(t *testing.T) {
+			offer := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi,
+				Transforms: append(slices.Clone(base), extra...)}})
+			keGroup := uint16(0)
+			for _, transform := range extra {
+				if transform.Type == TransDH {
+					keGroup = transform.ID
+				}
+			}
+			selection, err := selectChildRequestProposal(offer, nil, keGroup)
+			if err != nil {
+				t.Fatalf("the offer was refused: %v", err)
+			}
+			child := responderChild{number: selection.proposal.Number,
+				encryption: selection.encryption, dh: selection.dh, integ: selection.integ}
+			for _, want := range extra {
+				if !slices.Contains(child.proposal(spi).Transforms, want) {
+					t.Errorf("the answer is %v, which drops %v", child.proposal(spi).Transforms, want)
+				}
+			}
+		})
 	}
 }

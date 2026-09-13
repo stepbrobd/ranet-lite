@@ -648,7 +648,7 @@ func (c responderChild) proposal(spi []byte) Proposal {
 	}
 	transforms := []Transform{encryption, {Type: TransESN, ID: ESN_NO}}
 	// A proposal that spelled out DH NONE or INTEG NONE gets it back: section
-	// 3.3.6 wants one transform of every type the offer carried.
+	// 2.7 wants one transform of every type the offer carried.
 	if c.dh.Type != 0 {
 		transforms = append(transforms, c.dh)
 	}
