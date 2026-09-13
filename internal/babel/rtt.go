@@ -49,7 +49,7 @@ func DefaultCostParams() CostParams {
 		// section RECOMMENDS, deliberately. This is a global mesh: 120 ms
 		// saturates every intercontinental path, so the penalty stops ranking
 		// exactly the links it exists to rank, and a penalty of 150 against a
-		// wired rxcost of 96 makes a satellite hop cost less than two wired
+		// wired rxcost of 96 makes a satellite hop cost less than three wired
 		// ones.
 		RTTMax:  1024 * time.Millisecond,
 		RTTCost: 1024,

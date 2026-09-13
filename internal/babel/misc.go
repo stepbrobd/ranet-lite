@@ -44,8 +44,10 @@ func EncodeNextHop(addr net.IP) RawTLV {
 // DecodeNextHop returns the next hop and, as the second result, whether the
 // TLV is otherwise ignored. RFC 8966 section 4.6.8: "This TLV sets up the next
 // hop for subsequent Update TLVs even if it is otherwise ignored due to an
-// unknown mandatory sub-TLV", which is why the address comes back either way.
-// Only a malformed TLV returns an error.
+// unknown mandatory sub-TLV", which is the one case where the address comes
+// back alongside the ignore. A sub-TLV region this cannot parse at all is not
+// that case: the section extends the parser state to a TLV that was read and
+// then set aside, not to one that could not be read.
 func DecodeNextHop(body []byte) (addr net.IP, ae uint8, ignore bool, err error) {
 	if len(body) < 2 {
 		return nil, 0, false, fmt.Errorf("babel: short NextHop TLV")
@@ -59,8 +61,14 @@ func DecodeNextHop(body []byte) (addr net.IP, ae uint8, ignore bool, err error) 
 	if ae == AEIPv6LinkLocal {
 		length = 8
 	}
-	if _, err := decodeOptionalSubTLVs(body[2+length:]); err != nil {
-		return addr, ae, true, nil
+	subs, err := decodeSubTLVs(body[2+length:])
+	if err != nil {
+		return nil, 0, false, err
+	}
+	for _, sub := range subs {
+		if sub.Type >= 128 {
+			return addr, ae, true, nil
+		}
 	}
 	return addr, ae, false, nil
 }

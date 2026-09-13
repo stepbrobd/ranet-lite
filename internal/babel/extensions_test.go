@@ -91,15 +91,21 @@ var errIgnoredTLV = errors.New("babel: TLV ignored")
 func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 	prefix := netip.MustParsePrefix("2001:db8::/64")
 	for _, test := range []struct {
-		name   string
-		tlv    RawTLV
-		decode func([]byte) error
+		name string
+		tlv  RawTLV
+		// ignores says the TLV reports an unknown mandatory sub-TLV as an
+		// ignore rather than as a decode failure, because RFC 8966 section 4.5
+		// has it set its parser state either way. The two are asserted apart,
+		// or the closure translating one into the other would pass whichever
+		// the decoder did.
+		ignores bool
+		decode  func([]byte) error
 	}{
-		{"Hello", EncodeHello(Hello{Interval: 100}), func(b []byte) error { _, err := DecodeHello(b); return err }},
-		{"IHU", EncodeIHU(IHU{Interval: 100}), func(b []byte) error { _, _, err := DecodeIHU(b); return err }},
+		{"Hello", EncodeHello(Hello{Interval: 100}), false, func(b []byte) error { _, err := DecodeHello(b); return err }},
+		{"IHU", EncodeIHU(IHU{Interval: 100}), false, func(b []byte) error { _, _, err := DecodeIHU(b); return err }},
 		// Router-Id reports the ignore rather than failing, because the parser
 		// state is set either way. See TestRouterIDRoundTrip.
-		{"RouterID", EncodeRouterID([8]byte{1}), func(b []byte) error {
+		{"RouterID", EncodeRouterID([8]byte{1}), true, func(b []byte) error {
 			_, ignore, err := DecodeRouterID(b)
 			if ignore {
 				return errIgnoredTLV
@@ -108,17 +114,17 @@ func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 		}},
 		// NextHop reports the ignore the same way, and for the same reason:
 		// RFC 8966 section 4.6.8 sets the next hop either way.
-		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), func(b []byte) error {
+		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), true, func(b []byte) error {
 			_, _, ignore, err := DecodeNextHop(b)
 			if ignore {
 				return errIgnoredTLV
 			}
 			return err
 		}},
-		{"AckReq", EncodeAckReq(1, 100), func(b []byte) error { _, err := DecodeAckReq(b); return err }},
-		{"RouteRequest", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
-		{"WildcardRequest", EncodeRouteRequest(RouteRequest{AE: AEWildcard}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
-		{"SeqnoRequest", EncodeSeqnoRequest(SeqnoRequest{AE: AEIPv6, Prefix: prefix}), func(b []byte) error { _, err := DecodeSeqnoRequest(b); return err }},
+		{"AckReq", EncodeAckReq(1, 100), false, func(b []byte) error { _, err := DecodeAckReq(b); return err }},
+		{"RouteRequest", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}), false, func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
+		{"WildcardRequest", EncodeRouteRequest(RouteRequest{AE: AEWildcard}), false, func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},
+		{"SeqnoRequest", EncodeSeqnoRequest(SeqnoRequest{AE: AEIPv6, Prefix: prefix}), false, func(b []byte) error { _, err := DecodeSeqnoRequest(b); return err }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := test.decode(test.tlv.Body); err != nil {
@@ -127,8 +133,14 @@ func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 			if err := test.decode(append(append([]byte(nil), test.tlv.Body...), 0x7f, 0)); err != nil {
 				t.Fatalf("optional extension was rejected: %v", err)
 			}
-			if err := test.decode(append(append([]byte(nil), test.tlv.Body...), 0xff, 0)); err == nil {
+			err := test.decode(append(append([]byte(nil), test.tlv.Body...), 0xff, 0))
+			switch {
+			case err == nil:
 				t.Fatal("accepted an unknown mandatory extension")
+			case test.ignores && !errors.Is(err, errIgnoredTLV):
+				t.Fatalf("an unknown mandatory sub-TLV failed the decode rather than being ignored: %v", err)
+			case !test.ignores && errors.Is(err, errIgnoredTLV):
+				t.Fatal("a TLV with no parser state reported an ignore")
 			}
 		})
 	}

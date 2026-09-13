@@ -254,3 +254,27 @@ func TestStatsCountWhatEachNeighborSent(t *testing.T) {
 		t.Errorf("stats report %d originated prefixes, want one", stats.Originated)
 	}
 }
+
+// RFC 8966 section 4.6.8 sets the next hop "even if it is otherwise ignored
+// due to an unknown mandatory sub-TLV", and the decoder reporting that is only
+// half of it: the receive path has to disregard the ignore for this TLV, the
+// way it already does for Router-Id. Honoring it would drop every following
+// IPv4 Update in the packet under the section 4.6.9 rule.
+func TestIgnoredNextHopStillSetsTheParserState(t *testing.T) {
+	dest := netip.MustParsePrefix("10.5.0.0/16")
+	src := netip.MustParseAddr("192.0.2.1")
+	s, _, _ := captureSpeaker(t, Config{})
+	a := addReachablePeer(s, "a", 100)
+
+	nextHop := EncodeNextHop(net.ParseIP("192.0.2.254"))
+	nextHop.Body = append(append([]byte(nil), nextHop.Body...), 0x80, 0) // unknown, mandatory
+	s.Receive(a, buildPacket(netip.MustParseAddr("fe80::2"), multicastGroup, EncodePacket([]RawTLV{
+		nextHop,
+		EncodeRouterID([8]byte{1}),
+		EncodeUpdate(Update{AE: AEIPv4, Plen: dest.Bits(), Prefix: dest.Addr().AsSlice(),
+			Seqno: 1, Metric: 20, Interval: 1000}),
+	})))
+	if got, _ := s.mesh.Routes.Lookup(src, dest.Addr()); got != a {
+		t.Error("the update after an ignored next hop was dropped, so the whole packet's IPv4 routes go with it")
+	}
+}

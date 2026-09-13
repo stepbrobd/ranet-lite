@@ -93,8 +93,10 @@ func (s *Speaker) emitLocked(actions []sendAction) func() {
 	}
 }
 
-// coalesce merges the actions aimed at the same neighbor and destination into
-// one, preserving order. Requests are produced one per TLV, so one arriving
+// coalesce merges the actions aimed at the same neighbor and destination and
+// carrying the same priority into one, preserving order. The priority is part
+// of the key so a Hello, which is multicast like the dump, keeps its own place
+// in the transmission order and its own rollback. Requests are produced one per TLV, so one arriving
 // packet carrying forty seqno requests for forty prefixes would otherwise
 // leave as forty packets aimed at whichever third peer can answer them, and a
 // neighbor loss that starves a thousand prefixes as a thousand. reserveBatchesTo

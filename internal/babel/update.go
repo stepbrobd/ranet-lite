@@ -87,15 +87,17 @@ func encodeSourcePrefix(ae uint8, source netip.Prefix) []byte {
 	return encodeSubTLVs([]SubTLV{{Type: SubTLVSourcePrefix, Body: body}})
 }
 
-// PrefixDecoder holds the per-packet compression state RFC 8966 §4.6.9
-// requires: each Update's Omitted bytes refer to the previous prefix *of
-// the same address family sent within this packet*. Create one per
-// incoming packet, not one per neighbor.
+// prefixState is one address family's share of that, the previous prefix a
+// following Update's Omitted bytes refer to.
 type prefixState struct {
 	last [16]byte
 	have bool
 }
 
+// PrefixDecoder holds the per-packet compression state RFC 8966 §4.6.9
+// requires: each Update's Omitted bytes refer to the previous prefix *of
+// the same address family sent within this packet*. Create one per
+// incoming packet, not one per neighbor.
 type PrefixDecoder struct {
 	// AE 1 and AE 4 have independent compression state, even though both
 	// encode IPv4 prefixes (RFC 9229 section 4.1).
