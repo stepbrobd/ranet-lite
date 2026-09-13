@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1350,5 +1353,175 @@ func TestHelloIsNotCoalescedIntoTheDump(t *testing.T) {
 	}
 	if merged[0].priority == merged[1].priority {
 		t.Error("the two actions carry one priority, so the sort cannot tell them apart")
+	}
+}
+
+// A wildcard retraction is a walk of the whole route table, and its TLV is
+// twelve bytes: a hundred and twelve fit in one packet. After the first, every
+// route through that neighbor is already at infinity and the walk finds
+// nothing to do, so the repeats are the same work over again, under the lock
+// that carries every other neighbor's receive path, the hello emitter and
+// route selection. Measured at 403 ms per packet at maxRouteKeys routes.
+func TestRepeatedWildcardRetractionsCostNothing(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	now := time.Now()
+	const routes = 2000
+	speaker.mu.Lock()
+	for i := range routes {
+		key := routeKey{dest: netip.MustParsePrefix(fmt.Sprintf("fd00:%x:%x::/64", i>>16, i&0xffff))}
+		speaker.routes.update(neighbor, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 64},
+			time.Minute, now)
+	}
+	if got := len(speaker.routes.entries); got != routes {
+		t.Fatalf("the table holds %d routes, so this proves nothing", got)
+	}
+
+	// A packet of them. Each reselection reads every route of every entry, so
+	// the first is linear in the table and the rest have to be constant.
+	// Built by hand: EncodeUpdate has no AE 0 case, because this node never
+	// sends one. AE, flags, plen, omitted, interval, seqno, metric.
+	wildcard := EncodePacket([]RawTLV{{Type: TLVUpdate, Body: []byte{
+		AEWildcard, 0, 0, 0, 0x00, 0x64, 0, 0, 0xff, 0xff,
+	}}})
+	first := time.Now()
+	speaker.handlePacketLocked(neighbor, wildcard, now)
+	one := time.Since(first)
+
+	rest := time.Now()
+	for range 111 {
+		speaker.handlePacketLocked(neighbor, wildcard, now)
+	}
+	many := time.Since(rest)
+	speaker.mu.Unlock()
+
+	if one == 0 {
+		t.Fatal("the first retraction took no measurable time, so the comparison below proves nothing")
+	}
+	if many > one {
+		t.Errorf("111 repeated wildcard retractions took %s against %s for the first, so each one walks the table again", many, one)
+	}
+}
+
+// One neighbor alternating an update and a retraction for one prefix drives a
+// selection change per TLV, and sixty-six of those fit in one packet. Each was
+// a synchronous log write on the goroutine holding s.mu, which is the shape
+// the tenth round fixed in the hub's receive loop one level out.
+func TestSelectionChangesAreNotOneLogLineEach(t *testing.T) {
+	var lines atomic.Int64
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(countingWriter{&lines}, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	dest := netip.MustParsePrefix("fd00:1::/64")
+	key := routeKey{dest: dest}
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	const flaps = 66
+	for i := range flaps {
+		metric := uint16(64)
+		if i%2 == 1 {
+			metric = MetricInfinity
+		}
+		speaker.routes.update(neighbor, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: metric},
+			time.Minute, now)
+	}
+	if got := lines.Load(); got != 1 {
+		t.Errorf("%d selection changes produced %d log lines, want the one the interval allows", flaps, got)
+	}
+	if routeLogInterval > time.Second {
+		t.Errorf("a selection change is said at most once every %v, which is not a log anybody can follow a flapping mesh with",
+			routeLogInterval)
+	}
+	if speaker.routeChanges == 0 {
+		t.Error("the changes were not counted, so the line that stands for them says nothing")
+	}
+
+	// The other half of the bound: the interval passes and the next change is
+	// said out loud, carrying how many it stands for. A line that never comes
+	// back, or one that does not count, is a selection log that says nothing.
+	var said strings.Builder
+	slog.SetDefault(slog.New(slog.NewTextHandler(&said, nil)))
+	speaker.routeLogged = now.Add(-routeLogInterval - time.Second)
+	suppressed := speaker.routeChanges
+	speaker.routes.update(neighbor, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 64},
+		time.Minute, now)
+	if got := said.String(); !strings.Contains(got, "changes_since_last="+strconv.Itoa(suppressed+1)) {
+		t.Errorf("the line after the interval reads %q, which does not stand for the %d changes before it",
+			strings.TrimSpace(got), suppressed+1)
+	}
+}
+
+type countingWriter struct{ n *atomic.Int64 }
+
+func (w countingWriter) Write(b []byte) (int, error) { w.n.Add(1); return len(b), nil }
+
+// wildcardRetraction is the AE 0 Update of RFC 8966 section 4.6.9, built by
+// hand because EncodeUpdate has no AE 0 case: this node never sends one.
+func wildcardRetraction() RawTLV {
+	return RawTLV{Type: TLVUpdate, Body: []byte{AEWildcard, 0, 0, 0, 0x00, 0x64, 0, 0, 0xff, 0xff}}
+}
+
+// The memo that makes a repeated wildcard retraction free has to be forgotten
+// the moment the neighbor advertises a finite metric again, or its next
+// wildcard retraction is a no-op and the route it should have withdrawn stays
+// selected for as long as the neighbor keeps sending them.
+func TestARetractionAfterANewUpdateIsNotMemoized(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	prefix := netip.MustParsePrefix("fd00:6::/64")
+	announce := func(metric uint16) {
+		speaker.handlePacket(neighbor, EncodePacket([]RawTLV{
+			EncodeRouterID([8]byte{1}),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: metric}),
+		}))
+	}
+	selected := func() bool {
+		speaker.mu.Lock()
+		defer speaker.mu.Unlock()
+		entry := speaker.routes.entries[routeKey{dest: prefix}]
+		return entry != nil && entry.selected.neighbor != nil
+	}
+	announce(60)
+	if !selected() {
+		t.Fatal("the route was never selected, so this proves nothing")
+	}
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{wildcardRetraction()}))
+	if selected() {
+		t.Fatal("the first wildcard retraction did not withdraw the route")
+	}
+	announce(60)
+	if !selected() {
+		t.Fatal("the route did not come back, so the second retraction has nothing to do")
+	}
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{wildcardRetraction()}))
+	if selected() {
+		t.Error("the second wildcard retraction was skipped as already applied")
+	}
+}
+
+// A neighbor that goes away takes its memo with it. The map is keyed by the
+// neighbor's state pointer, so an entry left behind pins a retired one and
+// everything it held for the life of the speaker.
+func TestARetiredNeighborLeavesNoRetractionMemo(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{wildcardRetraction()}))
+	speaker.mu.Lock()
+	held := len(speaker.routes.retracted)
+	speaker.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("the retraction was recorded against %d neighbors, so this proves nothing", held)
+	}
+	speaker.mu.Lock()
+	speaker.routes.expireNeighbor(neighbor, time.Now())
+	left := len(speaker.routes.retracted)
+	speaker.mu.Unlock()
+	if left != 0 {
+		t.Errorf("a retired neighbor left %d memo entries, which pin it forever", left)
 	}
 }

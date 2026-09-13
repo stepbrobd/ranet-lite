@@ -155,7 +155,11 @@ type Speaker struct {
 	// raisedSeqno bounds originSeqno to one raise per received packet.
 	raisedSeqno   bool
 	updatePending bool
-	changed       chan struct{}
+	// routeChanges and routeLogged bound the selection-change log, see
+	// routeLogInterval. Both are touched only under s.mu, with installRoute.
+	routeChanges int
+	routeLogged  time.Time
+	changed      chan struct{}
 }
 
 // PeerHandle owns one exact registration. Closing a stale handle cannot
@@ -444,22 +448,49 @@ func (s *Speaker) Run(ctx context.Context) error {
 	}
 }
 
-// Called only with s.mu held, after route selection. Logging and forwarding
-// publication see the same immutable selection.
+// routeLogInterval bounds how often a selection change is said out loud at
+// info. One neighbor alternating an update and a retraction for one prefix
+// drives a change per TLV, and sixty-six of those fit in one packet, each a
+// synchronous write on the goroutine holding s.mu. Every change is still
+// written at debug, where it costs a level comparison unless somebody asked
+// for it, and the info line carries how many it stands for.
+//
+// Kept at or below a second so an operator watching a flapping mesh still sees
+// it move; TestSelectionChangesAreNotOneLogLineEach holds that bound.
+const routeLogInterval = time.Second
+
+// installRoute publishes one selection to the forwarding table. Called only
+// with s.mu held, after route selection, so the log line and the forwarding
+// entry see the same immutable selection.
 func (s *Speaker) installRoute(key routeKey, sel routeSelection) {
 	desc := key.dest.String()
 	if key.source.IsValid() {
 		desc = fmt.Sprintf("%s from %s", key.dest, key.source)
 	}
+	peer := ""
 	if sel.neighbor != nil {
+		peer = sel.neighbor.peer.ID
 		s.mesh.Routes.Set(key.source, key.dest, sel.neighbor.peer)
-		slog.Info("babel route installed", "route", desc, "peer", sel.neighbor.peer.ID, "metric", sel.cost)
+		slog.Debug("babel route installed", "route", desc, "peer", peer, "metric", sel.cost)
 	} else {
 		// Held as unreachable rather than removed. The entry still exists,
 		// RFC 8966 section 3.5.4, and until it is flushed a packet for this
 		// prefix must not follow a shorter one instead.
 		s.mesh.Routes.Set(key.source, key.dest, netstack.Unreachable)
-		slog.Info("babel route retracted", "route", desc)
+		slog.Debug("babel route retracted", "route", desc)
+	}
+	s.routeChanges++
+	now := time.Now()
+	if now.Sub(s.routeLogged) < routeLogInterval {
+		return
+	}
+	changes := s.routeChanges
+	s.routeChanges, s.routeLogged = 0, now
+	if sel.neighbor != nil {
+		slog.Info("babel route installed", "route", desc, "peer", peer,
+			"metric", sel.cost, "changes_since_last", changes)
+	} else {
+		slog.Info("babel route retracted", "route", desc, "changes_since_last", changes)
 	}
 }
 

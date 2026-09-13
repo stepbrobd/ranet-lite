@@ -83,6 +83,11 @@ type starveRequest struct {
 type routeTable struct {
 	entries map[routeKey]*keyEntry
 	sources map[sourceKey]*sourceEntry
+	// retracted is the neighbors whose routes are all at infinity already, so
+	// a repeated wildcard retraction costs a map lookup rather than a walk of
+	// the whole table. Bounded by the neighbor count, and cleared wherever one
+	// advertises a finite metric again.
+	retracted map[*neighborState]bool
 	// originsPerKey is how many distinct origins each prefix has spent of
 	// maxOriginsPerPrefix, so one prefix cannot fill the whole source table.
 	originsPerKey map[routeKey]int
@@ -114,6 +119,7 @@ func newRouteTable(install func(routeKey, routeSelection)) *routeTable {
 	return &routeTable{
 		entries:       make(map[routeKey]*keyEntry),
 		sources:       make(map[sourceKey]*sourceEntry),
+		retracted:     make(map[*neighborState]bool),
 		originsPerKey: make(map[routeKey]int),
 		originsBy:     make(map[originShare]int),
 		sourcesByPeer: make(map[string]int),
@@ -125,6 +131,9 @@ func newRouteTable(install func(routeKey, routeSelection)) *routeTable {
 // update applies the route acquisition procedure of RFC 8966 section 3.5.3 to
 // one advertised route and reruns selection.
 func (rt *routeTable) update(n *neighborState, key routeKey, adv advertisement, hold time.Duration, now time.Time) {
+	if adv.metric != MetricInfinity {
+		rt.forgetRetraction(n)
+	}
 	feasible := rt.feasible(key, adv, n.peer.ID)
 	entry := rt.entries[key]
 	var route *routeInfo
@@ -356,6 +365,7 @@ func (rt *routeTable) recomputeNeighbor(n *neighborState, now time.Time) {
 // keeps its routes, which an infinite link cost already makes unselectable,
 // until their own expiry timers run out.
 func (rt *routeTable) expireNeighbor(n *neighborState, now time.Time) {
+	delete(rt.retracted, n)
 	for key, entry := range rt.entries {
 		if _, ok := entry.routes[n]; ok {
 			delete(entry.routes, n)
@@ -364,17 +374,35 @@ func (rt *routeTable) expireNeighbor(n *neighborState, now time.Time) {
 	}
 }
 
-// retractNeighbor applies a wildcard retraction, RFC 8966 section 4.6.9 and
-// RFC 9079 section 5.2: every route from this neighbor, whatever its source
-// prefix, is retracted through the ordinary acquisition path so the prefixes
-// are held at infinity rather than vanishing.
+// retractNeighbor applies a wildcard retraction, RFC 8966 section 4.6.9 read
+// with RFC 9079 section 5.2: every route from this neighbor,
+// whatever its source prefix, goes to infinity through the ordinary
+// acquisition path, so the prefixes are held rather than vanishing.
+//
+// It is a walk of the whole route table, and a neighbor can put a hundred and
+// twelve wildcard retractions in one packet: the TLV is twelve bytes. After
+// the first, every route from that neighbor is already at infinity and the
+// walk finds nothing to do, so the repeat is remembered rather than redone.
+// Measured at 403 ms of the speaker lock per packet at maxRouteKeys routes,
+// which is every neighbor's receive path, the hello emitter and route
+// selection held behind one peer.
 func (rt *routeTable) retractNeighbor(n *neighborState, now time.Time) {
+	if rt.retracted[n] {
+		return
+	}
+	rt.retracted[n] = true
 	for key, entry := range rt.entries {
 		if route, ok := entry.routes[n]; ok {
 			route.rxMetric = MetricInfinity
 			rt.selectRoute(key, entry, now)
 		}
 	}
+}
+
+// forgetRetraction is called wherever a neighbor advertises a finite metric
+// again, which is what makes the next wildcard retraction from it real work.
+func (rt *routeTable) forgetRetraction(n *neighborState) {
+	delete(rt.retracted, n)
 }
 
 func (rt *routeTable) sweepExpired(now time.Time) {
