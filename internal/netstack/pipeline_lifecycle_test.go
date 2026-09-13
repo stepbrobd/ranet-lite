@@ -72,14 +72,18 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 	}
 }
 
-func TestMeshCloseCancelsReservationsAndDrainsQueuedTickets(t *testing.T) {
+// A reader that has handed its batch to the workers has also handed them every
+// ticket it reserved, and a ticket the sender never sees stalls that peer for
+// good. Close therefore has to drain the queue rather than abandon it, and has
+// to return while a peer is still open and still behind.
+func TestMeshCloseDrainsQueuedTickets(t *testing.T) {
 	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
 		return func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) { return [][]byte{bytes.Clone(raw[0])}, nil }, nil
 	}, func([][]byte) error { return nil })
 	defer peer.Close()
-	// Keep the sender waiting on its first ticket, filling every reservation
-	// slot before a reader attempts one more. Closing Mesh must release that
-	// reader even though the peer itself is still open.
+	// Keep the sender waiting on its first ticket, with every slot spoken for,
+	// so the dispatch below reserves nothing and Close still has a peer that
+	// will never finish.
 	for range cap(peer.slots) {
 		peer.reserveBatch(1)
 	}
@@ -101,7 +105,7 @@ func TestMeshCloseCancelsReservationsAndDrainsQueuedTickets(t *testing.T) {
 	case <-time.After(time.Second):
 		peer.Close()
 		<-done
-		t.Fatal("Mesh.Close blocked on a peer reservation")
+		t.Fatal("Mesh.Close did not return while a peer was still behind")
 	}
 	if len(m.outboundJobs) != 0 {
 		t.Fatal("Mesh.Close abandoned queued transmission tickets")
@@ -125,5 +129,67 @@ func TestSingleQueueInboundSplitsLargeBatches(t *testing.T) {
 	}
 	if second.packets[0][0] != byte(inboundWriteBatchSize) {
 		t.Fatal("split delivery changed packet order")
+	}
+}
+
+// One peer whose transport is behind must not stop the mesh forwarding to any
+// other. Every TUN reader dispatches under one lock, and a batch read off one
+// queue carries whichever destinations the kernel hashed onto it, so a
+// reservation that waits there puts the whole dataplane behind the slowest
+// peer on the mesh.
+func TestCongestedPeerDoesNotStallTheOthers(t *testing.T) {
+	sealer := func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) {
+		sealed := make([][]byte, len(raw))
+		for i := range raw {
+			sealed[i] = bytes.Clone(raw[i])
+		}
+		return sealed, nil
+	}
+	reserve := func(int) (BatchSealer, error) { return sealer, nil }
+	transmitted := make(chan struct{}, 4)
+	stuck := NewPeerReserved("stuck", reserve, func([][]byte) error { return nil })
+	defer stuck.Close()
+	healthy := NewPeerReserved("healthy", reserve, func(packets [][]byte) error {
+		for range packets {
+			transmitted <- struct{}{}
+		}
+		return nil
+	})
+	defer healthy.Close()
+	// Every slot spoken for and never returned, which is what a socket that
+	// cannot keep up looks like from this side.
+	for range cap(stuck.slots) {
+		stuck.reserveBatch(1)
+	}
+
+	m := &Mesh{closed: make(chan struct{}), outboundJobs: make(chan *outboundBatch, 4), outboundFree: make(chan *outboundBatch, 4)}
+	m.outboundWorkerWG.Add(1)
+	go m.outboundWorker()
+	defer m.Close()
+
+	dispatched := make(chan struct{})
+	go func() {
+		defer close(dispatched)
+		m.dispatchOutbound(&outboundBatch{
+			n: 2, bufs: [][]byte{framed(1), framed(2)}, sizes: []int{1, 1}, headers: []byte{0, 0},
+			peers: []*Peer{stuck, healthy}, peerOrder: []*Peer{stuck, healthy},
+			counts: map[*Peer]int{stuck: 1, healthy: 1}, batches: make(map[*Peer]*peerBatch),
+		})
+	}()
+	select {
+	case <-dispatched:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the congested peer held the dispatch lock every reader shares")
+	}
+	select {
+	case <-transmitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the packet for the peer that was not congested never reached its transport")
+	}
+	if got := stuck.Dropped(); got != 1 {
+		t.Errorf("the congested peer counted %d dropped packets, want 1", got)
+	}
+	if got := healthy.Dropped(); got != 0 {
+		t.Errorf("the peer that was not congested counted %d dropped packets, want 0", got)
 	}
 }

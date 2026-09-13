@@ -32,6 +32,11 @@ func (c *Client) Metrics(w io.Writer) {
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_babel_routes_received{peer=%q} %d\n", neighbor.Peer, neighbor.Routes)
 	}
+	fmt.Fprint(w, "# HELP ranet_lite_peer_send_dropped_total Packets refused for want of a transmission slot on a peer.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_peer_send_dropped_total counter\n")
+	for _, neighbor := range babel.Neighbors {
+		fmt.Fprintf(w, "ranet_lite_peer_send_dropped_total{peer=%q} %d\n", neighbor.Peer, neighbor.Dropped)
+	}
 	fmt.Fprint(w, "# HELP ranet_lite_babel_routes_selected Routes currently installed in the forwarding table.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_routes_selected gauge\n")
 	fmt.Fprintf(w, "ranet_lite_babel_routes_selected %d\n", babel.Selected)

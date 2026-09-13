@@ -249,13 +249,26 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 // fill both peers' slots, preventing either reader from reserving its second
 // peer. Submission order also keeps compatibility workers from all waiting on
 // an earlier ticket that is still queued behind them.
+//
+// Nothing here waits. Every TUN reader passes through this lock, and a batch
+// read off one queue carries whichever destinations the kernel hashed onto it,
+// so waiting for one peer's transmission slot would stop forwarding to every
+// other peer as well: a single backpressured socket would take the whole
+// dataplane down with it, and a queue that is full stays full for as long as
+// the transport is behind. That peer's share of the batch is dropped instead,
+// which is what an egress queue does when it fills, and every other peer's
+// packets go out on time. The drop is counted per peer.
 func (m *Mesh) dispatchOutbound(b *outboundBatch) {
 	m.outboundDispatchMu.Lock()
 	defer m.outboundDispatchMu.Unlock()
 	for _, peer := range b.peerOrder {
-		b.batches[peer] = peer.reserveBatchUntil(b.counts[peer], m.closed)
+		if batch := peer.reserveBatchNow(b.counts[peer]); batch != nil {
+			b.batches[peer] = batch
+		}
 	}
-	// Workers drain this queue during Close, including every reserved ticket.
+	// Submission never blocks: outboundFree is sized so that every batch in
+	// flight fits here. Workers drain the queue during Close, including every
+	// reserved ticket.
 	m.outboundJobs <- b
 }
 
@@ -263,12 +276,18 @@ func (m *Mesh) outboundWorker() {
 	defer m.outboundWorkerWG.Done()
 	for b := range m.outboundJobs {
 		for i := 0; i < b.n; i++ {
-			if peer := b.peers[i]; peer != nil {
+			// A peer with no batch had no transmission slot, so its share of
+			// this read was dropped before the tickets were handed out.
+			if peer := b.peers[i]; peer != nil && b.batches[peer] != nil {
 				b.batches[peer].append(b.bufs[i][tunOffset:tunOffset+b.sizes[i]], b.headers[i])
 			}
 		}
 		for _, peer := range b.peerOrder {
-			if err := b.batches[peer].enqueue(); err != nil {
+			batch := b.batches[peer]
+			if batch == nil {
+				continue
+			}
+			if err := batch.enqueue(); err != nil {
 				log.Printf("netstack: send batch through peer %s: %v", peer.ID, err)
 			}
 		}

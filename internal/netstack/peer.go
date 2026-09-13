@@ -6,6 +6,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // Peer separates parallel packet encryption from ordered, batched transport.
@@ -17,6 +18,7 @@ type Peer struct {
 
 	reserveMu sync.Mutex
 	reserved  uint64
+	dropped   atomic.Uint64
 
 	// Reserved peers hand completed crypto batches to one sender. slots bounds
 	// the total number of batches that may be encrypting, queued out of order,
@@ -132,11 +134,12 @@ type peerBatch struct {
 // reserveBatch assigns both the peer's transmission ticket and, when
 // supported, its ESP sequence range under one lock. Consequently ticket order,
 // sequence-range order, and the TUN intake order established by Mesh agree.
+//
+// It waits for a transmission slot, which nothing in the dataplane does: Mesh
+// reserves through reserveBatchNow so that one backpressured peer cannot stall
+// the readers feeding every other peer. What is left here is the unthrottled
+// producer the ordering tests and the benchmarks need.
 func (p *Peer) reserveBatch(count int) *peerBatch {
-	return p.reserveBatchUntil(count, nil)
-}
-
-func (p *Peer) reserveBatchUntil(count int, canceled <-chan struct{}) *peerBatch {
 	hasSlot := false
 	if p.slots != nil {
 		select {
@@ -144,25 +147,24 @@ func (p *Peer) reserveBatchUntil(count int, canceled <-chan struct{}) *peerBatch
 			hasSlot = true
 		case <-p.stop:
 			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: peer %s closed", p.ID)}
-		case <-canceled:
-			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: packet intake closed")}
 		}
 	}
 	return p.reserveBatchWithSlot(count, hasSlot)
 }
 
 // reserveBatchNow takes a transmission slot only if one is free. A caller that
-// would rather drop its packet than wait gets nil, having consumed neither a
+// would rather drop its packets than wait gets nil, having consumed neither a
 // ticket nor a sequence range, which is why the slot is taken before either: a
-// reserved ticket that never reaches the sender stalls it forever.
+// reserved ticket that never reaches the sender stalls it forever. The count
+// is what the caller was about to send, and is what the refusal is counted in.
 //
 // It does not wait at all, even briefly. A slot frees when the peer's sender
 // returns from the transport, so a queue that is full is one whose socket is
 // backpressured, and that lasts far longer than any wait worth having; a wait
-// would only add latency before dropping anyway. Meanwhile the speaker walks
-// every neighbor from one goroutine, so any wait is paid once per congested
-// neighbor per pass, and Receive runs on the sending peer's own decrypt path,
-// so it would hold that peer's inbound dataplane too.
+// would only add latency before dropping anyway. Both callers also run on a
+// goroutine that serves other peers: the speaker walks every neighbor from
+// one, Receive runs on the sending peer's own decrypt path, and Mesh dispatches
+// under a lock every TUN reader takes.
 func (p *Peer) reserveBatchNow(count int) *peerBatch {
 	if p.slots == nil {
 		return p.reserveBatchWithSlot(count, false)
@@ -171,11 +173,19 @@ func (p *Peer) reserveBatchNow(count int) *peerBatch {
 	case p.slots <- struct{}{}:
 		return p.reserveBatchWithSlot(count, true)
 	case <-p.stop:
+		p.dropped.Add(uint64(count))
 		return nil
 	default:
+		p.dropped.Add(uint64(count))
 		return nil
 	}
 }
+
+// Dropped counts the packets this peer refused rather than queued, because no
+// transmission slot was free or because it was already closing. It is the only
+// loss this package causes on purpose, so a peer whose path is congested shows
+// up as a rising counter here rather than as latency somewhere else.
+func (p *Peer) Dropped() uint64 { return p.dropped.Load() }
 
 func (p *Peer) reserveBatchWithSlot(count int, hasSlot bool) *peerBatch {
 	p.reserveMu.Lock()

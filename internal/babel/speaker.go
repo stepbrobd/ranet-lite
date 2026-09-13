@@ -486,6 +486,9 @@ type NeighborStat struct {
 	Alive  bool
 	Cost   uint16
 	Routes int
+	// Dropped is what the dataplane refused to queue for this neighbor, both
+	// its control traffic and whatever the mesh was forwarding through it.
+	Dropped uint64
 }
 
 // Stats is a consistent snapshot of the speaker for a metrics endpoint. It
@@ -516,10 +519,11 @@ func (s *Speaker) Stats() Stats {
 	}
 	for _, neighbor := range s.neighbors {
 		stats.Neighbors = append(stats.Neighbors, NeighborStat{
-			Peer:   neighbor.peer.ID,
-			Alive:  neighbor.isAlive(now),
-			Cost:   neighbor.linkCost(now),
-			Routes: received[neighbor],
+			Peer:    neighbor.peer.ID,
+			Alive:   neighbor.isAlive(now),
+			Cost:    neighbor.linkCost(now),
+			Routes:  received[neighbor],
+			Dropped: neighbor.peer.Dropped(),
 		})
 	}
 	sort.Slice(stats.Neighbors, func(i, j int) bool { return stats.Neighbors[i].Peer < stats.Neighbors[j].Peer })
