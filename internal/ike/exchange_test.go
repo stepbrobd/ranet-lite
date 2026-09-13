@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,5 +73,37 @@ func TestFullRangeSelectorSemantics(t *testing.T) {
 				t.Fatalf("validation = %v; want accepted=%v", err, test.ok)
 			}
 		})
+	}
+}
+
+// The teardown Delete gets its own retransmission budget, and the error it
+// reports has to name the budget it spent: an operator reading "no response
+// after 5 attempts" from an exchange that made two is being told the wrong
+// thing about how long the failure took.
+func TestSendRecvReportsTheBudgetItSpent(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+	request := (&Message{Header: Header{
+		SPIInitiator: randUint64Nonzero(), ExchangeType: INFORMATIONAL,
+		Flags: FlagInitiator, MessageID: 0,
+	}}).Encode()
+
+	// One attempt, so the test costs one requestTimeout rather than the full
+	// budget, and the peer never answers.
+	start := time.Now()
+	_, err = sendRecvWithin(mux, request, 1, nil)
+	if err == nil {
+		t.Fatal("an unanswered exchange reported success")
+	}
+	if !strings.Contains(err.Error(), "after 1 attempts") {
+		t.Errorf("the failure says %q, want it to name the one attempt it made", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*requestTimeout {
+		t.Errorf("one attempt took %s, which is more than the budget it was given", elapsed)
 	}
 }

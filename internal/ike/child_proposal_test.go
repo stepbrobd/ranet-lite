@@ -123,3 +123,40 @@ func TestNonceLengthFollowsTheNegotiatedPRF(t *testing.T) {
 		}
 	}
 }
+
+// A peer that spells out INTEG NONE alongside an AEAD cipher does it on every
+// proposal it sends, not only the IKE_SA_INIT one. Taking it there and
+// refusing it on the Child SA bundled into IKE_AUTH kills the handshake one
+// message after the exchange that was just made to work, and refusing it on an
+// IKE rekey leaves such a peer established and unable to rekey from its own
+// side. RFC 7296 section 3.3 then requires the answer to carry it back.
+func TestIntegNoneIsTakenAndEchoedOnEveryProposal(t *testing.T) {
+	integ := Transform{Type: TransInteg, ID: INTEG_NONE}
+	esp := func(extra ...Transform) []byte {
+		spi := []byte{0, 0, 0, 9}
+		return EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi, Transforms: append([]Transform{
+			{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+			{Type: TransESN, ID: ESN_NO},
+		}, extra...)}})
+	}
+	selection, err := selectChildRequestProposal(esp(integ), nil, 0)
+	if err != nil {
+		t.Fatalf("a Child SA proposal naming INTEG NONE was refused: %v", err)
+	}
+	if selection.integ != integ {
+		t.Errorf("the selection kept %+v, so the answer cannot carry it back", selection.integ)
+	}
+	if _, _, _, err := decodeChildProposal(esp(integ), nil); err != nil {
+		t.Errorf("decoding a Child SA proposal naming INTEG NONE failed: %v", err)
+	}
+
+	// And an integrity transform there is no key for is still refused, because
+	// every cipher this implementation offers is combined mode.
+	unusable := Transform{Type: TransInteg, ID: 12}
+	if _, err := selectChildRequestProposal(esp(unusable), nil, 0); err == nil {
+		t.Error("a Child SA proposal naming a real integrity algorithm was accepted")
+	}
+	if _, _, _, err := decodeChildProposal(esp(unusable), nil); err == nil {
+		t.Error("decoding a Child SA proposal naming a real integrity algorithm succeeded")
+	}
+}

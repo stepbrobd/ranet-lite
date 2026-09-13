@@ -337,7 +337,7 @@ const (
 	maxRetransmits = 5
 	// maxRetransmitsWhileBusy bounds an exchange the peer keeps alive without
 	// answering. The backoff is clamped at requestTimeout<<(maxRetransmits-1),
-	// so this is about eight minutes.
+	// which is thirty-two seconds, so twenty sends is about nine minutes.
 	maxRetransmitsWhileBusy = 20
 	// RFC 7296 section 2.6 bounds a cookie to 1..64 octets.
 	maxCookieLength = 64
@@ -680,12 +680,18 @@ func supportsSignatureHash(payloads []RawPayload, wanted uint16) (bool, error) {
 }
 
 func suiteFromProposal(p Proposal) (SASuite, error) {
-	if p.Number != 1 || p.Protocol != ProtoIKE || len(p.SPI) != 0 || len(p.Transforms) != 3 {
+	// Three transforms decide keys, and a responder that took an integrity
+	// transform we offered has to return it, RFC 7296 section 2.7, so four is
+	// a shape this end has to be able to read even though it never offers one.
+	if p.Number != 1 || p.Protocol != ProtoIKE || len(p.SPI) != 0 || len(p.Transforms) < 3 || len(p.Transforms) > 4 {
 		return SASuite{}, fmt.Errorf("ike: invalid selected IKE proposal shape")
 	}
 	offered := ikeProposal().Transforms
 	selected := make(map[TransformType]Transform, 3)
 	for _, transform := range p.Transforms {
+		if transform.Type == TransInteg && transform.ID == INTEG_NONE && !transform.UnsupportedAttributes {
+			continue
+		}
 		if transform.Type != TransEncr && transform.Type != TransPRF && transform.Type != TransDH {
 			return SASuite{}, fmt.Errorf("ike: unexpected selected transform type %d", transform.Type)
 		}

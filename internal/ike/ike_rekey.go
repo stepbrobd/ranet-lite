@@ -425,13 +425,27 @@ func selectIKERekeyProposal(proposal Proposal, keGroup, prfID uint16) ([]Transfo
 	// an unknown or unsupported Transform Type. Unknown attributes are marked
 	// on individual transforms by DecodeSA and skipped by exact matching below,
 	// allowing another transform of the same type to be selected.
-	for _, transform := range proposal.Transforms {
-		if transform.Type != TransEncr && transform.Type != TransPRF && transform.Type != TransDH {
+	var integ *Transform
+	for i := range proposal.Transforms {
+		transform := proposal.Transforms[i]
+		switch transform.Type {
+		case TransEncr, TransPRF, TransDH:
+		case TransInteg:
+			// An AEAD cipher needs no integrity transform, and a peer naming
+			// NONE says the same thing as omitting it, the way
+			// selectIKEProposal already takes it on the initial exchange.
+			// Refusing it here would leave such a peer established and unable
+			// to rekey from its own side.
+			if transform.ID != INTEG_NONE || transform.UnsupportedAttributes {
+				return nil, SASuite{}, 0, false
+			}
+			integ = &transform
+		default:
 			return nil, SASuite{}, 0, false
 		}
 	}
 	offered := ikeRekeyProposal(nil, prfID).Transforms
-	selected := make([]Transform, 0, 3)
+	selected := make([]Transform, 0, 4)
 	for _, typ := range []TransformType{TransEncr, TransPRF} {
 		found := false
 		for _, want := range offered {
@@ -461,6 +475,14 @@ func selectIKERekeyProposal(proposal Proposal, keGroup, prfID uint16) ([]Transfo
 	suite, err := suiteFromProposal(Proposal{Number: 1, Protocol: ProtoIKE, Transforms: selected})
 	if err != nil {
 		return nil, SASuite{}, 0, false
+	}
+	// "The accepted cryptographic suite MUST contain exactly one transform of
+	// each type included in the proposal", RFC 7296 section 2.7, so an
+	// integrity transform the peer offered is echoed rather than dropped. It
+	// is appended after the suite is derived, which reads the three that
+	// decide keys.
+	if integ != nil {
+		selected = append(selected, *integ)
 	}
 	return selected, suite, preferredDH, true
 }

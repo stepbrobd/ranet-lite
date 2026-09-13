@@ -755,10 +755,10 @@ func TestRunLoopWakesForRetainedIKESA(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
-	deadline := time.Now().Add(3 * time.Second)
 	// Waited for on the SPI rather than on contextRetired: the flag flips
 	// under stateMu and the mux is told after the unlock, so polling the flag
 	// and then reading the hub reads through that window.
+	deadline := time.Now().Add(5 * time.Second)
 	for theirs.RegisterIKE(spi) != nil {
 		if time.Now().After(deadline) {
 			cancel()

@@ -165,7 +165,10 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal")
 	}
 	p := props[0]
-	if p.Number != 1 || p.Protocol != ProtoESP || len(p.SPI) != 4 || len(p.Transforms) != 2 {
+	// Two transforms decide keys, and a peer that spelled out INTEG NONE gets
+	// it back, RFC 7296 section 2.7, so three is a shape this has to read.
+	if p.Number != 1 || p.Protocol != ProtoESP || len(p.SPI) != 4 ||
+		len(p.Transforms) < 2 || len(p.Transforms) > 3 {
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal shape")
 	}
 	remoteSPI := binary.BigEndian.Uint32(p.SPI)
@@ -190,6 +193,14 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 				return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has an unsupported ESN transform")
 			}
 			haveESN = true
+		case TransInteg:
+			// An AEAD cipher needs no integrity transform, and a peer naming
+			// NONE says the same thing as omitting it. Refusing the spelling
+			// would fail the Child SA bundled into IKE_AUTH for a peer whose
+			// IKE_SA_INIT selectIKEProposal has just accepted.
+			if transform.ID != INTEG_NONE || transform.KeyLengthBits != 0 || transform.UnsupportedAttributes {
+				return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has an integrity transform")
+			}
 		default:
 			return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has transform type %d", transform.Type)
 		}
@@ -229,7 +240,12 @@ type childProposalSelection struct {
 	proposal   Proposal
 	encryption Transform
 	dh         Transform
-	remoteSPI  uint32
+	// integ is the integrity transform the offer carried, or the zero value
+	// when it carried none. RFC 7296 section 2.7 wants one transform of every
+	// type the offer included back in the answer, and the only one this
+	// implementation can take is NONE.
+	integ     Transform
+	remoteSPI uint32
 }
 
 type invalidKEError struct{ group uint16 }
@@ -263,7 +279,7 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 		if p.Number == 0 || p.Protocol != ProtoESP || len(p.SPI) != 4 || binary.BigEndian.Uint32(p.SPI) == 0 {
 			continue
 		}
-		var encryption Transform
+		var encryption, integ Transform
 		var haveEncryption, haveESN, unacceptable bool
 		for _, transform := range p.Transforms {
 			switch transform.Type {
@@ -279,6 +295,15 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 				}
 			case TransDH:
 				// Selected below after checking encryption and ESN.
+			case TransInteg:
+				// See decodeChildProposal: NONE alongside an AEAD cipher says
+				// what omitting the transform says, and anything else is a
+				// transform this implementation has no key for.
+				if transform.ID != INTEG_NONE || transform.KeyLengthBits != 0 || transform.UnsupportedAttributes {
+					unacceptable = true
+					break
+				}
+				integ = transform
 			default:
 				unacceptable = true
 			}
@@ -286,7 +311,7 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 		if !unacceptable && haveEncryption && haveESN {
 			dh, preferred, ok := selectDHTransform(p.Transforms, keGroup, true)
 			if ok {
-				return childProposalSelection{p, encryption, dh, binary.BigEndian.Uint32(p.SPI)}, nil
+				return childProposalSelection{p, encryption, dh, integ, binary.BigEndian.Uint32(p.SPI)}, nil
 			}
 			if preferredDH == 0 {
 				preferredDH = preferred

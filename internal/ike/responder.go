@@ -633,6 +633,7 @@ type responderChild struct {
 	number     uint8
 	encryption Transform
 	dh         Transform
+	integ      Transform
 }
 
 func (c responderChild) proposal(spi []byte) Proposal {
@@ -646,10 +647,13 @@ func (c responderChild) proposal(spi []byte) Proposal {
 		encryption.KeyLengthBits = 0
 	}
 	transforms := []Transform{encryption, {Type: TransESN, ID: ESN_NO}}
+	// A proposal that spelled out DH NONE or INTEG NONE gets it back: section
+	// 3.3.6 wants one transform of every type the offer carried.
 	if c.dh.Type != 0 {
-		// A proposal that spelled out DH NONE gets it back: section 3.3.6 wants one
-		// transform of every type the offer carried.
 		transforms = append(transforms, c.dh)
+	}
+	if c.integ.Type != 0 {
+		transforms = append(transforms, c.integ)
 	}
 	return Proposal{
 		// RFC 7296 section 3.3.1: "the proposal number in the SA payload MUST match
@@ -696,6 +700,7 @@ func (s *Session) selectResponderChild(request *Message, ni, nr []byte) (respond
 		number:     selection.proposal.Number,
 		encryption: selection.encryption,
 		dh:         selection.dh,
+		integ:      selection.integ,
 	}, nil
 }
 
@@ -925,7 +930,7 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 			continue
 		}
 		// "The accepted cryptographic suite MUST contain exactly one transform
-		// of each type included in the proposal", RFC 7296 section 3.3, so an
+		// of each type included in the proposal", RFC 7296 section 2.7, so an
 		// integrity transform the initiator offered is echoed back rather than
 		// dropped from the answer.
 		transforms := []Transform{encr, prfT, dhT}

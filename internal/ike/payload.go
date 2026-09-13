@@ -26,8 +26,8 @@ type Message struct {
 
 	// skHeaderOffset is the byte offset (from the start of the decoded
 	// message) of the SK payload's generic header, set only when the last
-	// decoded payload is PayloadSK. It lets DecryptSK reconstruct the exact
-	// AAD (RFC 5282 §3.1: header + cleartext payloads + SK generic header)
+	// decoded payload is PayloadSK. It lets DecryptMessage reconstruct the exact
+	// AAD (RFC 5282 §5.1: header + cleartext payloads + SK generic header)
 	// without re-encoding anything.
 	skHeaderOffset int
 }
@@ -43,10 +43,9 @@ func validateResponseCriticalFlags(payloads []RawPayload) error {
 	return nil
 }
 
-// Encode serializes the message. It does not encrypt; callers that need an
-// SK payload must pre-build it (see sk.go) and pass it as the sole payload
-// after the header's cleartext payloads, i.e. call EncodeWithFirstNext with
-// PayloadSK as the first payload type when there's exactly one SK payload.
+// Encode serializes the message. It does not encrypt: a caller that needs an
+// SK payload pre-builds it (see sk.go) and passes it as the sole payload after
+// the header's cleartext payloads.
 func (m *Message) Encode() []byte {
 	return m.encode(0)
 }

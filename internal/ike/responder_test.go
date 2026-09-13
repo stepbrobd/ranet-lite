@@ -308,9 +308,10 @@ func TestSelectIKEProposalPrefersOurOrderAndReportsGroup(t *testing.T) {
 			t.Fatal("an unknown transform type was accepted")
 		}
 	})
-	// RFC 7296 section 3.3.3 makes an integrity transform optional for IKE,
-	// and a peer that spells out NONE alongside an AEAD cipher is saying the
-	// same thing as omitting it. strongSwan and libreswan both write it out.
+	// RFC 7296 section 3.3.2's transform registry gives integrity algorithm 0
+	// the name NONE, and an AEAD cipher needs none, so a peer that spells it
+	// out alongside one says what omitting the transform says. strongSwan and
+	// libreswan both write it out.
 	t.Run("takes an offer that spells out INTEG NONE and echoes it", func(t *testing.T) {
 		integ := Transform{Type: TransInteg, ID: INTEG_NONE}
 		body := offer(
@@ -324,7 +325,7 @@ func TestSelectIKEProposalPrefersOurOrderAndReportsGroup(t *testing.T) {
 			t.Fatalf("an offer naming INTEG NONE was refused: %v", err)
 		}
 		// "The accepted cryptographic suite MUST contain exactly one transform
-		// of each type included in the proposal", RFC 7296 section 3.3.
+		// of each type included in the proposal", RFC 7296 section 2.7.
 		if !slices.Contains(selected.Transforms, integ) {
 			t.Errorf("the answer is %v, which drops a transform type the offer included", selected.Transforms)
 		}

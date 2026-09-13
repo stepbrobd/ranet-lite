@@ -81,8 +81,8 @@ const (
 	PRF_HMAC_SHA2_384 uint16 = 6
 
 	// Integrity (Transform Type 3). An AEAD cipher needs none, and RFC 7296
-	// section 3.3.3 lets a peer say so either by omitting the transform or by
-	// offering NONE.
+	// section 3.3.2's registry gives algorithm 0 the name NONE, so a peer may
+	// say so either by omitting the transform or by offering that.
 	INTEG_NONE uint16 = 0
 
 	// DH groups (Transform Type 4)

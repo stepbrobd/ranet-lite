@@ -2,6 +2,7 @@ package ike
 
 import (
 	"encoding/binary"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,14 +32,24 @@ func TestSuiteFromProposalRequiresExactOfferSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, extra := range []Transform{
-		{Type: TransInteg, ID: 0},
+		{Type: TransInteg, ID: 12},
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 192},
+		{Type: TransformType(9), ID: 1},
 	} {
 		invalid := valid
 		invalid.Transforms = append(append([]Transform(nil), valid.Transforms...), extra)
 		if _, err := suiteFromProposal(invalid); err == nil {
 			t.Fatalf("accepted invalid selected transform %+v", extra)
 		}
+	}
+	// A responder that took an integrity transform this end offered has to
+	// return it, RFC 7296 section 2.7, so the four-transform answer is a shape
+	// this end has to read even though it never offers one. The three that
+	// decide keys are still matched exactly.
+	echoed := valid
+	echoed.Transforms = append(append([]Transform(nil), valid.Transforms...), Transform{Type: TransInteg, ID: INTEG_NONE})
+	if _, err := suiteFromProposal(echoed); err != nil {
+		t.Errorf("an answer echoing INTEG NONE was refused: %v", err)
 	}
 }
 
@@ -93,14 +104,36 @@ func TestUnknownTransformAttributeMakesOnlyTransformUnacceptable(t *testing.T) {
 }
 
 func TestIKERekeyProposalRejectsUnexpectedTransformType(t *testing.T) {
-	proposal := Proposal{Number: 1, Protocol: ProtoIKE, Transforms: []Transform{
+	base := []Transform{
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128},
 		{Type: TransPRF, ID: PRF_HMAC_SHA2_256},
 		{Type: TransDH, ID: DH_CURVE25519},
-		{Type: TransInteg, ID: 0},
-	}}
-	if _, _, _, ok := selectIKERekeyProposal(proposal, DH_CURVE25519, PRF_HMAC_SHA2_256); ok {
+	}
+	unknown := Proposal{Number: 1, Protocol: ProtoIKE,
+		Transforms: append(slices.Clone(base), Transform{Type: TransformType(9), ID: 1})}
+	if _, _, _, ok := selectIKERekeyProposal(unknown, DH_CURVE25519, PRF_HMAC_SHA2_256); ok {
 		t.Fatal("accepted IKE rekey proposal with unexpected transform type")
+	}
+	// An integrity transform this implementation has no key for is refused the
+	// same way, because every cipher it offers is combined mode.
+	unusable := Proposal{Number: 1, Protocol: ProtoIKE,
+		Transforms: append(slices.Clone(base), Transform{Type: TransInteg, ID: 12})}
+	if _, _, _, ok := selectIKERekeyProposal(unusable, DH_CURVE25519, PRF_HMAC_SHA2_256); ok {
+		t.Fatal("accepted an integrity transform there is no key for")
+	}
+	// INTEG NONE says what omitting the transform says, and selectIKEProposal
+	// takes it on the initial exchange, so refusing it here would leave such a
+	// peer established and unable to rekey from its own side. RFC 7296 section
+	// 2.7 then has the answer carry it: "The accepted cryptographic suite MUST
+	// contain exactly one transform of each type included in the proposal."
+	integ := Transform{Type: TransInteg, ID: INTEG_NONE}
+	none := Proposal{Number: 1, Protocol: ProtoIKE, Transforms: append(slices.Clone(base), integ)}
+	selected, _, _, ok := selectIKERekeyProposal(none, DH_CURVE25519, PRF_HMAC_SHA2_256)
+	if !ok {
+		t.Fatal("a rekey proposal naming INTEG NONE was refused")
+	}
+	if !slices.Contains(selected, integ) {
+		t.Errorf("the answer is %v, which drops a transform type the offer included", selected)
 	}
 }
 
