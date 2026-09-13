@@ -14,7 +14,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 		return
 	}
 	send := s.emitLocked(s.handlePacketLocked(n, raw, time.Now()))
-	s.wake()
+	s.wakeForPacketLocked()
 	s.mu.Unlock()
 	send()
 }

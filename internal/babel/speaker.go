@@ -160,6 +160,38 @@ type Speaker struct {
 	routeChanges int
 	routeLogged  time.Time
 	changed      chan struct{}
+	// nextHello and nextUpdate are the run loop's own timers, and sleepUntil
+	// is the deadline it is currently waiting on. They are loop state kept on
+	// the Speaker rather than in Run so the receive path can tell whether an
+	// arriving packet moved a deadline earlier than the one already set; all
+	// three are touched only under s.mu.
+	nextHello  time.Time
+	nextUpdate time.Time
+	sleepUntil time.Time
+	// nextRequestSweep is the earliest seqnoRequestSuppress window that has
+	// still to be cleaned up, kept the way the route table keeps its expiry
+	// minimum. The window is two seconds and every other deadline the loop has
+	// is a hello interval or longer, so without this the two suppression
+	// tables are swept a hello interval late and their per-neighbor budgets
+	// are held that long by entries that suppress nothing. Only ever moved
+	// earlier between sweeps; sweepRequestsLocked rebuilds it exactly.
+	nextRequestSweep time.Time
+	// passes counts what wakeForPacketLocked exists to keep down: one pass is
+	// a reselection of the whole route table. Kept because the decision is
+	// otherwise unobservable from outside -- a test can watch the wake
+	// channel, but nothing else can tell whether Run actually recorded the
+	// deadline it slept on -- and one increment per pass costs nothing.
+	passes uint64
+	// retryAt is when a pass that could not send everything it built tries
+	// again. See noteSendRetryLocked.
+	retryAt time.Time
+	// nextStarveRetry is the earliest starveRetries deadline, kept the way the
+	// route table keeps its own: deadlineLocked runs on the receive path now,
+	// and maxStarveRetries is four thousand, so walking the map there would
+	// hand a neighbor a walk of it per packet. Only ever moved earlier between
+	// passes, so it can be early -- one pass that finds nothing due -- and
+	// never late. retryStarvedLocked rebuilds it exactly.
+	nextStarveRetry time.Time
 }
 
 // PeerHandle owns one exact registration. Closing a stale handle cannot
@@ -261,7 +293,7 @@ func (s *Speaker) Receive(peer *netstack.Peer, raw []byte) bool {
 	}
 	n.addr = src
 	send := s.emitLocked(s.handlePacketLocked(n, payload, time.Now()))
-	s.wake()
+	s.wakeForPacketLocked()
 	s.mu.Unlock()
 	send()
 	return true
@@ -382,6 +414,13 @@ func originatedKey(dest, source netip.Prefix) (routeKey, bool) {
 	return key, true
 }
 
+// Passes is how many times the run loop has reselected the whole route table.
+func (s *Speaker) Passes() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.passes
+}
+
 func (s *Speaker) wake() {
 	select {
 	case s.changed <- struct{}{}:
@@ -389,53 +428,123 @@ func (s *Speaker) wake() {
 	}
 }
 
+// wakeForPacketLocked wakes the run loop for a packet that left it something
+// to do, and leaves it asleep for one that did not. A pass is a reselection of
+// the whole route table, 22 ms at maxRouteKeys prefixes over eight neighbors
+// and under the lock that is also every other neighbor's receive path, the
+// hello emitter and route installation, so a wake for every arriving packet
+// lets one neighbor charge this node that much for a fifty-two byte Hello as
+// fast as the link carries them. Deciding instead costs the 230 ns of
+// deadlineLocked, and the Hello and IHU a packet refreshes move their own
+// deadlines later, never earlier, which is the case this leaves asleep. Both
+// figures are floors, taken on an idle machine; see BenchmarkRunLoopPass.
+func (s *Speaker) wakeForPacketLocked() {
+	if s.pendingWorkLocked() || s.sleepUntil.IsZero() || s.deadlineLocked().Before(s.sleepUntil) {
+		s.wake()
+	}
+}
+
+// pendingWorkLocked is work that has arrived since the last pass and that a
+// pass has not tried yet: a prefix whose selection changed, which owes a
+// triggered update under RFC 8966 section 3.7.2, or a dump somebody asked for.
+// Every pass drains both, and `updateActions` clears what a periodic dump
+// supersedes, so neither survives a pass that ran.
+//
+// What a pass tried and could not send is deliberately not here. A rollback
+// restores the neighbor's `owed` and its `sentHello`, and both stay restored
+// for as long as that one peer cannot be sent to: a peer whose Child SA the
+// other end deleted refuses every reservation, and RFC 7296 section 1.4.1
+// lets it stay that way. "A pass is owed something" would then be true
+// forever, and every packet from every other neighbor would pay for a full
+// sweep, which is the amplification this function exists to close.
+// noteSendRetryLocked puts that on a timer instead.
+//
+// `routes.starved` is drained by `starvedActions` on the last line of
+// handlePacketLocked, so it is empty by the time this runs. It is tested as a
+// backstop for a writer that does not go through that path.
+func (s *Speaker) pendingWorkLocked() bool {
+	return s.updatePending || len(s.routes.dirty) != 0 || len(s.routes.starved) != 0
+}
+
+// noteSendRetryLocked schedules the retry for a pass that built something it
+// could not send. The rollback has put the work back, and nothing else will
+// pick it up: a Hello is retried by `!n.sentHello` and a triggered update by
+// the neighbor's own `owed`, both on the next pass, whenever that is. A
+// quarter of the hello interval gives a refused Hello more than a dozen
+// attempts inside the three and a half intervals that withdraw the routes
+// through this neighbor, and costs a pass rather than a packet.
+func (s *Speaker) noteSendRetryLocked(now time.Time) {
+	s.retryAt = earlier(s.retryAt, now.Add(max(s.cfg.HelloInterval/4, 50*time.Millisecond)))
+}
+
+// deadlineLocked is when the run loop next has to do something on its own,
+// with nothing arriving. Run sets the timer from it and records it as
+// sleepUntil, and the receive path recomputes it to decide whether a packet
+// brought that moment forward.
+func (s *Speaker) deadlineLocked() time.Time {
+	deadline := earlier(earlier(s.nextHello, s.nextUpdate), s.routes.nextExpiry())
+	deadline = earlier(earlier(deadline, s.nextStarveRetry), s.retryAt)
+	deadline = earlier(deadline, s.nextRequestSweep)
+	for _, n := range s.neighbors {
+		if n.alive {
+			deadline = earlier(deadline, n.helloExpiry())
+		}
+		if n.haveReportedCost {
+			deadline = earlier(deadline, n.ihuExpiry)
+		}
+	}
+	return deadline
+}
+
 // Run owns the timers and waits for all of its work before returning.
 // Remote Hello, IHU and Update deadlines are independent of our send intervals.
 func (s *Speaker) Run(ctx context.Context) error {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	nextHello, nextUpdate := time.Now(), time.Now()
+	s.mu.Lock()
+	s.nextHello, s.nextUpdate = time.Now(), time.Now()
+	s.mu.Unlock()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		now := time.Now()
 		s.mu.Lock()
+		// Cleared before the pass and set again by emitLocked if this pass
+		// also fails to send what it builds, so it always names the most
+		// recent attempt rather than an old one.
+		s.retryAt = time.Time{}
+		s.passes++
 		s.sweepExpiredLocked(now)
 		var actions []sendAction
-		helloDue := !now.Before(nextHello)
+		helloDue := !now.Before(s.nextHello)
 		if helloDue {
-			nextHello = now.Add(s.cfg.HelloInterval)
+			s.nextHello = now.Add(s.cfg.HelloInterval)
 		}
 		for _, n := range s.neighbors {
 			if helloDue || !n.sentHello {
 				actions = append(actions, s.helloAction(n, now))
 			}
 		}
-		if !now.Before(nextUpdate) || s.updatePending {
+		if !now.Before(s.nextUpdate) || s.updatePending {
 			actions = append(actions, s.updateActions(now)...)
 			s.updatePending = false
-			if !now.Before(nextUpdate) {
-				nextUpdate = now.Add(s.cfg.UpdateInterval)
+			if !now.Before(s.nextUpdate) {
+				s.nextUpdate = now.Add(s.cfg.UpdateInterval)
 			}
 		} else {
 			actions = append(actions, s.triggeredActions(now)...)
 		}
 		actions = append(actions, s.starvedActions(now)...)
 		actions = append(actions, s.retryStarvedLocked(now)...)
-		deadline := earlier(earlier(nextHello, nextUpdate), s.routes.nextExpiry())
-		for _, retry := range s.starveRetries {
-			deadline = earlier(deadline, retry.nextAt)
-		}
-		for _, n := range s.neighbors {
-			if n.alive {
-				deadline = earlier(deadline, n.helloExpiry())
-			}
-			if n.haveReportedCost {
-				deadline = earlier(deadline, n.ihuExpiry)
-			}
-		}
+		// Emitted before the deadline is computed: emitLocked is what learns
+		// that a peer refused a packet, and the retry it schedules for that is
+		// a term of the deadline. Recorded as sleepUntil before the lock goes,
+		// so a packet arriving between here and the select compares against
+		// the deadline this pass settled on.
 		send := s.emitLocked(actions)
+		deadline := s.deadlineLocked()
+		s.sleepUntil = deadline
 		s.mu.Unlock()
 		send()
 		timer.Reset(max(0, time.Until(deadline)))
@@ -544,6 +653,7 @@ func (s *Speaker) recordSeqnoRequest(index sourceKey, seqno uint16, asker string
 	}
 	s.pendingSeqno[index] = pendingSeqno{seqno: seqno, sentAt: now, asker: asker}
 	s.pendingByAsker[asker]++
+	s.noteRequestSweep(now)
 }
 
 func (s *Speaker) releaseSeqnoRequest(entry pendingSeqno) {
@@ -554,12 +664,22 @@ func (s *Speaker) releaseSeqnoRequest(entry pendingSeqno) {
 	s.pendingByAsker[entry.asker]--
 }
 
+// noteRequestSweep folds one suppression window into the sweep deadline.
+func (s *Speaker) noteRequestSweep(at time.Time) {
+	s.nextRequestSweep = earlier(s.nextRequestSweep, at.Add(seqnoRequestSuppress))
+}
+
 func (s *Speaker) sweepRequestsLocked(now time.Time) {
+	// Cleared first and rebuilt by the walk, which is the one pass that reads
+	// every window, so the kept minimum is exact again afterwards.
+	s.nextRequestSweep = time.Time{}
 	for index, pending := range s.pendingSeqno {
 		if !now.Before(pending.sentAt.Add(seqnoRequestSuppress)) {
 			s.releaseSeqnoRequest(pending)
 			delete(s.pendingSeqno, index)
+			continue
 		}
+		s.noteRequestSweep(pending.sentAt)
 	}
 	// askedSeqno expires on the same window. It is keyed by router id, which
 	// the peer chooses, and by neighbor pointer, so an entry left behind pins
@@ -567,7 +687,9 @@ func (s *Speaker) sweepRequestsLocked(now time.Time) {
 	for index, at := range s.askedSeqno {
 		if !now.Before(at.Add(seqnoRequestSuppress)) {
 			delete(s.askedSeqno, index)
+			continue
 		}
+		s.noteRequestSweep(at)
 	}
 }
 

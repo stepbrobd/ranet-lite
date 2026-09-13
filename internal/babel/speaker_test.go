@@ -1459,6 +1459,314 @@ type countingWriter struct{ n *atomic.Int64 }
 
 func (w countingWriter) Write(b []byte) (int, error) { w.n.Add(1); return len(b), nil }
 
+// settleRunLoop stands in for a pass that has just finished: nothing is owed,
+// and the loop is asleep on the deadline this state implies.
+func settleRunLoop(s *Speaker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextHello, s.nextUpdate = time.Now().Add(time.Hour), time.Now().Add(time.Hour)
+	s.updatePending = false
+	clear(s.routes.dirty)
+	s.routes.starved = nil
+	for _, n := range s.neighbors {
+		n.sentHello = true
+		clear(n.owed)
+	}
+	s.sleepUntil = s.deadlineLocked()
+	select {
+	case <-s.changed:
+	default:
+	}
+}
+
+// One pass of the run loop reselects the whole route table, tens of
+// milliseconds at a full one, all of it under the lock that is every other
+// neighbor's receive path. A wake for every arriving packet therefore lets one
+// neighbor charge this node a sweep for a fifty-two byte Hello, as fast as the
+// link carries them. The wake is owed to what a packet left behind, and a
+// Hello that only pushes its own deadline further out leaves nothing.
+func TestARefreshingHelloDoesNotWakeTheRunLoop(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	hello := func(seqno uint16, interval uint16) []byte {
+		return EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: seqno, Interval: interval})})
+	}
+	speaker.handlePacket(neighbor, hello(1, 400))
+	settleRunLoop(speaker)
+
+	speaker.handlePacket(neighbor, hello(2, 400))
+	if len(speaker.changed) != 0 {
+		t.Error("a Hello that only moved its own deadline later woke a full selection sweep")
+	}
+
+	// A Hello promising a much shorter interval brings the neighbor's own
+	// deadline forward, which the loop is asleep past, so it has to wake.
+	speaker.handlePacket(neighbor, hello(3, 1))
+	if len(speaker.changed) == 0 {
+		t.Error("a Hello that brought the neighbor's deadline forward left the loop asleep past it")
+	}
+
+	// An Update that changes a selection owes a triggered update, RFC 8966
+	// section 3.7.2, which waits for the next pass.
+	settleRunLoop(speaker)
+	makeNeighborReachable(neighbor)
+	prefix := netip.MustParsePrefix("fd00:5::/64")
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{
+		EncodeRouterID([8]byte{1}),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+			Interval: 6000, Seqno: 1, Metric: 60}),
+	}))
+	if len(speaker.routes.entries) != 1 {
+		t.Fatalf("the update installed %d routes, so this proves nothing", len(speaker.routes.entries))
+	}
+	if len(speaker.changed) == 0 {
+		t.Error("a selection change left the triggered update waiting for whatever wakes the loop next")
+	}
+}
+
+// The kept minimum stands in for a walk of up to maxStarveRetries entries that
+// the receive path would otherwise do per packet. It is allowed to be early,
+// which costs one pass that finds nothing due, and never late: a late one is a
+// seqno request that waits for whatever wakes the loop next, which on a quiet
+// link is nothing. Every write of a deadline has to fold into it, and the pass
+// that reads them all has to rebuild it.
+func TestTheStarveRetryDeadlineIsNeverLate(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	truest := func() time.Time {
+		var earliest time.Time
+		for _, retry := range speaker.starveRetries {
+			earliest = earlier(earliest, retry.nextAt)
+		}
+		return earliest
+	}
+	// Two-sided while nothing has been forgotten: the kept value is allowed to
+	// be early only because a removal can leave it so, and no removal has
+	// happened yet, so anything but equality here is a write that did not fold
+	// in. After a pass that forgets entries the weaker rule is all that holds.
+	exact := func(what string) {
+		t.Helper()
+		if want := truest(); !speaker.nextStarveRetry.Equal(want) {
+			t.Errorf("after %s the kept deadline is %v and the earliest retry is due at %v",
+				what, speaker.nextStarveRetry, want)
+		}
+	}
+	check := func(what string) {
+		t.Helper()
+		if want := truest(); speaker.nextStarveRetry.After(want) {
+			t.Errorf("after %s the kept deadline is %v, later than the %v something is due at",
+				what, speaker.nextStarveRetry, want)
+		}
+	}
+	for i := range 8 {
+		key := routeKey{dest: netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i))}
+		speaker.rememberStarved(key, [8]byte{byte(i)}, uint16(i), neighbor.peer.ID, now.Add(time.Duration(8-i)*time.Second))
+		exact("remembering one")
+	}
+	// The same prefix again pulls its own deadline back in, which is the write
+	// that reading the map afterwards would have caught for free.
+	first := routeKey{dest: netip.MustParsePrefix("fd00:0::/64")}
+	speaker.rememberStarved(first, [8]byte{0}, 9, neighbor.peer.ID, now.Add(-time.Hour))
+	exact("bringing one forward")
+
+	// A pass with some of them due and some not: the rebuild has to carry the
+	// ones it walked past as well as the ones it rescheduled.
+	speaker.retryStarvedLocked(now.Add(4 * time.Second))
+	if due, waiting := 0, 0; true {
+		for _, retry := range speaker.starveRetries {
+			if retry.attempts > 0 {
+				due++
+			} else {
+				waiting++
+			}
+		}
+		if due == 0 || waiting == 0 {
+			t.Fatalf("the pass found %d due and %d waiting, so it read only one kind", due, waiting)
+		}
+	}
+	check("a pass with some due and some not")
+
+	// Passes until every retry has spent its attempts, which is what empties
+	// the map. A kept deadline that survives that is one the rebuild did not
+	// clear, and the run loop then wakes for a retry that no longer exists.
+	at := now
+	for range seqnoRequestRetries + 2 {
+		at = at.Add(time.Hour)
+		speaker.retryStarvedLocked(at)
+		check("a pass that read every one of them")
+	}
+	if len(speaker.starveRetries) != 0 {
+		t.Fatalf("%d retries outlived their attempts, so the clear is not reached", len(speaker.starveRetries))
+	}
+	if !speaker.nextStarveRetry.IsZero() {
+		t.Errorf("with no retries left the loop is still due to wake at %v", speaker.nextStarveRetry)
+	}
+}
+
+// A peer that cannot be sent to must not make every packet from every other
+// neighbor pay for a full sweep. A rollback restores the neighbor's owed set
+// and its sentHello, and both stay restored for as long as that peer refuses:
+// a peer whose Child SA the other end deleted refuses every reservation, and
+// RFC 7296 section 1.4.1 lets it stay that way, so "a pass is owed something"
+// is true from then on. The work is put on a timer instead.
+func TestACongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
+	speaker, healthy, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(healthy)
+	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
+		func(int) (netstack.BatchSealer, error) { return nil, errors.New("no child sa") },
+		func([][]byte) error { return nil })).state
+	stuck.addr = netip.MustParseAddr("fe80::3")
+	makeNeighborReachable(stuck)
+
+	// A pass that builds a Hello for the stuck peer and cannot send it, which
+	// is what leaves sentHello false from here on.
+	speaker.mu.Lock()
+	send := speaker.emitLocked([]sendAction{speaker.helloAction(stuck, time.Now())})
+	speaker.mu.Unlock()
+	send()
+	if stuck.sentHello {
+		t.Fatal("the stuck peer took the hello, so this proves nothing")
+	}
+
+	// The healthy neighbor's own hello interval has to be settled first, or
+	// the second Hello shortens it and wakes the loop for that instead.
+	speaker.handlePacket(healthy, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 8, Interval: 400})}))
+
+	// Stand in for a loop that has finished that pass and is asleep on its
+	// deadline, without touching the flag the pass left behind.
+	speaker.mu.Lock()
+	speaker.nextHello, speaker.nextUpdate = time.Now().Add(time.Hour), time.Now().Add(time.Hour)
+	speaker.updatePending, speaker.retryAt = false, time.Time{}
+	clear(speaker.routes.dirty)
+	speaker.routes.starved = nil
+	speaker.sleepUntil = speaker.deadlineLocked()
+	select {
+	case <-speaker.changed:
+	default:
+	}
+	speaker.mu.Unlock()
+
+	speaker.handlePacket(healthy, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 9, Interval: 400})}))
+	if len(speaker.changed) != 0 {
+		t.Error("one peer that cannot be sent to made a refreshing Hello from another wake a full sweep")
+	}
+
+	// The Hello is not forgotten: the pass that could not send it schedules
+	// its own retry, and that retry is a term of the deadline.
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	speaker.retryAt = time.Time{}
+	speaker.emitLocked([]sendAction{speaker.helloAction(stuck, time.Now())})
+	if speaker.retryAt.IsZero() {
+		t.Fatal("a pass that could not send scheduled no retry, so the Hello waits for the hello interval")
+	}
+	if got := speaker.deadlineLocked(); !got.Equal(speaker.retryAt) {
+		t.Errorf("the deadline is %v and the retry is due at %v, which it does not carry", got, speaker.retryAt)
+	}
+}
+
+// The two request suppression tables expire on a two second window, which is
+// shorter than every other deadline the run loop has. Nothing on the receive
+// path sweeps them any more, so without a deadline of their own the budgets
+// they hold -- maxPendingSeqnoPerNeighbor of them per neighbor -- stay held by
+// entries that suppress nothing for as long as a hello interval, which
+// Validate allows to be minutes.
+func TestTheSuppressionWindowIsADeadlineOfItsOwn(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute})
+	makeNeighborReachable(neighbor)
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	speaker.nextHello, speaker.nextUpdate = now.Add(time.Hour), now.Add(time.Hour)
+
+	index := sourceKey{route: routeKey{dest: netip.MustParsePrefix("fd00:7::/64")}, routerID: [8]byte{3}}
+	if !speaker.allowSeqnoRequest(index, 1, neighbor.peer.ID, now) {
+		t.Fatal("the first request was suppressed")
+	}
+	if speaker.pendingByAsker[neighbor.peer.ID] != 1 {
+		t.Fatalf("the asker holds %d of its share", speaker.pendingByAsker[neighbor.peer.ID])
+	}
+	want := now.Add(seqnoRequestSuppress)
+	if got := speaker.deadlineLocked(); got.After(want) {
+		t.Fatalf("the loop sleeps until %v, past the %v the window expires at", got, want)
+	}
+
+	// The pass the deadline asks for gives the share back and leaves nothing
+	// behind to wake for.
+	speaker.sweepRequestsLocked(want)
+	if len(speaker.pendingSeqno) != 0 || len(speaker.pendingByAsker) != 0 {
+		t.Errorf("the sweep left %d entries and %d shares", len(speaker.pendingSeqno), len(speaker.pendingByAsker))
+	}
+	if !speaker.nextRequestSweep.IsZero() {
+		t.Errorf("with nothing left the sweep is still due at %v", speaker.nextRequestSweep)
+	}
+}
+
+// quietPasses waits for the run loop to stop working and reports how many
+// passes it has made.
+func quietPasses(t *testing.T, s *Speaker) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	last := s.Passes()
+	for still := 0; still < 10; still++ {
+		time.Sleep(10 * time.Millisecond)
+		if now := s.Passes(); now != last {
+			last, still = now, 0
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the run loop never went quiet")
+		}
+	}
+	return last
+}
+
+// The wake decision is only worth anything if Run actually records the
+// deadline it slept on: without that, sleepUntil stays zero, every packet
+// takes the zero branch, and the whole mechanism is inert while every test
+// that writes sleepUntil itself still passes. This one drives the real loop
+// and counts what the packets cost.
+func TestRefreshingHellosCostTheRunLoopNothing(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{
+		HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); speaker.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	hello := func(seqno uint16) []byte {
+		return EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: seqno, Interval: 400})})
+	}
+	quietPasses(t, speaker)
+	// The first Hello sets the neighbor's interval, which moves a deadline and
+	// is allowed to wake the loop.
+	speaker.handlePacket(neighbor, hello(1))
+	settled := quietPasses(t, speaker)
+
+	for i := range 50 {
+		speaker.handlePacket(neighbor, hello(uint16(2+i)))
+	}
+	if got := quietPasses(t, speaker); got != settled {
+		t.Errorf("fifty Hellos that refreshed a deadline already set cost %d reselections of the whole route table", got-settled)
+	}
+
+	// Receive is the other entry, and takes the same decision.
+	for i := range 50 {
+		speaker.Receive(neighbor.peer, buildPacket(netip.MustParseAddr("fe80::2"), multicastGroup, hello(uint16(60+i))))
+	}
+	if got := quietPasses(t, speaker); got != settled {
+		t.Errorf("fifty Hellos through Receive cost %d reselections of the whole route table", got-settled)
+	}
+
+	// And the loop is not merely asleep for good: something it owes still
+	// wakes it.
+	speaker.Originate(netip.MustParsePrefix("fd00:4::/64"))
+	if got := quietPasses(t, speaker); got == settled {
+		t.Error("originating a prefix woke nothing, so this test would pass with the loop stopped")
+	}
+}
+
 // wildcardRetraction is the AE 0 Update of RFC 8966 section 4.6.9, built by
 // hand because EncodeUpdate has no AE 0 case: this node never sends one.
 func wildcardRetraction() RawTLV {
@@ -1523,5 +1831,78 @@ func TestARetiredNeighborLeavesNoRetractionMemo(t *testing.T) {
 	speaker.mu.Unlock()
 	if left != 0 {
 		t.Errorf("a retired neighbor left %d memo entries, which pin it forever", left)
+	}
+}
+
+// The kept expiry minimum is rebuilt by the sweep, which is the one pass that
+// reads every route. Without the clear it only ever moves earlier, so the
+// first route to leave the table leaves a deadline permanently in the past and
+// the run loop spins on it.
+func TestTheExpiryMinimumIsRebuiltByTheSweep(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	prefix := netip.MustParsePrefix("fd00:8::/64")
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{
+		EncodeRouterID([8]byte{1}),
+		EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+			Interval: 100, Seqno: 1, Metric: 60}),
+	}))
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	if speaker.routes.nextExpiry().IsZero() {
+		t.Fatal("the route carried no expiry, so this proves nothing")
+	}
+	// Section 3.5.3 expires a route to infinity first and flushes it on the
+	// next expiry, so two sweeps empty the table.
+	at := time.Now().Add(time.Hour)
+	speaker.routes.sweepExpired(at)
+	at = at.Add(time.Hour)
+	speaker.routes.sweepExpired(at)
+	for _, entry := range speaker.routes.entries {
+		if len(entry.routes) != 0 {
+			t.Fatal("a route survived both sweeps, so the expiry is still real")
+		}
+	}
+	if got := speaker.routes.nextExpiry(); !got.IsZero() && !got.After(at) {
+		t.Errorf("a table with no routes left is due at %v, before the %v it was just swept at: "+
+			"the run loop wakes immediately, finds nothing, and does it again", got, at)
+	}
+}
+
+// The loop's own two timers are terms of the deadline, or it never sends a
+// periodic Hello or a periodic dump again.
+func TestTheLoopsOwnTimersAreTermsOfItsDeadline(t *testing.T) {
+	speaker, _, _ := captureSpeaker(t, Config{})
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	now := time.Now()
+	for name, set := range map[string]func(){
+		"hello":  func() { speaker.nextHello, speaker.nextUpdate = now.Add(time.Second), now.Add(time.Hour) },
+		"update": func() { speaker.nextHello, speaker.nextUpdate = now.Add(time.Hour), now.Add(time.Second) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			set()
+			if got := speaker.deadlineLocked(); !got.Equal(now.Add(time.Second)) {
+				t.Errorf("the deadline is %v, which does not carry the %s timer", got, name)
+			}
+		})
+	}
+}
+
+// A dump a reload or an origination asked for is work the next pass owes, and
+// nothing else records it.
+func TestAPendingDumpIsWorkTheNextPassOwes(t *testing.T) {
+	speaker, _, _ := captureSpeaker(t, Config{})
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	speaker.updatePending = false
+	clear(speaker.routes.dirty)
+	speaker.routes.starved = nil
+	if speaker.pendingWorkLocked() {
+		t.Fatal("a speaker with nothing to do reports work, so this proves nothing")
+	}
+	speaker.updatePending = true
+	if !speaker.pendingWorkLocked() {
+		t.Error("a pending dump is not work, so it waits for whatever wakes the loop next")
 	}
 }

@@ -71,15 +71,22 @@ func (s *Speaker) emitLocked(actions []sendAction) func() {
 	slices.SortStableFunc(merged, func(a, b sendAction) int {
 		return int(a.priority) - int(b.priority)
 	})
+	refused := false
 	for _, action := range merged {
 		reserved, whole := s.reserveBatchesTo(action.neighbor, action.dest, action.tlvs)
 		packets = append(packets, reserved...)
 		if whole {
 			continue
 		}
+		refused = true
 		for _, restore := range action.rollback {
 			restore()
 		}
+	}
+	if refused {
+		// The rollbacks have put the work back where the next pass will find
+		// it, and nothing else will wake for it. See noteSendRetryLocked.
+		s.noteSendRetryLocked(time.Now())
 	}
 	if len(packets) == 0 {
 		return func() {}
@@ -531,6 +538,7 @@ func (s *Speaker) rememberStarved(key routeKey, routerID [8]byte, seqno uint16, 
 	id := sourceKey{route: key, routerID: routerID}
 	if retry, ok := s.starveRetries[id]; ok {
 		retry.seqno, retry.nextAt = seqno, now.Add(seqnoRetryInitial)
+		s.nextStarveRetry = earlier(s.nextStarveRetry, retry.nextAt)
 		return
 	}
 	if len(s.starveRetries) >= maxStarveRetries || s.starveBy[asker] >= maxStarveRetriesPerNeighbor {
@@ -539,6 +547,7 @@ func (s *Speaker) rememberStarved(key routeKey, routerID [8]byte, seqno uint16, 
 	s.starveRetries[id] = &starveRetry{
 		key: key, routerID: routerID, seqno: seqno, asker: asker, nextAt: now.Add(seqnoRetryInitial),
 	}
+	s.nextStarveRetry = earlier(s.nextStarveRetry, now.Add(seqnoRetryInitial))
 	s.starveBy[asker]++
 }
 
@@ -557,12 +566,17 @@ func (s *Speaker) forgetStarved(id sourceKey, retry *starveRetry) {
 // attempts, is forgotten rather than asked about forever.
 func (s *Speaker) retryStarvedLocked(now time.Time) []sendAction {
 	var actions []sendAction
+	// Rebuilt as the walk goes: this is the pass that reads every deadline, so
+	// it is where the kept minimum can be made exact again after the removals
+	// and the writes that only ever moved it earlier.
+	s.nextStarveRetry = time.Time{}
 	for id, retry := range s.starveRetries {
 		if entry := s.routes.entries[retry.key]; entry != nil && entry.selected.neighbor != nil {
 			s.forgetStarved(id, retry)
 			continue
 		}
 		if now.Before(retry.nextAt) {
+			s.nextStarveRetry = earlier(s.nextStarveRetry, retry.nextAt)
 			continue
 		}
 		if retry.attempts >= seqnoRequestRetries {
@@ -571,6 +585,7 @@ func (s *Speaker) retryStarvedLocked(now time.Time) []sendAction {
 		}
 		retry.attempts++
 		retry.nextAt = now.Add(seqnoRetryInitial << (retry.attempts - 1))
+		s.nextStarveRetry = earlier(s.nextStarveRetry, retry.nextAt)
 		// Ask everyone holding a route for this prefix, not only whoever the
 		// starved one came from: the neighbor that can reach the origin may be
 		// a different one, and BIRD rebroadcasts for the same reason.
@@ -601,5 +616,6 @@ func (s *Speaker) allowAsk(n *neighborState, key routeKey, routerID [8]byte, now
 		return false
 	}
 	s.askedSeqno[index] = now
+	s.noteRequestSweep(now)
 	return true
 }
