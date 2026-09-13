@@ -463,12 +463,12 @@ tests that write to a real routing table. They skip unless run as root, and on
 darwin unless `RANET_LITE_DARWIN_NETTEST=1` is also set, because that machine is
 on a live mesh. Nothing in CI runs them, so run them by hand after changing a
 platform backend. Protocol-level interoperability is covered by the NixOS VM
-tests exposed by `flake.nix`. It boots separate client and gateway VMs; the
+tests exposed by `flake.nix`. Each boots separate client and gateway VMs; the
 client runs the packaged, user-facing `ranet-lite` binary with a real TUN
 device, while the gateway runs `charon-systemd`/`swanctl`, BIRD, and iperf3. The
-test verifies an Ed25519-authenticated IKEv2 and Child SA negotiation across
-asymmetric local and remote UDP ports, checks Babel route exchange in both
-directions, and measures TCP bandwidth through the negotiated ESP tunnel:
+default test verifies an Ed25519-authenticated IKEv2 and Child SA negotiation
+across asymmetric local and remote UDP ports, checks Babel route exchange in
+both directions, and measures TCP bandwidth through the negotiated ESP tunnel:
 
 ```sh
 nix build .#checks.x86_64-linux.integration -L
@@ -477,9 +477,9 @@ nix build .#checks.x86_64-linux.responder -L
 nix build .#checks.x86_64-linux.kernel -L
 ```
 
-`responder` stands two ranet-lite nodes up and has one dial the other, which is
-what upstream could not do at all. `kernel` exercises the route reconciler
-against a real table.
+`responder` inverts the exchange: strongSwan dials and ranet-lite answers, which
+upstream could not do at all, and the check asserts that ranet-lite never dials.
+`kernel` exercises the route reconciler against a real table.
 
 These checks exercise one-core and four-core clients, IPv4 and IPv6 routes,
 locally scheduled and peer-initiated rekeys, BIRD withdrawal/recovery, and a

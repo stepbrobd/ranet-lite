@@ -63,7 +63,7 @@ babel:
   # Optional link costs use the BIRD interface option names.
   # rxcost: 96
   # rtt_cost: 1024
-  # rtt_min: 0s
+  # rtt_min: 10ms
   # rtt_max: 1024ms
 
   # Optional announcements also support a source prefix, which the top-level

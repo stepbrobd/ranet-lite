@@ -11,8 +11,11 @@ import (
 	"sync/atomic"
 )
 
-// Table resolves the longest matching destination, then the longest matching
-// source at that destination. Its zero value is ready to use.
+// Table resolves destination first, over (source, destination) pairs: the
+// longest destination that has an entry matching the source wins, so a lookup
+// whose longest matching destination has no matching source falls back to a
+// shorter destination that does, rather than failing. Its zero value is ready
+// to use.
 //
 // Writers copy only the changed trie path and publish a new immutable root.
 // Lookups and iteration use one snapshot without locks or shared counters.
