@@ -154,6 +154,12 @@ type Route struct {
 	// Metric is RTA_PRIORITY as the kernel holds it, never the zero that
 	// means "your default" on the way in.
 	Metric uint32
+	// Scoped is set by the darwin backend on a route the kernel keys by
+	// interface scope as well as by destination, so a withdrawal can name the
+	// one it read back rather than re-deriving it. An unscoped route and a
+	// scoped one to the same destination are different keys, and deleting by
+	// destination alone removes whichever the flag happens to select.
+	Scoped bool
 	// Unreachable holds a prefix rather than carrying it, as
 	// RFC 8966 section 3.5.4 requires of a retracted route until it is
 	// flushed. Without it the entry leaves the table and a packet for that
@@ -471,21 +477,30 @@ func (r *Reconciler) metric(destination netip.Prefix) uint32 {
 // own routes it still holds that the mesh no longer wants. Both results are
 // sorted so a pass is reproducible and its log lines are stable.
 func diffRoutes(desired, actual []Route) (add, del []Route) {
+	// Scoped is how darwin's kernel keys a route, not what makes it a
+	// different route, so it is not part of the comparison: the diff decides
+	// from what the mesh asked for, and a withdrawal then names the scope the
+	// dump reported for the route it is withdrawing.
+	key := func(r Route) Route { r.Scoped = false; return r }
 	want := make(map[Route]bool, len(desired))
 	for _, route := range desired {
-		want[route] = true
+		want[key(route)] = true
 	}
 	have := make(map[Route]bool, len(actual))
 	for _, route := range actual {
-		have[route] = true
+		have[key(route)] = true
 	}
-	for route := range want {
-		if !have[route] {
+	emitted := make(map[Route]bool, len(desired)+len(actual))
+	for _, route := range desired {
+		if k := key(route); !have[k] && !emitted[k] {
+			emitted[k] = true
 			add = append(add, route)
 		}
 	}
-	for route := range have {
-		if !want[route] {
+	clear(emitted)
+	for _, route := range actual {
+		if k := key(route); !want[k] && !emitted[k] {
+			emitted[k] = true
 			del = append(del, route)
 		}
 	}
@@ -508,6 +523,7 @@ func compareRoutes(a, b Route) int {
 		a.PrefSrc.Compare(b.PrefSrc),
 		cmp.Compare(a.Metric, b.Metric),
 		cmp.Compare(boolOrder(a.Unreachable), boolOrder(b.Unreachable)),
+		cmp.Compare(boolOrder(a.Scoped), boolOrder(b.Scoped)),
 	)
 }
 

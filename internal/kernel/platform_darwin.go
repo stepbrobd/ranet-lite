@@ -213,9 +213,27 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 		return nil, fmt.Errorf("kernel: parse the route dump: %w", err)
 	}
 	var out []Route
+	stillScoped := make(map[netip.Prefix]bool, len(p.scoped))
 	for _, message := range messages {
-		if decoded, ok := p.decodeRoute(message); ok {
-			out = append(out, decoded)
+		decoded, ok := p.decodeRoute(message)
+		if !ok {
+			continue
+		}
+		out = append(out, decoded)
+		if decoded.Scoped {
+			stillScoped[decoded.Destination] = true
+		}
+	}
+	// p.scoped stands in for a source the FIB cannot hold, so it is a cache of
+	// something only the kernel knows, and the kernel can drop a route without
+	// telling this process: sleep and wake, a link change, another daemon's
+	// flush. A record that outlives its route makes AddRoute refuse every
+	// differently shaped scoped install at that destination as a second source
+	// for one slot, which is reported as skipped and retried forever, so the
+	// destination becomes uninstallable for the life of the process.
+	for destination := range p.scoped {
+		if !stillScoped[destination] {
+			delete(p.scoped, destination)
 		}
 	}
 	return out, nil
@@ -241,6 +259,18 @@ const skipRouteFlags = unix.RTF_MULTICAST | unix.RTF_BROADCAST |
 	unix.RTF_LOCAL | unix.RTF_WASCLONED | unix.RTF_LLINFO |
 	unix.RTF_BLACKHOLE | unix.RTF_GATEWAY
 
+// limitedBroadcast is the one entry the kernel installs that carries no flag
+// separating it from a route of ours: scoped, RTF_STATIC, and leaving through
+// the interface itself, which is exactly what this backend writes. It is not
+// created for a tun configured the way this backend configures one -- measured
+// on a throwaway utun carrying a /24 and a /48, where every entry the kernel
+// added named an address as its gateway and so was already excluded -- but it
+// is present on every broadcast-capable interface on this machine and on the
+// utun another overlay configures differently. Nothing here ever asks for it,
+// so naming it costs nothing and keeps an addressing change from turning it
+// into a route this reconciler deletes once a pass.
+var limitedBroadcast = netip.MustParsePrefix("255.255.255.255/32")
+
 // decodeRoute keeps only the routes this reconciler owns. Everything else in
 // the dump belongs to somebody else, so it is dropped here and can never reach
 // a delete list.
@@ -251,15 +281,6 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if !ok || rm.Type != unix.RTM_GET || rm.Index != p.index {
 		return Route{}, false
 	}
-	// RTF_IFSCOPE is handled after the destination is known: this reconciler
-	// sets it on some of its own routes, but the kernel and other daemons also
-	// set it on routes of theirs that are otherwise indistinguishable from
-	// ours. utun7 on a machine running Tailscale
-	// carries a scoped 255.255.255.255 entry with a link gateway and
-	// RTF_STATIC, which is exactly the shape this reconciler installs. So a
-	// scoped route counts as ours only if this process scoped that
-	// destination, and one orphaned by a crash is left alone rather than
-	// deleted on the strength of a guess.
 	if rm.Flags&unix.RTF_UP == 0 || rm.Flags&skipRouteFlags != 0 {
 		return Route{}, false
 	}
@@ -293,7 +314,16 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if !ok {
 		return Route{}, false
 	}
-	source, tracked := p.scoped[prefix]
+	if prefix == limitedBroadcast {
+		return Route{}, false
+	}
+	if _, tracked := p.scoped[prefix]; !tracked && p.occupied[prefix] && rm.Flags&unix.RTF_IFSCOPE != 0 {
+		// An install this process watched the kernel refuse, so another writer
+		// holds that scoped key and reporting it as ours would withdraw it on
+		// the next pass. Everything else scoped is adopted below.
+		return Route{}, false
+	}
+	source := p.scoped[prefix]
 	if rm.Flags&unix.RTF_IFSCOPE == 0 {
 		// The kernel keys a scoped route separately from the unscoped route to
 		// the same destination, so both can exist at once. Only the scoped one
@@ -301,16 +331,39 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// into one entry in the diff and leave the unscoped route, which for
 		// "::/0" is the whole machine's default, installed forever.
 		source = netip.Prefix{}
-	} else if !tracked {
-		return Route{}, false
 	}
+	// A scoped route this process did not install is still reported, with no
+	// source, so that it can be withdrawn. Requiring a record of the install
+	// instead made it invisible: an instance that attached to a tun it did not
+	// create, as ranet-lite does, inherited its predecessor's scoped routes and
+	// could neither withdraw them nor install over them, because darwin has no
+	// replace and the add came back EEXIST on every pass for the life of the
+	// process.
+	//
+	// It does mean taking over a scoped route out of this interface that
+	// belongs to somebody else, which is already what happens to an unscoped
+	// one: the interface is this process's, and another overlay sharing the
+	// machine scopes to its own. The dump runs before the install in a pass,
+	// so an inherited route is resolved before anything can record its
+	// destination as occupied.
+	//
+	// What is left of it is this: the destination survives and the source does
+	// not, so a source-specific route inherited this way is withdrawn and
+	// reinstalled rather than recognized. A destination now wanted unscoped and
+	// unsourced keeps the inherited scoped route, because the diff does not key
+	// on scope.
 	return Route{
 		Destination: prefix,
 		// The kernel keeps no source, so a scoped route's source comes back
 		// from what this process installed for that destination.
-		Source:      source,
-		PrefSrc:     p.prefSrc(prefix),
-		Metric:      p.metric(prefix),
+		Source:  source,
+		PrefSrc: p.prefSrc(prefix),
+		Metric:  p.metric(prefix),
+		// Read back rather than re-derived, because the kernel keys on it: an
+		// unscoped default and a scoped one are two routes, and a withdrawal
+		// that guessed from the destination would take out the wrong one and
+		// leave the one it was asked for.
+		Scoped:      rm.Flags&unix.RTF_IFSCOPE != 0,
 		Unreachable: rm.Flags&unix.RTF_REJECT != 0,
 	}, true
 }
@@ -373,6 +426,13 @@ func routeAddr(address netip.Addr) route.Addr {
 }
 
 func (p *routePlatform) AddRoute(r Route) error {
+	if r.Destination == limitedBroadcast {
+		// decodeRoute drops this destination from every dump, so an install
+		// would succeed once and then be invisible: every later pass would
+		// re-add it, get EEXIST, and warn that another program holds a route
+		// this reconciler wrote itself, and withdraw would never remove it.
+		return p.skipSourceSpecific(r)
+	}
 	if r.Source.IsValid() {
 		ours, err := p.sourceIsOurs(r.Source)
 		if err != nil {
@@ -465,12 +525,21 @@ func (p *routePlatform) AddRoute(r Route) error {
 // can announce one: the Update decoder bounds a prefix length only at 32 and
 // 128.
 //
+// A hold is scoped for a third reason. It answers with an error rather than
+// carrying the packet, and this FIB is the only one the machine has, so an
+// unscoped hold makes the prefix unreachable for everything on the box: a
+// retracted route shadows whatever else could still reach it for the length of
+// the hold, and a prefix this node originates itself does so for the life of
+// the process. Scoped, it holds for a socket bound to the mesh and is
+// invisible to everything else, which is the split the mesh's own forwarding
+// table already makes.
+//
 // Anything more specific stays unscoped, so the mesh is reachable from the Mac
 // itself without every program having to bind first. That is the same split
 // tailscale makes on the same machine: its exit-node default is scoped to its
 // utun, its 100.64/10 is not.
 func scopeOnDarwin(r Route) bool {
-	return r.Source.IsValid() || r.Destination.Bits() <= 1
+	return r.Source.IsValid() || r.Destination.Bits() <= 1 || r.Unreachable
 }
 
 func (p *routePlatform) DelRoute(r Route) error {
@@ -491,12 +560,12 @@ func (p *routePlatform) DelRoute(r Route) error {
 	if err != nil {
 		return err
 	}
-	if scopeOnDarwin(r) {
-		// The kernel keys a scoped route separately from the unscoped route to
-		// the same destination, so the delete has to carry the flag or it
-		// removes the wrong one. Asking the route rather than the record keeps
-		// withdrawing an unscoped default from taking out the scoped
-		// source-specific route that shares its destination.
+	// The kernel keys a scoped route separately from the unscoped route to the
+	// same destination, so the delete has to carry the flag the dump reported
+	// for this route. Re-deriving it from the destination would make every
+	// withdrawal of an unscoped default take out the scoped route instead and
+	// leave the unscoped one, which the next pass then tries to delete again.
+	if r.Scoped {
 		message.Flags |= unix.RTF_IFSCOPE
 	}
 	if err := p.sock.WriteRoute(message); err != nil && !gone(err) {

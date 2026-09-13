@@ -3,6 +3,7 @@
 package kernel
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"testing"
@@ -92,7 +93,10 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 	// of ours, is stable across a dump so a pass does not churn it, and comes
 	// back out again.
 	t.Run("source-specific route through the reconciler", func(t *testing.T) {
-		announced := Route{Destination: remote, Source: local.Masked()}
+		// Scoped is how the kernel keys it, and a dump fills it in; a route
+		// built by hand has to say so, or the withdrawal below goes unscoped
+		// and removes nothing.
+		announced := Route{Destination: remote, Source: local.Masked(), Scoped: true}
 		if err := plat.AddRoute(announced); err != nil {
 			t.Fatalf("install %s: %v", announced, err)
 		}
@@ -135,8 +139,8 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 	// capture everything to that destination.
 	t.Run("a source prefix that is not ours is refused", func(t *testing.T) {
 		foreign := Route{Destination: remote, Source: netip.MustParsePrefix("192.0.2.0/24")}
-		if err := plat.AddRoute(foreign); err != nil {
-			t.Fatalf("AddRoute reported an error rather than skipping: %v", err)
+		if err := plat.AddRoute(foreign); !errors.Is(err, errRouteSkipped) {
+			t.Fatalf("AddRoute reported %v rather than reporting the route skipped", err)
 		}
 		if reaches(t, tun, target, netip.Addr{}, 0) || reaches(t, tun, target, local.Addr(), 0) {
 			t.Error("a source prefix belonging to another node installed a route anyway")

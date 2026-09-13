@@ -638,8 +638,10 @@ func TestDarwinScopesSourceOfOurs(t *testing.T) {
 	}
 
 	// The withdrawal has to carry the flag too, or it removes the unscoped
-	// route to the same destination instead.
+	// route to the same destination instead. It takes the flag from the route
+	// it was handed, which a dump fills in, rather than guessing.
 	sock.sent = nil
+	announced.Scoped = true
 	if err := plat.DelRoute(announced); err != nil {
 		t.Fatalf("withdraw %s: %v", announced, err)
 	}
@@ -829,12 +831,23 @@ func TestDarwinDeleteSelectsScopeOfRouteItWithdraws(t *testing.T) {
 	if len(written) != 1 || written[0].Flags&unix.RTF_IFSCOPE != 0 {
 		t.Fatalf("withdrawing %s carried interface scope, which deletes a different route", specific.Destination)
 	}
-	if err := plat.DelRoute(Route{Destination: prefix("::/0")}); err != nil {
+	if err := plat.DelRoute(Route{Destination: prefix("::/0"), Scoped: true}); err != nil {
 		t.Fatal(err)
 	}
 	written = sock.messages(t)
 	if len(written) != 2 || written[1].Flags&unix.RTF_IFSCOPE == 0 {
 		t.Fatal("withdrawing an announced default did not select its interface scope")
+	}
+
+	// And the unscoped default that shares that destination goes unscoped,
+	// which is the pair that used to make every pass delete the wrong one and
+	// leave the one it was asked for.
+	if err := plat.DelRoute(Route{Destination: prefix("::/0")}); err != nil {
+		t.Fatal(err)
+	}
+	written = sock.messages(t)
+	if len(written) != 3 || written[2].Flags&unix.RTF_IFSCOPE != 0 {
+		t.Fatal("withdrawing an unscoped default carried interface scope, which deletes the scoped one instead")
 	}
 }
 
@@ -899,5 +912,95 @@ func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
 	carried.Unreachable = false
 	if add, del := diffRoutes([]Route{carried}, actual); len(add) != 1 || len(del) != 1 {
 		t.Fatalf("a hold and a path to one prefix compared equal: add %v, delete %v", add, del)
+	}
+}
+
+// ranet-lite attaches to a tun it did not necessarily create, so an instance
+// can start on an interface that already carries its predecessor's scoped
+// routes. Darwin has no replace, so a scoped route the dump does not report is
+// one this process can neither withdraw nor install over: the add comes back
+// EEXIST on every pass for the life of the process, and the destination it
+// names is wrong for just as long.
+func TestDarwinAdoptsAScopedRouteItDidNotInstall(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	inherited := []dumpEntry{
+		// an announced default, which this backend always scopes
+		{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+			dst: prefix("::/0"), gateway: ourGateway()},
+		// a held prefix, which is scoped for the same reason
+		{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE | unix.RTF_REJECT,
+			dst: prefix("2001:db8:1::/48"), gateway: ourGateway()},
+		// what a source-specific route leaves behind once the source this
+		// process recorded for it is gone with the process
+		{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
+			dst: prefix("2001:db8:2::/48"), gateway: ourGateway()},
+	}
+	got, err := plat.ownedRoutes(dumpRIB(t, inherited...))
+	if err != nil {
+		t.Fatalf("decode the dump: %v", err)
+	}
+	want := []Route{
+		{Destination: prefix("::/0"), Metric: defaultIPv6Metric, Scoped: true},
+		{Destination: prefix("2001:db8:1::/48"), Metric: defaultIPv6Metric, Scoped: true, Unreachable: true},
+		{Destination: prefix("2001:db8:2::/48"), Metric: defaultIPv6Metric, Scoped: true},
+	}
+	slices.SortFunc(got, compareRoutes)
+	slices.SortFunc(want, compareRoutes)
+	if !slices.Equal(got, want) {
+		t.Fatalf("the dump decoded to %v, want %v", got, want)
+	}
+	// Reported as scoped, so the withdrawal names the key the kernel filed it
+	// under rather than the unscoped route to the same destination.
+	for _, r := range got {
+		if !r.Scoped {
+			t.Errorf("%s came back unscoped, so deleting it would take out the wrong route", r.Destination)
+		}
+	}
+}
+
+// p.scoped stands in for a source the FIB cannot hold, so it is a cache of
+// something only the kernel knows, and the kernel can drop a route without
+// telling this process: sleep and wake, a link change, another daemon's flush.
+// A record that outlives its route makes every differently shaped scoped
+// install at that destination look like a second source for the one scoped
+// slot, which is reported as skipped and retried forever, so the destination
+// becomes uninstallable for the life of the process.
+func TestDarwinForgetsAScopedRouteThatLeftTheKernel(t *testing.T) {
+	plat, _ := testPlatform(t, Config{})
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
+	dest := prefix("2001:db8:1::/48")
+	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}); err != nil {
+		t.Fatalf("install the source-specific route: %v", err)
+	}
+	if _, recorded := plat.scoped[dest]; !recorded {
+		t.Fatal("the install did not record the scope, so this proves nothing")
+	}
+
+	// Something else removed it. The next dump has no scoped row for it.
+	if _, err := plat.ownedRoutes(dumpRIB(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, recorded := plat.scoped[dest]; recorded {
+		t.Error("the record outlived the route, so this destination can never be installed again")
+	}
+
+	// And a differently shaped scoped install at the same destination now
+	// works rather than being refused as a second source for one slot.
+	if err := plat.AddRoute(Route{Destination: dest, Unreachable: true, Metric: defaultIPv6Metric}); err != nil {
+		t.Errorf("a hold at the same destination was refused: %v", err)
+	}
+}
+
+// decodeRoute drops the limited broadcast from every dump, so installing it
+// would succeed once and then be invisible: every later pass would re-add it,
+// get EEXIST, and warn that another program holds a route this reconciler
+// wrote itself, and withdraw would never remove it.
+func TestDarwinRefusesWhatItsOwnDumpWouldNeverReport(t *testing.T) {
+	plat, sock := testPlatform(t, Config{})
+	if err := plat.AddRoute(Route{Destination: limitedBroadcast}); !errors.Is(err, errRouteSkipped) {
+		t.Errorf("installing the limited broadcast reported %v, want it reported as not installed", err)
+	}
+	if written := sock.messages(t); len(written) != 0 {
+		t.Errorf("the install wrote %d messages for a destination the dump never reports", len(written))
 	}
 }
