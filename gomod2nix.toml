@@ -1,0 +1,42 @@
+schema = 3
+
+[mod]
+[mod.'github.com/kr/pretty']
+version = 'v0.3.1'
+hash = 'sha256-DlER7XM+xiaLjvebcIPiB12oVNjyZHuJHoRGITzzpKU='
+
+[mod.'github.com/rogpeppe/go-internal']
+version = 'v1.14.1'
+hash = 'sha256-6NzhXCCD1Qhj05WHbCDxH5hwfNM6psoAk7uIxm7N55E='
+
+[mod.'golang.org/x/crypto']
+version = 'v0.55.0'
+hash = 'sha256-99uV/ESeqhaDEwqbXxDpePuwzO0JoEHGhqZXZVHq/H4='
+
+[mod.'golang.org/x/net']
+version = 'v0.57.0'
+hash = 'sha256-gKo8UMw4hfETBHm8N5GOfuNadse9TWEQXJo2YWq5bY4='
+
+[mod.'golang.org/x/sys']
+version = 'v0.47.0'
+hash = 'sha256-TpbRyWWqHjddP6QzUgAbaLd2EE0S+GYNRUIDJd18r98='
+
+[mod.'golang.zx2c4.com/wintun']
+version = 'v0.0.0-20230126152724-0fa3db229ce2'
+hash = 'sha256-cjMLNjKnnupVROWmeASORVieAL9ieYdzX3cFzG8bCpo='
+
+[mod.'golang.zx2c4.com/wireguard']
+version = 'v0.0.0-20260522210424-ecfc5a8d5446'
+hash = 'sha256-qfF39wqSCUlsXsaJyjcnv9n8ZjRJfIKDo6i2DursedU='
+
+[mod.'gopkg.in/check.v1']
+version = 'v1.0.0-20201130134442-10cb98267c6c'
+hash = 'sha256-VlIpM2r/OD+kkyItn6vW35dyc0rtkJufA93rjFyzncs='
+
+[mod.'gopkg.in/yaml.v3']
+version = 'v3.0.1'
+hash = 'sha256-FqL9TKYJ0XkNwJFnq9j0VvJ5ZUU1RvH/52h/f5bkYAU='
+
+[mod.'gvisor.dev/gvisor']
+version = 'v0.0.0-20260815055033-7d8fb7f28de4'
+hash = 'sha256-qNul+ILbeffSiOxFoVeNtayahFZVp+/W2YIJf53Hfc8='
