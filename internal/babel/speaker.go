@@ -433,8 +433,8 @@ func (s *Speaker) wake() {
 // the whole route table, 22 ms at maxRouteKeys prefixes over eight neighbors
 // and under the lock that is also every other neighbor's receive path, the
 // hello emitter and route installation, so a wake for every arriving packet
-// lets one neighbor charge this node that much for a fifty-two byte Hello as
-// fast as the link carries them. Deciding instead costs the 230 ns of
+// lets one neighbor charge this node that much for a sixty byte Hello as fast
+// as the link carries them. Deciding instead costs the 230 ns of
 // deadlineLocked, and the Hello and IHU a packet refreshes move their own
 // deadlines later, never earlier, which is the case this leaves asleep. Both
 // figures are floors, taken on an idle machine; see BenchmarkRunLoopPass.
@@ -471,11 +471,14 @@ func (s *Speaker) pendingWorkLocked() bool {
 // could not send. The rollback has put the work back, and nothing else will
 // pick it up: a Hello is retried by `!n.sentHello` and a triggered update by
 // the neighbor's own `owed`, both on the next pass, whenever that is. A
-// quarter of the hello interval gives a refused Hello more than a dozen
-// attempts inside the three and a half intervals that withdraw the routes
-// through this neighbor, and costs a pass rather than a packet.
+// quarter of the hello interval gives a refused Hello fourteen attempts inside
+// the three and a half intervals that withdraw the routes through this
+// neighbor, and costs a pass rather than a packet. The floor is a millisecond
+// rather than anything larger: at the ten millisecond interval Validate
+// accepts, a fifty millisecond floor put the first retry after the remote had
+// already declared this node dead.
 func (s *Speaker) noteSendRetryLocked(now time.Time) {
-	s.retryAt = earlier(s.retryAt, now.Add(max(s.cfg.HelloInterval/4, 50*time.Millisecond)))
+	s.retryAt = earlier(s.retryAt, now.Add(max(s.cfg.HelloInterval/4, time.Millisecond)))
 }
 
 // deadlineLocked is when the run loop next has to do something on its own,

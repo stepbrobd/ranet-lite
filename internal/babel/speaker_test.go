@@ -1486,7 +1486,7 @@ func settleRunLoop(s *Speaker) {
 // One pass of the run loop reselects the whole route table, tens of
 // milliseconds at a full one, all of it under the lock that is every other
 // neighbor's receive path. A wake for every arriving packet therefore lets one
-// neighbor charge this node a sweep for a fifty-two byte Hello, as fast as the
+// neighbor charge this node a sweep for a sixty byte Hello, as fast as the
 // link carries them. The wake is owed to what a packet left behind, and a
 // Hello that only pushes its own deadline further out leaves nothing.
 func TestARefreshingHelloDoesNotWakeTheRunLoop(t *testing.T) {
@@ -2263,5 +2263,35 @@ func TestACongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
 	}
 	if actions := speaker.triggeredActions(now); len(actions) != 1 || actions[0].neighbor != stuck {
 		t.Errorf("the retry built %d actions, want the one that owes the stuck peer its dump", len(actions))
+	}
+}
+
+// The floor under the send retry, at the shortest hello interval Validate
+// accepts. A pass that could not send its Hello has until deadTimeout, three
+// and a half intervals, before the remote withdraws every route through this
+// node; the retry has to fit several attempts inside that. A fifty millisecond
+// floor, which is what this replaced, puts the first attempt after the remote
+// has already given up.
+func TestTheSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
+	const shortest = 10 * time.Millisecond
+	speaker, _, _ := captureSpeaker(t, Config{HelloInterval: shortest, UpdateInterval: time.Minute})
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	speaker.retryAt = time.Time{}
+	speaker.noteSendRetryLocked(now)
+
+	dead := deadTimeout(shortest)
+	delay := speaker.retryAt.Sub(now)
+	if delay <= 0 {
+		t.Fatal("a pass that could not send scheduled no retry")
+	}
+	if delay >= dead {
+		t.Errorf("the retry is %v away and the remote declares this node dead at %v, so the first attempt is too late", delay, dead)
+	}
+	// Several attempts, not one that happens to land: the point of the floor
+	// is that a lost Hello has more than one chance inside the window.
+	if attempts := int(dead / delay); attempts < 4 {
+		t.Errorf("the retry allows %d attempts before the remote gives up, want several", attempts)
 	}
 }
