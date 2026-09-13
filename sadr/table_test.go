@@ -100,4 +100,13 @@ func TestSourcesAreGroupedByLengthNotByEntry(t *testing.T) {
 	if !node.haveAny {
 		t.Error("the match-all source is not held apart from the groups")
 	}
+	// The same lookup BenchmarkLookupBySourceCount is built around, asserted
+	// here because `go test` never runs a benchmark: a source no specific
+	// entry contains falls through every group to the match-all one.
+	if got, ok := table.Lookup(addr("fd7f:ffff::1"), addr("fd00::1")); !ok || got != 2000 {
+		t.Errorf("a source no group contains looked up %v, %v, want the match-all entry", got, ok)
+	}
+	if got, ok := table.Lookup(addr("fd00:1::5"), addr("fd00::1")); !ok || got != 1000 {
+		t.Errorf("a source one group contains looked up %v, %v, want the longest match", got, ok)
+	}
 }
