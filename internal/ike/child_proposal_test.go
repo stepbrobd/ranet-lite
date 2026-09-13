@@ -247,12 +247,13 @@ func TestTheChildAnswerIsCheckedAgainstWhatThisEndOffered(t *testing.T) {
 	}
 }
 
-// The reader above knows two transform types and the one integrity deviation.
-// A type added to espProposal has to be added to it in the same change, or
-// every answer to the new offer is refused as inconsistent and no Child SA is
-// ever established. This is that check, rather than a permissive default that
-// would accept a value the reader does nothing with.
-func TestTheChildAnswerReaderKnowsEveryTypeTheOfferNames(t *testing.T) {
+// This is a drift guard on the offer, not a test of the reader: the reader
+// knows two transform types, and a type added to espProposal has to be added
+// to it in the same change, or every answer to the new offer is refused as
+// inconsistent and no Child SA is ever established. Stated here rather than as
+// a permissive default that would accept a value the reader does nothing
+// with.
+func TestEspProposalOffersNoTypeTheAnswerReaderRefuses(t *testing.T) {
 	for _, transform := range espProposal([]byte{0, 0, 0, 1}).Transforms {
 		switch transform.Type {
 		case TransEncr, TransESN:

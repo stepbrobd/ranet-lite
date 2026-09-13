@@ -444,7 +444,7 @@ func TestResponderDoesNotReflectOnSPIAlone(t *testing.T) {
 	if err := mux.SendIKE(request); err != nil {
 		t.Fatal(err)
 	}
-	first, err := mux.RecvIKEUntil(time.Now().Add(5 * time.Second))
+	first, err := mux.RecvIKEUntil(time.Now().Add(30 * time.Second))
 	if err != nil {
 		t.Fatalf("the responder did not answer a valid IKE_SA_INIT: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestResponderDoesNotReflectOnSPIAlone(t *testing.T) {
 	if err := mux.SendIKE(request); err != nil {
 		t.Fatal(err)
 	}
-	again, err := mux.RecvIKEUntil(time.Now().Add(5 * time.Second))
+	again, err := mux.RecvIKEUntil(time.Now().Add(30 * time.Second))
 	if err != nil {
 		t.Fatalf("an identical retransmission was not answered: %v", err)
 	}

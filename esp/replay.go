@@ -89,6 +89,11 @@ func (w *replayWindow) clearRange(start, n uint32) {
 }
 
 // clearSpan clears n bits from start without wrapping.
+//
+// clearRange returns early on n == 0 and its wrap split gives both halves a
+// positive length, so the guard below is unreachable from there. It stays
+// because the arithmetic that follows it does not survive a zero: (end-1)/64
+// underflows and indexes past the mask.
 func (w *replayWindow) clearSpan(start, n uint32) {
 	if n == 0 {
 		return

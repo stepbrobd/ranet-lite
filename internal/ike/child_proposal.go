@@ -186,6 +186,13 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 	// and no implementation is known to. The responder half of this package
 	// echoes only what it was offered, which is the rule read from the other
 	// side.
+	//
+	// The count is a statement of the shape rather than the thing that
+	// enforces it: the switch below refuses every type the offer did not name
+	// and the two flags refuse a repeat, so nothing reaches this that the rest
+	// would let through. It stays because the rule is "one of each type the
+	// offer included" and that is easier to read as a number than as the
+	// absence of three other refusals.
 	if p.Number != 1 || p.Protocol != ProtoESP || len(p.SPI) != 4 || len(p.Transforms) != 2 {
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal shape")
 	}

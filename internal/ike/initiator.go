@@ -727,6 +727,10 @@ func suiteFromProposal(p Proposal) (SASuite, error) {
 	// terminate an exchange whose answer is not consistent with what it
 	// proposed. See decodeChildProposal for why an unoffered type is refused
 	// even where it could not change the suite.
+	//
+	// As in decodeChildProposal, the count states the shape and the checks
+	// below enforce it: the type test, the duplicate test and the
+	// completeness test leave nothing for it to catch on its own.
 	if p.Number != 1 || p.Protocol != ProtoIKE || len(p.SPI) != 0 || len(p.Transforms) != 3 {
 		return SASuite{}, fmt.Errorf("ike: invalid selected IKE proposal shape")
 	}
