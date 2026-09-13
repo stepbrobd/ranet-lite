@@ -38,6 +38,8 @@ type Client struct {
 	// sessions uses, so a reload can start and stop them individually.
 	dialersMu sync.Mutex
 	dialers   map[string]*dialer
+	// dialRetry overrides defaultReconnectDelay; zero means the default.
+	dialRetry time.Duration
 	// stopped closes the door on new dialers. Run sets it under dialersMu
 	// before waiting, so a reload arriving at the same moment cannot add to
 	// the WaitGroup after the wait has begun, which panics.

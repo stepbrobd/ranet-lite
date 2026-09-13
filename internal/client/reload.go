@@ -11,6 +11,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
@@ -111,6 +112,15 @@ func (c *Client) Reload(path string) error {
 
 	c.reg.Store(&reg)
 	c.cfg.Store(cfg)
+	// The registry decides who may connect, so it decides who may stay. A node
+	// taken out of it keeps every tunnel it already holds until somebody says
+	// otherwise, and this is the only moment anybody does.
+	for _, path := range c.sessions.revoke(func(peer ike.Identity) bool {
+		_, ok := c.lookupPeerKey(peer)
+		return ok
+	}) {
+		log.Printf("reload: %s is no longer in the registry, session closed", path)
+	}
 	originated, err := originatedRoutes(cfg)
 	if err != nil {
 		return err

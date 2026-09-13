@@ -14,7 +14,16 @@ import (
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
 
-const reconnectDelay = 10 * time.Second
+const defaultReconnectDelay = 10 * time.Second
+
+// reconnectDelay is how long a dialer waits between attempts. A test that has
+// to see the loop come round again overrides it; zero means the default.
+func (c *Client) reconnectDelay() time.Duration {
+	if c.dialRetry > 0 {
+		return c.dialRetry
+	}
+	return defaultReconnectDelay
+}
 
 // runPeer maintains one peer connection for the client's lifetime,
 // reconnecting on any failure (network blip, peer restart, etc.) rather
@@ -60,6 +69,17 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 		if ctx.Err() != nil {
 			return
 		}
+		// Re-checked every pass, not only before the loop: a node removed from
+		// the registry while this dialer is running hits exactly the case the
+		// check above exists to prevent, and logs the same lookup failure
+		// every reconnect delay for the life of the process. Leaving the loop
+		// also makes Reload's "so nothing will dial it" true, which it was not
+		// while syncPeers kept the dialer alive. forgetDialer drops the map
+		// entry, so the next reload starts a new one if the node comes back.
+		if _, _, ok := c.registry().FindNode(p.Organization, p.CommonName); !ok {
+			log.Printf("peer %s: no longer in the registry, giving up", name)
+			return
+		}
 		switch err := c.connectPeer(ctx, local, p, name); {
 		case err == nil:
 		case errors.Is(err, errSessionEstablished):
@@ -67,12 +87,12 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 			// The loop keeps running so this dialer takes over the moment the
 			// peer's session ends.
 		default:
-			log.Printf("peer %s: %v, reconnecting in %s", name, err, reconnectDelay)
+			log.Printf("peer %s: %v, reconnecting in %s", name, err, c.reconnectDelay())
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(reconnectDelay):
+		case <-time.After(c.reconnectDelay()):
 		}
 	}
 }
@@ -159,7 +179,7 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	}
 	localIdentity := ike.Identity{Organization: cfg.Organization, CommonName: cfg.CommonName, SerialNumber: local.SerialNumber}
 	remoteIdentity := ike.Identity{Organization: p.Organization, CommonName: node.CommonName, SerialNumber: ep.SerialNumber}
-	return c.serveSession(ctx, sess, name, sessionName, localIdentity, remoteIdentity)
+	return c.serveSession(ctx, sess, name, sessionName, localIdentity, remoteIdentity, remoteIdentity)
 }
 
 // errSessionEstablished means this peer is already reachable over a session

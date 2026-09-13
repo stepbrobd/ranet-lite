@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -287,5 +288,35 @@ func TestASpentSequenceSpaceAsksForAReplacementAndKeepsTheSession(t *testing.T) 
 	}
 	if fatalReserveError(errNoChildSA) || fatalReserveError(nil) {
 		t.Error("a refusal a replacement fixes closes the mux")
+	}
+}
+
+// A reload that drops a peer cancels that dialer's context while the node
+// keeps running, and the session it opened has to be told: the peer otherwise
+// carries on sending ESP into an SPI nobody answers until its own liveness
+// check expires, which is up to seventy seconds. Shutdown is not this case,
+// because closeAll has already swept by the time the node's context is
+// canceled, and that sweep exists so that no peer is told twice.
+func TestOnlyADroppedDialerTellsItsPeer(t *testing.T) {
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	dropped, cancelDropped := context.WithCancel(context.Background())
+	cancelDropped()
+	node, stopNode := context.WithCancel(context.Background())
+	stopNode()
+
+	for name, test := range map[string]struct {
+		dial, node context.Context
+		want       bool
+	}{
+		"a reload dropped the dialer": {dropped, live, true},
+		"the session is still open":   {live, live, false},
+		"the node is shutting down":   {dropped, node, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := dialerWasDropped(test.dial, test.node); got != test.want {
+				t.Errorf("dialerWasDropped = %v, want %v", got, test.want)
+			}
+		})
 	}
 }

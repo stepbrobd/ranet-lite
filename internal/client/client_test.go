@@ -531,7 +531,7 @@ func TestSimultaneousOpenConvergesOnSameSession(t *testing.T) {
 			if which == dialedByB {
 				initiator, responder = b, a
 			}
-			set.adopt("path", sessions[which], initiator, responder, nil)
+			set.adopt("path", sessions[which], initiator, responder, responder, nil)
 		}
 		for name, sess := range sessions {
 			if live := set.live["path"]; live != nil && live.session == sess {
@@ -973,6 +973,19 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	}
 	c.cfg.Store(cfg)
 	c.reg.Store(&joined)
+	// A live session for the node the rewrite below drops. The registry is the
+	// trust root, so a reload has to close it: refusing the next handshake
+	// leaves the tunnel it already holds carrying traffic until every other
+	// node restarts.
+	c.sessions = newSessionSet()
+	var revoked []*ike.Session
+	c.sessions.close = func(sess *ike.Session) { revoked = append(revoked, sess) }
+	c.sessions.active = func(*ike.Session) bool { return true }
+	third := &ike.Session{}
+	thirdID := ike.Identity{Organization: "example", CommonName: "third", SerialNumber: "1"}
+	if _, ok := c.sessions.adopt("example/third/1@1", third, thirdID, thirdID, thirdID, nil); !ok {
+		t.Fatal("the session for the node about to be dropped was not adopted")
+	}
 	c.syncPeers()
 	defer func() { cancel(); c.peers.Wait() }()
 
@@ -995,6 +1008,12 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	}
 	if _, _, ok := c.registry().FindNode("example", "third"); ok {
 		t.Error("the decommissioned node is still in the registry this node holds")
+	}
+	if len(revoked) != 1 || revoked[0] != third {
+		t.Errorf("the reload closed %d sessions, want the one whose node it dropped", len(revoked))
+	}
+	if _, held := c.sessions.live["example/third/1@1"]; held {
+		t.Error("the decommissioned node's session is still live, so it still carries traffic")
 	}
 }
 
@@ -1246,5 +1265,94 @@ func TestMetricsLabelsUseOnlyTheEscapesTheFormatDefines(t *testing.T) {
 	}
 	if strings.Contains(out.String(), `\t`) {
 		t.Error("a label value carries an escape the format does not define")
+	}
+}
+
+// The registry is what a handshake is checked against, so it is what decides
+// who may stay. A node taken out of it kept every tunnel it already held,
+// because the handshake check only refuses the next one and nothing revisited
+// the sessions already running. A reload is the only moment this node learns
+// that a node is gone.
+func TestReloadClosesASessionTheRegistryNoLongerNames(t *testing.T) {
+	set := newSessionSet()
+	var closed []*ike.Session
+	set.close = func(sess *ike.Session) { closed = append(closed, sess) }
+	set.active = func(*ike.Session) bool { return true }
+
+	stays := ike.Identity{Organization: "example", CommonName: "keeper", SerialNumber: "0"}
+	goes := ike.Identity{Organization: "example", CommonName: "gone", SerialNumber: "0"}
+	keeper, gone := &ike.Session{}, &ike.Session{}
+	for _, adopted := range []struct {
+		path string
+		sess *ike.Session
+		peer ike.Identity
+	}{{"example/keeper/0@0", keeper, stays}, {"example/gone/0@0", gone, goes}} {
+		if _, ok := set.adopt(adopted.path, adopted.sess, adopted.peer, adopted.peer, adopted.peer, nil); !ok {
+			t.Fatalf("%s was not adopted", adopted.path)
+		}
+	}
+
+	// A session whose handshake has not named a peer yet is not evidence of
+	// anything, and closing it would drop a tunnel still coming up.
+	anonymous := &ike.Session{}
+	set.mu.Lock()
+	set.live["example/anonymous/0@0"] = &liveSession{session: anonymous}
+	set.mu.Unlock()
+
+	// Trusted by name rather than "anything but goes", so the anonymous entry
+	// is untrusted too and only the guard above keeps it.
+	revoked := set.revoke(func(peer ike.Identity) bool { return peer == stays })
+	if len(revoked) != 1 || revoked[0] != "example/gone/0@0" {
+		t.Fatalf("the sweep closed %v, want only the path the registry dropped", revoked)
+	}
+	if len(closed) != 1 || closed[0] != gone {
+		t.Errorf("the sweep told %d sessions, and not the one that went", len(closed))
+	}
+	if _, held := set.live["example/gone/0@0"]; held {
+		t.Error("the revoked session is still live, so it still carries traffic")
+	}
+	if _, held := set.live["example/keeper/0@0"]; !held {
+		t.Error("the sweep took a session the registry still names")
+	}
+	if _, held := set.live["example/anonymous/0@0"]; !held {
+		t.Error("the sweep took a session whose handshake had not named a peer yet")
+	}
+}
+
+// A node taken out of the registry while its dialer is running stops being
+// dialed. The check before the loop covers a node that was already gone;
+// this one covers the reload that removes it afterwards, and without it the
+// dialer logs the same lookup failure every reconnect delay for the life of
+// the process while Reload's "so nothing will dial it" is not true.
+func TestDialerGivesUpOnANodeAReloadRemoved(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{ctx: ctx, cancel: cancel, privateKey: privateKey,
+		dialers: make(map[string]*dialer), dialRetry: time.Millisecond}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+
+	local, named := cfg.Endpoints[0], cfg.Peers[0]
+	if _, _, ok := reg.FindNode(named.Organization, named.CommonName); !ok {
+		t.Fatal("the fixture's own peer is not in its registry, so this proves nothing")
+	}
+	done := make(chan struct{})
+	go func() { c.runPeer(ctx, local, named); close(done) }()
+
+	// Still dialing while the registry names it.
+	select {
+	case <-done:
+		t.Fatal("the dialer gave up on a node the registry still names")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The reload takes the node out, and the next pass of the loop notices.
+	empty := registry.Registry{}
+	c.reg.Store(&empty)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("the dialer kept retrying a node the registry no longer names")
 	}
 }

@@ -52,7 +52,7 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 			// We answered, so the peer is this SA's initiator and we are its
 			// responder. Losing to a session the other end also prefers is
 			// ordinary on a full mesh and is not worth a line in the log.
-			err := c.serveSession(ctx, sess, name, sessionName, peer, accepted.Local)
+			err := c.serveSession(ctx, sess, name, sessionName, peer, accepted.Local, peer)
 			if err != nil && !errors.Is(err, errSessionEstablished) && ctx.Err() == nil {
 				log.Printf("peer %s: %v", name, err)
 			}

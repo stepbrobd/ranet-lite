@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 // this peer to the mesh and to babel, so it must be stable and unique per
 // peer. initiator and responder are this SA's own roles, the end that opened
 // it and the end that answered.
-func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sessionName string, initiator, responder ike.Identity) error {
+func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sessionName string, initiator, responder, remote ike.Identity) error {
 	defer sess.Mux().Close()
 	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
 
@@ -62,13 +63,25 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 		return sealer, err
 	}, sess.Mux().SendESPBatch)
 	defer peer.Close()
-	release, adopted := c.sessions.adopt(sessionName, sess, initiator, responder, func() func() {
+	release, adopted := c.sessions.adopt(sessionName, sess, initiator, responder, remote, func() func() {
 		return c.speaker.AddPeer(peer).Close
 	})
 	defer release()
 	if !adopted {
 		return errSessionEstablished
 	}
+	// A dialer that a reload dropped cancels this context while the node keeps
+	// running, and this end then simply stops: the peer carries on sending ESP
+	// into an SPI nobody answers until its own liveness check expires, which
+	// is up to seventy seconds. closeAll does this for every session at
+	// shutdown, for exactly the reason its doc gives, and this is the same
+	// thing for one peer. Shutdown is not this case, because closeAll has
+	// already swept by the time c.ctx is cancelled.
+	defer func() {
+		if dialerWasDropped(ctx, c.ctx) {
+			closeSession(sess)
+		}
+	}()
 
 	plain := make([][]byte, 0, 128)
 	emit := func(results []inboundDecrypted) {
@@ -152,6 +165,12 @@ type sessionSet struct {
 type liveSession struct {
 	session   *ike.Session
 	preferred bool
+	// peer is the identity the far end authenticated as, kept so a reload can
+	// ask whether the registry still names it. The registry is the trust root
+	// this node checks a handshake against, so a node taken out of it has to
+	// stop being carried; without this, revoking a node left every tunnel it
+	// already held up until each of the other nodes restarted.
+	peer ike.Identity
 }
 
 func newSessionSet() *sessionSet {
@@ -197,13 +216,18 @@ func identityOrder(id ike.Identity) string {
 // end that opened it and the end that answered. Naming them that way is what
 // keeps a dialer and a responder from deriving opposite answers for one SA,
 // which is invisible from either end alone.
-func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder ike.Identity, attach func() func()) (func(), bool) {
-	return s.adoptPreferred(path, sess, preferInitiator(initiator, responder), attach)
+func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder, remote ike.Identity, attach func() func()) (func(), bool) {
+	return s.adoptFor(path, sess, preferInitiator(initiator, responder), remote, attach)
 }
 
-// adoptPreferred is adopt with the rule already applied, for a test that drives
-// the resolution without two identities to derive it from.
+// adoptPreferred is adopt with the rule already applied and no peer identity,
+// for a test that drives the resolution without two identities to derive it
+// from.
 func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bool, attach func() func()) (func(), bool) {
+	return s.adoptFor(path, sess, preferred, ike.Identity{}, attach)
+}
+
+func (s *sessionSet) adoptFor(path string, sess *ike.Session, preferred bool, remote ike.Identity, attach func() func()) (func(), bool) {
 	s.mu.Lock()
 	if s.shut {
 		s.mu.Unlock()
@@ -230,7 +254,7 @@ func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bo
 	if attach != nil {
 		detach = attach()
 	}
-	s.live[path] = &liveSession{session: sess, preferred: preferred}
+	s.live[path] = &liveSession{session: sess, preferred: preferred, peer: remote}
 	s.mu.Unlock()
 	if previous != nil && previous.session != sess {
 		log.Printf("peer %s: replacing the previous session", path)
@@ -277,6 +301,36 @@ func (s *sessionSet) holds(path string) bool {
 	defer s.mu.Unlock()
 	live := s.live[path]
 	return live != nil && s.active(live.session)
+}
+
+// revoke closes every live session whose peer the registry no longer
+// authenticates, and reports which paths went. A reload is the only moment
+// this node learns that a node has been taken out of the mesh, and until it
+// acts on it the tunnels that node already holds keep carrying traffic: the
+// handshake check alone only refuses the next one.
+func (s *sessionSet) revoke(trusted func(ike.Identity) bool) []string {
+	if s == nil {
+		return nil // a Client built by hand in a test carries no sessions
+	}
+	s.mu.Lock()
+	var paths []string
+	var sessions []*ike.Session
+	for path, live := range s.live {
+		if live.peer == (ike.Identity{}) || trusted(live.peer) {
+			continue
+		}
+		paths = append(paths, path)
+		sessions = append(sessions, live.session)
+		delete(s.live, path)
+	}
+	s.mu.Unlock()
+	var closing sync.WaitGroup
+	for _, sess := range sessions {
+		closing.Go(func() { s.close(sess) })
+	}
+	closing.Wait()
+	slices.Sort(paths)
+	return paths
 }
 
 // closeAll tells every live peer the session is ending and drops it, and shuts

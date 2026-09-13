@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -62,6 +63,15 @@ var errNoChildSA = errors.New("peer has no active Child SA")
 // lose the work done to set up the IKE SA."
 func fatalReserveError(err error) bool {
 	return err != nil && !errors.Is(err, errNoChildSA) && !errors.Is(err, esp.ErrSequenceExhausted)
+}
+
+// dialerWasDropped reports whether a session is ending because the dialer that
+// opened it was canceled while the node keeps running, which a reload that
+// drops a peer does. Shutdown is not this case: closeAll has already told every
+// peer by the time the node's own context is canceled, and the sweep exists so
+// that no peer is told twice.
+func dialerWasDropped(dial, node context.Context) bool {
+	return dial.Err() != nil && node.Err() == nil
 }
 
 // requestRekey asks for a replacement Child SA, at most one attempt at a time.
