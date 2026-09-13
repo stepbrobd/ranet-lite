@@ -210,8 +210,9 @@ func (c *Config) RekeyRetryMaxValue() time.Duration {
 }
 
 // Endpoint mirrors the identity portion of ranet's endpoint configuration.
-// Socket address selection is global: StdNetBind owns one dual-stack socket
-// on Config.Port and the kernel selects the source address by route.
+// Socket address selection is global: the transport binds Config.Port for
+// every family the platform gives it, one dual-stack socket on darwin and one
+// per family on linux, and the kernel selects the source address by route.
 type Endpoint struct {
 	SerialNumber  string `yaml:"serial_number"`
 	AddressFamily string `yaml:"address_family"`
@@ -479,8 +480,11 @@ func (c *Config) validate() error {
 		if prefix.Addr().IsUnspecified() {
 			return fmt.Errorf("config: kernel.addresses %q is not an address an interface can carry", raw)
 		}
-		if err := maskedDefault(prefix); err != nil {
-			return fmt.Errorf("config: kernel.addresses %q %w", raw, err)
+		// Its own message rather than maskedDefault's: an entry here is
+		// assigned to an interface, never announced, so "write ::/0 if that is
+		// what you mean" is advice the check above rejects.
+		if prefix.Bits() == 0 {
+			return fmt.Errorf("config: kernel.addresses %q has no prefix length, which is what an interface carries an address under", raw)
 		}
 	}
 	return nil

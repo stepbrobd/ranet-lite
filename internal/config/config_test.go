@@ -371,6 +371,13 @@ func TestTopLevelListsRefuseWhatTheyCannotMean(t *testing.T) {
 		_, err := Load(path)
 		return err
 	}
+	// The message matters as much as the refusal: an entry here is assigned,
+	// never announced, so it must not be told to write a default instead.
+	if err := load(t, "kernel:\n  enabled: true\n  addresses:\n    - 2001:db8::1/0\n"); err == nil {
+		t.Error("a masked default was accepted as an address")
+	} else if strings.Contains(err.Error(), "announces a default route") {
+		t.Errorf("the refusal tells the operator to write a default: %v", err)
+	}
 	for name, addition := range map[string]string{
 		"originate masked default":    "originate:\n  - 2001:db8::1/0\n",
 		"originate masked default v4": "originate:\n  - 198.51.100.1/0\n",
@@ -397,5 +404,31 @@ func TestTopLevelListsRefuseWhatTheyCannotMean(t *testing.T) {
 				t.Errorf("a well-formed entry was refused: %v", err)
 			}
 		})
+	}
+}
+
+// Both fields of one entry can be wrong, and which one the refusal names has
+// to be the same on every load: iterating a map named a random one, so an
+// operator fixing what the message pointed at got a different message next
+// time, and any test asserting the text would flake.
+func TestOriginateRefusalNamesTheSameFieldEveryTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := testConfig + "babel:\n  originate:\n    - {prefix: \"2001:db8::1/0\", from: \"2001:db8::2/0\"}\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var first string
+	for attempt := range 40 {
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("an entry whose prefix and from are both masked defaults was accepted")
+		}
+		if attempt == 0 {
+			first = err.Error()
+			continue
+		}
+		if err.Error() != first {
+			t.Fatalf("load %d said %q, where the first said %q", attempt, err, first)
+		}
 	}
 }
