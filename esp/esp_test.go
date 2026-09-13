@@ -685,3 +685,35 @@ func TestPlaintextMustBeFourByteAligned(t *testing.T) {
 		}
 	}
 }
+
+// RFC 4303 section 2.4 has the sender number the padding 1, 2, 3, ... when the
+// encryption algorithm specifies no contents of its own, which neither RFC
+// 4106 nor RFC 7634 does, and has the receiver check it. The check is inside
+// the ICV, so what it catches is a sender this end does not understand rather
+// than an attacker, and an interop failure here is far easier to read as
+// "invalid padding contents" than as a packet that decrypts to nonsense.
+func TestPaddingContentsFollowTheSectionThatDefinesThem(t *testing.T) {
+	plaintext := func(pad ...byte) []byte {
+		out := make([]byte, 0, 4+len(pad)+2)
+		out = append(out, 0x45, 0, 0, 0)
+		out = append(out, pad...)
+		return append(out, byte(len(pad)), 4)
+	}
+	if _, _, err := parseTrailer(plaintext(1, 2)); err != nil {
+		t.Fatalf("the sequence the section names was refused: %v", err)
+	}
+	for name, pad := range map[string][]byte{
+		"zeroes":             {0, 0},
+		"counting from zero": {0, 1},
+		"repeated":           {1, 1},
+		"reversed":           {2, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := parseTrailer(plaintext(pad...)); err == nil {
+				t.Error("padding no conformant sender produces was accepted")
+			}
+		})
+	}
+	// That this end's own sender produces what its receiver takes is already
+	// what every round trip in this package shows.
+}

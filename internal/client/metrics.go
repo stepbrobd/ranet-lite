@@ -56,7 +56,12 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprint(w, "# TYPE ranet_lite_sessions gauge\n")
 	fmt.Fprintf(w, "ranet_lite_sessions %d\n", len(sessions))
 
-	fmt.Fprint(w, "# HELP ranet_lite_esp_inbound_packets_total Decrypted ESP packets delivered.\n")
+	// Authenticated and validated, which is not the same as delivered: the
+	// count includes babel control packets the speaker consumed, RFC 4303
+	// section 2.6 dummy packets that carry nothing, and packets a closing mesh
+	// discards. The name is what a dashboard already references, so the help
+	// text is what says so.
+	fmt.Fprint(w, "# HELP ranet_lite_esp_inbound_packets_total ESP packets that authenticated and passed validation, including babel control traffic and dummy packets.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_esp_inbound_packets_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_esp_inbound_packets_total %d\n", c.inboundPackets.Load())
 	fmt.Fprint(w, "# HELP ranet_lite_esp_inbound_dropped_total ESP packets that failed to decrypt or validate.\n")

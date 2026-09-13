@@ -19,6 +19,14 @@ import (
 const (
 	NextHeaderIPv4 = 4
 	NextHeaderIPv6 = 41
+	// NextHeaderNone marks the dummy packet of RFC 4303 section 2.6, which is
+	// recognized on receive and discarded there. Nothing here generates one,
+	// and appendSealed writes only the alignment padding, not the traffic flow
+	// confidentiality padding of section 2.7. Section 2.6 says "A transmitter
+	// MUST be capable of generating dummy packets", so this is a known gap
+	// rather than a decision: section 2.7's padding additionally has to be
+	// negotiated by the SA management protocol, which this IKE does not do, so
+	// the two would land together.
 	NextHeaderNone = 59
 
 	headerLen = 8 // SPI + 32-bit Sequence Number
