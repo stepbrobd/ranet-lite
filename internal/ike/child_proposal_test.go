@@ -1,6 +1,9 @@
 package ike
 
 import (
+	"encoding/binary"
+	"errors"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -356,5 +359,84 @@ func TestARekeyOffersOnlyTheCipherItsAnswerReaderWillTake(t *testing.T) {
 	}
 	if ciphers != 3 {
 		t.Errorf("the initial offer names %d ciphers, want every one this end has", ciphers)
+	}
+}
+
+// RFC 7296 section 1.3 gives INVALID_KE_PAYLOAD "two octets of data
+// associated with this notification: the accepted Diffie-Hellman group number
+// in big endian order", and has the initiator retry in the group the responder
+// gave. A notify without them tells a peer its group is wrong and not which
+// one to use, so its retry is a guess. Every site that sends one has to carry
+// them.
+func TestEveryInvalidKENotifyNamesAGroup(t *testing.T) {
+	// A Child SA offer whose DH group this end does not have, which is what
+	// draws the notify from the selector all three sites read.
+	spi := []byte{0, 0, 0, 3}
+	offer := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi, Transforms: []Transform{
+		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
+		{Type: TransESN, ID: ESN_NO},
+		{Type: TransDH, ID: DH_CURVE25519},
+	}}})
+	_, err := selectChildRequestProposal(offer, nil, 0)
+	var wrongGroup *invalidKEError
+	if !errors.As(err, &wrongGroup) {
+		t.Fatalf("an offer naming a group this end did not use reported %v", err)
+	}
+	if wrongGroup.group != DH_CURVE25519 {
+		t.Errorf("the error names group %d, want the one the offer asked for", wrongGroup.group)
+	}
+	// And the data every site puts in the notify names it. All three build it
+	// here, so this is the property rather than a sample of one site.
+	notify, err := DecodeNotify(EncodeNotify(Notify{Type: N_INVALID_KE_PAYLOAD,
+		Data: invalidKENotifyData(wrongGroup.group)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notify.Data) != 2 || binary.BigEndian.Uint16(notify.Data) != DH_CURVE25519 {
+		t.Errorf("the notify carries %v, which no initiator can retry from", notify.Data)
+	}
+	// The initiator reads it back as the group to come back with.
+	if group, ok := preferredGroupFromNotify(notify); !ok || group != DH_CURVE25519 {
+		t.Errorf("an initiator reading that notify got %d, %v", group, ok)
+	}
+}
+
+// preferredGroupFromNotify is what an initiator does with the data, spelled
+// out here so the two halves are checked against each other.
+func preferredGroupFromNotify(n Notify) (uint16, bool) {
+	if n.Type != N_INVALID_KE_PAYLOAD || len(n.Data) < 2 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(n.Data), true
+}
+
+// The property the test above asserts about the helper, asserted about the
+// sites instead. Three of them answer with this notify and each builds the
+// data separately, so a site that forgets it tells a peer its group is wrong
+// and not which one to use, and that peer's retry is a guess. Reverting the
+// third site alone left the suite green, which is how one of them came to be
+// forgotten in the first place.
+func TestEverySiteThatSendsInvalidKECarriesTheGroup(t *testing.T) {
+	// Read out of the source rather than driven, because one of the three sits
+	// inside completeResponderAuth and is reachable only through a whole
+	// handshake. What matters is that no site spells this notify without the
+	// data, which is exactly what the text says.
+	for _, name := range []string{"child_rekey.go", "ike_rekey.go", "responder.go"} {
+		body, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(body), "\n")
+		for i, line := range lines {
+			if !strings.Contains(line, "N_INVALID_KE_PAYLOAD") || strings.Contains(line, "notify.Type") {
+				continue
+			}
+			// The data is built on the same line or within the few after it,
+			// where the notify is assembled.
+			window := strings.Join(lines[max(0, i-4):min(len(lines), i+5)], "\n")
+			if !strings.Contains(window, "invalidKENotifyData") && !strings.Contains(window, "group)") {
+				t.Errorf("%s:%d sends INVALID_KE_PAYLOAD with no group: %s", name, i+1, strings.TrimSpace(line))
+			}
+		}
 	}
 }

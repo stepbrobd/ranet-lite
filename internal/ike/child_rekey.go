@@ -273,8 +273,8 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	if err != nil {
 		var invalidKE *invalidKEError
 		if errors.As(err, &invalidKE) {
-			data := binary.BigEndian.AppendUint16(nil, invalidKE.group)
-			return s.responseNotifyData(ctx, msgID, CREATE_CHILD_SA, N_INVALID_KE_PAYLOAD, data)
+			return s.responseNotifyData(ctx, msgID, CREATE_CHILD_SA, N_INVALID_KE_PAYLOAD,
+				invalidKENotifyData(invalidKE.group))
 		}
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}

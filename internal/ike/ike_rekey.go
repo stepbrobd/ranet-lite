@@ -326,8 +326,7 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		if preferredGroup == 0 {
 			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 		}
-		data := make([]byte, 2)
-		binary.BigEndian.PutUint16(data, preferredGroup)
+		data := invalidKENotifyData(preferredGroup)
 		// RFC 7296 §1.3 requires INVALID_KE_PAYLOAD, carrying the
 		// preferred group, when a proposal is acceptable but its KE payload
 		// uses a different group.

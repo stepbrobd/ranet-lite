@@ -538,14 +538,22 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 	child, err := s.selectResponderChild(request, ni, nr)
 	if err != nil {
 		notify := N_NO_PROPOSAL_CHOSEN
+		var data []byte
 		var wrongGroup *invalidKEError
 		if errors.As(err, &wrongGroup) {
+			// RFC 7296 section 1.3 gives INVALID_KE_PAYLOAD "two octets of
+			// data associated with this notification: the accepted
+			// Diffie-Hellman group number in big endian order", and has the
+			// initiator retry in the group the responder gave. Without them
+			// the peer is told its group is wrong and not which one to use,
+			// so the retry is a guess. The other two sites carry them.
 			notify = N_INVALID_KE_PAYLOAD
+			data = invalidKENotifyData(wrongGroup.group)
 		}
 		response, buildErr := s.response(ctx, 1, IKE_AUTH, []RawPayload{
 			{Type: PayloadIDr, Body: idrBody},
 			{Type: PayloadAUTH, Body: authBody},
-			{Type: PayloadN, Body: EncodeNotify(Notify{Type: notify})},
+			{Type: PayloadN, Body: EncodeNotify(Notify{Type: notify, Data: data})},
 		})
 		if buildErr == nil {
 			_ = s.mux.SendIKE(response)

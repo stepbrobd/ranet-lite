@@ -278,6 +278,20 @@ type childProposalSelection struct {
 
 type invalidKEError struct{ group uint16 }
 
+// invalidKENotifyData is the notification data every INVALID_KE_PAYLOAD
+// carries. RFC 7296 section 1.3: "There are two octets of data associated with
+// this notification: the accepted Diffie-Hellman group number in big endian
+// order", and the same section has the initiator retry "with a Diffie-Hellman
+// proposal and KEi in the group that the responder gave". A notify without
+// them says the group is wrong and not which one to use, so the retry is a
+// guess. Section 3.10.1's own entry for the type is "See Sections 1.2 and
+// 1.3."
+func invalidKENotifyData(group uint16) []byte {
+	data := make([]byte, 2)
+	binary.BigEndian.PutUint16(data, group)
+	return data
+}
+
 func (e *invalidKEError) Error() string {
 	return fmt.Sprintf("ike: peer must use DH group %d", e.group)
 }
