@@ -416,6 +416,30 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 			}
 		}
 		if len(tlvs) > 0 {
+			// A dump that cannot be sent has to leave the neighbor owing what
+			// it was going to say. updateActions drains the triggered queue
+			// and clears every owed set before building, on the grounds that
+			// the dump supersedes them, so without this a refused dump takes
+			// the record of the work with it: the retry noteSendRetryLocked
+			// schedules then builds nothing, and a peer that joined during a
+			// congested moment black-holes everything this node originates
+			// until the next periodic dump, which is an update interval away
+			// and may be minutes.
+			//
+			// Restored onto this neighbor and nowhere else. Recording a
+			// speaker-wide pending dump as well would make pendingWorkLocked
+			// true for as long as the one peer stays stuck, which reopens the
+			// per-packet wake that function exists to close, and it would hold
+			// Run in the updateActions branch so each of those wakes rebuilt
+			// the whole dump for every healthy neighbor too. triggeredActions
+			// picks these keys up from n.owed on the retry noteSendRetryLocked
+			// schedules, and sends them to this neighbor alone.
+			owed := slices.Clone(keys)
+			rollback = append(rollback, func() {
+				for _, key := range owed {
+					n.owed[key] = struct{}{}
+				}
+			})
 			actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, priority: priorityDump, tlvs: tlvs, rollback: rollback})
 		}
 	}

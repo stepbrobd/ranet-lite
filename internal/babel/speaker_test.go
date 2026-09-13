@@ -2127,3 +2127,141 @@ func TestASuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
 		}
 	}
 }
+
+// updateActions drains the triggered queue and clears every neighbor's owed
+// set before it builds, because the dump supersedes them. A dump that is then
+// refused therefore took the record of the work with it, and the retry a
+// refused pass schedules had nothing left to find: a peer that joined during a
+// congested moment black-holed everything this node originates until the next
+// periodic dump, which is an update interval away.
+func TestARefusedDumpIsStillOwed(t *testing.T) {
+	speaker, _, _ := captureSpeaker(t, Config{HelloInterval: time.Minute, UpdateInterval: time.Minute})
+	speaker.Originate(netip.MustParsePrefix("fd00:1::/64"))
+	speaker.Originate(netip.MustParsePrefix("fd00:2::/64"))
+
+	refuse := true
+	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
+		func(int) (netstack.BatchSealer, error) {
+			if refuse {
+				return nil, errors.New("no child sa")
+			}
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return nil })).state
+	stuck.addr = netip.MustParseAddr("fe80::3")
+	makeNeighborReachable(stuck)
+
+	now := time.Now()
+	speaker.mu.Lock()
+	speaker.retryAt = time.Time{}
+	actions := speaker.updateActions(now)
+	// What Run does the moment it has built the dump, on the grounds that the
+	// dump carries everything the flag stood for.
+	speaker.updatePending = false
+	send := speaker.emitLocked(actions)
+	speaker.mu.Unlock()
+	send()
+
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	if len(stuck.owed) == 0 && !speaker.updatePending {
+		t.Fatal("the refused dump left nothing owed, so the retry it scheduled builds nothing")
+	}
+	if speaker.retryAt.IsZero() {
+		t.Fatal("the refused dump scheduled no retry")
+	}
+	// The retry the pass scheduled builds the dump again.
+	refuse = false
+	var retry []sendAction
+	if speaker.updatePending {
+		retry = speaker.updateActions(now)
+	} else {
+		retry = speaker.triggeredActions(now)
+	}
+	updates := 0
+	for _, action := range retry {
+		if action.neighbor != stuck {
+			continue
+		}
+		for _, tlv := range action.tlvs {
+			if tlv.Type == TLVUpdate {
+				updates++
+			}
+		}
+	}
+	if updates < 2 {
+		t.Errorf("the retry built %d Updates for the peer that refused, want the two it originates", updates)
+	}
+}
+
+// The same amplification through the other rollback. A dump the transport
+// refuses leaves that neighbor owing every key it carried, which is what the
+// retry rebuilds. Recording a speaker-wide pending dump alongside it makes
+// pendingWorkLocked true for as long as that one peer stays stuck, so every
+// packet from every other neighbor wakes a full sweep -- and takes the
+// updateActions branch, so each of those wakes rebuilds and resends the whole
+// dump to the healthy neighbors as well.
+func TestACongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
+	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
+	speaker, healthy, packets := captureSpeaker(t, long)
+	makeNeighborReachable(healthy)
+	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
+		func(int) (netstack.BatchSealer, error) { return nil, errors.New("no child sa") },
+		func([][]byte) error { return nil })).state
+	stuck.addr = netip.MustParseAddr("fe80::3")
+	makeNeighborReachable(stuck)
+	speaker.Originate(netip.MustParsePrefix("fd00:16::/64"))
+
+	// A dump the stuck peer refuses, in the order Run runs it: build, clear
+	// the flag this branch was entered on, then emit. emitLocked runs the
+	// rollback under the lock, so anything set afterwards came from there.
+	now := time.Now()
+	speaker.mu.Lock()
+	actions := speaker.updateActions(now)
+	speaker.updatePending = false
+	send := speaker.emitLocked(actions)
+	speaker.mu.Unlock()
+	send()
+	if len(stuck.owed) == 0 {
+		t.Fatal("the stuck peer owes nothing after refusing the dump, so this proves nothing")
+	}
+
+	// Stand in for a loop asleep on the deadline that pass settled, without
+	// touching what the rollback left behind.
+	speaker.handlePacket(healthy, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 8, Interval: 400})}))
+	speaker.mu.Lock()
+	speaker.nextHello, speaker.nextUpdate = now.Add(time.Hour), now.Add(time.Hour)
+	speaker.retryAt = time.Time{}
+	clear(speaker.routes.dirty)
+	speaker.routes.starved = nil
+	speaker.sleepUntil = speaker.deadlineLocked()
+	select {
+	case <-speaker.changed:
+	default:
+	}
+	speaker.mu.Unlock()
+
+	before := len(*packets)
+	for seqno := 9; seqno < 29; seqno++ {
+		speaker.handlePacket(healthy, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: uint16(seqno), Interval: 400})}))
+	}
+	if len(speaker.changed) != 0 {
+		t.Error("one peer that refused a dump made a refreshing Hello from another wake a full sweep")
+	}
+	if sent := len(*packets) - before; sent != 0 {
+		t.Errorf("twenty refreshing Hellos drew %d packets at the healthy neighbor, want none", sent)
+	}
+
+	// The dump is not forgotten: the neighbor still owes it, and a pass that
+	// is not a periodic dump rebuilds it for that neighbor alone.
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	if speaker.updatePending {
+		t.Error("a refused dump left a speaker-wide pending dump, which every neighbor pays for")
+	}
+	if actions := speaker.triggeredActions(now); len(actions) != 1 || actions[0].neighbor != stuck {
+		t.Errorf("the retry built %d actions, want the one that owes the stuck peer its dump", len(actions))
+	}
+}
