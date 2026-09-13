@@ -174,9 +174,8 @@ type peerBatch struct {
 // returns from the transport, so a queue that is full is one whose socket is
 // backpressured, and that lasts far longer than any wait worth having; a wait
 // would only add latency before dropping anyway. The caller also runs on a
-// goroutine that serves other peers: the speaker walks every neighbor from
-// one, Receive runs on the sending peer's own decrypt path, and Mesh dispatches
-// under a lock every TUN reader takes.
+// goroutine that serves other peers: Mesh dispatches under a lock every TUN
+// reader takes. ReserveRawOrDrop says the same of its own callers.
 func (p *Peer) reserveBatchNow(count int) *peerBatch {
 	return p.reserveNow(p.slots, count, false)
 }
@@ -291,14 +290,32 @@ func (b *peerBatch) enqueue() error {
 		return b.transmit()
 	}
 	b.encrypt()
+	// Checked before the queue, not beside it: p.completed is sized to hold
+	// every batch the two budgets can hand a ticket to, so on a closing peer
+	// both arms of a select are ready and Go picks uniformly. Half of what was
+	// reserved before Close and encrypted after it was therefore reported as
+	// sent, never transmitted, and counted by nothing. Every session teardown
+	// and replacement creates that overlap.
+	select {
+	case <-p.stop:
+		return b.abandon()
+	default:
+	}
 	select {
 	case p.completed <- b:
 		return nil
 	case <-p.stop:
-		b.releaseStorage()
-		b.releaseSlot()
-		return fmt.Errorf("netstack: peer %s closed", p.ID)
+		return b.abandon()
 	}
+}
+
+// abandon gives back what a batch reserved and counts its packets as dropped,
+// for a peer that closed after it had its ticket.
+func (b *peerBatch) abandon() error {
+	b.peer.dropped.Add(uint64(len(b.raw)))
+	b.releaseStorage()
+	b.releaseSlot()
+	return fmt.Errorf("netstack: peer %s closed", b.peer.ID)
 }
 
 // transmit is the synchronous form used by control traffic and tests. Routed

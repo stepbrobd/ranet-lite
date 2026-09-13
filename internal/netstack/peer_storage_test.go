@@ -266,3 +266,42 @@ func TestClosedPeerRefusesAndCountsEverything(t *testing.T) {
 		t.Errorf("the peer counted %d of %d packets it refused", got, 2*offered)
 	}
 }
+
+// p.completed is sized to hold every batch the two budgets can hand a ticket
+// to, so on a closing peer both arms of the enqueue select are ready and Go
+// picks uniformly. Half of what was reserved before Close and encrypted after
+// it was reported as sent, never transmitted, and counted by nothing, which is
+// the one signal that would have shown it. Every session teardown and
+// replacement creates that overlap.
+func TestBatchReservedBeforeCloseIsRefusedAndCounted(t *testing.T) {
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { t.Error("a closed peer transmitted"); return nil })
+
+	// Reserved while the peer is open, so each holds a ticket and a slot. The
+	// dataplane budget is sized by the core count, so this takes all of it.
+	reserved := cap(peer.slots)
+	var batches []*peerBatch
+	for i := range reserved {
+		b := peer.reserveBatchNow(1)
+		if b == nil {
+			t.Fatalf("the peer refused reservation %d while it was open", i)
+		}
+		b.append([]byte{1}, 0)
+		batches = append(batches, b)
+	}
+	peer.Close()
+
+	for i, b := range batches {
+		if err := b.enqueue(); err == nil {
+			t.Fatalf("batch %d was accepted by a closed peer and will never be transmitted", i)
+		}
+	}
+	if got := peer.Dropped(); got != uint64(reserved) {
+		t.Errorf("the peer counted %d of the %d packets it will never send", got, reserved)
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/netip"
 	"runtime"
 	"sync"
@@ -220,7 +221,20 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 		}
 		n, err := dev.Read(b.bufs, b.sizes, tunOffset)
 		if err != nil {
-			return // device closed
+			// Closure is the ordinary reason and says nothing. Anything else
+			// ends this queue's reader for the life of the process, and on
+			// linux the kernel keeps steering its share of flows to the queue
+			// it belongs to, so a share of the mesh black-holes with nothing
+			// in the log. The device's own error channel carries a netlink
+			// failure on linux and a route-socket overflow on darwin, neither
+			// of which is closure.
+			select {
+			case <-m.closed:
+			default:
+				slog.Error("netstack tun reader stopped", "interface", m.Name, "err", err)
+			}
+			m.outboundFree <- b
+			return
 		}
 		b.n = n
 		for i := 0; i < n; i++ {
