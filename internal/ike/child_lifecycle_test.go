@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -592,6 +593,57 @@ func offeredChildSPI(t *testing.T, inner []RawPayload) uint32 {
 		t.Fatalf("invalid Child SA proposal: %#v, %v", proposals, err)
 	}
 	return binary.BigEndian.Uint32(proposals[0].SPI)
+}
+
+// And the rekey this end actually sends carries that one offer, not the
+// initial one: espRekeyProposal exists only if the exchange uses it.
+//
+// Each fixture carries the EncrKeyBits canonicalEncryptionTransform stores, so
+// ChaCha20-Poly1305 is 256 here and absent on the wire, which RFC 7296 section
+// 3.3.5 requires of a fixed-length-key transform. Comparing the two spellings
+// raw drops every cipher and offers ESN alone.
+func TestTheRekeyOnTheWireOffersOneCipher(t *testing.T) {
+	for _, installed := range []ChildSA{
+		{EncrID: ENCR_CHACHA20_POLY1305, EncrKeyBits: 256, LocalSPI: 1, RemoteSPI: 2},
+		{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 256, LocalSPI: 1, RemoteSPI: 2},
+		{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 1, RemoteSPI: 2},
+	} {
+		t.Run(fmt.Sprintf("%d/%d", installed.EncrID, installed.EncrKeyBits), func(t *testing.T) {
+			wantBits := installed.EncrKeyBits
+			if installed.EncrID == ENCR_CHACHA20_POLY1305 {
+				wantBits = 0
+			}
+			mux, _ := lifecycleMuxes(t)
+			s := &Session{mux: mux, current: &ikeContext{suite: SASuite{PRFID: PRF_HMAC_SHA2_256}},
+				requests: make(chan *localRequest), Child: installed, childRetireDelay: time.Second}
+			if err := mux.RegisterESP(installed.LocalSPI); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- s.RekeyChild() }()
+			defer func() { <-done }()
+
+			rekey := <-s.requests
+			payloads, err := decodeChildExchangePayloads(rekey.inner, PRF_HMAC_SHA2_256)
+			if err != nil {
+				t.Fatalf("invalid rekey request: %v", err)
+			}
+			proposals, err := DecodeSA(payloads.sa.Body)
+			if err != nil || len(proposals) != 1 {
+				t.Fatalf("invalid rekey proposal: %#v, %v", proposals, err)
+			}
+			var ciphers []Transform
+			for _, transform := range proposals[0].Transforms {
+				if transform.Type == TransEncr {
+					ciphers = append(ciphers, transform)
+				}
+			}
+			if len(ciphers) != 1 || ciphers[0].ID != installed.EncrID || ciphers[0].KeyLengthBits != wantBits {
+				t.Errorf("the rekey on the wire offers %v, want only %d with %d key bits", ciphers, installed.EncrID, wantBits)
+			}
+			rekey.result <- requestResult{err: errors.New("done with this exchange")}
+		})
+	}
 }
 
 // Both ends may decide to close one Child SA at once, and RFC 7296 section

@@ -71,8 +71,12 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		return fmt.Errorf("ike: generate Child SA rekey nonce: %w", err)
 	}
 	tsv4, tsv6 := FullRangeV4(), FullRangeV6()
+	offer := espProposal(spi)
+	if old != nil {
+		offer = espRekeyProposal(spi, *old)
+	}
 	inner := []RawPayload{
-		{Type: PayloadSA, Body: EncodeSA([]Proposal{espProposal(spi)})},
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{offer})},
 		{Type: PayloadNonce, Body: EncodeNonce(nonce)},
 		{Type: PayloadTSi, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
 		{Type: PayloadTSr, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},

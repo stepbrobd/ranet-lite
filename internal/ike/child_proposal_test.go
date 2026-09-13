@@ -306,3 +306,55 @@ func TestTheResponderEchoesEveryTypeTheOfferNamed(t *testing.T) {
 		})
 	}
 }
+
+// decodeChildProposal holds a rekey answer to the cipher the SA being replaced
+// already uses, so the rekey offer has to ask for that one alone. Offering all
+// three asks a question this end refuses the answer to: RFC 7296 section 2.7
+// lets the responder take any transform in the proposal, and a peer whose
+// preference order changed between the initial exchange and the rekey answers
+// within the offer and is turned down.
+func TestARekeyOffersOnlyTheCipherItsAnswerReaderWillTake(t *testing.T) {
+	spi := []byte{0, 0, 0, 5}
+	for _, old := range []ChildSA{
+		{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 256},
+		{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128},
+		{EncrID: ENCR_CHACHA20_POLY1305},
+	} {
+		offer := espRekeyProposal(spi, old)
+		ciphers := 0
+		for _, transform := range offer.Transforms {
+			if transform.Type != TransEncr {
+				continue
+			}
+			ciphers++
+			if transform.ID != old.EncrID || transform.KeyLengthBits != old.EncrKeyBits {
+				t.Errorf("the rekey offer names %v, which its own answer reader refuses", transform)
+			}
+		}
+		if ciphers != 1 {
+			t.Errorf("the rekey offer names %d ciphers, want the one the answer may carry", ciphers)
+		}
+		// Every answer a responder may build from that offer is one this end
+		// reads, which is the property the two halves have to agree on.
+		selection, err := selectChildRequestProposal(EncodeSA([]Proposal{offer}), nil, 0)
+		if err != nil {
+			t.Fatalf("the rekey offer was refused: %v", err)
+		}
+		child := responderChild{number: selection.proposal.Number,
+			encryption: selection.encryption, dh: selection.dh, integ: selection.integ}
+		if _, _, _, err := decodeChildProposal(EncodeSA([]Proposal{child.proposal(spi)}), &old); err != nil {
+			t.Errorf("an answer built from the rekey offer was refused: %v", err)
+		}
+	}
+	// The initial offer still names all three, because there is no old SA to
+	// hold the answer to.
+	ciphers := 0
+	for _, transform := range espProposal(spi).Transforms {
+		if transform.Type == TransEncr {
+			ciphers++
+		}
+	}
+	if ciphers != 3 {
+		t.Errorf("the initial offer names %d ciphers, want every one this end has", ciphers)
+	}
+}

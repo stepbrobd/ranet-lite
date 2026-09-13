@@ -157,6 +157,20 @@ func canonicalEncryptionTransform(t Transform) (Transform, error) {
 	return t, nil
 }
 
+// canonicalChildCipher rebuilds an installed Child SA's encryption transform
+// in the spelling that goes on the wire. ChildSA.EncrKeyBits holds the key
+// length the SA actually uses, which for ChaCha20-Poly1305 is the 256 bits
+// canonicalEncryptionTransform fills in rather than a Key Length attribute
+// RFC 7296 section 3.3.5 forbids on a fixed-length-key transform, so it is
+// dropped again before the transform is canonicalized.
+func canonicalChildCipher(child ChildSA) (Transform, error) {
+	bits := child.EncrKeyBits
+	if child.EncrID == ENCR_CHACHA20_POLY1305 {
+		bits = 0
+	}
+	return canonicalEncryptionTransform(Transform{Type: TransEncr, ID: child.EncrID, KeyLengthBits: bits})
+}
+
 // decodeChildProposal validates the selected, single ESP proposal shared by
 // IKE_AUTH and both CREATE_CHILD_SA directions.
 func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, uint32, error) {
@@ -227,11 +241,7 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: incomplete Child SA proposal")
 	}
 	if expected != nil {
-		wantBits := expected.EncrKeyBits
-		if expected.EncrID == ENCR_CHACHA20_POLY1305 {
-			wantBits = 0
-		}
-		want, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
+		want, err := canonicalChildCipher(*expected)
 		if err != nil || encryption.ID != want.ID || encryption.KeyLengthBits != want.KeyLengthBits {
 			return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal changed encryption transform")
 		}
@@ -282,11 +292,7 @@ func selectChildRequestProposal(body []byte, expected *ChildSA, keGroup uint16) 
 	}
 	var want *Transform
 	if expected != nil {
-		wantBits := expected.EncrKeyBits
-		if expected.EncrID == ENCR_CHACHA20_POLY1305 {
-			wantBits = 0
-		}
-		canonical, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
+		canonical, err := canonicalChildCipher(*expected)
 		if err != nil {
 			return childProposalSelection{}, err
 		}

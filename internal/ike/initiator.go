@@ -439,6 +439,40 @@ func espProposal(spi []byte) Proposal {
 	}
 }
 
+// espRekeyProposal offers only the cipher the SA being replaced already uses.
+// decodeChildProposal holds a rekey answer to that cipher, so offering the
+// other two asks a question this end refuses the answer to: RFC 7296 section
+// 2.7 lets the responder take any of them, and a third party whose preference
+// order changed between the initial exchange and the rekey would be turned
+// down for answering within the offer. ikeRekeyProposal pins the PRF across a
+// rekey for the same kind of reason.
+func espRekeyProposal(spi []byte, old ChildSA) Proposal {
+	p := espProposal(spi)
+	// Both sides are canonicalized before they are compared. espProposal
+	// spells ChaCha20-Poly1305 with no Key Length attribute, which RFC 7296
+	// section 3.3.5 requires of a fixed-length-key transform, while the
+	// installed SA records the 256 bits the key has; comparing those raw
+	// matches nothing and leaves an offer of ESN alone, which section 3.3.6
+	// has every responder refuse for "missing a mandatory Transform Type".
+	want, err := canonicalChildCipher(old)
+	if err != nil {
+		return p
+	}
+	keep := p.Transforms[:0]
+	for _, transform := range p.Transforms {
+		if transform.Type != TransEncr {
+			keep = append(keep, transform)
+			continue
+		}
+		canonical, err := canonicalEncryptionTransform(transform)
+		if err == nil && canonical.ID == want.ID && canonical.KeyLengthBits == want.KeyLengthBits {
+			keep = append(keep, transform)
+		}
+	}
+	p.Transforms = keep
+	return p
+}
+
 // Initiate runs IKE_SA_INIT then IKE_AUTH against cfg.RemoteAddr:RemotePort
 // and returns an established Session with one Child SA. It implements
 // exactly RFC 7815's minimal-initiator surface plus what ranet's
