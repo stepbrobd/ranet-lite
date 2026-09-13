@@ -94,14 +94,27 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 		if b[0] == 0 {
 			return 0, nil, nil, fmt.Errorf("ike: non-minimal DER length")
 		}
-		length = 0
+		var value uint64
 		for _, octet := range b[:count] {
-			length = length<<8 | int(octet)
+			value = value<<8 | uint64(octet)
 		}
 		b = b[count:]
-		if length < 128 {
+		if value < 128 {
 			return 0, nil, nil, fmt.Errorf("ike: non-minimal DER length")
 		}
+		// Compared unsigned, against what is actually here, before it becomes
+		// an int. Four length octets reach 4294967295, which as a 32 bit int
+		// is negative: what caught that before was the minimality test above,
+		// which is here for something else, so one certificate was refused as
+		// a non-minimal length on a 32 bit build and as truncated content on a
+		// 64 bit one. With the accumulator unsigned that test no longer sees
+		// it at all, so this one is what keeps int(value) from going negative
+		// and the slice below from panicking. Verified on a 386 build; see
+		// TestDERLengthBeyondTheBufferIsRefusedNotSliced.
+		if value > uint64(len(b)) {
+			return 0, nil, nil, fmt.Errorf("ike: truncated DER content")
+		}
+		length = int(value)
 	}
 	if len(b) < length {
 		return 0, nil, nil, fmt.Errorf("ike: truncated DER content")
