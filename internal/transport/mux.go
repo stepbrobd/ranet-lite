@@ -60,8 +60,14 @@ type Hub struct {
 	// stderr per packet, on the goroutine that receives for all of them.
 	// Reading the counter is what an operator needs; the log line only has to
 	// point at it.
-	dropped  atomic.Uint64
+	dropped atomic.Uint64
+	// reported is nanoseconds since started, which is read through time.Since
+	// so it comes from the monotonic clock: on the wall clock a step backwards
+	// silences the report for the length of the step. It starts one interval
+	// in the past, so the first drop is said out loud rather than swallowed by
+	// a hub that has only just opened.
 	reported atomic.Int64
+	started  time.Time
 }
 
 // dropReportInterval bounds how often a full receive queue is logged. The
@@ -76,7 +82,7 @@ func (h *Hub) Dropped() uint64 { return h.dropped.Load() }
 // noteDrop counts refused datagrams and reports them at most once an interval.
 func (h *Hub) noteDrop(count int, reason string) {
 	total := h.dropped.Add(uint64(count))
-	now := time.Now().UnixNano()
+	now := int64(time.Since(h.started))
 	last := h.reported.Load()
 	if now-last < int64(dropReportInterval) || !h.reported.CompareAndSwap(last, now) {
 		return
@@ -141,7 +147,9 @@ func NewHub(localAddr string) (*Hub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: open bind: %w", err)
 	}
-	h := &Hub{bind: bind, port: port, ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux), muxes: make(map[*Mux]struct{}), done: make(chan struct{})}
+	h := &Hub{bind: bind, port: port, ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux),
+		muxes: make(map[*Mux]struct{}), done: make(chan struct{}), started: time.Now()}
+	h.reported.Store(-int64(dropReportInterval))
 	for _, fn := range fns {
 		go h.receiveLoop(fn)
 	}

@@ -305,3 +305,31 @@ func TestBatchReservedBeforeCloseIsRefusedAndCounted(t *testing.T) {
 		t.Errorf("the peer counted %d of the %d packets it will never send", got, reserved)
 	}
 }
+
+// A batch whose sealer could not give out a sequence range is counted where
+// that happens, which is the case a peer that deleted its Child SA presents,
+// and Close follows on the same path. Counting it again when the closed peer
+// refuses it makes the drop counter report more packets than the peer was
+// ever given.
+func TestReservationFailureIsCountedOnce(t *testing.T) {
+	refused := errors.New("no child sa")
+	peer := NewPeerReserved("peer",
+		func(int) (BatchSealer, error) { return nil, refused },
+		func([][]byte) error { return nil })
+
+	b := peer.reserveBatchNow(1)
+	if b == nil {
+		t.Fatal("the peer refused a reservation while it was open")
+	}
+	b.append([]byte{1}, 0)
+	if peer.Dropped() != 1 {
+		t.Fatalf("the sealer failure counted %d, want one", peer.Dropped())
+	}
+	peer.Close()
+	if err := b.enqueue(); err == nil {
+		t.Fatal("a closed peer accepted the batch")
+	}
+	if got := peer.Dropped(); got != 1 {
+		t.Errorf("the peer counted %d drops for one packet it was given once", got)
+	}
+}

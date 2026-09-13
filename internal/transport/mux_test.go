@@ -1,8 +1,10 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
 	"runtime"
 	"testing"
@@ -33,7 +35,7 @@ func testSendESPBatch(t *testing.T, network, addr string) {
 	}
 	defer m.Close()
 
-	// A batch larger than Bind's limit exercises sendESPLoop's splitting and
+	// A batch larger than Bind's limit exercises the send path's splitting and
 	// pending-batch handling as well as the ordinary batched send path.
 	const n = 200
 	batch := make([][]byte, n)
@@ -733,4 +735,49 @@ func TestZeroSPIIsRefusedOnBothProtocols(t *testing.T) {
 	if err := mux.RegisterIKE(1); err != nil {
 		t.Errorf("a nonzero IKE SPI was refused: %v", err)
 	}
+}
+
+// A full receive queue is the only signal that this node is behind on receive
+// rather than losing packets on the wire, and anyone who can reach the port can
+// fill one. The count is what an operator reads; the log line is rate limited
+// because one receive loop serves every session on the hub and a line per
+// datagram is a synchronous write to stderr per packet.
+func TestFullReceiveQueueIsCountedAndReportedOnce(t *testing.T) {
+	logs := captureTransportLogs(t)
+	hub, err := NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	if got := hub.Dropped(); got != 0 {
+		t.Fatalf("a fresh hub has already dropped %d", got)
+	}
+
+	const dropped = 500
+	for range dropped {
+		hub.noteDrop(1, "a peer's ESP receive queue")
+	}
+	if got := hub.Dropped(); got != dropped {
+		t.Errorf("the hub counted %d of %d refused datagrams", got, dropped)
+	}
+	if got := bytes.Count(logs.Bytes(), []byte("receive queue full")); got != 1 {
+		t.Errorf("%d datagrams produced %d log lines, want one", dropped, got)
+	}
+
+	// Past the interval it says so again, so a queue that stays full is not
+	// silent for the life of the process.
+	hub.reported.Store(hub.reported.Load() - int64(dropReportInterval))
+	hub.noteDrop(1, "a peer's ESP receive queue")
+	if got := bytes.Count(logs.Bytes(), []byte("receive queue full")); got != 2 {
+		t.Errorf("the report never came back after the interval: %d lines", got)
+	}
+}
+
+func captureTransportLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &logs
 }

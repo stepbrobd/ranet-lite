@@ -2,7 +2,10 @@ package netstack
 
 import (
 	"bytes"
+	"errors"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,5 +194,64 @@ func TestCongestedPeerDoesNotStallOthers(t *testing.T) {
 	}
 	if got := healthy.Dropped(); got != 0 {
 		t.Errorf("the peer that was not congested counted %d dropped packets, want 0", got)
+	}
+}
+
+// failingReadDevice returns one transient read error and would go on reading
+// afterwards, which is what a netlink failure on linux or a route-socket
+// overflow on darwin looks like from here. Neither is device closure.
+type failingReadDevice struct {
+	recordingDevice
+	reads atomic.Int64
+	fail  int64
+}
+
+func (d *failingReadDevice) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	if d.reads.Add(1) == d.fail {
+		return 0, errors.New("read failed")
+	}
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	sizes[0] = 1
+	bufs[0][offset] = 0x60
+	return 1, nil
+}
+
+// A read error that is not closure used to end the queue's reader with no log,
+// no metric and no restart. On linux the kernel keeps steering its share of
+// flows to that queue, so a share of the mesh black-holes for the life of the
+// process with nothing saying so; on darwin there is one queue, so all
+// outbound forwarding stops. The reader still stops, because nothing here can
+// repair the device, but it says so and gives its batch back.
+func TestTunReadFailureIsReportedAndGivesTheBatchBack(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	dev := &failingReadDevice{fail: 3}
+	m := &Mesh{Name: "test0", devs: []tun.Device{dev}, closed: make(chan struct{}),
+		Routes: NewRouteTable(), outboundFree: make(chan *outboundBatch, 2),
+		outboundBufferSize: DefaultMTU + tunOffset}
+	for range 2 {
+		m.outboundFree <- m.newOutboundBatch(4)
+	}
+	m.outboundReaderWG.Add(1)
+	done := make(chan struct{})
+	go func() { m.outboundReader(dev); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reader never returned after its device failed")
+	}
+	if got := dev.reads.Load(); got != 3 {
+		t.Errorf("the device was read %d times, want the three up to the failure", got)
+	}
+	if len(m.outboundFree) != 2 {
+		t.Errorf("the reader kept %d of its batches, so the pool shrinks on every failure", 2-len(m.outboundFree))
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("tun reader stopped")) {
+		t.Errorf("a failed read said nothing: %s", logs.Bytes())
 	}
 }

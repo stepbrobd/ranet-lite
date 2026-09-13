@@ -310,9 +310,14 @@ func (b *peerBatch) enqueue() error {
 }
 
 // abandon gives back what a batch reserved and counts its packets as dropped,
-// for a peer that closed after it had its ticket.
+// for a peer that closed after it had its ticket. A batch whose sealer already
+// failed was counted where that happened, and the two overlap in the ordinary
+// teardown window: a peer that deleted its Child SA cannot hand out a sequence
+// range, and Close follows on the same path.
 func (b *peerBatch) abandon() error {
-	b.peer.dropped.Add(uint64(len(b.raw)))
+	if b.err == nil {
+		b.peer.dropped.Add(uint64(len(b.raw)))
+	}
 	b.releaseStorage()
 	b.releaseSlot()
 	return fmt.Errorf("netstack: peer %s closed", b.peer.ID)
