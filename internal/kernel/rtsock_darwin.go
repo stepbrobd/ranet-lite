@@ -245,8 +245,14 @@ func ioctlRequest(fd int, request uintptr, argument []byte) error {
 // reconciler. Its own writes still wake it once; the settle window in Run
 // absorbs the burst and the following pass finds nothing to do.
 type routeMonitor struct {
-	file   *os.File
-	index  int
+	file  *os.File
+	index int
+	// self is this process, which stamps every route message it writes. XNU
+	// broadcasts the result of a route_output to every PF_ROUTE listener,
+	// including the writer's own monitor, and SO_USELOOPBACK is off only on
+	// the socket that writes. Without this a refused install wakes the pass
+	// that made it.
+	self   uintptr
 	signal chan struct{}
 	done   chan struct{}
 }
@@ -270,6 +276,7 @@ func newRouteMonitor(index int) (*routeMonitor, error) {
 	monitor := &routeMonitor{
 		file:   os.NewFile(uintptr(fd), "pf-route-monitor"),
 		index:  index,
+		self:   uintptr(os.Getpid()),
 		signal: make(chan struct{}, 1),
 		done:   make(chan struct{}),
 	}
@@ -313,6 +320,15 @@ func (m *routeMonitor) interesting(buf []byte) bool {
 	for _, message := range messages {
 		rm, ok := message.(*route.RouteMessage)
 		if !ok || rm.Index != m.index {
+			continue
+		}
+		// Our own writes come back to us, results and all, and a failed one
+		// would otherwise drive the reconciler in a circle: an install the
+		// kernel refuses stays in the diff on purpose, so waking on its echo
+		// means installing, failing, waking and installing again, four times a
+		// second for as long as the other writer holds the key. A successful
+		// one still wakes, which converges: the next pass has nothing to do.
+		if rm.ID == m.self && rm.Err != nil {
 			continue
 		}
 		switch rm.Type {

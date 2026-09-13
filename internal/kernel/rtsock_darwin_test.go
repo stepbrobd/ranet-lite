@@ -4,6 +4,7 @@ package kernel
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -136,11 +137,12 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 		t.Fatalf("%s holds %v, want %v (err %v)", device, got, want, err)
 	}
 
-	// A repeated install is not an error and changes nothing, as
-	// lets a pass repair a partial apply.
+	// A repeated install reports the route as already held and changes
+	// nothing, which is what lets a pass repair a partial apply without
+	// counting what it did not do.
 	for _, r := range want {
-		if err := plat.AddRoute(r); err != nil {
-			t.Fatalf("reinstall %s: %v", r, err)
+		if err := plat.AddRoute(r); !errors.Is(err, errRouteSkipped) {
+			t.Fatalf("reinstall %s reported %v", r, err)
 		}
 	}
 	if got, _ := plat.Routes(); !slices.Equal(got, want) {
@@ -150,8 +152,8 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 	// A source-specific route is skipped rather than flattened. Flattening
 	// this one would install a default route out of the tun.
 	specific := Route{Destination: prefix("::/0"), Source: netTestRoute6, Metric: defaultIPv6Metric}
-	if err := plat.AddRoute(specific); err != nil {
-		t.Fatalf("a source-specific route has to be skipped, not failed: %v", err)
+	if err := plat.AddRoute(specific); !errors.Is(err, errRouteSkipped) {
+		t.Fatalf("a source-specific route reported %v rather than reporting itself skipped", err)
 	}
 	if got, _ := plat.Routes(); !slices.Equal(got, want) {
 		t.Fatalf("a source-specific route reached the kernel: %s now holds %v", device, got)
