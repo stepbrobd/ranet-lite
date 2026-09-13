@@ -967,7 +967,7 @@ func TestDarwinAdoptsScopedRouteItDidNotInstall(t *testing.T) {
 // install at that destination look like a second source for the one scoped
 // slot, which is reported as skipped and retried forever, so the destination
 // becomes uninstallable for the life of the process.
-func TestDarwinForgetsAScopedRouteThatLeftTheKernel(t *testing.T) {
+func TestDarwinForgetsScopedRouteThatLeftTheKernel(t *testing.T) {
 	plat, _ := testPlatform(t, Config{})
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
 	dest := prefix("2001:db8:1::/48")
@@ -1134,7 +1134,7 @@ func TestDarwinOccupiedRecordSurvivesTheOtherKey(t *testing.T) {
 // same way the warning set is. A node that meets a hundred foreign keys over
 // its life would otherwise carry a hundred records forever, and a stale one
 // hides a route from the dump that nothing can then withdraw.
-func TestDarwinForgetsAnOccupiedKeyTheMeshStoppedAsking(t *testing.T) {
+func TestDarwinForgetsOccupiedKeyTheMeshStoppedAsking(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	dest := prefix("2001:db8:1::/48")
 	sock.err = unix.EEXIST
@@ -1265,5 +1265,50 @@ func TestDarwinKnowsItsOwnRouteFromOneAnotherProgramHolds(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("the dump reports %v, so this reconciler disowned the route it installed itself", got)
+	}
+}
+
+// XNU broadcasts the result of every route write to every PF_ROUTE listener,
+// including the writer's own monitor, and SO_USELOOPBACK is cleared only on
+// the socket that writes. An install the kernel refuses stays in the diff on
+// purpose, so waking on its own echo means installing, failing, waking and
+// installing again, measured at four times a second for as long as the other
+// writer holds the key, which on a laptop is any prefix the machine already
+// has a route for.
+func TestDarwinMonitorIgnoresItsOwnRefusedWrites(t *testing.T) {
+	monitor := &routeMonitor{index: testIndex, self: uintptr(unix.Getpid())}
+	// Marshal writes the pid but not the errno, which is the field that says
+	// the write failed, so it goes in by hand at the offset the parser reads.
+	const errnoOffset = 28
+	echo := func(kind int, id uintptr, errno unix.Errno) []byte {
+		t.Helper()
+		message := &route.RouteMessage{
+			Version: unix.RTM_VERSION, Type: kind, Index: testIndex, ID: id,
+			Addrs: []route.Addr{unix.RTAX_DST: routeAddr(prefix("2001:db8::/48").Addr())},
+		}
+		raw, marshalErr := message.Marshal()
+		if marshalErr != nil {
+			t.Fatalf("marshal a route message: %v", marshalErr)
+		}
+		binary.NativeEndian.PutUint32(raw[errnoOffset:errnoOffset+4], uint32(errno))
+		return raw
+	}
+	if monitor.interesting(echo(unix.RTM_ADD, monitor.self, unix.EEXIST)) {
+		t.Error("the monitor woke on this reconciler's own refused install, which is what it made")
+	}
+	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self, 0)) {
+		t.Error("a write of ours that landed did not wake the pass that has to see it")
+	}
+	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self+1, unix.EEXIST)) {
+		t.Error("another program's failed write did not wake the reconciler")
+	}
+	if !monitor.interesting(echo(unix.RTM_DELETE, monitor.self+1, 0)) {
+		t.Error("another program deleting a route out of this interface did not wake the reconciler")
+	}
+	// A message whose declared length runs past the buffer. Something changed
+	// and a pass is cheap next to missing it.
+	truncated := echo(unix.RTM_ADD, monitor.self+1, 0)
+	if !monitor.interesting(truncated[:len(truncated)-4]) {
+		t.Error("a message that will not parse must wake rather than be dropped")
 	}
 }

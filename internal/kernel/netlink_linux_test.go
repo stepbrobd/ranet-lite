@@ -378,7 +378,7 @@ func TestNetlinkHoldsRetractedPrefix(t *testing.T) {
 		cfg:      Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol},
 		index:    index,
 		conn:     conn,
-		occupied: map[string]bool{},
+		occupied: map[Route]bool{}, refused: map[Route]bool{},
 	}
 
 	// An explicit metric, the way the reconciler always sets one: a zero

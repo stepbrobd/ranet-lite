@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -420,21 +421,37 @@ func TestReconcileCountsOnlyAppliedRoutes(t *testing.T) {
 	}
 }
 
-func TestReconcileDoesNotCountSkippedRoutes(t *testing.T) {
+// A route the platform refuses stays in the diff on purpose, because the
+// install is retried until it lands. It must not be counted as added, and a
+// pass that moved nothing must say nothing: a node holding one permanently
+// unrepresentable route would otherwise log once per pass for its whole life.
+func TestReconcileSaysNothingAboutPassThatMovedNothing(t *testing.T) {
 	logs := captureKernelLogs(t)
 	reconciler, table, fake := harness(t, Config{})
 	skipped := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
 	fake.failAdd[skipped] = errRouteSkipped
 	table.Set(skipped.Source, skipped.Destination, nil)
+	for pass := range 3 {
+		if err := reconciler.reconcile(); err != nil {
+			t.Fatalf("pass %d: an unrepresentable route triggered retry: %v", pass, err)
+		}
+	}
+	if bytes.Contains(logs.Bytes(), []byte("kernel routes reconciled")) {
+		t.Errorf("a pass that installed nothing reported itself: %s", logs.Bytes())
+	}
+
+	// The line is still there for a pass that does move something.
+	logs.Reset()
+	table.Set(netip.Prefix{}, prefix("198.51.100.0/24"), nil)
 	if err := reconciler.reconcile(); err != nil {
-		t.Fatalf("an unrepresentable route triggered retry: %v", err)
+		t.Fatal(err)
 	}
 	var counts map[string]any
 	if err := json.Unmarshal(logs.Bytes(), &counts); err != nil {
 		t.Fatal(err)
 	}
-	if counts["added"] != float64(0) {
-		t.Errorf("an unrepresentable route was counted as added: %v", counts["added"])
+	if counts["added"] != float64(1) {
+		t.Errorf("the installed route was counted as %v, want one", counts["added"])
 	}
 }
 
@@ -550,6 +567,25 @@ func TestRunWithdrawsOnCancel(t *testing.T) {
 func TestNewRejectsReservedProtocol(t *testing.T) {
 	if _, err := New(Config{Interface: "ranet0", Protocol: 2}, netstack.NewRouteTable()); err == nil {
 		t.Fatal("RTPROT_KERNEL must be rejected")
+	}
+}
+
+// An announced default is installed unscoped on linux, so a reconciler given
+// the main table would put the whole machine's default out of the tun and take
+// the ESP underlay with it. Nothing else refuses a route in main, and the one
+// warning that would have said so is off outside it.
+func TestNewRejectsReservedTable(t *testing.T) {
+	for _, table := range []uint32{253, 254, 255} {
+		if _, err := New(Config{Interface: "ranet0", Table: table}, netstack.NewRouteTable()); err == nil {
+			t.Errorf("table %d was accepted, and the kernel keeps it for itself", table)
+		}
+	}
+	// A table the kernel does not reserve is not what this refuses. New still
+	// fails here, because there is no such interface on the machine running
+	// the suite, so the check is on the reason rather than on success.
+	_, err := New(Config{Interface: "ranet0", Table: 252}, netstack.NewRouteTable())
+	if err != nil && strings.Contains(err.Error(), "is reserved") {
+		t.Errorf("a table the kernel does not reserve was refused: %v", err)
 	}
 }
 
@@ -702,5 +738,75 @@ func TestWhereComesFromThePlatform(t *testing.T) {
 	fake.name = "somewhere"
 	if got := r.Where(); got != "somewhere" {
 		t.Errorf("the reconciler reports %q rather than asking the platform", got)
+	}
+}
+
+// A prefix whose meaning is the link it sits on has no business in a routing
+// table that forwards out of a tunnel. The kernel keys its own entries for
+// these per interface, and only a default or a source-specific route is
+// interface-scoped on darwin, so an announced "ff00::/8" or "fe80::/64" went
+// into the one FIB every program on that machine shares and shadowed its own
+// multicast and link-local plumbing. Coexisting with whatever else is on the
+// box is a requirement of this tool, not a nicety.
+func TestPrefixesTheMeshCannotCarryAreNotInstalled(t *testing.T) {
+	r, table, kernel := harness(t, Config{})
+	peer := netstack.NewPeer("peer", nil, nil)
+	refused := []netip.Prefix{
+		prefix("ff00::/8"),
+		prefix("ff02::1/128"),
+		prefix("fe80::/64"),
+		prefix("224.0.0.0/4"),
+		prefix("169.254.0.0/16"),
+		prefix("127.0.0.0/8"),
+		prefix("::1/128"),
+		limitedBroadcast,
+	}
+	wanted := prefix("2001:db8::/48")
+	for _, p := range append(refused, wanted) {
+		table.Set(netip.Prefix{}, p, peer)
+	}
+	if err := r.applyRoutes(); err != nil {
+		t.Fatal(err)
+	}
+	installed := kernel.snapshot()
+	if len(installed) != 1 {
+		t.Fatalf("the reconciler installed %v, want only %s", installed, wanted)
+	}
+	if installed[0].Destination != wanted {
+		t.Errorf("the reconciler installed %s rather than %s", installed[0].Destination, wanted)
+	}
+}
+
+// "Only an address this reconciler added itself, in this process lifetime, is
+// ever removed again." Both platforms assign by upsert, so the same address
+// under a different prefix length rewrites an entry somebody else put there
+// and reports success. Recording that as owned takes it away at shutdown, and
+// ranet-lite attaches to a tun it did not necessarily create.
+func TestAddressAnotherWriterHoldsIsLeftAlone(t *testing.T) {
+	wanted := prefix("2001:db8::1/128")
+	r, _, kernel := harness(t, Config{Addresses: []netip.Prefix{wanted}})
+	kernel.addrs[prefix("2001:db8::1/64")] = true
+
+	if err := r.applyAddresses(); err != nil {
+		t.Fatalf("applying addresses failed rather than skipping one: %v", err)
+	}
+	if r.owned[wanted] {
+		t.Error("an address another writer put on the link was recorded as ours, so shutdown takes it away")
+	}
+	if kernel.addrs[wanted] {
+		t.Error("the reconciler rewrote an address it does not own")
+	}
+	if !kernel.addrs[prefix("2001:db8::1/64")] {
+		t.Error("the other writer's address is gone")
+	}
+
+	// An address nothing else holds is still assigned and still owned.
+	free := prefix("2001:db8::2/128")
+	r.cfg.Addresses = append(r.cfg.Addresses, free)
+	if err := r.applyAddresses(); err != nil {
+		t.Fatal(err)
+	}
+	if !r.owned[free] || !kernel.addrs[free] {
+		t.Error("a free address was not assigned")
 	}
 }

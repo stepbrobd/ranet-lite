@@ -42,7 +42,14 @@ type netlinkPlatform struct {
 	// A foreign route on our key does not go away by itself, so every pass
 	// would otherwise repeat the same warning. Only the reconcile loop touches
 	// this, and it runs one pass at a time.
-	occupied map[string]bool
+	//
+	// refused is what the current pass has seen refused, and Routes swaps it
+	// into occupied at the start of the next one. A foreign route is filtered
+	// out of the dump by protocol, so it never reaches a delete list and
+	// DelRoute is never called for it: when the mesh stops announcing that
+	// prefix the record would have no exit at all.
+	occupied map[Route]bool
+	refused  map[Route]bool
 }
 
 func newPlatform(cfg Config) (platform, error) {
@@ -63,7 +70,8 @@ func newPlatform(cfg Config) (platform, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	return &netlinkPlatform{cfg: cfg, index: index, conn: conn, monitor: monitor, occupied: make(map[string]bool)}, nil
+	return &netlinkPlatform{cfg: cfg, index: index, conn: conn, monitor: monitor,
+		occupied: make(map[Route]bool), refused: make(map[Route]bool)}, nil
 }
 
 func (p *netlinkPlatform) Notify() <-chan struct{} { return p.monitor.signal }
@@ -73,6 +81,9 @@ func (p *netlinkPlatform) Close() error {
 }
 
 func (p *netlinkPlatform) Routes() ([]Route, error) {
+	// Routes starts every reconcile pass, so it is where the warn-once record
+	// rotates, the same way the darwin backend rotates its own.
+	p.occupied, p.refused = p.refused, make(map[Route]bool, len(p.refused))
 	var out []Route
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
 		body := make([]byte, unix.SizeofRtMsg)
@@ -220,8 +231,11 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 	return body
 }
 
-// where is the routing table this reconciler owns.
-func (p *netlinkPlatform) where(cfg Config) string { return fmt.Sprintf("table %d", cfg.Table) }
+// where is the routing table this reconciler owns and the protocol it stamps,
+// which together with the interface are what makes a route on linux its own.
+func (p *netlinkPlatform) where(cfg Config) string {
+	return fmt.Sprintf("table %d protocol %d", cfg.Table, cfg.Protocol)
+}
 
 func (p *netlinkPlatform) AddRoute(route Route) error {
 	// EXCL rather than REPLACE. A replace takes over whatever sits first at the
@@ -240,10 +254,14 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 	flags := uint16(unix.NLM_F_CREATE | unix.NLM_F_EXCL | unix.NLM_F_ACK)
 	_, err := p.conn.execute(unix.RTM_NEWROUTE, flags, p.routeMessage(route, false))
 	if errors.Is(err, unix.EEXIST) {
-		if key := route.String(); !p.occupied[key] {
-			p.occupied[key] = true
+		// Keyed by the route rather than by its printed form, which omits the
+		// preferred source and the scope: two routes differing only there
+		// would otherwise share one record.
+		p.refused[route] = true
+		if !p.occupied[route] {
+			p.occupied[route] = true
 			slog.Warn("kernel is leaving a route that another writer holds",
-				"route", key, "table", p.cfg.Table,
+				"route", route, "table", p.cfg.Table,
 				"detail", "something else holds this prefix at this metric in this table, so it was not installed")
 		}
 		// Not a failure and not an install. Reported as an error it would put
@@ -265,7 +283,7 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 		err = fmt.Errorf("%w (prefsrc %s is not an address of this host)", err, route.PrefSrc)
 	}
 	if err == nil {
-		delete(p.occupied, route.String())
+		delete(p.occupied, route)
 	}
 	return err
 }
@@ -278,7 +296,7 @@ func (p *netlinkPlatform) DelRoute(route Route) error {
 	if err == nil {
 		// A route that left the desired set takes its warn-once record with
 		// it, or the map keeps an entry for a key nothing asks about again.
-		delete(p.occupied, route.String())
+		delete(p.occupied, route)
 	}
 	return err
 }

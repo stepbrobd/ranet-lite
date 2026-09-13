@@ -45,7 +45,7 @@ func writePlatform(t *testing.T) (*netlinkPlatform, *fakeNetlink) {
 		cfg:      Config{Interface: "ranet0", Table: 200, Protocol: DefaultProtocol},
 		index:    7,
 		conn:     conn,
-		occupied: map[string]bool{},
+		occupied: map[Route]bool{}, refused: map[Route]bool{},
 	}, conn
 }
 
@@ -103,7 +103,7 @@ func TestLinuxReportsOccupiedRouteAsSkipped(t *testing.T) {
 		}
 	}
 	// And it is not mistaken for an install: the next pass has to try again.
-	if !plat.occupied[route.String()] {
+	if !plat.occupied[route] {
 		t.Error("the refusal was not recorded, so the warning repeats once a pass")
 	}
 
@@ -113,7 +113,7 @@ func TestLinuxReportsOccupiedRouteAsSkipped(t *testing.T) {
 	if err := plat.AddRoute(route); err != nil {
 		t.Fatalf("install after the key freed: %v", err)
 	}
-	if plat.occupied[route.String()] {
+	if plat.occupied[route] {
 		t.Error("the route installed and is still recorded as held by somebody else")
 	}
 }
@@ -221,7 +221,7 @@ func TestForeignWriterReportNamesAnUnclaimedProtocolByNumber(t *testing.T) {
 // operator reads in the startup line and what the policy rules look up.
 func TestLinuxOwnsATable(t *testing.T) {
 	plat, _ := writePlatform(t)
-	if got := plat.where(plat.cfg); got != "table 200" {
+	if got := plat.where(plat.cfg); got != "table 200 protocol 155" {
 		t.Errorf("linux reports %q, want the table it owns", got)
 	}
 }

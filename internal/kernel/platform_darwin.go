@@ -294,18 +294,6 @@ type occupiedKey struct {
 	scoped      bool
 }
 
-// limitedBroadcast is the one entry the kernel installs that carries no flag
-// separating it from a route of ours: scoped, RTF_STATIC, and leaving through
-// the interface itself, which is exactly what this backend writes. It is not
-// created for a tun configured the way this backend configures one (measured
-// on a throwaway utun carrying a /24 and a /48, where every entry the kernel
-// added named an address as its gateway and so was already excluded), but it
-// is present on every broadcast-capable interface on this machine and on the
-// utun another overlay configures differently. Nothing here ever asks for it,
-// so naming it costs nothing and keeps an addressing change from turning it
-// into a route this reconciler deletes once a pass.
-var limitedBroadcast = netip.MustParsePrefix("255.255.255.255/32")
-
 // decodeRoute keeps only the routes this reconciler owns. Everything else in
 // the dump belongs to somebody else, so it is dropped here and can never reach
 // a delete list.
@@ -361,6 +349,12 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// row hid this reconciler's own unscoped route to the same
 		// destination, which it then reinstalled and warned about on every
 		// pass and never withdrew.
+		//
+		// Reachable only for a key whose row changed shape between two passes:
+		// p.ours is rebuilt from each dump and every pass dumps before it
+		// installs, so a key refused in this pass is one the last dump did not
+		// report. What this then catches is the foreign route moving onto this
+		// interface, under this gateway, after the refusal.
 		return Route{}, false
 	}
 	source := p.scoped[prefix]
@@ -458,11 +452,13 @@ func routeAddr(address netip.Addr) route.Addr {
 
 func (p *routePlatform) AddRoute(r Route) error {
 	if r.Destination == limitedBroadcast {
-		// decodeRoute drops this destination from every dump, so an install
-		// would succeed once and then be invisible: every later pass would
-		// re-add it, get EEXIST, and warn that another program holds a route
-		// this reconciler wrote itself, and withdraw would never remove it.
-		return p.skipSourceSpecific(r)
+		// desired refuses this destination before the diff sees it, on both
+		// platforms. The backstop is here because the reason is this one's:
+		// decodeRoute drops it from every dump, so an install would succeed
+		// once and then be invisible, and every later pass would re-add it,
+		// get EEXIST, warn that another program holds a route this reconciler
+		// wrote itself, and never withdraw it.
+		return p.skipRoute(r, "the limited broadcast address is not a destination")
 	}
 	if r.Source.IsValid() {
 		ours, err := p.sourceIsOurs(r.Source)
@@ -582,9 +578,16 @@ func scopeOnDarwin(r Route) bool {
 func (p *routePlatform) DelRoute(r Route) error {
 	_, installed := p.scoped[r.Destination]
 	if r.Source.IsValid() && !installed {
-		// Nothing was installed for a source we cannot express, and deleting
-		// what is left after dropping the source would take out whatever else
-		// holds that destination.
+		// Nothing was installed for a source this backend cannot express, and
+		// the FIB holds no source, so deleting what is left after dropping it
+		// would take out whatever else holds that destination. For the
+		// announced default that is the machine's own default route.
+		//
+		// The reconciler's own delete list cannot reach this: it holds only
+		// routes the dump reported, and the dump attaches a source only from
+		// p.scoped, so installed is true for every one of them. It is here
+		// because the cost of being wrong about that is the whole machine's
+		// routing, and because withdraw and the tests reach DelRoute directly.
 		//
 		// The answer comes from what this process recorded at install rather
 		// than from asking the kernel which addresses are on the interface
@@ -623,19 +626,26 @@ func (p *routePlatform) DelRoute(r Route) error {
 	return nil
 }
 
-// skipSourceSpecific reports a route the darwin FIB cannot express, once per
-// route rather than once per pass. errRouteSkipped rather than a failure is
-// deliberate: the reconciler would otherwise retry with backoff forever over
-// something no retry can fix, and the mesh's own table still forwards by
-// source.
-func (p *routePlatform) skipSourceSpecific(r Route) error {
+// skipRoute reports a route this backend will not install, once per route
+// rather than once per pass, naming why. errRouteSkipped rather than a failure
+// is deliberate: the reconciler would otherwise retry with backoff forever
+// over something no retry can fix, and the mesh's own table still forwards it.
+func (p *routePlatform) skipRoute(r Route, why string) error {
 	key := Route{Destination: r.Destination, Source: r.Source}
 	if !p.warned[key] {
-		slog.Warn("kernel cannot install a source-specific route on darwin",
+		slog.Warn("kernel is leaving a route uninstalled: "+why,
 			"destination", r.Destination, "source", r.Source)
 	}
 	p.pending[key] = true
 	return errRouteSkipped
+}
+
+// skipSourceSpecific is the case that reaches skipRoute most: the darwin FIB
+// holds one source per destination, so a second source or a plain route
+// competing with a source-specific one at the same destination cannot be
+// expressed at all.
+func (p *routePlatform) skipSourceSpecific(r Route) error {
+	return p.skipRoute(r, "the darwin FIB holds one source per destination")
 }
 
 func (p *routePlatform) Addrs() ([]netip.Prefix, error) {

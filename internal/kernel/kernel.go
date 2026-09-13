@@ -82,6 +82,10 @@ const (
 	// notifications the reconciler's own writes generate, so one batch of
 	// babel updates costs one kernel dump rather than one per route.
 	settleDelay = 250 * time.Millisecond
+	// reservedTable is the lowest rtnetlink table number the kernel keeps for
+	// itself: 253 default, 254 main, 255 local. Named here rather than taken
+	// from unix.RT_TABLE_DEFAULT because this file builds on darwin too.
+	reservedTable = 253
 	// defaultIPv6Metric is IP6_RT_PRIO_USER, what the kernel stamps on an
 	// IPv6 route that arrives without RTA_PRIORITY. The reconciler sends it
 	// explicitly instead, so a dump reports back exactly what it installed.
@@ -226,6 +230,10 @@ type Reconciler struct {
 	// and left behind is not in here, so it stays: losing an address that
 	// turns out to be somebody else's is worse than leaking one.
 	owned map[netip.Prefix]bool
+	// warnedAddrs is the addresses reported as held by somebody else under the
+	// current pass, rotated the way warned is so a report costs one log line
+	// rather than one per pass.
+	warnedAddrs map[netip.Prefix]bool
 	// enslaved records that this reconciler set the link's master itself.
 	enslaved bool
 	// master is the last master observed, so a link somebody else owns is
@@ -258,6 +266,16 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 		// indistinguishable from the kernel's own.
 		return nil, fmt.Errorf("kernel: protocol %d is reserved, use 4 through 255", cfg.Protocol)
 	}
+	if cfg.Table >= reservedTable {
+		// rtnetlink reserves 253, 254 and 255 for default, main and local.
+		// Nothing else here would refuse a route in main, and an announced
+		// default is installed unscoped on linux, so the reconciler would put
+		// the whole machine's default out of the tun and take the ESP underlay
+		// with it. collectForeignWriters also stops reporting the kernel's own
+		// entries outside main, which is the one warning that would have said
+		// so.
+		return nil, fmt.Errorf("kernel: table %d is reserved, use 1 through %d", cfg.Table, reservedTable-1)
+	}
 	if cfg.PrefSrc4.IsValid() {
 		if address := cfg.PrefSrc4.Unmap(); address.Is4() {
 			cfg.PrefSrc4 = address.WithZone("")
@@ -287,8 +305,9 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 	return &Reconciler{
 		cfg: cfg, src: src, plat: plat,
-		owned:  make(map[netip.Prefix]bool),
-		warned: make(map[Route]bool),
+		owned:       make(map[netip.Prefix]bool),
+		warnedAddrs: make(map[netip.Prefix]bool),
+		warned:      make(map[Route]bool),
 	}
 }
 
@@ -314,8 +333,10 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	stopTimer(retry)
 	defer retry.Stop()
 
-	slog.Info("kernel reconciler started", "interface", r.cfg.Interface,
-		"table", r.cfg.Table, "protocol", r.cfg.Protocol)
+	// The space this reconciler owns comes from the platform: darwin has one
+	// FIB and no rt_proto, so naming a table and a protocol there prints two
+	// settings it refuses to honor.
+	slog.Info("kernel reconciler started", "interface", r.cfg.Interface, "where", r.Where())
 
 	// An install refuses a key another writer already holds, so sharing a table
 	// with another daemon means the routes it refuses are routes the mesh
@@ -422,7 +443,12 @@ func (r *Reconciler) applyRoutes() error {
 			errs = append(errs, fmt.Errorf("add route %s: %w", route, err))
 		}
 	}
-	if len(add) > 0 || len(del) > 0 {
+	// Reported only when something moved. A route the platform refuses stays
+	// in the diff on purpose, because the install is retried on every pass
+	// until it lands, so a node holding one permanently unrepresentable route
+	// would otherwise log "added=0 removed=0" once per pass for its whole
+	// life.
+	if added > 0 || removed > 0 {
 		slog.Info("kernel routes reconciled", "added", added, "removed", removed)
 	}
 	return errors.Join(errs...)
@@ -440,6 +466,15 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 		if !ok {
 			continue
 		}
+		if reason := unroutable(destination); reason != "" {
+			key := Route{Destination: destination}
+			if !r.warned[key] {
+				slog.Warn("kernel is not installing a prefix the mesh cannot carry",
+					"destination", destination, "detail", reason)
+			}
+			warned[key] = true
+			continue
+		}
 		route := Route{
 			Destination: destination,
 			Metric:      r.metric(destination),
@@ -447,7 +482,12 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 		}
 		if entry.Source.IsValid() {
 			source, ok := canonicalPrefix(entry.Source)
-			if !ok || source.Addr().Is4() || destination.Addr().Is4() {
+			// A source covering every address is not a source-specific route.
+			// The linux encoder derives rtm_src_len from its length and omits
+			// RTA_SRC at zero, so the route installs as a plain one, reads
+			// back with no source, never matches the diff, and is withdrawn
+			// and reinstalled on every pass for the life of the process.
+			if !ok || source.Bits() == 0 || source.Addr().Is4() || destination.Addr().Is4() {
 				// the IPv4 FIB has no source-specific lookup, and installing
 				// such a route as an ordinary one would steal traffic from
 				// every other source. Report it and leave it to the mesh's
@@ -469,6 +509,37 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 	}
 	r.warned = warned
 	return out
+}
+
+// limitedBroadcast is the one entry the darwin kernel installs that carries no
+// flag separating it from a route of ours: scoped, RTF_STATIC, and leaving
+// through the interface itself, which is exactly what that backend writes. It
+// is not created for a tun configured the way this backend configures one
+// (measured on a throwaway utun carrying a /24 and a /48, where every entry
+// the kernel added named an address as its gateway and so was already
+// excluded), but it is present on every broadcast-capable interface on that
+// machine and on the utun another overlay configures differently.
+var limitedBroadcast = netip.MustParsePrefix("255.255.255.255/32")
+
+// unroutable names why a prefix has no business in a routing table that
+// forwards out of a mesh tunnel, or is empty for one that does. These are
+// prefixes whose meaning is the link they sit on: the kernel keys its own
+// entries for them per interface, and a route the mesh installs at the same
+// key shadows the machine's own plumbing. On darwin that is the single FIB
+// every program shares, which this tool has to coexist with, and only a
+// default or a source-specific route is interface-scoped there.
+func unroutable(destination netip.Prefix) string {
+	switch addr := destination.Addr(); {
+	case addr.IsMulticast():
+		return "multicast is delivered on a link, not routed through a tunnel"
+	case addr.IsLinkLocalUnicast():
+		return "a link-local prefix names the link it arrived on"
+	case addr.IsLoopback():
+		return "loopback belongs to the host"
+	case destination == limitedBroadcast:
+		return "the limited broadcast address is not a destination"
+	}
+	return ""
 }
 
 // metric is the value the kernel will actually hold, so a dump compares equal
@@ -561,12 +632,31 @@ func (r *Reconciler) applyAddresses() error {
 		return fmt.Errorf("list addresses: %w", err)
 	}
 	have := make(map[netip.Prefix]bool, len(actual))
+	held := make(map[netip.Addr]netip.Prefix, len(actual))
 	for _, prefix := range actual {
 		have[prefix] = true
+		held[prefix.Addr()] = prefix
 	}
+	warned := make(map[netip.Prefix]bool, len(r.warnedAddrs))
 	var errs []error
 	for _, prefix := range r.cfg.Addresses {
 		if have[prefix] {
+			continue
+		}
+		// Both platforms assign an address by upsert: linux matches an
+		// existing ifa by address alone and darwin's SIOCAIFADDR has no
+		// "already present" at all, so assigning the same address under a
+		// different prefix length rewrites somebody else's entry and reports
+		// success. The reconciler would then record it as its own and take it
+		// away at shutdown, against the rule that only an address it added
+		// itself is ever removed. ranet-lite attaches to a tun it did not
+		// necessarily create, so this is reachable without anything unusual.
+		if existing, taken := held[prefix.Addr()]; taken {
+			if !r.warnedAddrs[prefix] {
+				slog.Warn("kernel is leaving an address another writer holds",
+					"interface", r.cfg.Interface, "address", prefix, "held_as", existing)
+			}
+			warned[prefix] = true
 			continue
 		}
 		if err := r.plat.AddAddr(prefix); err != nil {
@@ -576,6 +666,7 @@ func (r *Reconciler) applyAddresses() error {
 		slog.Info("kernel address assigned", "interface", r.cfg.Interface, "address", prefix)
 		r.owned[prefix] = true
 	}
+	r.warnedAddrs = warned
 	return errors.Join(errs...)
 }
 

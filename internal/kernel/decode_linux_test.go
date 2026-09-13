@@ -21,7 +21,7 @@ func TestLinuxDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 	plat := &netlinkPlatform{
 		cfg:      Config{Interface: "ranet0", Table: ourTable, Protocol: ourProtocol},
 		index:    ourIndex,
-		occupied: map[string]bool{},
+		occupied: map[Route]bool{}, refused: map[Route]bool{},
 	}
 	ours := netip.MustParsePrefix("10.99.0.0/24")
 
