@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
@@ -45,6 +46,11 @@ type Client struct {
 
 	inboundPackets atomic.Uint64
 	inboundDropped atomic.Uint64
+	// dropReported is nanoseconds since started, read through time.Since so it
+	// comes off the monotonic clock, and primed one interval in the past so
+	// the first refused batch is still said out loud. See noteInboundDropped.
+	dropReported atomic.Int64
+	started      time.Time
 }
 
 func (c *Client) config() *config.Config      { return c.cfg.Load() }
@@ -105,7 +111,9 @@ func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.R
 		workers: max(1, runtime.GOMAXPROCS(0)),
 		ctx:     ctx, cancel: cancel,
 		dialers: make(map[string]*dialer),
+		started: time.Now(),
 	}
+	c.dropReported.Store(-int64(espDropReportInterval))
 	c.cfg.Store(cfg)
 	c.reg.Store(&reg)
 	return c, nil

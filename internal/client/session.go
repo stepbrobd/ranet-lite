@@ -93,9 +93,9 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 			}
 		}
 		if dropped > 0 {
-			log.Printf("peer %s: dropped %d ESP packets in batch, last error: %v", name, dropped, lastError)
+			c.noteInboundDropped(name, dropped, lastError)
 		}
-		c.countInbound(len(results)-dropped, dropped)
+		c.countInbound(len(results)-dropped, 0)
 		c.Mesh.DeliverInboundBatch(plain)
 		clear(plain)
 	}

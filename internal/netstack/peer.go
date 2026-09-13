@@ -3,12 +3,13 @@ package netstack
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"maps"
 	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Peer separates parallel packet encryption from ordered, batched transport.
@@ -21,6 +22,15 @@ type Peer struct {
 	reserveMu sync.Mutex
 	reserved  uint64
 	dropped   atomic.Uint64
+	// sendErrReported is nanoseconds since started, read through time.Since so
+	// it comes off the monotonic clock, and primed one interval in the past so
+	// the first failure is still said out loud. A peer that deleted its Child
+	// SA and kept the IKE SA, which RFC 7296 section 1.4.1 permits and this
+	// tree stays connected for, fails every reservation from then on: without
+	// this that is one synchronous log write per TUN batch, for as long as the
+	// peer stays in that state. Dropped is the exact count.
+	sendErrReported atomic.Int64
+	started         time.Time
 
 	// Reserved peers hand completed crypto batches to one sender. slots bounds
 	// the total number of batches that may be encrypting, queued out of order,
@@ -81,7 +91,9 @@ func NewPeerReserved(id string, reserveFn func(count int) (BatchSealer, error), 
 }
 
 func newPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), reserveFn func(count int) (BatchSealer, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
-	p := &Peer{ID: id, encryptFn: encryptFn, reserveFn: reserveFn, transmitBatchFn: transmitBatchFn}
+	p := &Peer{ID: id, encryptFn: encryptFn, reserveFn: reserveFn, transmitBatchFn: transmitBatchFn,
+		started: time.Now()}
+	p.sendErrReported.Store(-int64(sendErrReportInterval))
 	if reserveFn == nil {
 		p.sendCond = sync.NewCond(&p.sendMu)
 	} else {
@@ -422,6 +434,19 @@ func (b *peerBatch) releaseStorage() {
 	}
 }
 
+// sendErrReportInterval bounds how often a batch the transport refused is said
+// out loud. See Peer.sendErrReported.
+const sendErrReportInterval = 10 * time.Second
+
+func (p *Peer) noteSendError(err error) {
+	now := int64(time.Since(p.started))
+	previous := p.sendErrReported.Load()
+	if now-previous < int64(sendErrReportInterval) || !p.sendErrReported.CompareAndSwap(previous, now) {
+		return
+	}
+	slog.Warn("netstack send batch failed", "peer", p.ID, "err", err, "dropped_total", p.dropped.Load())
+}
+
 func (p *Peer) senderLoop() {
 	defer close(p.senderDone)
 	pending := make(map[uint64]*peerBatch, cap(p.completed))
@@ -485,7 +510,7 @@ func (p *Peer) senderLoop() {
 			if b.done != nil {
 				b.done <- b.err
 			} else if b.err != nil {
-				log.Printf("netstack: send batch through peer %s: %v", p.ID, b.err)
+				p.noteSendError(b.err)
 			}
 		}
 		clear(packets)

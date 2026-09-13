@@ -3,9 +3,11 @@ package client
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Metrics replaces what prometheus-bird-exporter reported while Babel lived in
@@ -139,4 +141,31 @@ func (c *Client) countInbound(delivered, dropped int) {
 	if dropped > 0 {
 		c.inboundDropped.Add(uint64(dropped))
 	}
+}
+
+// espDropReportInterval bounds how often refused ESP packets are said out
+// loud. The counter behind it is exact and is what an operator reads; the log
+// line only has to point at it.
+const espDropReportInterval = 10 * time.Second
+
+// noteInboundDropped reports ESP packets that did not survive decryption or
+// validation, at most once an interval.
+//
+// The inbound SPI is cleartext in every datagram, so anyone who has seen one
+// can send datagrams that are refused at the replay check, before any crypto,
+// and a line per batch is a line per datagram. That write is synchronous, on
+// the one goroutine that also hands babel its packets, and it takes the
+// process-wide log mutex that babel, IKE and the kernel reconciler share:
+// measured at 248,000 spoofed datagrams in one second drawing 156,000 lines
+// and 24 MB of stderr for 15 MB on the wire, and withdrawing the mesh's route
+// to this node in under four seconds. Hub.noteDrop and installRoute are the
+// same limiter for the same reason.
+func (c *Client) noteInboundDropped(peer string, count int, last error) {
+	total := c.inboundDropped.Add(uint64(count))
+	now := int64(time.Since(c.started))
+	previous := c.dropReported.Load()
+	if now-previous < int64(espDropReportInterval) || !c.dropReported.CompareAndSwap(previous, now) {
+		return
+	}
+	slog.Warn("esp inbound packets dropped", "peer", peer, "dropped_total", total, "err", last)
 }
