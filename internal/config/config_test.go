@@ -312,6 +312,16 @@ babel:
 		// Neither family has a lookup that could express this, and installing
 		// it as an ordinary route would steal traffic from every other source.
 		"mismatched families": `{ prefix: "::/0", from: "10.0.0.0/8" }`,
+		// originatedKey masks, so this announces "::/0" and claims the exit.
+		// The mapping spelling is the one an exit actually uses, so refusing
+		// it only in the top-level list refuses it where nobody writes it.
+		"masked default":        `{ prefix: "2001:db8::1/0", from: "2602:f590::/36" }`,
+		"masked default, bare":  `2001:db8::1/0`,
+		"masked default, v4":    `198.51.100.1/0`,
+		"masked source default": `{ prefix: "2001:db8::/48", from: "2001:db8::1/0" }`,
+		// A source covering every address is kept by nothing: originatedKey
+		// drops it and the entry becomes an ordinary announcement.
+		"source covering everything": `{ prefix: "2001:db8::/48", from: "::/0" }`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := load(t, entry); err == nil {
@@ -344,5 +354,44 @@ func TestAssignOriginatedSkipsADefault(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Errorf("assigned %v, want only the two host prefixes", got)
+	}
+}
+
+// The top-level list is the other spelling of the same announcement, and what
+// an operator writes for a prefix with no source. Both entries below load into
+// a node that announces something other than what it says, and the second is
+// an address the reconciler retries on every pass for the life of the process.
+func TestTopLevelListsRefuseWhatTheyCannotMean(t *testing.T) {
+	load := func(t *testing.T, addition string) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(testConfig+addition), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		return err
+	}
+	for name, addition := range map[string]string{
+		"originate masked default":    "originate:\n  - 2001:db8::1/0\n",
+		"originate masked default v4": "originate:\n  - 198.51.100.1/0\n",
+		"kernel address unspecified":  "kernel:\n  enabled: true\n  addresses:\n    - \"::/0\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := load(t, addition); err == nil {
+				t.Error("the config loaded, so nothing says this cannot mean what it looks like")
+			}
+		})
+	}
+	// The spellings that do mean what they say stay accepted.
+	for name, addition := range map[string]string{
+		"a real default":   "originate:\n  - \"::/0\"\n",
+		"a real address":   "kernel:\n  enabled: true\n  addresses:\n    - 2001:db8::1/128\n",
+		"a plain announce": "originate:\n  - 2001:db8::/48\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := load(t, addition); err != nil {
+				t.Errorf("a well-formed entry was refused: %v", err)
+			}
+		})
 	}
 }

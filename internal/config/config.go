@@ -108,9 +108,9 @@ func (c *Config) KernelAddresses() ([]netip.Prefix, error) {
 	// A default is announced, never assigned: an exit originates "::/0" from
 	// its transit prefix, and assign_originated would otherwise try to put
 	// "::/0" on the tun on every pass and fail on every one. The test is the
-	// address rather than the prefix length, because "2001:db8::1/0" carries
-	// host bits and is an address the operator could have meant, while a
-	// prefix length says nothing about that.
+	// address rather than the prefix length, because a prefix length says
+	// nothing about whether an address can be assigned; validate refuses the
+	// other zero-length spellings outright.
 	add := func(prefix netip.Prefix) {
 		if prefix.Addr().IsUnspecified() || seen[prefix] {
 			return
@@ -243,6 +243,21 @@ type Babel struct {
 	Originate []OriginatePrefix `yaml:"originate"`
 }
 
+// maskedDefault refuses a prefix that announces the default route while
+// carrying host bits, which is always a typo: originatedKey masks it, so the
+// node announces "::/0" to the whole mesh and claims to be its exit. A real
+// default is written "::/0" and is refused nothing.
+func maskedDefault(prefix netip.Prefix) error {
+	if prefix.Bits() != 0 || prefix.Addr().IsUnspecified() {
+		return nil
+	}
+	unspecified := "::"
+	if prefix.Addr().Is4() {
+		unspecified = "0.0.0.0"
+	}
+	return fmt.Errorf("announces a default route, write %s/0 if that is what you mean", unspecified)
+}
+
 // OriginatePrefix is either a bare CIDR prefix or a mapping carrying a source
 // prefix, so both entries below are valid:
 //
@@ -261,6 +276,9 @@ func (o *OriginatePrefix) UnmarshalYAML(value *yaml.Node) error {
 		prefix, err := netip.ParsePrefix(value.Value)
 		if err != nil {
 			return fmt.Errorf("config: originate %q: %w", value.Value, err)
+		}
+		if err := maskedDefault(prefix); err != nil {
+			return fmt.Errorf("config: originate %q %w", value.Value, err)
 		}
 		o.Prefix = prefix
 		return nil
@@ -287,9 +305,22 @@ func (o *OriginatePrefix) UnmarshalYAML(value *yaml.Node) error {
 		}
 		*target = prefix
 	}
+	for name, prefix := range map[string]netip.Prefix{"prefix": o.Prefix, "from": o.From} {
+		if !prefix.IsValid() {
+			continue
+		}
+		if err := maskedDefault(prefix); err != nil {
+			return fmt.Errorf("config: originate %s %q %w", name, prefix, err)
+		}
+	}
 	switch {
 	case !o.Prefix.IsValid():
 		return fmt.Errorf("config: originate: prefix is required")
+	case o.From.IsValid() && o.From.Bits() == 0:
+		// originatedKey keeps a source only when it is shorter than the whole
+		// address space, so this one is dropped and the entry silently becomes
+		// an ordinary announcement of its destination.
+		return fmt.Errorf("config: originate %s from %s: a source covering every address is not a source-specific route, drop the from", o.Prefix, o.From)
 	case o.From.IsValid() && o.From.Addr().Is4() != o.Prefix.Addr().Is4():
 		// The source prefix is encoded under the destination's address
 		// encoding, so the pair has no representation on the wire.
@@ -424,16 +455,21 @@ func (c *Config) validate() error {
 		if err != nil {
 			return fmt.Errorf("config: originate %q: %w", raw, err)
 		}
-		// "2001:db8::1/0" is a default carrying host bits, which is always a
-		// typo: originatedKey masks it, so the node announces "::/0" to the
-		// whole mesh and claims to be its exit. A real default is written
-		// "::/0" and is refused nothing.
-		if prefix.Bits() == 0 && !prefix.Addr().IsUnspecified() {
-			unspecified := "::"
-			if prefix.Addr().Is4() {
-				unspecified = "0.0.0.0"
-			}
-			return fmt.Errorf("config: originate %q announces a default route, write %s/0 if that is what you mean", raw, unspecified)
+		if err := maskedDefault(prefix); err != nil {
+			return fmt.Errorf("config: originate %q %w", raw, err)
+		}
+	}
+	for _, raw := range c.Kernel.Addresses {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			return fmt.Errorf("config: kernel.addresses %q: %w", raw, err)
+		}
+		// Assigning the unspecified address is not something an interface can
+		// do, and KernelAddresses skips it, so accepting the entry and
+		// dropping it silently is the one outcome that tells the operator
+		// nothing.
+		if prefix.Addr().IsUnspecified() {
+			return fmt.Errorf("config: kernel.addresses %q is not an address an interface can carry", raw)
 		}
 	}
 	return nil
