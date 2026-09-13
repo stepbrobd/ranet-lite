@@ -35,6 +35,22 @@ func listenPeer(t *testing.T) *net.UDPConn {
 	return conn
 }
 
+// peerLoop runs one fake-peer goroutine and joins it with the test. The
+// goroutine reports through t, and a socket with no deadline parks for as long
+// as the session under test does not send: a t.Fatal elsewhere would otherwise
+// finish the test with the goroutine still parked, and its first log line then
+// panics the whole package binary with "Log in goroutine after test completed"
+// instead of printing the failure that caused it.
+func peerLoop(t *testing.T, peer *net.UDPConn, body func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); body() }()
+	t.Cleanup(func() {
+		_ = peer.SetDeadline(time.Now())
+		<-done
+	})
+}
+
 func TestSessionScheduledRekeyFailureRetries(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
@@ -65,7 +81,7 @@ func TestSessionScheduledRekeyFailureRetries(t *testing.T) {
 	}
 
 	retried := make(chan struct{})
-	go func() {
+	peerLoop(t, peer, func() {
 		buf := make([]byte, 2048)
 		n, addr, err := peer.ReadFromUDP(buf)
 		if err != nil {
@@ -92,7 +108,7 @@ func TestSessionScheduledRekeyFailureRetries(t *testing.T) {
 			return
 		}
 		close(retried)
-	}()
+	})
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.Run(context.Background()) }()
@@ -184,7 +200,7 @@ func TestSessionScheduledRekeyChild(t *testing.T) {
 	})
 
 	peerDone := make(chan struct{})
-	go func() {
+	peerLoop(t, peer, func() {
 		defer close(peerDone)
 		buf := make([]byte, 2048)
 		n, addr, err := peer.ReadFromUDP(buf)
@@ -311,7 +327,7 @@ func TestSessionScheduledRekeyChild(t *testing.T) {
 		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
 			t.Errorf("write post-rekey response: %v", err)
 		}
-	}()
+	})
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.Run(context.Background()) }()
@@ -359,7 +375,7 @@ func TestSessionRekeyIKE(t *testing.T) {
 	}
 
 	peerDone := make(chan struct{})
-	go func() {
+	peerLoop(t, peer, func() {
 		defer close(peerDone)
 		buf := make([]byte, 2048)
 		n, addr, err := peer.ReadFromUDP(buf)
@@ -495,7 +511,7 @@ func TestSessionRekeyIKE(t *testing.T) {
 		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
 			t.Errorf("write old IKE delete response: %v", err)
 		}
-	}()
+	})
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.Run(context.Background()) }()
@@ -1311,7 +1327,7 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 
 	var ids []uint32
 	peerDone := make(chan struct{})
-	go func() {
+	peerLoop(t, peer, func() {
 		defer close(peerDone)
 		buf := make([]byte, 2048)
 		for range 2 {
@@ -1341,7 +1357,7 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.Run(context.Background()) }()
