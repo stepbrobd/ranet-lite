@@ -42,12 +42,12 @@ originate:
 # rekey_retry_initial: 5s
 # rekey_retry_max: 5m
 
-# One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
-# endpoint only dials remote endpoints with the same address family.
 # Answer peers that dial us as well as dialing. Off by default; required for a
 # full mesh, where every node both dials and answers.
 # responder: true
 
+# One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
+# endpoint only dials remote endpoints with the same address family.
 peers:
   - organization: example       # optional, defaults to the top-level organization
     common_name: gateway

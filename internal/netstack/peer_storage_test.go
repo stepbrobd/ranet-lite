@@ -242,7 +242,7 @@ func TestControlTrafficHasItsOwnBudget(t *testing.T) {
 // budget and the stop channel ready picks uniformly, so half of what a closed
 // peer was offered was accepted, reported as sent, never transmitted, and
 // never counted as dropped, which is the one counter that would have shown it.
-func TestAClosedPeerRefusesAndCountsEverything(t *testing.T) {
+func TestClosedPeerRefusesAndCountsEverything(t *testing.T) {
 	peer := NewPeerReserved("peer",
 		func(int) (BatchSealer, error) {
 			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {

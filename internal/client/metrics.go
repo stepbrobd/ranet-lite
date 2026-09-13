@@ -22,7 +22,7 @@ func (c *Client) Metrics(w io.Writer) {
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_babel_neighbor_up{peer=%q} %d\n", neighbor.Peer, boolValue(neighbor.Alive))
 	}
-	fmt.Fprint(w, "# HELP ranet_lite_babel_neighbor_cost Link cost to a babel neighbor, 65535 is infinity\n")
+	fmt.Fprint(w, "# HELP ranet_lite_babel_neighbor_cost Link cost to a babel neighbor, where 65535 is infinity.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_neighbor_cost gauge\n")
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_babel_neighbor_cost{peer=%q} %d\n", neighbor.Peer, neighbor.Cost)
@@ -32,7 +32,7 @@ func (c *Client) Metrics(w io.Writer) {
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_babel_routes_received{peer=%q} %d\n", neighbor.Peer, neighbor.Routes)
 	}
-	fmt.Fprint(w, "# HELP ranet_lite_peer_send_dropped_total Packets refused for want of a transmission slot on a peer.\n")
+	fmt.Fprint(w, "# HELP ranet_lite_peer_send_dropped_total Packets a peer did not send: no transmission slot free, the peer closing, or its outbound SA unable to give out a sequence range.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_peer_send_dropped_total counter\n")
 	for _, neighbor := range babel.Neighbors {
 		fmt.Fprintf(w, "ranet_lite_peer_send_dropped_total{peer=%q} %d\n", neighbor.Peer, neighbor.Dropped)

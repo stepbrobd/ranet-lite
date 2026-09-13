@@ -173,7 +173,7 @@ type peerBatch struct {
 // It does not wait at all, even briefly. A slot frees when the peer's sender
 // returns from the transport, so a queue that is full is one whose socket is
 // backpressured, and that lasts far longer than any wait worth having; a wait
-// would only add latency before dropping anyway. Both callers also run on a
+// would only add latency before dropping anyway. The caller also runs on a
 // goroutine that serves other peers: the speaker walks every neighbor from
 // one, Receive runs on the sending peer's own decrypt path, and Mesh dispatches
 // under a lock every TUN reader takes.
@@ -289,9 +289,6 @@ func (b *peerBatch) enqueue() error {
 	p := b.peer
 	if p.completed == nil {
 		return b.transmit()
-	}
-	if !b.hasSlot {
-		return b.err // canceled before receiving a transmission ticket
 	}
 	b.encrypt()
 	select {

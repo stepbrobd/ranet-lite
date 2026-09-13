@@ -386,8 +386,8 @@ locally.
 An install that collides with a route another program holds is reported once and
 left alone. darwin has no replace, and the collision does not resolve itself, so
 the route stays in the diff and the install is attempted again on every pass,
-silently after that first report; the reconcile line counts it as not installed
-rather than as added.
+silently after that first report. The reconcile line counts it as not installed
+rather than as added, and says nothing at all about a pass that moved nothing.
 
 Addresses are narrower still: only an address this process added is ever
 removed, and one already on the link belongs to whoever put it there. That rule
@@ -458,19 +458,28 @@ reload that fails validation changes nothing.
 go test ./... -race
 ```
 
-None of the unit tests require root or any privileged resource. Protocol-level
-interoperability is covered by the NixOS VM test exposed by `flake.nix`. It
-boots separate client and gateway VMs; the client runs the packaged, user-facing
-`ranet-lite` binary with a real TUN device, while the gateway runs
-`charon-systemd`/`swanctl`, BIRD, and iperf3. The test verifies an
-Ed25519-authenticated IKEv2 and Child SA negotiation across asymmetric local and
-remote UDP ports, checks Babel route exchange in both directions, and measures
-TCP bandwidth through the negotiated ESP tunnel:
+The unit tests need no privileges, with one exception: `internal/kernel` has
+tests that write to a real routing table. They skip unless run as root, and on
+darwin unless `RANET_LITE_DARWIN_NETTEST=1` is also set, because that machine is
+on a live mesh. Nothing in CI runs them, so run them by hand after changing a
+platform backend. Protocol-level interoperability is covered by the NixOS VM
+tests exposed by `flake.nix`. It boots separate client and gateway VMs; the
+client runs the packaged, user-facing `ranet-lite` binary with a real TUN
+device, while the gateway runs `charon-systemd`/`swanctl`, BIRD, and iperf3. The
+test verifies an Ed25519-authenticated IKEv2 and Child SA negotiation across
+asymmetric local and remote UDP ports, checks Babel route exchange in both
+directions, and measures TCP bandwidth through the negotiated ESP tunnel:
 
 ```sh
 nix build .#checks.x86_64-linux.integration -L
 nix build .#checks.x86_64-linux.integration-multicore -L
+nix build .#checks.x86_64-linux.responder -L
+nix build .#checks.x86_64-linux.kernel -L
 ```
+
+`responder` stands two ranet-lite nodes up and has one dial the other, which is
+what upstream could not do at all. `kernel` exercises the route reconciler
+against a real table.
 
 These checks exercise one-core and four-core clients, IPv4 and IPv6 routes,
 locally scheduled and peer-initiated rekeys, BIRD withdrawal/recovery, and a
