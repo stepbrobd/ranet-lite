@@ -32,10 +32,17 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	tunnel.askedAt.Store(-int64(rekeyAskInterval))
 	// requestRekey owns the goroutine and the one-at-a-time guard, so this
 	// runs on its own and may block.
+	//
+	// A rekey that fails is reported and left alone. RFC 7296 section 1.4.1:
+	// "A failed attempt to create a Child SA SHOULD NOT tear down the IKE SA:
+	// there is no reason to lose the work done to set up the IKE SA." Every
+	// notify below 16384 arrives here as an error, TEMPORARY_FAILURE and
+	// NO_ADDITIONAL_SAS included, and both are ordinary: two ends recreating a
+	// deleted Child SA at once produce exactly the second. The schedule
+	// retries, and the session keeps carrying what it has.
 	tunnel.rekey = func() {
 		if err := sess.RekeyChildProactively(); err != nil && !sess.Mux().IsClosed() {
 			log.Printf("peer %s: proactive Child SA rekey: %v", name, err)
-			_ = sess.Mux().Close()
 		}
 	}
 	if err := tunnel.install(sess.Child); err != nil {

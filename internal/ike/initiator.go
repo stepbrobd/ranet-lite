@@ -96,6 +96,8 @@ type Session struct {
 	childMu  sync.RWMutex
 	Child    ChildSA
 	retiring ChildSA
+	// retiringBy bounds how long the replaced SA waits for the peer's Delete.
+	retiringBy time.Time
 	// Run expires replaced inbound SAs after an overlap period, allowing
 	// queued and reordered ESP to finish after the Delete acknowledgment.
 	retired          []childRetirement

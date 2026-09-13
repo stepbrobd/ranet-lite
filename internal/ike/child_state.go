@@ -2,6 +2,7 @@ package ike
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -22,19 +23,35 @@ func (s *Session) SetChildRetireHandler(fn func(uint32) error) {
 	s.handlerMu.Unlock()
 }
 
-func (s *Session) replaceChild(child ChildSA) error {
-	s.childMu.Lock()
-	defer s.childMu.Unlock()
+// canReplaceChild reports why a replacement could not be installed, so a
+// negotiation can refuse before it puts a proposal the peer will act on onto
+// the wire.
+func (s *Session) canReplaceChild(localSPI uint32) error {
+	s.childMu.RLock()
+	defer s.childMu.RUnlock()
+	return s.canReplaceChildLocked(localSPI)
+}
+
+func (s *Session) canReplaceChildLocked(localSPI uint32) error {
 	if s.retiring.LocalSPI != 0 {
 		return fmt.Errorf("ike: Child SA %08x is still awaiting retirement", s.retiring.LocalSPI)
 	}
-	if child.LocalSPI == s.Child.LocalSPI {
-		return fmt.Errorf("ike: Child SA SPI %08x is already active", child.LocalSPI)
+	if localSPI == s.Child.LocalSPI {
+		return fmt.Errorf("ike: Child SA SPI %08x is already active", localSPI)
 	}
 	for _, retired := range s.retired {
-		if child.LocalSPI == retired.spi {
-			return fmt.Errorf("ike: Child SA SPI %08x is still draining", child.LocalSPI)
+		if localSPI == retired.spi {
+			return fmt.Errorf("ike: Child SA SPI %08x is still draining", localSPI)
 		}
+	}
+	return nil
+}
+
+func (s *Session) replaceChild(child ChildSA) error {
+	s.childMu.Lock()
+	defer s.childMu.Unlock()
+	if err := s.canReplaceChildLocked(child.LocalSPI); err != nil {
+		return err
 	}
 	if err := s.mux.RegisterESP(child.LocalSPI); err != nil {
 		return err
@@ -52,9 +69,20 @@ func (s *Session) replaceChild(child ChildSA) error {
 	s.Child = child
 	if old.LocalSPI != 0 {
 		s.retiring = old
+		// The peer owes a Delete for it, and a peer is free not to send one.
+		// Nothing else bounds this, and while it is set every rekey in both
+		// directions is refused, so it has a deadline of its own: the SA is
+		// retired on the ordinary timer if the Delete never comes.
+		s.retiringBy = time.Now().Add(retirementDeadline)
 	}
 	return nil
 }
+
+// retirementDeadline bounds how long a replaced Child SA waits for the peer's
+// Delete. RFC 7296 section 2.8 expects one promptly; a peer that never sends it
+// would otherwise lock out every later rekey for the life of the session, which
+// it can do deliberately by rekeying once and going quiet.
+const retirementDeadline = 30 * time.Second
 
 func (s *Session) currentChild() ChildSA {
 	s.childMu.RLock()
@@ -107,19 +135,36 @@ func (s *Session) retireInboundLocked(spi uint32, replaced bool) error {
 }
 
 // nextRetirement is when the earliest replaced inbound SA may be dropped, so
-// the control loop can wait for it rather than poll for it.
+// the control loop can wait for it rather than poll for it. The SA waiting for
+// the peer's Delete counts too: nothing else would wake the loop to give up on
+// a Delete that is not coming.
 func (s *Session) nextRetirement() (time.Time, bool) {
 	s.childMu.Lock()
 	defer s.childMu.Unlock()
-	if len(s.retired) == 0 {
-		return time.Time{}, false
+	var earliest time.Time
+	if len(s.retired) > 0 {
+		earliest = s.retired[0].expiresAt
 	}
-	return s.retired[0].expiresAt, true
+	if s.retiring.LocalSPI != 0 && (earliest.IsZero() || s.retiringBy.Before(earliest)) {
+		earliest = s.retiringBy
+	}
+	return earliest, !earliest.IsZero()
 }
 
 func (s *Session) expireRetiredChildren(now time.Time) error {
 	s.childMu.Lock()
 	defer s.childMu.Unlock()
+	// A replaced SA whose Delete never arrived. Retiring it on the timer is
+	// what keeps a peer from locking out every later rekey by going quiet;
+	// its inbound keys then drain like any other replaced SA.
+	if s.retiring.LocalSPI != 0 && !now.Before(s.retiringBy) {
+		slog.Warn("ike retiring a replaced Child SA the peer never deleted",
+			"spi", s.retiring.LocalSPI, "after", retirementDeadline)
+		if err := s.retireInboundLocked(s.retiring.LocalSPI, true); err != nil {
+			return fmt.Errorf("ike: retire an undeleted Child SA: %w", err)
+		}
+		s.retiring = ChildSA{}
+	}
 	for len(s.retired) > 0 && !now.Before(s.retired[0].expiresAt) {
 		if err := s.retireInboundLocked(s.retired[0].spi, false); err != nil {
 			return fmt.Errorf("ike: expire retired Child SA: %w", err)

@@ -84,6 +84,14 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		// initiator expects in inbound ESP packets (RFC 7296 §1.3.3).
 		inner = append([]RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: ProtoESP, SPI: oldLocalSPI, Type: N_REKEY_SA})}}, inner...)
 	}
+	// Refused here rather than after the exchange. The peer installs the
+	// replacement and switches its outbound SPI the moment it answers, so
+	// proposing an SA this end cannot then install leaves the peer sending
+	// into an SPI that was never registered, and every scheduled retry does
+	// it again.
+	if err := s.canReplaceChild(localSPI); err != nil {
+		return err
+	}
 	response, err := s.requestOnLocked(context, CREATE_CHILD_SA, inner)
 	if err != nil {
 		return fmt.Errorf("ike: Child SA negotiation request: %w", err)
