@@ -70,6 +70,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	if err := validateRuntimeConfig(cfg, privateKey, reg); err != nil {
 		return nil, err
 	}
+	warnUnforwardableTransit(cfg)
 	mesh, err := netstack.NewNamed(0, cfg.TUN)
 	if err != nil {
 		return nil, err

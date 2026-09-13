@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/registry"
@@ -130,4 +131,35 @@ func validatePeers(cfg *config.Config, reg registry.Registry, localFamilies map[
 		}
 	}
 	return refuse, skip
+}
+
+// warnUnforwardableTransit says so when this node offers to carry the mesh and
+// the kernel will not.
+//
+// Babel carries no capability signal: a node that advertises a route is
+// promising to forward it, and the only thing a peer ever learns is the
+// advertisement. So a node that redistributes with forwarding off attracts
+// traffic and drops it, and the sender is never told. Nothing here can fix
+// that from the far end, which leaves saying it at the end that knows.
+//
+// A warning rather than a refusal, because forwarding can be turned on after
+// this process starts and because babel.no_transit is the setting that makes
+// the promise match the machine.
+func warnUnforwardableTransit(cfg *config.Config) {
+	if cfg.Babel.NoTransit {
+		return
+	}
+	v4, v6 := forwardingEnabled()
+	if v4 && v6 {
+		return
+	}
+	var off []string
+	if !v4 {
+		off = append(off, "IPv4")
+	}
+	if !v6 {
+		off = append(off, "IPv6")
+	}
+	log.Printf("config: this node redistributes the routes it learns, so it is offering to carry the mesh, but %s forwarding is off: peers that select it will have their traffic dropped with nothing to tell them. Set babel.no_transit on a leaf, or turn forwarding on",
+		strings.Join(off, " and "))
 }
