@@ -276,6 +276,21 @@ func (s *Speaker) advertisementFor(key routeKey) (advertisement, *neighborState,
 		// router-id and sequence number with an arbitrary finite metric.
 		return advertisement{routerID: s.cfg.RouterID, seqno: s.originSeqno}, nil, true
 	}
+	if s.cfg.NoTransit {
+		// Reported as unknown rather than as a retraction of this node's own
+		// making. advertiseTo synthesizes the identical infinite
+		// advertisement for a prefix nothing here knows, so the two are the
+		// same on the wire, and saying "not mine" is the honest shape: a node
+		// that never relays has no route of its own to withdraw. What matters
+		// for RFC 8966 section 3.8.1.1 is that a Route Request still draws a
+		// retraction rather than silence, which the shared path provides.
+		//
+		// Refusing to advertise cannot close a loop, and Appendix C allows it
+		// outright: "Babel can use any metric that is strictly monotonic,
+		// including one that assigns an infinite metric to a selected subset
+		// of routes."
+		return advertisement{}, nil, false
+	}
 	entry := s.routes.entries[key]
 	if entry == nil {
 		return advertisement{}, nil, false

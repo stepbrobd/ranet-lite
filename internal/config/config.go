@@ -267,6 +267,11 @@ type Babel struct {
 	// Originate announces source-specific prefixes, which the plain top-level
 	// originate list cannot express.
 	Originate []OriginatePrefix `yaml:"originate"`
+	// NoTransit advertises only this node's own prefixes and never relays a
+	// route it learned. The fleet's BIRD already behaves this way, and a leaf
+	// wants it. Off by default, because a converted fleet needs the relaying
+	// and turning it off silently would break the mesh it is replacing.
+	NoTransit bool `yaml:"no_transit"`
 }
 
 // maskedDefault refuses a prefix that announces the default route while
@@ -385,7 +390,7 @@ func (b Babel) SpeakerConfig() babel.Config {
 		cost.RTTMax = time.Duration(*b.RTTMax)
 	}
 	return babel.Config{HelloInterval: time.Duration(b.HelloInterval),
-		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost}
+		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost, NoTransit: b.NoTransit}
 }
 
 func Load(path string) (*Config, error) {

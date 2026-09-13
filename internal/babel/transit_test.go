@@ -1343,3 +1343,57 @@ func TestSpentRetryGivesItsNeighborTheShareBack(t *testing.T) {
 		t.Errorf("its neighbor still holds %d of its share for a request nothing repeats any more", got)
 	}
 }
+
+// A leaf on a laptop uplink must not offer to carry the mesh. Redistribution
+// makes a converted fleet work and makes a leaf a transit router alike, and
+// the fleet's BIRD already draws that line with "export where proto =
+// dbabel0". Measured on a real leaf before this existed: 112 sessions, every
+// learned route advertised to every peer, and the community forwarding
+// third-party traffic through the laptop within minutes.
+func TestNoTransitAdvertisesOnlyWhatThisNodeOriginates(t *testing.T) {
+	fabric := newMeshFabric(t, Config{NoTransit: true}, "a-b", "b-c")
+	far := netip.MustParsePrefix("fd00:c::/64")
+	own := netip.MustParsePrefix("fd00:b::/64")
+	fabric.speakers["c"].Originate(far)
+	fabric.speakers["b"].Originate(own)
+	fabric.flush("c", "b", "a")
+
+	// b still learns and forwards the route itself: this narrows what it says,
+	// not what it knows, or the leaf could not reach the mesh at all.
+	if got := fabric.nextHop("b", routeKey{dest: far}); got != "c" {
+		t.Fatalf("b reaches the origin via %q, want \"c\"", got)
+	}
+	if peer, ok := fabric.meshes["b"].Routes.Lookup(netip.MustParseAddr("2001:db8::1"), far.Addr()); !ok || peer.ID != "c" {
+		t.Fatal("b did not install the route it learned, so it cannot use the mesh")
+	}
+
+	// What it must not do is pass it on.
+	if got := updatesFor(t, fabric.tlvs("b", "a"), far); len(got) != 0 {
+		t.Errorf("b relayed %d updates for a route it learned, so it is transit", len(got))
+	}
+	if got := fabric.nextHop("a", routeKey{dest: far}); got != "" {
+		t.Errorf("a learned the relayed route via %q, so the leaf is carrying transit", got)
+	}
+
+	// And its own prefix still reaches the mesh, or the leaf is invisible.
+	if got := fabric.nextHop("a", routeKey{dest: own}); got != "b" {
+		t.Errorf("a reaches b's own prefix via %q, want \"b\"", got)
+	}
+
+	// A Route Request must be answered, RFC 8966 section 3.8.1.1, and the
+	// honest answer from a node that will not carry the prefix is a
+	// retraction rather than the silence an omission would produce. Appendix C
+	// permits answering with infinity rather than with the route this node
+	// holds: "any metric that is strictly monotonic, including one that
+	// assigns an infinite metric to a selected subset of routes".
+	fabric.inject("b", "a", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: far}))
+	answers := updatesFor(t, fabric.tlvs("b", "a"), far)
+	if len(answers) == 0 {
+		t.Fatal("a route request for a prefix this node will not carry drew no answer at all")
+	}
+	for _, update := range answers {
+		if update.Metric != MetricInfinity {
+			t.Errorf("the answer offered metric %d, want a retraction", update.Metric)
+		}
+	}
+}

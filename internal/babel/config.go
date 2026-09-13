@@ -18,6 +18,15 @@ type Config struct {
 	Cost           CostParams
 	// Maximum Babel UDP payload, including its four-byte protocol header.
 	PacketSize int
+	// NoTransit advertises only the prefixes this node originates, never a
+	// route it learned from somebody else. The BIRD side of a ranet fleet
+	// already draws that line with "export where proto = dbabel0". A node that
+	// redistributes is offering to carry the mesh's traffic, and a leaf on a
+	// laptop uplink should not: measured on one, the community started
+	// forwarding third-party traffic through it within minutes. Refusing to
+	// advertise can never close a loop, so this only ever narrows what the
+	// feasibility distance already bounds.
+	NoTransit bool
 }
 
 const maxInterval = 65535 * 10 * time.Millisecond
