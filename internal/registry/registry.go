@@ -7,6 +7,7 @@ package registry
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/json"
@@ -145,7 +146,11 @@ func (n Node) FindEndpoint(serial string) (Endpoint, bool) {
 // address family; if that fails, ranet falls back to the address family's
 // wildcard, which isn't a dialable address — callers must treat a failure
 // here as "endpoint not currently reachable", not retry with a wildcard.
-func (e Endpoint) ResolveRemote() (net.IP, error) {
+//
+// The context is what makes shutdown prompt: a hostname whose resolver is
+// unreachable otherwise holds the dialer for the resolver's own timeout, and
+// the client waits for every dialer before it returns.
+func (e Endpoint) ResolveRemote(ctx context.Context) (net.IP, error) {
 	if e.Address == nil {
 		return nil, fmt.Errorf("registry: endpoint %s has no address", e.SerialNumber)
 	}
@@ -155,7 +160,7 @@ func (e Endpoint) ResolveRemote() (net.IP, error) {
 		}
 		return ip, nil
 	}
-	ips, err := net.LookupIP(*e.Address)
+	ips, err := net.DefaultResolver.LookupIP(ctx, resolverNetwork(e.AddressFamily), *e.Address)
 	if err != nil {
 		return nil, fmt.Errorf("registry: resolve %s: %w", *e.Address, err)
 	}
@@ -165,6 +170,20 @@ func (e Endpoint) ResolveRemote() (net.IP, error) {
 		}
 	}
 	return nil, fmt.Errorf("registry: %s has no %s address", *e.Address, e.AddressFamily)
+}
+
+// resolverNetwork narrows the lookup to the family this endpoint declares, so
+// a name with only the other family's records fails at the resolver rather
+// than after it.
+func resolverNetwork(family string) string {
+	switch family {
+	case "ip4":
+		return "ip4"
+	case "ip6":
+		return "ip6"
+	default:
+		return "ip"
+	}
 }
 
 func addressFamilyMatches(family string, ip net.IP) bool {

@@ -81,7 +81,7 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 // config-specified serial if given, otherwise the first one whose address
 // actually resolves (a node commonly has endpoints for address families or
 // links that aren't currently usable, e.g. address: null).
-func resolveEndpoint(node registry.Node, serial, family string) (registry.Endpoint, error) {
+func resolveEndpoint(ctx context.Context, node registry.Node, serial, family string) (registry.Endpoint, error) {
 	if serial != "" {
 		ep, ok := node.FindEndpoint(serial)
 		if !ok {
@@ -94,7 +94,7 @@ func resolveEndpoint(node registry.Node, serial, family string) (registry.Endpoi
 	}
 	for _, ep := range node.Endpoints {
 		if ep.AddressFamily == family {
-			if _, err := ep.ResolveRemote(); err == nil {
+			if _, err := ep.ResolveRemote(ctx); err == nil {
 				return ep, nil
 			}
 		}
@@ -112,11 +112,11 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	if !ok {
 		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)
 	}
-	ep, err := resolveEndpoint(node, p.SerialNumber, local.AddressFamily)
+	ep, err := resolveEndpoint(ctx, node, p.SerialNumber, local.AddressFamily)
 	if err != nil {
 		return err
 	}
-	remoteIP, err := ep.ResolveRemote()
+	remoteIP, err := ep.ResolveRemote(ctx)
 	if err != nil {
 		return err
 	}

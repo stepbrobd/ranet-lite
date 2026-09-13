@@ -38,7 +38,7 @@ func TestLoadRegistry(t *testing.T) {
 	if ep.Address != nil {
 		t.Fatalf("expected nil address, got %v", *ep.Address)
 	}
-	if _, err := ep.ResolveRemote(); err == nil {
+	if _, err := ep.ResolveRemote(t.Context()); err == nil {
 		t.Fatal("expected ResolveRemote to fail for a nil address")
 	}
 
@@ -55,7 +55,7 @@ func TestLoadRegistry(t *testing.T) {
 	if ep.Address == nil || *ep.Address != "" {
 		t.Fatalf("expected empty-string address, got %v", ep.Address)
 	}
-	if _, err := ep.ResolveRemote(); err == nil {
+	if _, err := ep.ResolveRemote(t.Context()); err == nil {
 		t.Fatal("expected ResolveRemote to fail for an empty-string address")
 	}
 
@@ -103,7 +103,7 @@ func TestLoadRegistry(t *testing.T) {
 	if !ok {
 		t.Fatal("endpoint serial 0 not found")
 	}
-	ip, err := ep.ResolveRemote()
+	ip, err := ep.ResolveRemote(t.Context())
 	if err != nil {
 		t.Fatalf("ResolveRemote: %v", err)
 	}

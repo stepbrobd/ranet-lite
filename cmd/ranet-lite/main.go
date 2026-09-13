@@ -105,13 +105,20 @@ func main() {
 	// the device externally.
 	var reconciler sync.WaitGroup
 	if cfg.Kernel.Enabled {
+		// log.Fatal is os.Exit, which runs no deferred function, so the node
+		// opened above is closed by hand here. These two are the failures a
+		// misconfigured node actually hits.
+		fatal := func(err error) {
+			node.Close()
+			log.Fatal(err)
+		}
 		kernelCfg, err := kernelConfig(cfg, mesh.Name)
 		if err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		routes, err := kernel.New(kernelCfg, mesh.Routes)
 		if err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		reconciler.Go(func() {
 			if err := routes.Run(ctx); err != nil {
