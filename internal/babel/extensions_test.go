@@ -1,6 +1,7 @@
 package babel
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
@@ -85,6 +86,8 @@ func TestMappedPrefixIsRejected(t *testing.T) {
 	}
 }
 
+var errIgnoredTLV = errors.New("babel: TLV ignored")
+
 func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 	prefix := netip.MustParsePrefix("2001:db8::/64")
 	for _, test := range []struct {
@@ -94,7 +97,15 @@ func TestUnknownMandatoryExtensionsAreRejected(t *testing.T) {
 	}{
 		{"Hello", EncodeHello(Hello{Interval: 100}), func(b []byte) error { _, err := DecodeHello(b); return err }},
 		{"IHU", EncodeIHU(IHU{Interval: 100}), func(b []byte) error { _, _, err := DecodeIHU(b); return err }},
-		{"RouterID", EncodeRouterID([8]byte{1}), func(b []byte) error { _, err := DecodeRouterID(b); return err }},
+		// Router-Id reports the ignore rather than failing, because the parser
+		// state is set either way. See TestRouterIDRoundTrip.
+		{"RouterID", EncodeRouterID([8]byte{1}), func(b []byte) error {
+			_, ignore, err := DecodeRouterID(b)
+			if ignore {
+				return errIgnoredTLV
+			}
+			return err
+		}},
 		{"NextHop", EncodeNextHop(net.ParseIP("fe80::1")), func(b []byte) error { _, err := DecodeNextHop(b); return err }},
 		{"AckReq", EncodeAckReq(1, 100), func(b []byte) error { _, err := DecodeAckReq(b); return err }},
 		{"RouteRequest", EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}), func(b []byte) error { _, err := DecodeRouteRequest(b); return err }},

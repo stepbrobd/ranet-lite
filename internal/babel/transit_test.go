@@ -477,19 +477,19 @@ func TestSourceTableGarbageCollection(t *testing.T) {
 	if len(rt.sources) != 1 {
 		t.Fatal("a feasibility distance was dropped before its timer expired")
 	}
-	// A distance backing a route outlives its timer: forgetting it would make
-	// updates feasible that selection has already refused.
+	// And goes when it expires, whether or not a route still references it.
+	// RFC 8966 section 3.7.3 makes the removal unconditional, and Appendix B
+	// sets the source GC time longer than the route expiry time so that it is
+	// safe. Keeping a referenced entry instead makes a prefix whose only path
+	// worsened unreachable for the life of the process: the route stays
+	// unfeasible, so it stays referenced, so the distance that refuses it is
+	// never collected.
 	n := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
 	makeNeighborReachable(n)
 	rt.update(n, key, advertisement{routerID: adv.routerID, seqno: 2, metric: 1}, time.Hour, now)
 	rt.sweepSources(now.Add(2 * sourceGCTime))
-	if len(rt.sources) != 1 {
-		t.Fatal("a feasibility distance still backing a route was collected")
-	}
-	rt.expireNeighbor(n, now)
-	rt.sweepSources(now.Add(2 * sourceGCTime))
 	if len(rt.sources) != 0 {
-		t.Fatal("an unreferenced feasibility distance survived its timer")
+		t.Fatal("a feasibility distance outlived its garbage-collection timer")
 	}
 }
 
@@ -966,4 +966,45 @@ func TestRunRetriesStarvedSeqnoRequest(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// A peer chooses how many Seqno Requests to put in one packet, and eighty fit.
+// RFC 8966 section 3.2.2 asks a node not to raise its own sequence number
+// spontaneously, and every raise re-dirties everything it originates.
+func TestOriginSeqnoRisesAtMostOncePerPacket(t *testing.T) {
+	fabric := newMeshFabric(t, Config{}, "a-b")
+	speaker := fabric.speakers["a"]
+	dest := netip.MustParsePrefix("fd00:a::/64")
+	speaker.Originate(dest)
+	speaker.mu.Lock()
+	before := speaker.originSeqno
+	speaker.mu.Unlock()
+
+	requests := make([]RawTLV, 0, 80)
+	for i := range 80 {
+		requests = append(requests, EncodeSeqnoRequest(SeqnoRequest{
+			AE: AEIPv6, Prefix: dest, RouterID: routerID("a"),
+			Seqno: before + uint16(i) + 1, HopCount: 3,
+		}))
+	}
+	fabric.inject("a", "b", requests...)
+
+	speaker.mu.Lock()
+	raised := speaker.originSeqno - before
+	speaker.mu.Unlock()
+	if raised != 1 {
+		t.Errorf("one packet of %d requests raised the origin sequence number by %d, want 1", len(requests), raised)
+	}
+
+	// A later packet can still raise it, or a genuine request goes unanswered.
+	fabric.inject("a", "b", EncodeSeqnoRequest(SeqnoRequest{
+		AE: AEIPv6, Prefix: dest, RouterID: routerID("a"),
+		Seqno: speaker.originSeqno + 1, HopCount: 3,
+	}))
+	speaker.mu.Lock()
+	total := speaker.originSeqno - before
+	speaker.mu.Unlock()
+	if total != 2 {
+		t.Errorf("a second packet raised the origin sequence number to %d above the start, want 2", total)
+	}
 }

@@ -13,16 +13,23 @@ func EncodeRouterID(id [8]byte) RawTLV {
 	return RawTLV{Type: TLVRouterID, Body: body}
 }
 
-func DecodeRouterID(body []byte) ([8]byte, error) {
-	var id [8]byte
+// DecodeRouterID also reports whether the TLV is otherwise to be ignored,
+// which an unknown mandatory sub-TLV makes it. The router id is returned
+// either way: RFC 8966 section 4.6.7 says "This TLV sets the router-id even if
+// it is otherwise ignored due to an unknown mandatory sub-TLV", and section
+// 4.5 says the same generally, that "parsing a TLV MUST update the parser
+// state even if the TLV is otherwise ignored". Two nodes that disagree about
+// which router id an Update belongs to keep different source-table entries for
+// it, and neither one's feasibility distance then bounds the other.
+func DecodeRouterID(body []byte) (id [8]byte, ignore bool, err error) {
 	if len(body) < 10 {
-		return id, fmt.Errorf("babel: short Router-Id TLV")
-	}
-	if _, err := decodeOptionalSubTLVs(body[10:]); err != nil {
-		return id, err
+		return id, false, fmt.Errorf("babel: short Router-Id TLV")
 	}
 	copy(id[:], body[2:10])
-	return id, nil
+	if _, err := decodeOptionalSubTLVs(body[10:]); err != nil {
+		return id, true, nil
+	}
+	return id, false, nil
 }
 
 // NextHop TLV, RFC 8966 §4.6.8.

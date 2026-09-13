@@ -168,15 +168,23 @@ func (s *Session) RekeyIKE() error {
 			s.current = collision
 			s.collision = newContext
 			s.stateMu.Unlock()
-			if _, err := s.requestOnLocked(newContext, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
-				return fmt.Errorf("ike: delete redundant local IKE SA: %w", err)
-			}
+			// The redundant SA goes whether or not the peer answers. Leaving
+			// it in s.collision refuses every later peer rekey, and the next
+			// local one takes this branch again with no peer nonce, so the
+			// failure would be permanent rather than one lost exchange.
+			deleteErr := func() error {
+				_, err := s.requestOnLocked(newContext, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}})
+				return err
+			}()
 			s.mux.UnregisterIKE(spiI)
 			s.stateMu.Lock()
 			if s.collision == newContext {
 				s.collision = nil
 			}
 			s.stateMu.Unlock()
+			if deleteErr != nil {
+				return fmt.Errorf("ike: delete redundant local IKE SA: %w", deleteErr)
+			}
 			return nil
 		}
 		slog.Info("ike simultaneous rekey selected local candidate")

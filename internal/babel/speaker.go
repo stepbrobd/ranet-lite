@@ -118,6 +118,8 @@ type Speaker struct {
 	askedSeqno    map[askedKey]time.Time
 	starveRetries map[sourceKey]*starveRetry
 	originSeqno   uint16
+	// raisedSeqno bounds originSeqno to one raise per received packet.
+	raisedSeqno   bool
 	updatePending bool
 	changed       chan struct{}
 }

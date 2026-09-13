@@ -25,6 +25,9 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 		slog.Warn("babel bad packet", "err", err)
 		return nil
 	}
+	// Reset per packet: the sequence number this node originates rises at most
+	// once for the whole of it, however many requests it carries.
+	s.raisedSeqno = false
 	recvTS := uint32(now.UnixMicro())
 	var helloTxTS uint32
 	var haveHelloTS bool
@@ -99,7 +102,9 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			linkChanged = true
 
 		case TLVRouterID:
-			if id, err := DecodeRouterID(t.Body); err == nil {
+			// The parser state is set even when the TLV is ignored, which the
+			// second result reports. Only a malformed TLV leaves it alone.
+			if id, _, err := DecodeRouterID(t.Body); err == nil {
 				routerID, haveRouterID = id, true
 			}
 
@@ -225,8 +230,14 @@ func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Ti
 func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Time) []sendAction {
 	key := routeKey{source: request.SourcePrefix, dest: request.Prefix}
 	if _, local := s.originate[key]; local {
-		if request.RouterID == s.cfg.RouterID && seqnoGT(request.Seqno, s.originSeqno) {
-			s.originSeqno++ // at most one increment per request
+		// At most one increment per request, and at most one per packet: a
+		// peer chooses how many requests to put in one, and eighty fit. RFC
+		// 8966 section 3.2.2 asks a node not to raise its own sequence number
+		// spontaneously, and every raise re-dirties everything this node
+		// originates.
+		if request.RouterID == s.cfg.RouterID && seqnoGT(request.Seqno, s.originSeqno) && !s.raisedSeqno {
+			s.raisedSeqno = true
+			s.originSeqno++
 			// Everything we originate carries the new sequence number, so the
 			// whole set is due a triggered update, not just this prefix.
 			for origin := range s.originate {

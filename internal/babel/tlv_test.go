@@ -228,12 +228,29 @@ func TestHelloRejectsTruncatedSubTLV(t *testing.T) {
 func TestRouterIDRoundTrip(t *testing.T) {
 	id := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 	tlv := EncodeRouterID(id)
-	got, err := DecodeRouterID(tlv.Body)
-	if err != nil {
-		t.Fatal(err)
+	got, ignore, err := DecodeRouterID(tlv.Body)
+	if err != nil || ignore {
+		t.Fatalf("a plain Router-Id decoded as %v, ignore %v", err, ignore)
 	}
 	if got != id {
 		t.Fatalf("got %v, want %v", got, id)
+	}
+
+	// RFC 8966 section 4.6.7: "This TLV sets the router-id even if it is
+	// otherwise ignored due to an unknown mandatory sub-TLV." Two nodes that
+	// disagree about which router id an Update belongs to keep different
+	// source-table entries for it, and the feasibility condition is indexed by
+	// that id, so neither one's distance bounds the other.
+	withMandatory := append(append([]byte(nil), tlv.Body...), encodeSubTLVs([]SubTLV{{Type: 200}})...)
+	got, ignore, err = DecodeRouterID(withMandatory)
+	if err != nil {
+		t.Fatalf("an ignored Router-Id failed to decode: %v", err)
+	}
+	if !ignore {
+		t.Error("a Router-Id carrying an unknown mandatory sub-TLV was not reported as ignored")
+	}
+	if got != id {
+		t.Errorf("an ignored Router-Id set the parser state to %v, want %v", got, id)
 	}
 }
 

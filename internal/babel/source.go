@@ -96,27 +96,24 @@ func (rt *routeTable) requestSeqno(key routeKey, adv advertisement) uint16 {
 }
 
 // sweepSources drops feasibility distances whose garbage-collection timer has
-// expired. An entry still backing a route table entry is kept regardless:
-// forgetting it would make updates feasible that selection has already
-// rejected, which is the one direction that can close a loop.
+// expired, unconditionally. RFC 8966 section 3.7.3: "When the garbage-collection
+// timer expires, the entry is removed from the source table", with no exception
+// for an entry a route still references, and Appendix B deliberately sets the
+// source GC time longer than the route expiry time so that removal is safe.
+//
+// Keeping a referenced entry instead made an unreachable prefix permanent. A
+// neighbor whose path genuinely worsens advertises a metric this node has
+// already bettered, so the route is unfeasible and unselectable; the node asks
+// the origin for a new sequence number, and if every request and reply is lost
+// it stops asking. The neighbor keeps refreshing the unfeasible route, so the
+// distance stays referenced, so it is never collected, so the route stays
+// unfeasible for the life of the process. Expiring it is what lets the path
+// come back.
 func (rt *routeTable) sweepSources(now time.Time) {
 	for index, entry := range rt.sources {
-		if now.Before(entry.gcAt) || rt.referenced(index) {
+		if now.Before(entry.gcAt) {
 			continue
 		}
 		delete(rt.sources, index)
 	}
-}
-
-func (rt *routeTable) referenced(index sourceKey) bool {
-	entry := rt.entries[index.route]
-	if entry == nil {
-		return false
-	}
-	for _, route := range entry.routes {
-		if route.routerID == index.routerID {
-			return true
-		}
-	}
-	return false
 }
