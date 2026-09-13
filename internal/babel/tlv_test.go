@@ -314,3 +314,21 @@ func TestDecodePacketRejectsUnsupportedVersion(t *testing.T) {
 		t.Fatal("DecodePacket accepted an unsupported version")
 	}
 }
+
+// net.IPv4zero is one slice shared by everything in the process that names it.
+// A decoded prefix is handed to a caller with no reason to treat it as
+// read-only, so handing back that slice puts what the net package compares
+// against one write away from any of them.
+func TestADecodedWildcardPrefixIsNotThePackagesOwnZero(t *testing.T) {
+	var decoder PrefixDecoder
+	update, err := decoder.Decode([]byte{AEWildcard, 0, 0, 0, 0x00, 0x64, 0, 0, 0xff, 0xff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(update.Prefix) == 0 {
+		t.Fatal("the wildcard decoded to no prefix at all")
+	}
+	if len(update.Prefix) == len(net.IPv4zero) && &update.Prefix[0] == &net.IPv4zero[0] {
+		t.Error("the decoded prefix is net.IPv4zero itself")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 )
 
 // SubTLVSourcePrefix is the mandatory Source Prefix sub-TLV (RFC 9079).
@@ -150,7 +151,10 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 
 	var ip net.IP
 	if ae == AEWildcard {
-		ip = net.IPv4zero
+		// Cloned, not aliased: net.IPv4zero is one slice shared by everything
+		// in the process that names it, and this one is handed to a caller
+		// that has no reason to treat a decoded prefix as read-only.
+		ip = slices.Clone(net.IPv4zero)
 	} else {
 		size := 16
 		if ae == AEIPv4 || ae == AEIPv4ViaIPv6 {
@@ -215,6 +219,10 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	return u, nil
 }
 
+// clearPrefixTail zeroes the bits past plen, so a prefix the sender left
+// dirty cannot decode to two different netip.Prefix values. plen has to be
+// within raw, which Decode establishes for each AE before it builds the
+// buffer: 32 bits for the two IPv4 encodings and 128 for IPv6.
 func clearPrefixTail(raw []byte, plen int) {
 	if plen > 0 && plen%8 != 0 {
 		raw[plen/8] &= byte(0xff << (8 - plen%8))

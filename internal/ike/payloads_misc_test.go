@@ -3,6 +3,7 @@ package ike
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -85,5 +86,20 @@ func TestTrafficSelectorAddressWidthMustMatchItsType(t *testing.T) {
 				t.Errorf("a well-formed selector was refused: %v", err)
 			}
 		})
+	}
+}
+
+// net.IPv4zero and net.IPv6zero are single slices shared by everything in the
+// process that names them, and To4 returns a window into the first rather than
+// a new one. A selector is handed to callers that encode it and may hold it,
+// so it must not be either of those slices.
+func TestTheFullRangeSelectorsAreNotThePackagesOwnZeroes(t *testing.T) {
+	if v4 := FullRangeV4(); len(v4.StartAddr) != 0 && len(net.IPv4zero) != 0 &&
+		&v4.StartAddr[0] == &net.IPv4zero[12] {
+		t.Error("the IPv4 selector starts inside net.IPv4zero")
+	}
+	if v6 := FullRangeV6(); len(v6.StartAddr) == len(net.IPv6zero) && len(net.IPv6zero) != 0 &&
+		&v6.StartAddr[0] == &net.IPv6zero[0] {
+		t.Error("the IPv6 selector is net.IPv6zero itself")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"slices"
 )
 
 // --- Key Exchange payload, RFC 7296 §3.4 ---
@@ -148,14 +149,20 @@ type TrafficSelector struct {
 
 // FullRangeV4 / FullRangeV6 are the 0.0.0.0/0 and ::/0 selectors ranet
 // configures for every child SA (tunnel mode, no per-node subnetting).
+//
+// Both start addresses are copies. net.IPv4zero and net.IPv6zero are single
+// slices shared by everything in the process that names them, and To4 hands
+// back a window into the first rather than a new one, so a caller that wrote
+// through a selector it was given would rewrite what the net package itself
+// compares against.
 func FullRangeV4() TrafficSelector {
 	return TrafficSelector{Type: TS_IPV4_ADDR_RANGE, EndPort: 0xffff,
-		StartAddr: net.IPv4zero.To4(), EndAddr: net.IPv4(255, 255, 255, 255).To4()}
+		StartAddr: slices.Clone(net.IPv4zero.To4()), EndAddr: net.IPv4(255, 255, 255, 255).To4()}
 }
 
 func FullRangeV6() TrafficSelector {
 	return TrafficSelector{Type: TS_IPV6_ADDR_RANGE, EndPort: 0xffff,
-		StartAddr: net.IPv6zero, EndAddr: net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}
+		StartAddr: slices.Clone(net.IPv6zero), EndAddr: net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}
 }
 
 func (ts TrafficSelector) encode() []byte {

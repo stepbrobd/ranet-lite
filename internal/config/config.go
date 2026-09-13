@@ -148,7 +148,12 @@ func (c *Config) KernelAddresses() ([]netip.Prefix, error) {
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind == yaml.ScalarNode && value.Tag == "!!int" && value.Value == "0" {
+	if value.Kind != yaml.ScalarNode {
+		// Value is empty for a mapping or a sequence, so without this the
+		// error is `invalid duration ""` with nothing pointing at the line.
+		return fmt.Errorf("line %d: a duration is a scalar such as 4s, not %s", value.Line, nodeKindName(value.Kind))
+	}
+	if value.Tag == "!!int" && value.Value == "0" {
 		*d = 0
 		return nil
 	}
@@ -158,6 +163,19 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	}
 	*d = Duration(parsed)
 	return nil
+}
+
+func nodeKindName(kind yaml.Kind) string {
+	switch kind {
+	case yaml.MappingNode:
+		return "a mapping"
+	case yaml.SequenceNode:
+		return "a sequence"
+	case yaml.AliasNode:
+		return "an alias"
+	default:
+		return "a document"
+	}
 }
 
 func (c *Config) ReplayWindowSize() uint32 {
@@ -231,8 +249,14 @@ type Peer struct {
 }
 
 type Babel struct {
-	HelloInterval  time.Duration `yaml:"hello_interval"`
-	UpdateInterval time.Duration `yaml:"update_interval"`
+	// Spelled with the same Duration as every other interval in this file.
+	// yaml.v3 decodes a bare time.Duration from a duration string and from
+	// nothing else, so `hello_interval: 0` was a parse error while every other
+	// duration in the file takes zero for "leave the default alone", and one
+	// block disagreed with itself about the spelling. Zero here still means
+	// the speaker's own default.
+	HelloInterval  Duration `yaml:"hello_interval"`
+	UpdateInterval Duration `yaml:"update_interval"`
 	// Link cost, named after the BIRD babel interface options it mirrors: a
 	// fixed rxcost plus up to rtt_cost scaled linearly between rtt_min and
 	// rtt_max. An unset field keeps the speaker's default.
@@ -360,7 +384,8 @@ func (b Babel) SpeakerConfig() babel.Config {
 	if b.RTTMax != nil {
 		cost.RTTMax = time.Duration(*b.RTTMax)
 	}
-	return babel.Config{HelloInterval: b.HelloInterval, UpdateInterval: b.UpdateInterval, Cost: cost}
+	return babel.Config{HelloInterval: time.Duration(b.HelloInterval),
+		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost}
 }
 
 func Load(path string) (*Config, error) {
