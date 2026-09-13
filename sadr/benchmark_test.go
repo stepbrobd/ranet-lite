@@ -55,3 +55,34 @@ func BenchmarkRouteChange(b *testing.B) {
 		table.Set(netip.Prefix{}, prefixes[i%len(prefixes)], i)
 	}
 }
+
+// One packet's classification runs inline on every TUN reader, and the number
+// of source prefixes on one destination is a number a neighbor chooses: babel
+// holds one entry per source and destination pair and nothing makes the
+// destinations distinct, so a single short prefix can carry a neighbor's whole
+// share. The cost of a lookup must not follow that number.
+func BenchmarkLookupBySourceCount(b *testing.B) {
+	dst := netip.MustParsePrefix("fd00::/16")
+	source := netip.MustParseAddr("fd7f:ffff::1")
+	target := netip.MustParseAddr("fd00::1")
+	for _, sources := range []int{1, 64, 1024, 16384} {
+		b.Run(fmt.Sprint(sources), func(b *testing.B) {
+			var table Table[int]
+			for i := range sources {
+				// Distinct /48s under a common /16, none of which contains the
+				// source looked up, plus the match-all entry that answers it.
+				src := netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, 0,
+					byte(i >> 8), byte(i), byte(i >> 16)}), 48)
+				table.Set(src, dst, i+1)
+			}
+			table.Set(netip.Prefix{}, dst, 0)
+			if got, ok := table.Lookup(source, target); !ok || got != 0 {
+				b.Fatalf("the lookup answered %v, %v, so it is not reaching the match-all entry", got, ok)
+			}
+			b.ResetTimer()
+			for b.Loop() {
+				table.Lookup(source, target)
+			}
+		})
+	}
+}
