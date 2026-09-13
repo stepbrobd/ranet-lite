@@ -45,6 +45,14 @@ type Peer struct {
 	// under load, measured; three lost hellos withdraw every route through the
 	// peer and the transfer then has nowhere to go. Control traffic is small
 	// and rare enough that a budget of its own costs a few hundred kilobytes.
+	// queueMu makes closing the queue and inserting into it one decision.
+	// The sender's stop path drains what it holds and returns, so a batch
+	// that lands in the queue after that drain is read by nobody: never
+	// transmitted, never counted, its slot never given back, and its caller
+	// told it succeeded. Testing p.stop before the send cannot close that,
+	// because the drain can happen between the test and the send.
+	queueMu      sync.Mutex
+	queueClosed  bool
 	completed    chan *peerBatch
 	slots        chan struct{}
 	controlSlots chan struct{}
@@ -315,21 +323,21 @@ func (b *peerBatch) enqueue() error {
 		return b.transmit()
 	}
 	b.encrypt()
-	// Checked before the queue, not beside it: p.completed is sized to hold
-	// every batch the two budgets can hand a ticket to, so on a closing peer
-	// both arms of a select are ready and Go picks uniformly. Half of what was
-	// reserved before Close and encrypted after it was therefore reported as
-	// sent, never transmitted, and counted by nothing. Every session teardown
-	// and replacement creates that overlap.
-	select {
-	case <-p.stop:
+	p.queueMu.Lock()
+	if p.queueClosed {
+		p.queueMu.Unlock()
 		return b.abandon()
-	default:
 	}
+	// Never blocks: p.completed holds every batch the two budgets can hand a
+	// ticket to, and every batch that reaches here holds one. The default arm
+	// is therefore unreachable, and giving the batch back is what to do if it
+	// ever is, rather than blocking with queueMu held.
 	select {
 	case p.completed <- b:
+		p.queueMu.Unlock()
 		return nil
-	case <-p.stop:
+	default:
+		p.queueMu.Unlock()
 		return b.abandon()
 	}
 }
@@ -398,6 +406,11 @@ func (b *peerBatch) send() error {
 // order so a caller watching the counter sees what it expects, and drains
 // whatever else is already in the queue behind them.
 func (p *Peer) discardQueued(pending map[uint64]*peerBatch) {
+	// Closed first, so nothing can arrive behind the drain. enqueue takes the
+	// same lock and gives its batch back rather than queueing it.
+	p.queueMu.Lock()
+	p.queueClosed = true
+	p.queueMu.Unlock()
 	for {
 		select {
 		case b := <-p.completed:

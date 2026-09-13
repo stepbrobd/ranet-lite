@@ -501,3 +501,67 @@ func TestATransportFailureIsSaidRarely(t *testing.T) {
 type countingWriter struct{ n *atomic.Int64 }
 
 func (w countingWriter) Write(b []byte) (int, error) { w.n.Add(1); return len(b), nil }
+
+// A batch that lands in the queue after the sender's last drain is read by
+// nobody: never transmitted, never counted, its slot never given back, and its
+// caller told it went. Testing the stop channel before the send cannot close
+// that, because the drain happens between the test and the send, and the queue
+// is sized so its send arm is always ready. Every teardown and every session
+// replacement creates the window.
+//
+// The window is narrow without help: reverting the fix loses about one batch
+// in ninety thousand here and none at all in some runs. Under -race, which is
+// how this suite and the flake check run it, the scheduler widens it enough to
+// lose one every time.
+func TestNoBatchIsLostBetweenTheStopCheckAndTheQueue(t *testing.T) {
+	const teardowns, producers, packets = 2000, 4, 6
+	for range teardowns {
+		var transmitted atomic.Int64
+		peer := NewPeerReserved("peer",
+			func(int) (BatchSealer, error) {
+				return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+					return append(out[:0], raw...), nil
+				}, nil
+			},
+			func(sealed [][]byte) error { transmitted.Add(int64(len(sealed))); return nil })
+
+		var sent atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range producers {
+			wg.Go(func() {
+				<-start
+				for range packets {
+					b := peer.reserveBatchNow(1)
+					if b == nil {
+						continue // the budget was full, which is counted where it happens
+					}
+					b.append([]byte{1}, 0)
+					if err := b.enqueue(); err == nil {
+						sent.Add(1)
+					}
+				}
+			})
+		}
+		close(start)
+		peer.Close()
+		wg.Wait()
+
+		// Counted against what reached the transport, not against what the
+		// caller was told: a lost batch was told it went, so a test that
+		// believes the caller cannot see the loss at all.
+		offered := int64(producers * packets)
+		if got := transmitted.Load() + int64(peer.Dropped()); got != offered {
+			t.Fatalf("%d packets were reserved, %d reached the transport and %d were counted as dropped",
+				offered, transmitted.Load(), peer.Dropped())
+		}
+		// enqueue returning nil promises the queue took the batch, not that it
+		// left: the sender may still give it back, and that is counted above.
+		_ = sent.Load()
+		// And every transmission slot came back, or the next session on this
+		// peer has fewer of them for good.
+		if got := len(peer.slots) + len(peer.controlSlots); got != 0 {
+			t.Fatalf("%d transmission slots were not given back", got)
+		}
+	}
+}
