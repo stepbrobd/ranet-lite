@@ -108,13 +108,36 @@ var ErrSendQueueFull = errors.New("netstack: peer send queue is full")
 // drained, and two such peers would each hold the other's emitter. The caller
 // is told, and gives back whatever the dropped packet had consumed.
 func (p *Peer) SendRawOrDrop(raw []byte, nextHeader byte) error {
+	reserved, err := p.ReserveRawOrDrop(raw, nextHeader)
+	if err != nil {
+		return err
+	}
+	return reserved.Send()
+}
+
+// Reserved is one packet holding its place in a peer's transmission order. A
+// peer sends in the order places were taken, not in the order Send is called.
+type Reserved struct{ batch *peerBatch }
+
+// ReserveRawOrDrop takes the peer's next place for one packet and drops it
+// rather than waiting when no transmission slot is free, exactly as
+// SendRawOrDrop does. It exists for a caller that decides several packets
+// under a lock it cannot hold while sending: taking the places under that lock
+// and sending after releasing it is what keeps two such callers from inverting
+// what they decided. Every reservation has to be sent -- a place taken and
+// never used stalls everything behind it.
+func (p *Peer) ReserveRawOrDrop(raw []byte, nextHeader byte) (*Reserved, error) {
 	b := p.reserveBatchNow(1)
 	if b == nil {
-		return ErrSendQueueFull
+		return nil, ErrSendQueueFull
 	}
 	b.append(raw, nextHeader)
-	return b.enqueue()
+	return &Reserved{batch: b}, nil
 }
+
+// Send hands a reservation to the peer's sender, which emits it once
+// everything reserved ahead of it has gone.
+func (r *Reserved) Send() error { return r.batch.enqueue() }
 
 type peerBatch struct {
 	peer      *Peer

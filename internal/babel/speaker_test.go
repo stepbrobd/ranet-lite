@@ -336,7 +336,9 @@ func TestAcknowledgmentUsesUnicastDestination(t *testing.T) {
 	neighbor := speaker.neighbors[peer.ID]
 	destination := netip.MustParseAddr("fe80::2")
 	neighbor.addr = destination
-	speaker.sendTo(neighbor, destination, []RawTLV{EncodeAck(1)})
+	if reserved := speaker.reserveTo(neighbor, destination, []RawTLV{EncodeAck(1)}); reserved != nil {
+		reserved.Send()
+	}
 	got, ok := netip.AddrFromSlice(sent[24:40])
 	if !ok || got != destination {
 		t.Fatalf("Ack destination = %v, want %v", got, destination)
@@ -673,5 +675,83 @@ func TestUnscheduledHelloDoesNotFlapANeighbor(t *testing.T) {
 	s.handlePacket(neighbor, unscheduled)
 	if !neighbor.isAlive(now) {
 		t.Error("an unscheduled Hello took a live neighbor down")
+	}
+}
+
+// Two goroutines emit: Run, and Receive on the sending peer's own decrypt
+// path. Both decide under s.mu and both have to send after releasing it,
+// because an in-memory transport delivers inline and would otherwise re-enter
+// Receive. Whichever reaches the peer first would then win, so a retraction
+// decided before the update that replaces it can reach the neighbor after it,
+// and the neighbor holds the wrong answer until the next periodic dump.
+func TestTheEmittersCannotInvertWhatTheyDecided(t *testing.T) {
+	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := make(chan uint16, 4)
+	peer := netstack.NewPeerReserved("peer",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func(sealed [][]byte) error {
+			for _, raw := range sealed {
+				tlvs, err := DecodePacket(raw[ipv6HeaderLen+udpHeaderLen:])
+				if err != nil {
+					return err
+				}
+				var decoder PrefixDecoder
+				for _, tlv := range tlvs {
+					if tlv.Type != TLVUpdate {
+						continue
+					}
+					update, err := decoder.Decode(tlv.Body)
+					if err != nil {
+						return err
+					}
+					metrics <- update.Metric
+				}
+			}
+			return nil
+		})
+	defer peer.Close()
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	neighbor := speaker.neighbors[peer.ID]
+	neighbor.addr = netip.MustParseAddr("fe80::2")
+
+	prefix := netip.MustParsePrefix("fd00:1::/64")
+	update := func(metric uint16) []sendAction {
+		return []sendAction{{neighbor: neighbor, dest: neighbor.addr, tlvs: []RawTLV{
+			EncodeRouterID([8]byte{1}),
+			EncodeUpdate(Update{AE: AEIPv6, Plen: prefix.Bits(), Prefix: prefix.Addr().AsSlice(),
+				Interval: 6000, Seqno: 1, Metric: metric}),
+		}}}
+	}
+
+	// The retraction is decided first and sent last, which is the interleaving
+	// the two emitters produce whenever the second one is not descheduled.
+	speaker.mu.Lock()
+	sendRetraction := speaker.emitLocked(update(MetricInfinity))
+	speaker.mu.Unlock()
+	speaker.mu.Lock()
+	sendReplacement := speaker.emitLocked(update(64))
+	speaker.mu.Unlock()
+	sendReplacement()
+	sendRetraction()
+
+	var order []uint16
+	for range 2 {
+		select {
+		case metric := <-metrics:
+			order = append(order, metric)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of the two updates reached the peer", len(order))
+		}
+	}
+	if order[0] != MetricInfinity || order[1] != 64 {
+		t.Fatalf("the neighbor was told %v, so it ends up holding the retraction that was decided first", order)
 	}
 }

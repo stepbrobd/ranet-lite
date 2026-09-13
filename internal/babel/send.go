@@ -24,21 +24,52 @@ type sendAction struct {
 	rollback []func()
 }
 
-func (s *Speaker) sendActions(actions []sendAction) {
-	var undo []func()
+// emitLocked fixes the transmission order of everything the caller decided
+// under s.mu and returns the function that sends it, which runs after the lock
+// is released. It must be called with s.mu held.
+//
+// The split is the point. Two goroutines emit: Run, and Receive on the sending
+// peer's own decrypt path. Both decide under this lock and both have to send
+// after releasing it, because an in-memory transport delivers inline and would
+// re-enter Receive. Taking each packet's place in its peer's transmission
+// order here, rather than at send time, is what keeps the second one from
+// overtaking the first: a retraction decided before the update that replaces
+// it would otherwise reach the neighbor after it, and the neighbor would hold
+// the wrong answer until the next periodic dump.
+//
+// A packet with no transmission slot free is dropped here, and the bookkeeping
+// it consumed is rolled back while the lock is still held.
+func (s *Speaker) emitLocked(actions []sendAction) func() {
+	var packets []*netstack.Reserved
 	for _, action := range coalesce(actions) {
-		if !s.sendBatchesTo(action.neighbor, action.dest, action.tlvs) {
-			undo = append(undo, action.rollback...)
+		reserved, whole := s.reserveBatchesTo(action.neighbor, action.dest, action.tlvs)
+		packets = append(packets, reserved...)
+		if whole {
+			continue
+		}
+		for _, restore := range action.rollback {
+			restore()
 		}
 	}
-	if len(undo) == 0 {
-		return
+	if len(packets) == 0 {
+		return func() {}
 	}
+	return func() {
+		for _, packet := range packets {
+			if err := packet.Send(); err != nil {
+				slog.Warn("babel send failed", "err", err)
+			}
+		}
+	}
+}
+
+// sendActions is emitLocked for a caller that is not holding s.mu, which is
+// every caller outside the two emitters.
+func (s *Speaker) sendActions(actions []sendAction) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, restore := range undo {
-		restore()
-	}
+	send := s.emitLocked(actions)
+	s.mu.Unlock()
+	send()
 }
 
 // coalesce merges the actions aimed at the same neighbor and destination into
@@ -86,9 +117,10 @@ func coalesce(actions []sendAction) []sendAction {
 	return merged
 }
 
-// sendTo reports whether the packet reached the peer's ordered sender.
-func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) bool {
-	// Timestamp just before entering the packet/ESP queues, rather than when
+// reserveTo builds one packet and takes its place in the peer's transmission
+// order, or reports nil when the peer has no slot free.
+func (s *Speaker) reserveTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) *netstack.Reserved {
+	// Timestamp as the packet takes its place in the queue, rather than when
 	// the timer collected actions for potentially many peers.
 	for i, tlv := range tlvs {
 		if tlv.Type == TLVHello {
@@ -100,23 +132,32 @@ func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV
 		}
 	}
 	pkt := buildPacket(s.cfg.LinkLocalAddr, destination, EncodePacket(tlvs))
-	switch err := n.peer.SendRawOrDrop(pkt, esp.NextHeaderIPv6); {
+	reserved, err := n.peer.ReserveRawOrDrop(pkt, esp.NextHeaderIPv6)
+	switch {
 	case errors.Is(err, netstack.ErrSendQueueFull):
 		slog.Warn("babel packet dropped, peer send queue full", "peer", n.peer.ID, "tlvs", len(tlvs))
-		return false
+		return nil
 	case err != nil:
 		slog.Warn("babel send failed", "peer", n.peer.ID, "err", err)
-		return false
+		return nil
 	default:
-		slog.Debug("babel sent packet", "peer", n.peer.ID, "tlvs", len(tlvs), "bytes", len(pkt))
-		return true
+		slog.Debug("babel queued packet", "peer", n.peer.ID, "tlvs", len(tlvs), "bytes", len(pkt))
+		return reserved
 	}
 }
 
-// sendBatchesTo splits tlvs at the configured packet size and reports whether
-// every piece reached the peer's sender.
-func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) bool {
-	delivered := true
+// reserveBatchesTo splits tlvs at the configured packet size and reports the
+// pieces that took a place, and whether every piece did.
+func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) ([]*netstack.Reserved, bool) {
+	var reserved []*netstack.Reserved
+	whole := true
+	take := func(batch []RawTLV) {
+		if packet := s.reserveTo(n, destination, batch); packet != nil {
+			reserved = append(reserved, packet)
+		} else {
+			whole = false
+		}
+	}
 	var batch []RawTLV
 	size := headerLen
 	for i := 0; i < len(tlvs); {
@@ -130,7 +171,7 @@ func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs [
 			groupSize += 2 + len(tlv.Body)
 		}
 		if len(batch) > 0 && size+groupSize > s.cfg.PacketSize {
-			delivered = s.sendTo(n, destination, batch) && delivered
+			take(batch)
 			batch, size = nil, headerLen
 		}
 		batch = append(batch, tlvs[i:end]...)
@@ -138,9 +179,9 @@ func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs [
 		i = end
 	}
 	if len(batch) > 0 {
-		delivered = s.sendTo(n, destination, batch) && delivered
+		take(batch)
 	}
-	return delivered
+	return reserved, whole
 }
 
 // The action builders below require s.mu. They never perform I/O.
@@ -363,9 +404,9 @@ func (s *Speaker) seqnoRequestAction(n *neighborState, key routeKey, routerID [8
 func (s *Speaker) flushUpdates() {
 	now := time.Now()
 	s.mu.Lock()
-	actions := s.updateActions(now)
+	send := s.emitLocked(s.updateActions(now))
 	s.mu.Unlock()
-	s.sendActions(actions)
+	send()
 }
 
 func aeFor(p netip.Prefix) uint8 {

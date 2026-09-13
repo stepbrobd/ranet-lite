@@ -219,10 +219,10 @@ func (s *Speaker) Receive(peer *netstack.Peer, raw []byte) bool {
 		return true // never deliver a retired session's control traffic to TUN
 	}
 	n.addr = src
-	actions := s.handlePacketLocked(n, payload, time.Now())
+	send := s.emitLocked(s.handlePacketLocked(n, payload, time.Now()))
 	s.wake()
 	s.mu.Unlock()
-	s.sendActions(actions)
+	send()
 	return true
 }
 
@@ -396,8 +396,9 @@ func (s *Speaker) Run(ctx context.Context) error {
 				deadline = earlier(deadline, n.ihuExpiry)
 			}
 		}
+		send := s.emitLocked(actions)
 		s.mu.Unlock()
-		s.sendActions(actions)
+		send()
 		timer.Reset(max(0, time.Until(deadline)))
 		select {
 		case <-ctx.Done():

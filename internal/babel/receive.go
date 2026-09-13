@@ -13,10 +13,10 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 		s.mu.Unlock()
 		return
 	}
-	actions := s.handlePacketLocked(n, raw, time.Now())
+	send := s.emitLocked(s.handlePacketLocked(n, raw, time.Now()))
 	s.wake()
 	s.mu.Unlock()
-	s.sendActions(actions)
+	send()
 }
 
 func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time) []sendAction {
