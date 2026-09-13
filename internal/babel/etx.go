@@ -9,11 +9,8 @@ package babel
 // The fleet's BIRD runs "link quality etx" on its tunnel interfaces, so a link
 // dropping packets costs more there and cost nothing here until this existed.
 //
-// One part of Appendix A.1 is deliberately absent. It flushes a neighbor whose
-// histories hold only zeros; this tree reaches the same end through liveness,
-// where a neighbor that misses deadTimeout worth of Hellos goes down and its
-// link cost goes infinite, so a second rule keyed on the same silence would
-// only decide the same thing at a slightly different moment.
+// Appendix A.1's flush is keyed on liveness here rather than on an all-zero
+// vector, and happens in neighborState.forgetLink.
 
 // helloHistory is the 16-bit vector of Appendix A.1, most recent in the low
 // bit, together with the sequence number expected next.

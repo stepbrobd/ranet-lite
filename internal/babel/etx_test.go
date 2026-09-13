@@ -4,6 +4,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
 // The receive half of RFC 8966 Appendix A.1, which decides what the vector
@@ -271,6 +273,124 @@ func TestHelloLossReachesTheCostSelectionUses(t *testing.T) {
 	}
 }
 
+// A link that comes back is judged on the Hellos it has sent since, not on the
+// ones it missed while it was down. See forgetLink for why the receive path
+// cannot notice on its own; without it the link returns costing sixteen times
+// nominal.
+func TestLinkThatComesBackIsNotCostedByItsOutage(t *testing.T) {
+	const interval = time.Second
+	s, _, _ := captureSpeaker(t, Config{HelloInterval: interval})
+	a := addReachablePeer(s, "a", 96)
+	start := time.Now()
+	// The peer numbers its Hellos whether or not they arrive, one per
+	// interval, so the first one after an outage of any length is in sequence.
+	sent := uint16(1)
+	deliver := func() {
+		s.Receive(a, buildPacket(netip.MustParseAddr("fe80::2"), multicastGroup,
+			EncodePacket([]RawTLV{
+				EncodeHello(Hello{Seqno: sent, Interval: 100}),
+				EncodeIHU(IHU{RxCost: 96, Interval: 1000}),
+			})))
+	}
+	for range betaWindow {
+		sent++
+		deliver()
+	}
+	s.mu.Lock()
+	n := s.neighbors[a.ID]
+	healthy := n.linkCost(start, s.cfg.Cost)
+	s.mu.Unlock()
+	if healthy != 96 {
+		t.Fatalf("a link that lost nothing costs %d, want the configured 96", healthy)
+	}
+
+	// A minute of silence, swept the way Run sweeps it, one pass per interval.
+	s.mu.Lock()
+	for elapsed := interval; elapsed <= time.Minute; elapsed += interval {
+		sent++
+		s.sweepExpiredLocked(start.Add(elapsed))
+	}
+	up := n.alive
+	s.mu.Unlock()
+	if up {
+		t.Fatal("a minute of silence left the neighbor up, so this proves nothing")
+	}
+
+	sent++
+	deliver()
+	s.mu.Lock()
+	back := n.linkCost(time.Now(), s.cfg.Cost)
+	s.mu.Unlock()
+	if back != healthy {
+		t.Errorf("the link came back costing %d against %d before the outage", back, healthy)
+	}
+}
+
+// The IHU says what this node knows about receiving from the neighbor, and
+// there are three states rather than two. Never heard from keeps the nominal
+// cost, so a new adjacency forms in one exchange. Heard and still heard reads
+// beta. Heard and gone quiet is infinite, which forgetLink erases the evidence
+// for and which on a one-way link is all that stops the far end selecting a
+// direction that is dead.
+func TestIHUSaysWhatThisNodeHearsFromTheNeighbor(t *testing.T) {
+	const interval = time.Second
+	s, _, _ := captureSpeaker(t, Config{HelloInterval: interval})
+	a := addReachablePeer(s, "a", 96)
+	start := time.Now()
+	rxcost := func(at time.Time) uint16 {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		n := s.neighbors[a.ID]
+		for _, tlv := range s.helloAction(n, at).tlvs {
+			if tlv.Type != TLVIHU {
+				continue
+			}
+			ihu, _, err := DecodeIHU(tlv.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return ihu.RxCost
+		}
+		t.Fatal("the hello action carried no IHU")
+		return 0
+	}
+	if got := rxcost(start); got != 96 {
+		t.Errorf("a neighbor this node hears is advertised %d, want the configured 96", got)
+	}
+
+	s.mu.Lock()
+	for elapsed := interval; elapsed <= time.Minute; elapsed += interval {
+		s.sweepExpiredLocked(start.Add(elapsed))
+	}
+	s.mu.Unlock()
+	if got := rxcost(start.Add(time.Minute)); got != MetricInfinity {
+		t.Errorf("a neighbor gone quiet is advertised %d, so the far end keeps selecting a dead direction", got)
+	}
+
+	fresh, _, _ := captureSpeaker(t, Config{HelloInterval: interval})
+	b := netstack.NewPeer("b", func(raw []byte, _ byte) ([]byte, error) { return raw, nil }, func([]byte) error { return nil })
+	handle := fresh.AddPeer(b)
+	defer func() { handle.Close(); b.Close() }()
+	freshCost := func() uint16 {
+		fresh.mu.Lock()
+		defer fresh.mu.Unlock()
+		for _, tlv := range fresh.helloAction(fresh.neighbors[b.ID], time.Now()).tlvs {
+			if tlv.Type == TLVIHU {
+				ihu, _, err := DecodeIHU(tlv.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return ihu.RxCost
+			}
+		}
+		t.Fatal("the hello action carried no IHU")
+		return 0
+	}
+	if got := freshCost(); got != 96 {
+		t.Errorf("a neighbor never heard from is advertised %d, which costs the adjacency an exchange", got)
+	}
+}
+
 // RFC 8966 section 4.6.5 counts Hellos that were sent. A reservation the peer
 // refuses is a Hello that never reached the wire, so keeping the increment
 // tells the neighbor it lost one nobody transmitted, and with Hello loss now
@@ -291,7 +411,7 @@ func TestRefusedHelloDoesNotSpendASequenceNumber(t *testing.T) {
 	before := n.helloSeqno
 	for range 4 {
 		action := s.helloAction(n, time.Now())
-		for _, restore := range action.rollback {
+		for _, restore := range action.whenRefused {
 			restore()
 		}
 	}

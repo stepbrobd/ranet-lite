@@ -980,8 +980,10 @@ func TestRunRetriesStarvedSeqnoRequest(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
+	// Joined whatever the test does, so a t.Fatal below does not leave Run
+	// holding the speaker this test is still reading.
+	defer func() { cancel(); <-done }()
 	go func() { done <- speaker.Run(ctx) }()
 
 	// Bring the retry forward rather than waiting out its backoff, and clear
@@ -1010,14 +1012,10 @@ func TestRunRetriesStarvedSeqnoRequest(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			cancel()
-			<-done
 			t.Fatal("Run never repeated the seqno request, so a lost one is a permanent black hole")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	cancel()
-	<-done
 }
 
 // A peer chooses how many Seqno Requests to put in one packet, and eighty fit.

@@ -31,6 +31,15 @@ type Config struct {
 
 const maxInterval = 65535 * 10 * time.Millisecond
 
+// WithDefaults is the configuration the speaker runs, every unset field filled
+// in. Two configurations have to be compared through this rather than as they
+// were written: an omitted interval and one spelled out as its own default
+// describe the same speaker.
+func (c Config) WithDefaults() Config {
+	c.setDefaults()
+	return c
+}
+
 func (c *Config) setDefaults() {
 	if c.HelloInterval == 0 {
 		// The RFC 8966 Appendix B default, which is also BIRD's and what the

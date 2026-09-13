@@ -68,10 +68,12 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			}
 			// An unscheduled Hello, which RFC 8966 section 3.4.1 permits a node
 			// to send "for any reason", carries no interval and so promises
-			// nothing about the next one. Marking the neighbor up on one with
-			// no promise outstanding makes it up and immediately down again,
-			// which costs a pair of log lines and a full reselection per Hello.
-			if h.Interval == 0 && n.helloExpiry().IsZero() {
+			// nothing about the next one. Marking the neighbor up while no
+			// scheduled promise is outstanding makes it up and immediately down
+			// again, which costs a pair of log lines and a full reselection per
+			// Hello. A promise that has lapsed is no promise: reading only
+			// whether one was ever made takes every later unscheduled Hello.
+			if h.Interval == 0 && !now.Before(n.helloExpiry()) {
 				continue
 			}
 			if !n.alive {
@@ -84,6 +86,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 					n.unicastHelloTime = now
 					n.unicastHelloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
 				} else {
+					n.heard = true
 					n.lastHelloTime = now
 					n.helloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
 					// Appendix A.1 resets the timer to 1.5 times the advertised
@@ -281,7 +284,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 // since the periodic update carries the same thing.
 func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Time) []sendAction {
 	var tlvs []RawTLV
-	var rollback []func()
+	var rollback []tlvUndo
 	if request.AE == AEWildcard {
 		if !n.lastFullDump.IsZero() && now.Sub(n.lastFullDump) < s.cfg.UpdateInterval {
 			return nil
@@ -292,19 +295,16 @@ func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Ti
 		// refunding it would turn off the limit exactly while this node is too
 		// congested to deliver: every later request would walk the table
 		// again, under the lock that also carries hellos and retractions.
+		// The prefixes are owed back through dumpFor, which is the other half:
+		// the allowance is spent whether or not the answer went out.
 		n.lastFullDump = now
-		for _, key := range s.advertisableKeys() {
-			advertised, undo := s.advertiseTo(n, key, false, now)
-			tlvs = append(tlvs, advertised...)
-			if undo != nil {
-				rollback = append(rollback, undo)
-			}
-		}
+		tlvs, rollback = s.dumpFor(n, s.advertisableKeys(), now)
 	} else {
-		advertised, undo := s.advertiseTo(n, routeKey{source: request.SourcePrefix, dest: request.Prefix}, true, now)
+		key := routeKey{source: request.SourcePrefix, dest: request.Prefix}
+		advertised, spent := s.advertiseTo(n, key, true, now)
 		tlvs = advertised
-		if undo != nil {
-			rollback = append(rollback, undo)
+		if len(tlvs) > 0 {
+			rollback = []tlvUndo{{key: key, spent: spent}}
 		}
 	}
 	if len(tlvs) == 0 {
@@ -333,16 +333,16 @@ func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Ti
 				s.routes.dirty[origin] = struct{}{}
 			}
 		}
-		advertised, undo := s.advertiseTo(n, key, true, now)
-		return sendTLVs(n, advertised, undo)
+		advertised, spent := s.advertiseTo(n, key, true, now)
+		return sendTLVs(n, key, advertised, spent)
 	}
 	if entry := s.routes.entries[key]; entry != nil {
 		// Split horizon keeps us from answering the neighbor we learned the
 		// route from; forwarding the request onwards is the useful reply.
 		if sel := entry.selected; sel.neighbor != nil && sel.neighbor != n &&
 			(sel.routerID != request.RouterID || !seqnoGT(request.Seqno, sel.seqno)) {
-			advertised, undo := s.advertiseTo(n, key, true, now)
-			return sendTLVs(n, advertised, undo)
+			advertised, spent := s.advertiseTo(n, key, true, now)
+			return sendTLVs(n, key, advertised, spent)
 		}
 	}
 	if request.RouterID == s.cfg.RouterID || request.HopCount < 2 {
@@ -390,15 +390,12 @@ func (s *Speaker) forwardTarget(key routeKey, from *neighborState) *neighborStat
 	return unfeasible
 }
 
-func sendTLVs(n *neighborState, tlvs []RawTLV, rollback func()) []sendAction {
+func sendTLVs(n *neighborState, key routeKey, tlvs []RawTLV, spent bool) []sendAction {
 	if len(tlvs) == 0 {
 		return nil
 	}
-	action := sendAction{neighbor: n, dest: n.destination(), priority: priorityRequest, tlvs: tlvs}
-	if rollback != nil {
-		action.rollback = []func(){rollback}
-	}
-	return []sendAction{action}
+	return []sendAction{{neighbor: n, dest: n.destination(), priority: priorityRequest,
+		tlvs: tlvs, rollback: []tlvUndo{{key: key, spent: spent}}}}
 }
 
 const rttTimestampHorizon = 3 * time.Minute

@@ -26,6 +26,11 @@ type neighborState struct {
 	// whatever quality its last Hello gave it until the neighbor expires.
 	multicastHistory helloHistory
 	nextHelloDue     time.Time
+	// heard is whether a scheduled Hello has ever arrived from this neighbor.
+	// forgetLink clears the history and the promise, so it is the only thing
+	// left that tells a neighbor gone quiet from one never heard from, and the
+	// IHU says different things about the two.
+	heard bool
 
 	// RFC 9616 timestamps: echo their latest Hello in our IHU. Their reply
 	// may refer to an older local Hello, so local transmit history is unneeded.
@@ -104,6 +109,20 @@ func (n *neighborState) helloExpiry() time.Time {
 
 func (n *neighborState) isAlive(now time.Time) bool {
 	return n.alive && now.Before(n.helloExpiry())
+}
+
+// forgetLink drops what this node learned about a neighbor's Hello stream, the
+// flush of RFC 8966 Appendix A.1. It runs when liveness declares the neighbor
+// down, because the timer half advanced the expected seqno in lockstep with
+// the peer's counter: the first Hello back is in sequence, so the reboot reset
+// on the receive path never fires and the link returns costed by its outage.
+// It clears the scheduled promise too, so a later unscheduled Hello reads as
+// the promiseless packet it is rather than as one still covered.
+func (n *neighborState) forgetLink() {
+	n.multicastHistory = helloHistory{}
+	n.nextHelloDue = time.Time{}
+	n.lastHelloTime, n.helloInterval = time.Time{}, 0
+	n.unicastHelloTime, n.unicastHelloInterval = time.Time{}, 0
 }
 
 // linkCost is C(A,B) of RFC 8966 section 3.4.3, the cost this node puts on the

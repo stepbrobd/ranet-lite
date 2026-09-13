@@ -32,18 +32,70 @@ const (
 	priorityDump
 )
 
+// tlvUndo gives back what one group of an action's TLVs consumed: the prefix
+// the group advertised, and whether that advertisement spent the record of the
+// neighbor having been told about it, which only a retraction does. firstTLV
+// must be the group's first index and the list must stay in ascending order of
+// it: reserveBatchesTo never splits a group across packets, so an undo then
+// belongs to exactly one packet, and takeUndos walks the list once.
+//
+// It carries the prefix rather than a closure over it because a dump builds
+// one per prefix, sixteen thousand at maxRouteKeys, and a closure each is an
+// allocation each under the lock the whole protocol runs on.
+type tlvUndo struct {
+	firstTLV int
+	key      routeKey
+	spent    bool
+}
+
 type sendAction struct {
 	neighbor *neighborState
 	dest     netip.Addr
 	priority sendPriority
 	tlvs     []RawTLV
-	// rollback undoes the bookkeeping this packet consumed, and runs only if
-	// the packet was dropped. Recording has to happen while the actions are
-	// built, so that two requests in one packet do not each draw a full dump,
-	// but a record consumed by a packet that never left is a record nothing
-	// will redo: a dropped retraction takes the prefix out of every later
-	// dump as well, and the neighbor black-holes it until its own expiry.
-	rollback []func()
+	// rollback undoes what the TLVs consumed, per packet: a record spent by a
+	// packet that never left is one nothing will redo, and a whole action
+	// rolled back for one refused packet re-owes a table the neighbor is
+	// already receiving. See oweAgain and takeUndos.
+	rollback []tlvUndo
+	// whenRefused runs for the whole action when no packet reached the
+	// transport and the retry will send the same bytes again. A Hello's
+	// sequence number belongs here rather than in rollback: one lost in the
+	// syscall was spent, and giving it back repeats a number to the peer.
+	whenRefused []func()
+}
+
+// lostUndo is one undo waiting for the next pass, with the neighbor it belongs
+// to: the sender reports on its own goroutine, where the speaker's state is
+// not this goroutine's to touch.
+type lostUndo struct {
+	neighbor *neighborState
+	undo     tlvUndo
+}
+
+// reservedPacket is one packet holding a place in its peer's transmission
+// order, with the neighbor it is for and the undos of the TLVs it carries.
+// They outlive the reservation because the transport answers later, see
+// netstack.Place.OnFailure.
+type reservedPacket struct {
+	place    *netstack.Place
+	neighbor *neighborState
+	undo     []tlvUndo
+}
+
+// takeUndos splits off the undos of the TLVs in [from, to) and returns the
+// rest. Rescanning from the front for each packet is quadratic in the dump,
+// 4.2 ms of it at maxRouteKeys prefixes, under the lock the whole protocol
+// runs on.
+func takeUndos(rollback []tlvUndo, from, to int) ([]tlvUndo, []tlvUndo) {
+	for len(rollback) > 0 && rollback[0].firstTLV < from {
+		rollback = rollback[1:]
+	}
+	end := 0
+	for end < len(rollback) && rollback[end].firstTLV < to {
+		end++
+	}
+	return rollback[:end], rollback[end:]
 }
 
 // emitLocked fixes the transmission order of everything the caller decided
@@ -60,9 +112,12 @@ type sendAction struct {
 // next periodic dump.
 //
 // A packet with no transmission slot free is dropped here, and the bookkeeping
-// it consumed is rolled back while the lock is still held.
+// it consumed is rolled back while the lock is still held. One that takes a
+// slot and is then lost in the transport is given back on a later pass
+// instead, because that answer arrives on the sender's own goroutine. See
+// noteLost.
 func (s *Speaker) emitLocked(actions []sendAction) func() {
-	var packets []*netstack.Place
+	var packets []reservedPacket
 	// Ordered by what a pass can afford to lose, least first. Sorting on the
 	// destination instead put the Hello behind every request of the pass,
 	// because a Hello is multicast too and coalesce had merged it into the
@@ -74,13 +129,16 @@ func (s *Speaker) emitLocked(actions []sendAction) func() {
 	})
 	refused := false
 	for _, action := range merged {
-		reserved, whole := s.reserveBatchesTo(action.neighbor, action.dest, action.tlvs)
+		reserved, lost, whole := s.reserveBatchesTo(action)
 		packets = append(packets, reserved...)
+		for _, undo := range lost {
+			s.oweAgain(action.neighbor, undo)
+		}
 		if whole {
 			continue
 		}
 		refused = true
-		for _, restore := range action.rollback {
+		for _, restore := range action.whenRefused {
 			restore()
 		}
 	}
@@ -94,10 +152,60 @@ func (s *Speaker) emitLocked(actions []sendAction) func() {
 	}
 	return func() {
 		for _, packet := range packets {
-			if err := packet.Send(); err != nil {
+			// Registered before the send, because the sender may finish with
+			// the packet inside Send on a peer that transmits synchronously.
+			packet.place.OnFailure(s.noteLost(packet.neighbor, packet.undo))
+			if err := packet.place.Send(); err != nil {
 				slog.Warn("babel send failed", "err", err)
 			}
 		}
+	}
+}
+
+// noteLost is the completion signal for one packet, or nil when the packet
+// carries no bookkeeping to give back. It runs on the peer's sender goroutine,
+// so it takes no speaker lock.
+//
+// The wake is spaced like the retry a refused reservation schedules, and for
+// the same reason. A peer whose transport keeps failing after the reservation
+// succeeded closes a loop with nothing in it to wait on: give the work back,
+// rebuild it, reserve it, lose it, wake, as fast as the syscall returns.
+// Measured at 40,000 passes a second, each a reselection of the whole table
+// under the lock every neighbor's receive path needs.
+func (s *Speaker) noteLost(n *neighborState, undo []tlvUndo) func(error) {
+	if len(undo) == 0 {
+		return nil
+	}
+	return func(err error) {
+		now := time.Now()
+		s.lostMu.Lock()
+		for _, entry := range undo {
+			s.lost = append(s.lost, lostUndo{neighbor: n, undo: entry})
+		}
+		soon := now.Sub(s.lostWoke) < s.sendRetryInterval()
+		if !soon {
+			s.lostWoke = now
+		}
+		s.lostMu.Unlock()
+		slog.Debug("babel packet lost after it was queued", "err", err)
+		if !soon {
+			s.wake()
+		}
+	}
+}
+
+// applyLostLocked gives back the bookkeeping of every packet a peer's sender
+// lost since the last pass. Without it a retraction that reached the transport
+// and no further leaves the prefix out of n.advertised, so every later dump
+// skips it and the neighbor keeps routing through a next hop that has
+// withdrawn it. It must be called with s.mu held.
+func (s *Speaker) applyLostLocked() {
+	s.lostMu.Lock()
+	lost := s.lost
+	s.lost = nil
+	s.lostMu.Unlock()
+	for _, entry := range lost {
+		s.oweAgain(entry.neighbor, entry.undo)
 	}
 }
 
@@ -138,13 +246,21 @@ func coalesce(actions []sendAction) []sendAction {
 			// into. Copying on every merge instead would make a neighbor loss
 			// that starves a thousand prefixes quadratic in the number of
 			// prefixes, which is the case this function exists for.
-			merged[i].tlvs = append(slices.Clone(merged[i].tlvs), action.tlvs...)
-			merged[i].rollback = append(slices.Clone(merged[i].rollback), action.rollback...)
+			merged[i].rollback = slices.Clone(merged[i].rollback)
+			merged[i].tlvs = slices.Clone(merged[i].tlvs)
+			merged[i].whenRefused = slices.Clone(merged[i].whenRefused)
 			owned[i] = true
-			continue
+		}
+		// Renumbered onto the end of what is already there, in place: a
+		// neighbor loss that starves a thousand prefixes merges a thousand
+		// actions, and a fresh slice for each one is a thousand allocations.
+		offset := len(merged[i].tlvs)
+		for _, entry := range action.rollback {
+			entry.firstTLV += offset
+			merged[i].rollback = append(merged[i].rollback, entry)
 		}
 		merged[i].tlvs = append(merged[i].tlvs, action.tlvs...)
-		merged[i].rollback = append(merged[i].rollback, action.rollback...)
+		merged[i].whenRefused = append(merged[i].whenRefused, action.whenRefused...)
 	}
 	return merged
 }
@@ -178,17 +294,24 @@ func (s *Speaker) reserveTo(n *neighborState, destination netip.Addr, tlvs []Raw
 	}
 }
 
-// reserveBatchesTo splits tlvs at the configured packet size and reports the
-// pieces that took a place, and whether every piece did.
-func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) ([]*netstack.Place, bool) {
-	var reserved []*netstack.Place
+// reserveBatchesTo splits an action at the configured packet size and takes a
+// place for each piece. It reports the pieces that took one, the undos of the
+// pieces that did not, and whether every piece did.
+func (s *Speaker) reserveBatchesTo(action sendAction) ([]reservedPacket, []tlvUndo, bool) {
+	tlvs := action.tlvs
+	var reserved []reservedPacket
+	var lost []tlvUndo
 	whole := true
-	take := func(batch []RawTLV) {
-		if packet := s.reserveTo(n, destination, batch); packet != nil {
-			reserved = append(reserved, packet)
-		} else {
-			whole = false
+	pending := action.rollback
+	take := func(batch []RawTLV, from, to int) {
+		var undo []tlvUndo
+		undo, pending = takeUndos(pending, from, to)
+		if place := s.reserveTo(action.neighbor, action.dest, batch); place != nil {
+			reserved = append(reserved, reservedPacket{place: place, neighbor: action.neighbor, undo: undo})
+			return
 		}
+		lost = append(lost, undo...)
+		whole = false
 	}
 	var batch []RawTLV
 	size := headerLen
@@ -203,6 +326,7 @@ func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlv
 	// packet at the default size, the figure routeReply uses for the same TLV.
 	// Cleared with the batch, because the state does not cross the boundary.
 	var inEffect []byte
+	batchFrom := 0
 	encoded := func(group []RawTLV) int {
 		n := 0
 		for _, tlv := range group {
@@ -225,8 +349,8 @@ func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlv
 		}
 		groupSize := encoded(trimmed)
 		if len(batch) > 0 && size+groupSize > s.cfg.PacketSize {
-			take(batch)
-			batch, size, inEffect = nil, headerLen, nil
+			take(batch, batchFrom, i)
+			batch, size, inEffect, batchFrom = nil, headerLen, nil, i
 			trimmed, groupSize = group, encoded(group)
 		}
 		if group[0].Type == TLVRouterID {
@@ -237,9 +361,9 @@ func (s *Speaker) reserveBatchesTo(n *neighborState, destination netip.Addr, tlv
 		i = end
 	}
 	if len(batch) > 0 {
-		take(batch)
+		take(batch, batchFrom, len(tlvs))
 	}
-	return reserved, whole
+	return reserved, lost, whole
 }
 
 // The action builders below require s.mu. They never perform I/O.
@@ -247,14 +371,25 @@ func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 	centis := uint16(s.cfg.HelloInterval / (10 * time.Millisecond))
 	n.sentHello = true
 	n.helloSeqno++
-	ihu := IHU{RxCost: s.cfg.Cost.rxCost(&n.multicastHistory), Interval: centis}
+	// The rxcost is the only thing that tells the far end about the direction
+	// this node receives on, so a neighbor this node once heard and no longer
+	// does is told so. forgetLink discards the history that would have said it
+	// through beta, and on a link that works one way the far end otherwise
+	// keeps selecting routes through a direction that is dead. A neighbor never
+	// heard from is a different thing and keeps the nominal cost, so a new
+	// adjacency forms in one exchange rather than two.
+	rxcost := s.cfg.Cost.rxCost(&n.multicastHistory)
+	if n.heard && !n.isAlive(now) {
+		rxcost = MetricInfinity
+	}
+	ihu := IHU{RxCost: rxcost, Interval: centis}
 	if n.haveTheirHello {
 		ihu.OriginTS, ihu.ReceiveTS, ihu.HasTS = n.theirHelloTxTS, n.theirHelloRxTS, true
 	}
 	return sendAction{neighbor: n, dest: multicastGroup, priority: priorityHello, tlvs: []RawTLV{
 		EncodeHello(Hello{Seqno: n.helloSeqno, Interval: centis, HasTS: true}),
 		EncodeIHU(ihu),
-	}, rollback: []func(){func() {
+	}, whenRefused: []func(){func() {
 		// The seqno is given back. RFC 8966 section 4.6.5 counts Hellos that
 		// were sent, and a refused reservation is one that never reached the
 		// wire, so keeping the increment tells the neighbor it lost a Hello
@@ -308,10 +443,10 @@ func (s *Speaker) advertisementFor(key routeKey) (advertisement, *neighborState,
 // feasibility distance of RFC 8966 section 3.7.3 an upper bound on what the
 // mesh has been told. force answers a route request, which must produce a
 // retraction even for a prefix we know nothing about (section 3.8.1.1).
-// advertiseTo returns the TLVs for one prefix and, separately, how to undo the
-// bookkeeping it just consumed if the packet is dropped. See
-// sendAction.rollback.
-func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now time.Time) ([]RawTLV, func()) {
+// advertiseTo returns the TLVs for one prefix and whether building them spent
+// the record of this neighbor having been told the prefix is reachable, which
+// a packet that never leaves has to give back. See sendAction.rollback.
+func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now time.Time) ([]RawTLV, bool) {
 	adv, nextHop, known := s.advertisementFor(key)
 	if !known {
 		adv = advertisement{routerID: s.cfg.RouterID, seqno: s.originSeqno, metric: MetricInfinity}
@@ -324,11 +459,11 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 		// its expiry timer.
 		adv.metric = MetricInfinity
 	}
-	var rollback func()
+	spent := false
 	if adv.metric == MetricInfinity {
 		_, sent := n.advertised[key]
 		if !sent && !force {
-			return nil, nil
+			return nil, false
 		}
 		// Only what was actually spent is given back. A forced retraction for
 		// a prefix this node never advertised consumes nothing, and rolling
@@ -339,7 +474,7 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 		// phantoms back in, so it never drains.
 		if sent {
 			delete(n.advertised, key)
-			rollback = func() { n.advertised[key] = struct{}{} }
+			spent = true
 		}
 	} else {
 		// observe records the feasibility distance this advertisement commits
@@ -350,7 +485,7 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 		s.routes.observe(key, adv, s.selectedPeer(key), now)
 		n.advertised[key] = struct{}{}
 	}
-	return updateTLVs(key, adv, s.cfg.UpdateInterval), rollback
+	return updateTLVs(key, adv, s.cfg.UpdateInterval), spent
 }
 
 // selectedPeer names the neighbor whose route this node has chosen for a
@@ -423,44 +558,55 @@ func (s *Speaker) updateActionsFor(keys []routeKey, now time.Time) []sendAction 
 	}
 	actions := make([]sendAction, 0, len(s.neighbors))
 	for _, n := range s.neighbors {
-		var tlvs []RawTLV
-		var rollback []func()
-		for _, key := range keys {
-			advertised, undo := s.advertiseTo(n, key, false, now)
-			tlvs = append(tlvs, advertised...)
-			if undo != nil {
-				rollback = append(rollback, undo)
-			}
-		}
+		tlvs, rollback := s.dumpFor(n, keys, now)
 		if len(tlvs) > 0 {
-			// A dump that cannot be sent has to leave the neighbor owing what
-			// it was going to say. updateActions drains the triggered queue
-			// and clears every owed set before building, on the grounds that
-			// the dump supersedes them, so without this a refused dump takes
-			// the record of the work with it: the retry noteSendRetryLocked
-			// schedules then builds nothing, and a peer that joined during a
-			// congested moment black-holes everything this node originates
-			// until the next periodic dump, which is an update interval away
-			// and may be minutes.
-			//
-			// Restored onto this neighbor and nowhere else. Recording a
-			// speaker-wide pending dump as well would make pendingWorkLocked
-			// true for as long as the one peer stays stuck, which reopens the
-			// per-packet wake that function exists to close, and it would hold
-			// Run in the updateActions branch so each of those wakes rebuilt
-			// the whole dump for every healthy neighbor too. triggeredActions
-			// picks these keys up from n.owed on the retry noteSendRetryLocked
-			// schedules, and sends them to this neighbor alone.
-			owed := slices.Clone(keys)
-			rollback = append(rollback, func() {
-				for _, key := range owed {
-					n.owed[key] = struct{}{}
-				}
-			})
 			actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, priority: priorityDump, tlvs: tlvs, rollback: rollback})
 		}
 	}
 	return actions
+}
+
+// dumpFor builds the advertisements for one neighbor and the undo of each,
+// keyed to the TLVs it produced. updateActions clears every owed set before
+// building, on the grounds that the dump supersedes them, so a packet that
+// cannot be sent has to leave the neighbor owing what it was carrying.
+func (s *Speaker) dumpFor(n *neighborState, keys []routeKey, now time.Time) ([]RawTLV, []tlvUndo) {
+	tlvs := make([]RawTLV, 0, 2*len(keys))
+	rollback := make([]tlvUndo, 0, len(keys))
+	for _, key := range keys {
+		advertised, spent := s.advertiseTo(n, key, false, now)
+		if len(advertised) == 0 {
+			continue
+		}
+		rollback = append(rollback, tlvUndo{firstTLV: len(tlvs), key: key, spent: spent})
+		tlvs = append(tlvs, advertised...)
+	}
+	return tlvs, rollback
+}
+
+// oweAgain gives back what one prefix's advertisement consumed and leaves this
+// neighbor, and no other, owing it. Recording a speaker-wide pending dump
+// instead would make pendingWorkLocked true for as long as the one peer stays
+// stuck, which reopens the per-packet wake that function exists to close.
+// triggeredActions picks the key up on the retry noteSendRetryLocked
+// schedules and sends it to this neighbor alone.
+//
+// A key nothing would rebuild is not owed. A Route Request may name any
+// prefix, and the retry builds nothing for one this node has no route to, does
+// not originate and has never told this neighbor about, so owing it grows a
+// set neighborState.owed says is bounded by the route table. The last of the
+// three is the retraction case, where the prefix has left both tables and the
+// only reason to speak is that the neighbor was told it was reachable.
+func (s *Speaker) oweAgain(n *neighborState, undo tlvUndo) {
+	if undo.spent {
+		n.advertised[undo.key] = struct{}{}
+	}
+	_, known := s.routes.entries[undo.key]
+	_, local := s.originate[undo.key]
+	_, told := n.advertised[undo.key]
+	if known || local || told {
+		n.owed[undo.key] = struct{}{}
+	}
 }
 
 // updateActions is the periodic full dump of RFC 8966 section 3.7.1. It
@@ -494,31 +640,16 @@ func (s *Speaker) triggeredActions(now time.Time) []sendAction {
 		}
 		keys := slices.Collect(maps.Keys(n.owed))
 		clear(n.owed)
-		var tlvs []RawTLV
-		var rollback []func()
-		for _, key := range keys {
-			advertised, undo := s.advertiseTo(n, key, false, now)
-			tlvs = append(tlvs, advertised...)
-			if undo != nil {
-				rollback = append(rollback, undo)
-			}
-		}
-		if len(tlvs) == 0 {
-			continue
-		}
 		// "Whenever it changes the selected router-id for a given destination,
 		// a node MUST send an update as an urgent TLV", section 3.7.2, and
 		// takeDirty has already consumed the record that one is owed. A
-		// dropped packet without this leaves the change to the next periodic
-		// dump, which is sixteen seconds at the defaults and four expiries at
-		// a neighbor that has lost the prefix. Only this neighbor's copy goes
-		// back, so one congested peer does not make the speaker repeat the
-		// update to every healthy one on every wake.
-		rollback = append(rollback, func() {
-			for _, key := range keys {
-				n.owed[key] = struct{}{}
-			}
-		})
+		// dropped packet without dumpFor's re-owe leaves the change to the
+		// next periodic dump, which is sixteen seconds at the defaults and
+		// four expiries at a neighbor that has lost the prefix.
+		tlvs, rollback := s.dumpFor(n, keys, now)
+		if len(tlvs) == 0 {
+			continue
+		}
 		actions = append(actions, sendAction{neighbor: n, dest: multicastGroup, priority: priorityDump, tlvs: tlvs, rollback: rollback})
 	}
 	return actions

@@ -690,6 +690,21 @@ func TestUnscheduledHelloDoesNotFlapANeighbor(t *testing.T) {
 	if !neighbor.isAlive(now) {
 		t.Error("an unscheduled Hello took a live neighbor down")
 	}
+
+	// A promise that has lapsed is no promise, and neither is one the sweep
+	// has already forgotten. The two guards close the same window from either
+	// side, so this holds the pair rather than the receive path alone:
+	// reverting both revives the neighbor on every later unscheduled Hello,
+	// one pair of log lines and one reselection of every prefix it holds.
+	lapsed := now.Add(deadTimeout(neighbor.helloInterval) + time.Second)
+	s.mu.Lock()
+	s.sweepExpiredLocked(lapsed)
+	s.emitLocked(s.handlePacketLocked(neighbor, unscheduled, lapsed))
+	alive := neighbor.alive
+	s.mu.Unlock()
+	if alive {
+		t.Error("an unscheduled Hello revived a neighbor whose scheduled deadline had lapsed")
+	}
 }
 
 // Two goroutines emit: Run, and Receive on the sending peer's own decrypt
@@ -965,6 +980,15 @@ func TestDroppedDumpDoesNotRefundTheRateLimit(t *testing.T) {
 	if charged.IsZero() {
 		t.Fatal("the allowance was given back when the packets were dropped, so the next request walks the whole table again")
 	}
+	// The other half of the same rule. The allowance is spent, so the neighbor
+	// cannot ask again inside the window, and nothing but n.owed will make the
+	// speaker rebuild what it could not send.
+	speaker.mu.Lock()
+	owed := len(neighbor.owed)
+	speaker.mu.Unlock()
+	if owed == 0 {
+		t.Error("a refused answer to a route request owes the neighbor nothing, so the prefixes wait for the next periodic dump")
+	}
 
 	// The second request falls inside the window and has to be refused, even
 	// though nothing the first one produced reached the neighbor.
@@ -973,6 +997,206 @@ func TestDroppedDumpDoesNotRefundTheRateLimit(t *testing.T) {
 	speaker.mu.Unlock()
 	if len(again) != 0 {
 		t.Error("a second wildcard request drew another whole dump, so the rate limit is off while congested")
+	}
+}
+
+// A retraction lost after its place was taken has already come out of
+// n.advertised, and advertiseTo keeps a retraction out of every later dump for
+// a prefix the neighbor was never told about, so the neighbor keeps routing
+// through a next hop that has withdrawn it. See netstack.Place.OnFailure.
+func TestRetractionLostInTheTransportIsAdvertisedAgain(t *testing.T) {
+	dest := netip.MustParsePrefix("fd00::/64")
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	speaker.Originate(dest)
+	speaker.flushUpdates()
+	speaker.mu.Lock()
+	_, told := neighbor.advertised[routeKey{dest: dest}]
+	speaker.mu.Unlock()
+	if !told {
+		t.Fatal("the neighbor was never told about the prefix, so this proves nothing")
+	}
+
+	// The peer takes the packet and then loses it in the syscall.
+	failing := netstack.NewPeerReserved("failing",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return errors.New("sendto: network is unreachable") })
+	defer failing.Close()
+	speaker.mu.Lock()
+	neighbor.peer = failing
+	speaker.mu.Unlock()
+	speaker.SetOriginated(nil)
+	speaker.flushUpdates()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		speaker.mu.Lock()
+		speaker.applyLostLocked()
+		_, again := neighbor.advertised[routeKey{dest: dest}]
+		speaker.mu.Unlock()
+		if again {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a retraction lost in the transport left the prefix out of every later dump")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// addPeer registers a peer with the speaker and closes both halves with the
+// test. NewPeerReserved starts a sender goroutine and AddPeer returns the
+// handle that removes the neighbor, so taking .state off the call and
+// discarding the rest parks one sender per call for the life of the binary.
+func addPeer(t *testing.T, s *Speaker, peer *netstack.Peer) *neighborState {
+	t.Helper()
+	handle := s.AddPeer(peer)
+	t.Cleanup(func() { handle.Close(); peer.Close() })
+	return handle.state
+}
+
+// refusingPeer fails every reservation, the way a peer whose Child SA the
+// other end deleted does.
+func refusingPeer(id string) *netstack.Peer {
+	return netstack.NewPeerReserved(id,
+		func(int) (netstack.BatchSealer, error) { return nil, errors.New("no child sa") },
+		func([][]byte) error { return nil })
+}
+
+// A prefix this node stops originating has left both of its tables, and the
+// only reason to speak about it is that the neighbor was told it was
+// reachable. A refused retraction for one has to leave the neighbor owing it
+// like any other, or the retry builds nothing and the neighbor keeps
+// forwarding to a prefix this node has dropped until the next periodic dump.
+func TestRefusedRetractionOfADroppedPrefixIsStillOwed(t *testing.T) {
+	dest := netip.MustParsePrefix("fd00:dead::/64")
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	makeNeighborReachable(neighbor)
+	speaker.Originate(dest)
+	speaker.flushUpdates()
+	speaker.mu.Lock()
+	_, told := neighbor.advertised[routeKey{dest: dest}]
+	speaker.mu.Unlock()
+	if !told {
+		t.Fatal("the neighbor was never told about the prefix, so this proves nothing")
+	}
+
+	peer := refusingPeer("refusing")
+	defer peer.Close()
+	speaker.mu.Lock()
+	neighbor.peer = peer
+	speaker.mu.Unlock()
+	speaker.SetOriginated(nil)
+	speaker.flushUpdates()
+
+	speaker.mu.Lock()
+	_, owed := neighbor.owed[routeKey{dest: dest}]
+	speaker.mu.Unlock()
+	if !owed {
+		t.Error("a refused retraction for a dropped prefix owes the neighbor nothing, so the retry rebuilds nothing")
+	}
+}
+
+// A peer whose transport keeps failing after the reservation succeeded closes
+// a loop with nothing in it to wait on: the pass gives the work back, rebuilds
+// it, reserves it, loses it and wakes. Measured at 40,000 passes a second
+// before the wake was spaced like the retry a refused reservation schedules.
+func TestLostPacketsDoNotWakeTheLoopPerPacket(t *testing.T) {
+	// One prefix per packet or two, so eight of them lose several packets
+	// rather than one, and a long hello interval so the retry interval the
+	// wake is spaced by is a second rather than a millisecond.
+	speaker, neighbor, _ := captureSpeaker(t, Config{PacketSize: 63, HelloInterval: 4 * time.Second})
+	makeNeighborReachable(neighbor)
+	losing := netstack.NewPeerReserved("losing",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return errors.New("sendto: network is unreachable") })
+	defer losing.Close()
+	speaker.mu.Lock()
+	neighbor.peer = losing
+	speaker.mu.Unlock()
+	for i := range 8 {
+		speaker.Originate(netip.MustParsePrefix(fmt.Sprintf("fd00:1%x::/64", i)))
+	}
+
+	lost := func() (int, time.Time) {
+		speaker.lostMu.Lock()
+		defer speaker.lostMu.Unlock()
+		return len(speaker.lost), speaker.lostWoke
+	}
+	speaker.flushUpdates()
+	deadline := time.Now().Add(2 * time.Second)
+	var first time.Time
+	for {
+		count, woke := lost()
+		if count > 0 && first.IsZero() {
+			first = woke
+		}
+		if count >= 4 {
+			if !woke.Equal(first) {
+				t.Errorf("%d lost packets inside one retry interval woke the loop more than once", count)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the transport lost %d undos, so this proves nothing", count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// partialPeer accepts the first accept reservations and refuses every one
+// after that, which is a dump that goes out in part. A peer whose control
+// budget is merely full refuses from the first packet, so nothing covers the
+// case where the earlier packets are on their way.
+func partialPeer(id string, accept int) *netstack.Peer {
+	taken := 0
+	return netstack.NewPeerReserved(id,
+		func(int) (netstack.BatchSealer, error) {
+			taken++
+			if taken > accept {
+				return nil, errors.New("no child sa")
+			}
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { return nil })
+}
+
+// A dump that placed all but its last packets has to leave the neighbor owing
+// the prefixes it could not say, and only those. Re-owing the whole dump sends
+// the speaker back over every prefix on the retry, under the lock that also
+// carries every neighbor's receive path, for as long as the peer stays
+// congested, and the neighbor is already receiving what it re-owes.
+func TestPartlyRefusedDumpOwesOnlyWhatItLost(t *testing.T) {
+	const prefixes, accept = 8, 1
+	// The smallest packet the speaker takes, so eight prefixes need several.
+	speaker, neighbor, _ := captureSpeaker(t, Config{PacketSize: 63})
+	makeNeighborReachable(neighbor)
+	for i := range prefixes {
+		speaker.Originate(netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i)))
+	}
+	peer := partialPeer("partial", accept)
+	defer peer.Close()
+	speaker.mu.Lock()
+	neighbor.peer = peer
+	clear(neighbor.owed)
+	send := speaker.emitLocked(speaker.updateActions(time.Now()))
+	owed := len(neighbor.owed)
+	speaker.mu.Unlock()
+	send()
+
+	if owed == 0 || owed >= prefixes {
+		t.Errorf("a dump that placed %d packet of %d prefixes left %d owed, want what the refused packets carried",
+			accept, prefixes, owed)
 	}
 }
 
@@ -1724,9 +1948,7 @@ func TestStarveRetryDeadlineIsNeverLate(t *testing.T) {
 func TestCongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
 	speaker, healthy, _ := captureSpeaker(t, Config{})
 	makeNeighborReachable(healthy)
-	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
-		func(int) (netstack.BatchSealer, error) { return nil, errors.New("no child sa") },
-		func([][]byte) error { return nil })).state
+	stuck := addPeer(t, speaker, refusingPeer("stuck"))
 	stuck.addr = netip.MustParseAddr("fe80::3")
 	makeNeighborReachable(stuck)
 
@@ -2139,7 +2361,7 @@ func TestRefusedDumpIsStillOwed(t *testing.T) {
 	speaker.Originate(netip.MustParsePrefix("fd00:2::/64"))
 
 	refuse := true
-	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
+	stuck := addPeer(t, speaker, netstack.NewPeerReserved("stuck",
 		func(int) (netstack.BatchSealer, error) {
 			if refuse {
 				return nil, errors.New("no child sa")
@@ -2148,7 +2370,7 @@ func TestRefusedDumpIsStillOwed(t *testing.T) {
 				return append(out[:0], raw...), nil
 			}, nil
 		},
-		func([][]byte) error { return nil })).state
+		func([][]byte) error { return nil }))
 	stuck.addr = netip.MustParseAddr("fe80::3")
 	makeNeighborReachable(stuck)
 
@@ -2206,9 +2428,7 @@ func TestCongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
 	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
 	speaker, healthy, packets := captureSpeaker(t, long)
 	makeNeighborReachable(healthy)
-	stuck := speaker.AddPeer(netstack.NewPeerReserved("stuck",
-		func(int) (netstack.BatchSealer, error) { return nil, errors.New("no child sa") },
-		func([][]byte) error { return nil })).state
+	stuck := addPeer(t, speaker, refusingPeer("stuck"))
 	stuck.addr = netip.MustParseAddr("fe80::3")
 	makeNeighborReachable(stuck)
 	speaker.Originate(netip.MustParsePrefix("fd00:16::/64"))

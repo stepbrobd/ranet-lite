@@ -85,8 +85,8 @@ const (
 // bounds it, and every entry is walked under s.mu on each wake of the run
 // loop. Without the share one neighbor fills the table from the ordinary route
 // acquisition path, and RFC 8966 section 3.8.2.1's "repeat such a request a
-// small number of times" then stops happening for every other neighbor, which
-// is exactly what covers a lost request or a lost reply.
+// small number of times" then stops happening for every other neighbor, so a
+// lost request or a lost reply is never covered.
 const (
 	maxStarveRetries            = 1 << 12
 	maxStarveRetriesPerNeighbor = 1 << 10
@@ -160,6 +160,14 @@ type Speaker struct {
 	routeChanges int
 	routeLogged  time.Time
 	changed      chan struct{}
+
+	// lost holds the undos of packets a peer's sender queued and then could
+	// not transmit. The sender reports them from its own goroutine, so they
+	// are collected under a lock of their own and applied by the next pass
+	// rather than taken straight into the protocol state. See noteLost.
+	lostMu   sync.Mutex
+	lost     []lostUndo
+	lostWoke time.Time
 	// nextHello and nextUpdate are the run loop's own timers, and sleepUntil
 	// is the deadline it is currently waiting on. They are loop state kept on
 	// the Speaker rather than in Run so the receive path can tell whether an
@@ -495,7 +503,14 @@ func (s *Speaker) pendingWorkLocked() bool {
 // accepts, a fifty millisecond floor put the first retry after the remote had
 // already declared this node dead.
 func (s *Speaker) noteSendRetryLocked(now time.Time) {
-	s.retryAt = earlier(s.retryAt, now.Add(max(s.cfg.HelloInterval/4, time.Millisecond)))
+	s.retryAt = earlier(s.retryAt, now.Add(s.sendRetryInterval()))
+}
+
+// sendRetryInterval is how long a pass waits before trying again what it could
+// not send. Read from cfg, which New settles and nothing writes afterwards, so
+// the sender goroutine may ask too.
+func (s *Speaker) sendRetryInterval() time.Duration {
+	return max(s.cfg.HelloInterval/4, time.Millisecond)
 }
 
 // deadlineLocked is when the run loop next has to do something on its own,
@@ -550,6 +565,7 @@ func (s *Speaker) Run(ctx context.Context) error {
 		// recent attempt rather than an old one.
 		s.retryAt = time.Time{}
 		s.passes++
+		s.applyLostLocked()
 		s.sweepExpiredLocked(now)
 		var actions []sendAction
 		helloDue := !now.Before(s.nextHello)
@@ -653,6 +669,7 @@ func (s *Speaker) sweepExpiredLocked(now time.Time) {
 		if n.alive && !n.isAlive(now) {
 			slog.Info("babel neighbor down", "peer", n.peer.ID)
 			n.alive, n.haveReportedCost = false, false
+			n.forgetLink()
 		}
 		if n.haveReportedCost && !now.Before(n.ihuExpiry) {
 			n.haveReportedCost = false
