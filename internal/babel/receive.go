@@ -138,6 +138,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			// Update TLVs even if it is otherwise ignored due to an unknown
 			// mandatory sub-TLV", so the state follows the address rather than
 			// the decision to ignore.
+			//
 			// Matched on the encoding, which is the address family section
 			// 4.6.9 pairs an Update with. See DecodeNextHop.
 			if _, ae, _, err := DecodeNextHop(t.Body); err == nil && ae == AEIPv4 {

@@ -278,13 +278,17 @@ func TestNextHopRoundTrip(t *testing.T) {
 		t.Errorf("the ignored TLV gave back %v, want the next hop %v it still sets", got, addr)
 	}
 
-	// A sub-TLV region that cannot be parsed at all is not that case. The
-	// section extends the parser state to a TLV that was read and then set
-	// aside, not to one that could not be read, and taking a next hop from a
-	// malformed TLV would let one bypass the rule in section 4.6.9.
+	// A sub-TLV region that cannot be parsed at all is one of those other
+	// reasons, so it is an ignore rather than a failure: section 4.5 makes the
+	// parser state "identical across implementations" only if every
+	// implementation updates it before looking at the sub-TLVs at all.
 	malformed := append(append([]byte(nil), tlv.Body...), 0x01, 0x04)
-	if _, _, ignore, err := DecodeNextHop(malformed); err == nil || ignore {
+	got, _, ignore, err = DecodeNextHop(malformed)
+	if err != nil || !ignore {
 		t.Errorf("a malformed sub-TLV region reported ignore=%v err=%v", ignore, err)
+	}
+	if !got.Equal(addr) {
+		t.Errorf("the ignored TLV gave back %v, want the next hop %v it still sets", got, addr)
 	}
 }
 
