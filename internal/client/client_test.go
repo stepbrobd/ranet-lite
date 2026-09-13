@@ -154,6 +154,52 @@ func TestStartupSkipsAPeerNoLocalFamilyCanDial(t *testing.T) {
 	}
 }
 
+// The fleet's BIRD exports only its own directly connected routes, so a node
+// hears about a prefix from the node that originates it or not at all. Dialing
+// a few exits and relying on transit reaches those exits and nothing behind
+// them, which is why ranet dials every node in the registry and why this has
+// to as well. Measured on a leaf: sixteen peers reached five of eleven mesh
+// addresses, the whole registry reached eleven of eleven.
+func TestFullMeshDialsEveryNodeTheRegistryNames(t *testing.T) {
+	cfg, _, reg := runtimeFixture(t)
+	reg[0].Nodes = append(reg[0].Nodes, registry.Node{
+		CommonName: "other",
+		Endpoints:  []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Port: 13000}},
+	})
+	reg = append(reg, registry.Organization{
+		Organization: "elsewhere", PublicKey: reg[0].PublicKey,
+		Nodes: []registry.Node{{CommonName: "far", Endpoints: []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Port: 13000}}}},
+	})
+
+	if got := effectivePeers(cfg, reg); len(got) != 1 || got[0].CommonName != "gateway" {
+		t.Fatalf("without full_mesh the peers list is not honored: %v", got)
+	}
+
+	// The configured entry stays, and stays first, because it can pin a
+	// serial_number that a generated entry cannot. Generating a second one for
+	// the same node would dial both of its endpoints.
+	cfg.FullMesh = true
+	got := effectivePeers(cfg, reg)
+	var names []string
+	for _, peer := range got {
+		names = append(names, peer.Organization+"/"+peer.CommonName)
+	}
+	want := []string{"example/gateway", "example/other", "elsewhere/far"}
+	if !slices.Equal(names, want) {
+		t.Errorf("full_mesh dials %v, want %v", names, want)
+	}
+	if got[0].SerialNumber != "1" {
+		t.Errorf("the configured entry lost its pinned serial, got %q", got[0].SerialNumber)
+	}
+	// Every organization, not only this node's own: the registry is the trust
+	// root for the whole community and ranet dials all of it.
+	for _, peer := range got {
+		if peer.Organization == cfg.Organization && peer.CommonName == cfg.CommonName {
+			t.Error("full_mesh dialed this node itself")
+		}
+	}
+}
+
 func TestValidateESPTunnelPayload(t *testing.T) {
 	ipv4 := make([]byte, 20)
 	ipv4[0], ipv4[3] = 0x45, 20

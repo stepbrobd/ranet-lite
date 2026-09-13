@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/registry"
@@ -57,6 +58,37 @@ func validateLocalConfig(cfg *config.Config, privateKey ed25519.PrivateKey, reg 
 	return localFamilies, nil
 }
 
+// effectivePeers is who this node dials: the configured list, or every node
+// the registry names when full_mesh is set, which is the N-to-N reconciliation
+// ranet does, with the configured entries kept ahead of the generated ones.
+// This node itself is never in it. Registry order is kept, so the same pair of
+// files produces the same order on every start.
+func effectivePeers(cfg *config.Config, reg registry.Registry) []config.Peer {
+	if !cfg.FullMesh {
+		return cfg.Peers
+	}
+	named := make(map[string]struct{}, len(cfg.Peers))
+	for _, peer := range cfg.Peers {
+		named[peer.Organization+"\x00"+peer.CommonName] = struct{}{}
+	}
+	peers := slices.Clone(cfg.Peers)
+	for _, org := range reg {
+		for _, node := range org.Nodes {
+			if org.Organization == cfg.Organization && node.CommonName == cfg.CommonName {
+				continue
+			}
+			// An explicit entry wins for its node: it can pin a
+			// serial_number, and a generated one names none, so generating a
+			// second entry for the same node would dial both endpoints.
+			if _, ok := named[org.Organization+"\x00"+node.CommonName]; ok {
+				continue
+			}
+			peers = append(peers, config.Peer{Organization: org.Organization, CommonName: node.CommonName})
+		}
+	}
+	return peers
+}
+
 // validatePeers reports one error per peer the registry cannot support, split
 // into what a startup refuses and what it only logs. They are returned rather
 // than raised because a reload treats both as advisory, see Reload.
@@ -69,7 +101,7 @@ func validateLocalConfig(cfg *config.Config, privateKey ed25519.PrivateKey, reg 
 // whose named endpoint is missing or of the wrong family, stays fatal: each of
 // those is somebody having written the wrong thing down.
 func validatePeers(cfg *config.Config, reg registry.Registry, localFamilies map[string]struct{}) (refuse, skip []error) {
-	for _, peer := range cfg.Peers {
+	for _, peer := range effectivePeers(cfg, reg) {
 		_, node, ok := reg.FindNode(peer.Organization, peer.CommonName)
 		if !ok {
 			refuse = append(refuse, fmt.Errorf("config: peer node %q not found in organization %q", peer.CommonName, peer.Organization))

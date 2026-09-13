@@ -34,15 +34,21 @@ func peerPath(peer config.Peer, local config.Endpoint) string {
 // leaving the mesh costs one dialer rather than a restart, which would drop
 // every SA on this node.
 func (c *Client) syncPeers() {
-	cfg := c.config()
-	wanted := make(map[string]struct{}, len(cfg.Endpoints)*len(cfg.Peers))
 	c.dialersMu.Lock()
 	defer c.dialersMu.Unlock()
+	// Read inside the lock. Two calls can be in flight, since Run makes one at
+	// startup and every SIGHUP makes another, and a set computed before the
+	// lock is a set that may already be stale when it is installed: the later
+	// caller would then cancel every dialer the earlier one started and
+	// nothing would run again to correct it.
+	cfg := c.config()
+	peers := effectivePeers(cfg, c.registry())
+	wanted := make(map[string]struct{}, len(cfg.Endpoints)*len(peers))
 	if c.stopped || c.ctx.Err() != nil {
 		return
 	}
 	for _, local := range cfg.Endpoints {
-		for _, peer := range cfg.Peers {
+		for _, peer := range peers {
 			path := peerPath(peer, local)
 			wanted[path] = struct{}{}
 			if _, running := c.dialers[path]; running {
@@ -136,7 +142,7 @@ func (c *Client) Reload(path string) error {
 	for _, organization := range reg {
 		nodes += len(organization.Nodes)
 	}
-	log.Printf("reloaded %s: %d peers, %d nodes in the registry", path, len(cfg.Peers), nodes)
+	log.Printf("reloaded %s: %d peers, %d nodes in the registry", path, len(effectivePeers(cfg, reg)), nodes)
 	return nil
 }
 

@@ -53,6 +53,15 @@ type Config struct {
 	// A full mesh needs it on, since every node both dials and answers.
 	Responder bool `yaml:"responder"`
 
+	// FullMesh dials every node the registry names, the N-to-N reconciliation
+	// ranet performs. Reach on this fleet needs it: the BIRD side exports only
+	// its own directly connected routes, so a node learns a prefix from the
+	// node originating it or not at all, and dialing a few exits reaches those
+	// exits and nothing behind them. Peers still apply, and an entry there
+	// wins for its node, which is the only way to pin a serial_number since a
+	// generated peer names none.
+	FullMesh bool `yaml:"full_mesh"`
+
 	// FWMark is set with SO_MARK on the one UDP socket carrying IKE and ESP,
 	// linux only, so a policy rule can keep the underlay in a table of the
 	// operator's choosing. Needed on a node whose mesh address is the only
@@ -447,10 +456,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: private_key is required")
 	case c.Registry == "":
 		return fmt.Errorf("config: registry is required")
-	case len(c.Peers) == 0 && !c.Responder:
+	case len(c.Peers) == 0 && !c.Responder && !c.FullMesh:
 		// A responder needs no peers: it answers whoever the registry knows.
 		// Without one, a node with neither would do nothing at all.
-		return fmt.Errorf("config: at least one peer is required unless responder is set")
+		return fmt.Errorf("config: at least one peer is required unless responder or full_mesh is set")
 	case c.ReplayWindow != nil && *c.ReplayWindow > 1<<20:
 		return fmt.Errorf("config: replay_window must not exceed %d", uint32(1<<20))
 	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
