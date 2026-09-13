@@ -380,12 +380,13 @@ func (b *peerBatch) transmit() error {
 		if err := b.enqueue(); err != nil {
 			return err
 		}
-		select {
-		case err := <-b.done:
-			return err
-		case <-p.stop:
-			return fmt.Errorf("netstack: peer %s closed", p.ID)
-		}
+		// Waited for on the answer alone. Every batch that carries done is
+		// answered exactly once: the sender answers what it transmits, and
+		// discardQueued answers what it gives back, and those are the only two
+		// readers of the queue. Racing that against p.stop made a batch the
+		// transport had already taken report "closed" whenever the close won
+		// the pick, which is about half the time once both are ready.
+		return <-b.done
 	}
 
 	p.sendMu.Lock()

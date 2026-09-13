@@ -45,6 +45,11 @@ type neighborState struct {
 	measuredRTT      time.Duration
 	haveRTT          bool
 	// rttExpiry is when a measurement that stopped arriving stops being used.
+	// It takes the value of ihuExpiry, but only on an IHU that carried a
+	// usable sample, so the two part company as soon as a neighbor keeps
+	// sending IHUs without timestamps. deadlineLocked carries both for that
+	// reason.
+	//
 	// The RFC 9616 timestamps are read off a wall clock, so a step makes
 	// validTimestampGap reject every sample from then on, and without this the
 	// neighbor would keep the last cost it computed for the life of the

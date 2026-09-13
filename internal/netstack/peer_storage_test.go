@@ -634,3 +634,50 @@ func TestACompatibilityPeerCountsWhatItLoses(t *testing.T) {
 		t.Errorf("it counted %d as lost by the transport, which took everything it was given", got)
 	}
 }
+
+// Once the peer is closing, both arms of transmit's select are ready and Go
+// picks uniformly, so a batch the sender had already transmitted was reported
+// as closed about half the time. The sender always answers a batch that
+// carries done, so a finished answer is the one to take.
+func TestTransmitPrefersTheAnswerOverTheStopSignal(t *testing.T) {
+	for range 200 {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		peer := NewPeerReserved("peer",
+			func(int) (BatchSealer, error) {
+				return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+					return append(out[:0], raw...), nil
+				}, nil
+			},
+			func([][]byte) error {
+				once.Do(func() { close(entered) })
+				<-release
+				return nil
+			})
+
+		b := peer.reserveBatchNow(1)
+		if b == nil {
+			t.Fatal("the peer refused a reservation while it was open")
+		}
+		b.append([]byte{1}, 0)
+		done := make(chan error, 1)
+		go func() { done <- b.transmit() }()
+
+		// The transport has the batch, so the answer is about to arrive.
+		<-entered
+		// Closed directly rather than through Close, which would wait on the
+		// sender this test has parked inside the transport.
+		close(peer.stop)
+		close(release)
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("transmit reported %v for a batch the transport took", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("transmit never returned")
+		}
+		<-peer.senderDone
+	}
+}

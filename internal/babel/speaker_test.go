@@ -2295,3 +2295,31 @@ func TestTheSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
 		t.Errorf("the retry allows %d attempts before the remote gives up, want several", attempts)
 	}
 }
+
+// rttExpiry follows ihuExpiry only on an IHU that carried a usable timestamp
+// pair, so a neighbor that keeps sending IHUs without them advances one and
+// not the other. Without a deadline term of its own the sweep that drops the
+// stale measurement waits for whatever pass comes next, which at the hello
+// interval Validate accepts is minutes, and the advertised rxcost keeps
+// following a measurement that has already expired.
+func TestAStaleRTTHasADeadlineOfItsOwn(t *testing.T) {
+	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
+	speaker, neighbor, _ := captureSpeaker(t, long)
+	makeNeighborReachable(neighbor)
+	now := time.Now()
+	speaker.mu.Lock()
+	defer speaker.mu.Unlock()
+	speaker.nextHello, speaker.nextUpdate = now.Add(time.Hour), now.Add(time.Hour)
+	speaker.retryAt, speaker.nextStarveRetry, speaker.nextRequestSweep = time.Time{}, time.Time{}, time.Time{}
+
+	// An IHU carried a sample, and later ones did not, so the RTT expires
+	// before the IHU does.
+	neighbor.haveRTT, neighbor.measuredRTT = true, 5*time.Millisecond
+	neighbor.rttExpiry = now.Add(time.Minute)
+	neighbor.haveReportedCost, neighbor.ihuExpiry = true, now.Add(time.Hour)
+	neighbor.alive, neighbor.lastHelloTime, neighbor.helloInterval = true, now, time.Hour
+
+	if got := speaker.deadlineLocked(); !got.Equal(neighbor.rttExpiry) {
+		t.Errorf("the deadline is %v, want the RTT expiry at %v that nothing else carries", got, neighbor.rttExpiry)
+	}
+}
