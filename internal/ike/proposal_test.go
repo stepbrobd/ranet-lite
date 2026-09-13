@@ -2,6 +2,8 @@ package ike
 
 import (
 	"encoding/binary"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -111,5 +113,41 @@ func TestSupportsIdentitySignatureHash(t *testing.T) {
 	}
 	if ok, err := supportsSignatureHash(nil, HashIdentity); err != nil || ok {
 		t.Fatalf("missing notification = %v, %v", ok, err)
+	}
+}
+
+// A rekey has to converge on one Diffie-Hellman group when both ends propose
+// at once, and it does that by ranking candidates the same way at both ends:
+// by this node's own offer order, which is identical on every node running
+// this code. A ranking that did not follow the offer would make two nodes
+// prefer different groups and neither exchange would complete.
+func TestIKEGroupPreferenceFollowsTheOfferOrder(t *testing.T) {
+	var groups []uint16
+	for _, transform := range ikeProposal().Transforms {
+		if transform.Type == TransDH {
+			groups = append(groups, transform.ID)
+		}
+	}
+	if len(groups) < 2 {
+		t.Fatalf("only %d groups are offered, so there is no order to follow", len(groups))
+	}
+	for i, group := range groups {
+		if got := ikeGroupPreference(group); got != i {
+			t.Errorf("group %d ranks %d, want %d, its place in what we offer", group, got, i)
+		}
+	}
+	// Anything we do not offer ranks behind everything we do, so a group we
+	// cannot generate is never the one picked.
+	if got, last := ikeGroupPreference(1), ikeGroupPreference(groups[len(groups)-1]); got <= last {
+		t.Errorf("a group we do not offer ranks %d, ahead of or level with our last at %d", got, last)
+	}
+}
+
+// The error is what tells the peer which group to come back with, so it has to
+// name it.
+func TestInvalidKEErrorNamesTheGroup(t *testing.T) {
+	message := (&invalidKEError{group: DH_CURVE25519}).Error()
+	if !strings.Contains(message, strconv.Itoa(int(DH_CURVE25519))) {
+		t.Errorf("the error reads %q and does not name group %d", message, DH_CURVE25519)
 	}
 }

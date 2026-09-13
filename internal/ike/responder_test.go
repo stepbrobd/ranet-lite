@@ -83,7 +83,28 @@ func (h *responderHarness) dial(t *testing.T) (*Session, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return InitiateContext(ctx, PeerConfig{
+	return InitiateContext(ctx, h.peerConfig())
+}
+
+// Initiate is the blocking form, and the one the package documents its whole
+// profile on. Nothing in this repository calls it, so without this it is
+// reached by nothing at all and could stop compiling to the same thing.
+func TestInitiateIsInitiateContextWithNoDeadline(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	session, err := Initiate(h.peerConfig())
+	if err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	defer session.Mux().Close()
+	responder := <-h.sessions
+	defer responder.Mux().Close()
+	if accepted := <-h.identities; accepted.Peer.CommonName != "client" {
+		t.Fatalf("the responder accepted %q", accepted.Peer.CommonName)
+	}
+}
+
+func (h *responderHarness) peerConfig() PeerConfig {
+	return PeerConfig{
 		Organization:     "testorg",
 		LocalCommonName:  "client",
 		LocalSerial:      "2",
@@ -94,7 +115,7 @@ func (h *responderHarness) dial(t *testing.T) (*Session, error) {
 		RemoteAddr:       net.ParseIP("127.0.0.1"),
 		RemotePort:       h.remotePort,
 		Hub:              h.initiator,
-	})
+	}
 }
 
 // Two ranet-lite nodes could never reach each other before the responder
