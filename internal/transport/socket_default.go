@@ -37,9 +37,9 @@ func openPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint
 		// Refused rather than ignored: a mark this platform cannot set is a
 		// rule somewhere that will never match, and the configuration that
 		// asked for it was written to keep the underlay out of the overlay.
-		// darwin has no fwmark and does not need one, because an announced
-		// default is installed interface-scoped there and an unbound socket
-		// never sees it.
+		// darwin reaches the same end through interface scope on the routes
+		// the reconciler installs, which scopeRoute in internal/kernel
+		// decides.
 		return nil, nil, 0, errors.New("fwmark is a linux facility and is set on no other platform")
 	}
 	b := &portableBind{conn.NewStdNetBind()}

@@ -67,8 +67,11 @@ kernel picks it, a `from <mesh address>` policy rule sends the datagram to the
 mesh table, and an exit-announced default there routes the ESP underlay into the
 tun that is carrying it. `SO_MARK` plus a rule of your own keeps it out. This
 package writes no policy rules, so the rule belongs with the ones the deployment
-already owns. darwin needs none: an announced default is installed
-interface-scoped there, so an unbound socket never sees it.
+already owns. darwin needs none: the reconciler installs a route
+interface-scoped when it is a default or when it covers one of the registry's
+endpoint addresses, and an unbound socket never sees a scoped route. A hostname
+endpoint is not covered, because resolving one is a network call and the scope
+decision is made once per reconcile pass.
 
 A leaf should set `babel.no_transit`, which advertises only the prefixes this
 node originates and never relays one it learned. Redistribution serves a
@@ -202,8 +205,8 @@ a full mesh needs every node to answer as well as dial. It is off unless
 `responder` is set. Identities are compared by name rather than by their DER
 bytes: ranet writes `O` and `CN` as `UTF8String` while strongSwan picks the
 string type from the value, so one name legitimately reaches the wire in two
-encodings. AUTH signs the bytes as received either way, so the name is only what
-selects which key must verify it.
+encodings. AUTH signs the bytes as received either way, so the name only selects
+which key must verify it.
 
 IKE rekeys retain the negotiated PRF. This avoids differing key expansion
 behavior between
@@ -445,17 +448,28 @@ originated, so a node joining or leaving the mesh costs one dialer instead of
 dropping every SA this node is carrying. ranet's own `ExecReload` works the same
 way, and it matters because the registry is rewritten every time any node joins.
 
-What a reload changes is which peers this node dials, not which sessions it is
-already carrying. On a node with `responder` set, a peer removed from both
-`peers:` and the registry keeps the session it opened until one side goes: the
-dialer for it stops, and nothing evicts a session that is still answering. That
-is deliberate. The registry is rewritten on every join, so evicting on absence
-would mean a node that read it mid-write dropped every peer at once, which is a
-worse failure than carrying one peer too long. Restart the node to be rid of it.
+A reload also decides which sessions stay. The registry is the trust root a
+handshake is checked against, so a node taken out of it stops being carried:
+every session whose authenticated peer the new registry no longer names is
+closed, and the line naming it says so. A registry read mid-write fails to parse
+rather than arriving empty, so the sweep never runs against half a file.
+
+A session this node dialed also ends when its dialer does, and taking the peer
+out of `peers:` stops that dialer. One the peer opened against this node's
+`responder` survives, because nothing was dialing it.
+
+Revocation tests whether the organization still names the node and its key still
+parses, not which endpoint the peer asserted. Renumbering a serial is a registry
+edit rather than a revocation, and a node whose own endpoints were renumbered
+has done nothing to lose the session it is carrying.
 
 Everything else is refused rather than applied, because a reload cannot reach
 it. Identity, port, TUN device and local endpoints each change what peers have
-already authenticated or what the dataplane is attached to. The `babel` block is
+already authenticated or what the dataplane is attached to. So does the private
+key. It is read once at startup and the responder holds its own copy, so a
+reload re-reads the file only to compare: a rotation is refused by name whether
+it moved the path or rewrote the file in place, rather than reported as applied
+while the node keeps signing with the key it started on. The `babel` block is
 built into the speaker once, apart from the prefixes it originates, which a
 reload does apply. The `kernel` block, including the addresses
 `assign_originated` expands into, is read once at startup. The rekey and replay
