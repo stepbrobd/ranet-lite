@@ -50,16 +50,33 @@ type trieNode[V comparable] struct {
 	// and nothing makes the destinations distinct, so one short prefix can
 	// carry the lot -- and that walk is inline on every TUN reader. This makes
 	// it one masked map lookup per distinct length, which the address width
-	// bounds at 129 however many entries there are. Measured per lookup, with
-	// every entry on one destination and the answer the match-all one, before
-	// and after: 10.7 ns and 13.4 ns at one source, 84 us and 13.4 ns at
-	// 16384. The edit path pays for the maps, 357 ns and 452 ns per route
-	// change, which is a route install against a packet. See
-	// BenchmarkLookupBySourceCount and BenchmarkRouteChange.
-	byLen   []srcIndex[V]
-	anySrc  V
-	haveAny bool
-	child   [2]*trieNode[V]
+	// bounds at 129 per destination node however many entries there are; a
+	// packet pays that at every node on its path, not once.
+	//
+	// Measured per lookup on one node with every entry on one destination and
+	// the answer the match-all one, scanning against indexed: 9.6 ns at one
+	// source, 68 us against 13.6 ns at 16384 all at one length. indexSrcs
+	// declines to build one where it would not pay, which is the other half of
+	// the trade.
+	//
+	// Those are one node. A packet pays at every node on its path, and the
+	// path is as deep as the destination prefixes a neighbor announces, so the
+	// figure a forwarding decision actually costs is the product: 16.7 ns at
+	// one node holding 448 sources at one length, 510 ns down a chain of 32
+	// such nodes, and 1.7 us and 54 us for the same two with those 448 spread
+	// over 112 lengths. The last is a shape a neighbor can build with the
+	// source prefix sub-TLV of RFC 9079, and 54 us inline on the TUN reader is
+	// about 18,000 forwarding decisions a second on one core. Bounding it
+	// needs a different structure for the sources rather than a better
+	// threshold, so it is measured here rather than claimed away. See
+	// BenchmarkLookupBySourceCount, BenchmarkLookupByDistinctLengths,
+	// BenchmarkLookupDownADestinationChain, BenchmarkRouteChangeOnOneDestination
+	// and BenchmarkFillOneDestination.
+	byLen     []srcIndex[V]
+	indexOnce sync.Once
+	anySrc    V
+	haveAny   bool
+	child     [2]*trieNode[V]
 }
 
 // srcIndex is every source prefix of one length at one destination node.
@@ -68,25 +85,58 @@ type srcIndex[V comparable] struct {
 	m    map[netip.Prefix]V
 }
 
+// indexThreshold is how many sources one length has to carry, on average,
+// before maps beat scanning them. A map probe is about twice what
+// Prefix.Contains costs, so an index over lengths that carry one prefix each
+// is slower than the ordered scan it replaces -- measured at 471 ns against
+// about 1.2 us for 128 sources at 128 distinct lengths -- and it is the edit
+// path that pays to build it.
+const indexThreshold = 4
+
 // indexSrcs derives byLen and anySrc. srcs is ordered longest first, so the
-// groups come out in the same order and the first that answers is the longest
-// match.
-func indexSrcs[V comparable](srcs []srcEntry[V]) ([]srcIndex[V], V, bool) {
-	var byLen []srcIndex[V]
-	var anySrc V
-	haveAny := false
-	for _, entry := range srcs {
+// runs of one length are contiguous, the groups come out in the same order,
+// and the first that answers is the longest match.
+//
+// It returns no index at all when one would not pay: few sources, or many
+// spread thinly over many lengths, which is the shape where the scan wins on
+// both the lookup and the rebuild. Lookup falls back to the ordered scan, so
+// the answer is the same either way.
+func indexSrcs[V comparable](srcs []srcEntry[V]) []srcIndex[V] {
+	specific := 0
+	runs := 0
+	for i, entry := range srcs {
 		if !entry.src.IsValid() {
-			anySrc, haveAny = entry.value, true
 			continue
 		}
-		bits := uint8(entry.src.Bits())
-		if len(byLen) == 0 || byLen[len(byLen)-1].bits != bits {
-			byLen = append(byLen, srcIndex[V]{bits: bits, m: make(map[netip.Prefix]V, 1)})
+		specific++
+		if i == 0 || srcs[i-1].src.Bits() != entry.src.Bits() {
+			runs++
 		}
-		byLen[len(byLen)-1].m[entry.src] = entry.value
 	}
-	return byLen, anySrc, haveAny
+	if runs == 0 || specific < runs*indexThreshold {
+		return nil
+	}
+	// Sized per run rather than grown from one, which is what made a rebuild
+	// walk log2(n) growth rounds for every length it held.
+	byLen := make([]srcIndex[V], 0, runs)
+	for i := 0; i < len(srcs); {
+		if !srcs[i].src.IsValid() {
+			i++
+			continue
+		}
+		bits := srcs[i].src.Bits()
+		end := i
+		for end < len(srcs) && srcs[end].src.IsValid() && srcs[end].src.Bits() == bits {
+			end++
+		}
+		group := srcIndex[V]{bits: uint8(bits), m: make(map[netip.Prefix]V, end-i)}
+		for _, entry := range srcs[i:end] {
+			group.m[entry.src] = entry.value
+		}
+		byLen = append(byLen, group)
+		i = end
+	}
+	return byLen
 }
 
 // Route is one canonical source/destination entry. An invalid Source matches
@@ -108,12 +158,53 @@ func newTrieNode[V comparable](address [16]byte, prefixLen uint8, srcs []srcEntr
 	return n
 }
 
-// setSrcs replaces a node's sources and the index derived from them. Nodes are
-// copied rather than mutated once published, so this only ever runs on a node
-// the caller still owns.
+// setSrcs replaces a node's sources and the match-all entry derived from them.
+// Nodes are copied rather than mutated once published, so this only ever runs
+// on a node the caller still owns.
+//
+// The per-length index is deliberately not built here. Building it on every
+// edit made filling one destination quadratic in map operations rather than in
+// the slice copies the copy-on-write discipline already costs: each Set
+// rebuilt every map from scratch, so n sources cost n rebuilds of up to n
+// entries, measured at 267 ms and about a gigabyte of allocator traffic for
+// 4096 sources on one destination, all of it under the babel speaker lock.
+// The index is worth its cost to a lookup and nothing to an edit, so index
+// builds it on the first lookup that needs it instead.
 func (n *trieNode[V]) setSrcs(srcs []srcEntry[V]) {
 	n.srcs = srcs
-	n.byLen, n.anySrc, n.haveAny = indexSrcs(srcs)
+	n.anySrc, n.haveAny = matchAllSource(srcs)
+}
+
+// index is the per-length index, built once. A node is immutable from the
+// moment it is published, so one build serves every lookup that ever reads it,
+// and sync.Once makes concurrent readers agree on which build that is.
+func (n *trieNode[V]) index() []srcIndex[V] {
+	n.indexOnce.Do(func() { n.byLen = indexSrcs(n.srcs) })
+	return n.byLen
+}
+
+// matchAllSource finds the entry whose source matches every address. srcs is
+// ordered longest first and an invalid source has Bits() -1, so it is last,
+// but the scan does not depend on that.
+func matchAllSource[V comparable](srcs []srcEntry[V]) (anySrc V, haveAny bool) {
+	for _, entry := range srcs {
+		if !entry.src.IsValid() {
+			return entry.value, true
+		}
+	}
+	return anySrc, haveAny
+}
+
+// clone is a copy of the node with a fresh index. A plain value copy would
+// carry the sync.Once with it, which vet refuses and which would leave the
+// copy sharing the original's decision about whether the index is built.
+func (n *trieNode[V]) clone() *trieNode[V] {
+	return &trieNode[V]{
+		address: n.address, prefixLen: n.prefixLen,
+		byteIndex: n.byteIndex, bitShift: n.bitShift,
+		srcs: n.srcs, anySrc: n.anySrc, haveAny: n.haveAny,
+		child: n.child,
+	}
 }
 
 func commonBits(a, b [16]byte) uint8 {
@@ -158,14 +249,14 @@ func edit[V comparable](n *trieNode[V], address [16]byte, prefixLen uint8, chang
 		}
 		return parent
 	}
-	copy := *n
+	copy := n.clone()
 	if n.prefixLen == prefixLen {
 		copy.setSrcs(change(n.srcs))
 	} else {
 		bit := branch(address, n.prefixLen)
 		copy.child[bit] = edit(n.child[bit], address, prefixLen, change)
 	}
-	return compact(&copy)
+	return compact(copy)
 }
 
 func compact[V comparable](n *trieNode[V]) *trieNode[V] {
@@ -267,7 +358,7 @@ func removeValue[V comparable](n *trieNode[V], value V) *trieNode[V] {
 	if !match && left == n.child[0] && right == n.child[1] {
 		return n
 	}
-	copy := *n
+	copy := n.clone()
 	copy.child = [2]*trieNode[V]{left, right}
 	if match {
 		kept := make([]srcEntry[V], 0, len(n.srcs))
@@ -278,7 +369,7 @@ func removeValue[V comparable](n *trieNode[V], value V) *trieNode[V] {
 		}
 		copy.setSrcs(kept)
 	}
-	return compact(&copy)
+	return compact(copy)
 }
 
 func (t *Table[V]) Lookup(src, dst netip.Addr) (V, bool) {
@@ -298,13 +389,27 @@ func (t *Table[V]) Lookup(src, dst netip.Addr) (V, bool) {
 		// One masked map lookup per distinct source prefix length, longest
 		// first, so the first that answers is the longest match and the rest
 		// cannot beat it. See trieNode.byLen for what walking every entry
-		// instead cost. A deeper node still overwrites this, which is
-		// destination specificity beating source specificity, as before.
+		// instead cost, and indexSrcs for when the walk is the cheaper of the
+		// two and there is no index to use. A deeper node still overwrites
+		// this, which is destination specificity beating source specificity,
+		// as before.
 		matched := false
-		for _, group := range n.byLen {
-			if value, ok := group.m[netip.PrefixFrom(src, int(group.bits)).Masked()]; ok {
-				result, found, matched = value, true, true
-				break
+		if byLen := n.index(); byLen != nil {
+			for _, group := range byLen {
+				if value, ok := group.m[netip.PrefixFrom(src, int(group.bits)).Masked()]; ok {
+					result, found, matched = value, true, true
+					break
+				}
+			}
+		} else {
+			for _, entry := range n.srcs {
+				if !entry.src.IsValid() {
+					continue // the match-all entry is held apart, below
+				}
+				if entry.src.Contains(src) {
+					result, found, matched = entry.value, true, true
+					break
+				}
 			}
 		}
 		if !matched && n.haveAny {

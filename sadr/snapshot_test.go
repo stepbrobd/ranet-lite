@@ -144,3 +144,43 @@ func TestConcurrentReadersAndWriters(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// The per-length index is built on the first lookup that reads it, so the
+// build races every other lookup of the same node, and an edit publishes a new
+// node whose index is unbuilt again. The test above never reaches it: its only
+// source matches everything, and indexSrcs declines to index that. This one
+// holds enough sources at one length to be indexed, and churns them while
+// readers look up.
+func TestConcurrentLookupsBuildTheIndexOnce(t *testing.T) {
+	var table Table[int]
+	dst := prefix("2001:db8::/32")
+	const sources = 64
+	for i := range sources {
+		table.Set(netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, 0, byte(i >> 8), byte(i)}), 64).Masked(), dst, i+1)
+	}
+	// Inside the prefix built for i == 1, which is fd00:1::/64.
+	source, target := addr("fd00:1::5"), addr("2001:db8::1")
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 500 {
+				table.Lookup(source, target)
+			}
+		})
+	}
+	for range 2 {
+		wg.Go(func() {
+			for i := range 200 {
+				table.Set(netip.PrefixFrom(netip.AddrFrom16([16]byte{0xfd, 0, 0xff, byte(i)}), 64).Masked(), dst, i)
+			}
+		})
+	}
+	wg.Wait()
+
+	// Every source is still reachable: a lookup that raced a build must not
+	// have seen a half-built index.
+	if got, ok := table.Lookup(source, target); !ok || got == 0 {
+		t.Errorf("lookup after the churn returned %v, %v", got, ok)
+	}
+}
