@@ -136,7 +136,7 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 		t.Fatalf("%s holds %v, want %v (err %v)", device, got, want, err)
 	}
 
-	// A repeated install is not an error and changes nothing, which is what
+	// A repeated install is not an error and changes nothing, as
 	// lets a pass repair a partial apply.
 	for _, r := range want {
 		if err := plat.AddRoute(r); err != nil {

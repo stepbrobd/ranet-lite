@@ -444,7 +444,7 @@ func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 // is backed up therefore stops hellos, updates and retractions to every other
 // neighbor, and at the default dead timeout each of them declares this node
 // down fourteen seconds later.
-func TestAStalledNeighborDoesNotHoldTheOthers(t *testing.T) {
+func TestStalledNeighborDoesNotHoldOthers(t *testing.T) {
 	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
@@ -494,15 +494,20 @@ func TestAStalledNeighborDoesNotHoldTheOthers(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the speaker was held by one neighbor whose transport never returned")
 	}
-	if len(healthy) == 0 {
+	// Waited for rather than sampled: a place is taken under the lock and the
+	// peer's own sender goroutine transmits it afterwards, so a machine that
+	// has not scheduled that goroutine yet is not a speaker that is stuck.
+	select {
+	case <-healthy:
+	case <-time.After(20 * time.Second):
 		t.Error("the healthy neighbor received nothing")
 	}
 }
 
-// The speaker's construction wires three things nothing else sets, and each
-// can be nulled out with the rest of the suite green: the route table's
-// forwarding-entry removal, and the two Appendix A.3 hysteresis parameters.
-func TestSpeakerConstructionWiresTheRouteTable(t *testing.T) {
+// Three things reach the route table only through New, and each can be nulled
+// out with the rest of the suite green: dropping a forwarding entry, and the
+// two RFC 8966 Appendix A.3 hysteresis parameters the config decides.
+func TestNewSpeakerCarriesItsConfigurationIntoTheRouteTable(t *testing.T) {
 	cfg := Config{HelloInterval: 4 * time.Second, UpdateInterval: 16 * time.Second}
 	cfg.Cost = DefaultCostParams()
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
@@ -521,19 +526,23 @@ func TestSpeakerConstructionWiresTheRouteTable(t *testing.T) {
 		}
 	}
 	// RFC 8966 Appendix A.3 recommends a hysteresis time constant of a small
-	// multiple of the Hello interval. Zero turns the smoothing off entirely.
-	if speaker.routes.tau == 0 {
-		t.Error("hysteresis is disabled, so a flapping link changes the selected route every update")
+	// multiple of the Hello interval, and one link's base cost is the scale at
+	// which a metric change is worth a triggered update. Zero for either turns
+	// that off: a flapping link would change the selected route on every
+	// update and send one for every change.
+	if want := 3 * cfg.HelloInterval; speaker.routes.tau != want {
+		t.Errorf("hysteresis time constant is %s, want %s", speaker.routes.tau, want)
 	}
-	if speaker.routes.trigger == 0 {
-		t.Error("the triggered-update threshold is zero, so every metric change sends one")
+	if speaker.routes.trigger != cfg.Cost.RxCost {
+		t.Errorf("triggered-update threshold is %d, want one link's base cost, %d",
+			speaker.routes.trigger, cfg.Cost.RxCost)
 	}
 }
 
 // The defaults are a fleet interoperability choice, not an arbitrary number.
-func TestBabelDefaultsMatchTheFleet(t *testing.T) {
+func TestBabelDefaultsMatchFleet(t *testing.T) {
 	cost := DefaultCostParams()
-	// BABEL_RXCOST_WIRED, which is what BIRD uses and what the fleet sets
+	// BABEL_RXCOST_WIRED, the value BIRD uses and the fleet sets
 	// explicitly. At 32 a ranet-lite hop looks three times cheaper than a BIRD
 	// hop and a mixed fleet pulls transit onto whichever nodes run this.
 	if cost.RxCost != 96 {
@@ -545,7 +554,7 @@ func TestBabelDefaultsMatchTheFleet(t *testing.T) {
 	var cfg Config
 	cfg.setDefaults()
 	if cfg.HelloInterval != 4*time.Second || cfg.UpdateInterval != 16*time.Second {
-		t.Errorf("default intervals are %s and %s, want 4s and 16s, which is what RFC 8966 Appendix B gives",
+		t.Errorf("default intervals are %s and %s, want the 4s and 16s of RFC 8966 Appendix B",
 			cfg.HelloInterval, cfg.UpdateInterval)
 	}
 }

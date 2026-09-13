@@ -93,7 +93,7 @@ type routeTable struct {
 	tau     time.Duration
 	trigger uint16
 	install func(routeKey, routeSelection)
-	// forget drops the forwarding entry entirely, which is what ends the
+	// forget drops the forwarding entry entirely, ending the
 	// unreachable hold install leaves behind for a retracted prefix.
 	forget func(routeKey)
 	// warnedOverfull keeps a refused flood from becoming a log flood.

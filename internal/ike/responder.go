@@ -367,6 +367,15 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 // mismatching source on its own leaves it building raw ESP that no userspace
 // transport ever sees. The destination hash is the honest one, over the
 // address this datagram actually came from.
+//
+// It follows that the peer must be reachable on the port it already knows.
+// RFC 7296 section 2.23 obliges a conformant initiator that sees the mismatch
+// to move everything to UDP 4500, and nothing here binds 4500 separately, so
+// the registry port has to be the port both ends keep using. strongSwan does
+// that when charon.port_nat_t is set to it, which the fleet and the
+// integration test both configure, and a peer left on the default would float
+// away to a socket that is not listening. Config rejects port 500 outright for
+// the related reason that the non-ESP marker cannot be used there.
 func (r *Responder) buildSAInitResponse(spiI, spiR uint64, proposal Proposal, suite SASuite, dh *DHKeyPair, nr []byte, endpoint transport.Endpoint) ([]byte, error) {
 	hashAlgos := make([]byte, 2)
 	binary.BigEndian.PutUint16(hashAlgos, HashIdentity)
@@ -392,16 +401,6 @@ func (r *Responder) buildSAInitResponse(spiI, spiR uint64, proposal Proposal, su
 	header := Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: IKE_SA_INIT, Flags: FlagResponse, MessageID: 0}
 	return (&Message{Header: header, Payloads: payloads}).Encode(), nil
 }
-
-//
-// It follows from this that the peer must be reachable on the port it already
-// knows. RFC 7296 §2.23 obliges a conformant initiator that sees the mismatch
-// to move everything to UDP 4500, and nothing here binds 4500 separately, so
-// the registry port has to be the port both ends keep using. strongSwan does
-// that when charon.port_nat_t is set to it, which is what the fleet and the
-// integration test both configure; a peer left on the default would float away
-// to a socket that is not listening. Config rejects port 500 outright for the
-// related reason that the non-ESP marker cannot be used there.
 
 // completeResponderAuth waits for IKE_AUTH, authenticates the initiator and
 // answers with our own AUTH and the selected Child SA. A duplicate
@@ -660,7 +659,7 @@ func (r *Responder) localIdentity(idr *RawPayload) (Identity, error) {
 
 // firstUnsupportedCritical reports the first payload this profile does not
 // implement whose critical bit is set. An unrecognized payload without the bit
-// is skipped, which is what the flag is for.
+// is skipped, which the flag exists for.
 func firstUnsupportedCritical(payloads []RawPayload) (PayloadType, bool) {
 	for _, payload := range payloads {
 		if payload.Critical && !supportedPayloadType(payload.Type) {

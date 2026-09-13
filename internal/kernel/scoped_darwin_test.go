@@ -12,7 +12,7 @@ import (
 )
 
 // TestDarwinScopedRouteSelection establishes which sockets reach a route
-// carrying RTF_IFSCOPE, which is what decides whether a Mac can hold an
+// carrying RTF_IFSCOPE, which decides whether a Mac can hold an
 // address an exit announces without taking the whole default route.
 //
 // This test owns the utun's file descriptor, so a packet arriving on it proves
@@ -237,7 +237,7 @@ func requireNetTest(t *testing.T) {
 	}
 }
 
-// createUTUNWithFD is createUTUN plus the control descriptor, which is what
+// createUTUNWithFD is createUTUN plus the control descriptor, which
 // makes the packet observable: a datagram the kernel routes out of this
 // interface is readable here and nowhere else.
 func createUTUNWithFD(t *testing.T) (string, int) {

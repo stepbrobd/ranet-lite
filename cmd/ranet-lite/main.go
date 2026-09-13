@@ -1,5 +1,5 @@
 // Command ranet-lite connects a real TUN device to a ranet mesh through
-// userspace IKEv2/ESP and an embedded Babel stub. Babel exchanges control
+// userspace IKEv2/ESP and an embedded Babel speaker. Babel exchanges control
 // packets inside ESP. Address and kernel route configuration are external
 // unless the kernel block in the config file turns the reconciler on.
 package main

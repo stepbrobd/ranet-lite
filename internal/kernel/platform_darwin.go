@@ -231,10 +231,13 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 // never expresses. Removing any of them would break something this reconciler
 // did not create.
 //
-// RTF_REJECT is not among them: it is the shape a held prefix is installed
-// with, so a reject route out of our own interface with our own gateway shape
-// is one of ours, by the same argument as every other route out of it.
-const skipRouteFlags = unix.RTF_IFSCOPE | unix.RTF_MULTICAST | unix.RTF_BROADCAST |
+// Neither RTF_REJECT nor RTF_IFSCOPE is among them: both are shapes this
+// reconciler installs, the first for a held prefix and the second for an
+// announced default or a source-specific route, so a route out of our own
+// interface carrying either is one of ours by the same argument as every other
+// route out of it. RTF_IFSCOPE is then checked again once the destination is
+// known, because other daemons scope routes of their own.
+const skipRouteFlags = unix.RTF_MULTICAST | unix.RTF_BROADCAST |
 	unix.RTF_LOCAL | unix.RTF_WASCLONED | unix.RTF_LLINFO |
 	unix.RTF_BLACKHOLE | unix.RTF_GATEWAY
 
@@ -257,7 +260,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	// scoped route counts as ours only if this process scoped that
 	// destination, and one orphaned by a crash is left alone rather than
 	// deleted on the strength of a guess.
-	if rm.Flags&unix.RTF_UP == 0 || rm.Flags&(skipRouteFlags&^unix.RTF_IFSCOPE) != 0 {
+	if rm.Flags&unix.RTF_UP == 0 || rm.Flags&skipRouteFlags != 0 {
 		return Route{}, false
 	}
 	if len(rm.Addrs) <= unix.RTAX_NETMASK {
@@ -313,7 +316,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 }
 
 // sourceIsOurs reports whether a source prefix covers an address on this
-// interface, which is what interface scope can stand in for. Anything else is
+// interface, which interface scope can stand in for. Anything else is
 // a prefix belonging to some other node and cannot be expressed here.
 func (p *routePlatform) sourceIsOurs(source netip.Prefix) (bool, error) {
 	assigned, err := p.Addrs()
@@ -332,7 +335,7 @@ func (p *routePlatform) sourceIsOurs(source netip.Prefix) (bool, error) {
 }
 
 // routeMessage encodes one RTM_ADD or RTM_DELETE. The gateway is the interface
-// itself, a sockaddr_dl carrying only its index, which is what
+// itself, a sockaddr_dl carrying only its index, which
 // "route -interface" sends and the only thing ifa_ifwithnet reads: ranet-lite
 // picks the peer after the kernel hands over the packet, so there is no next
 // hop to name.
@@ -474,9 +477,8 @@ func (p *routePlatform) DelRoute(r Route) error {
 	_, installed := p.scoped[r.Destination]
 	if r.Source.IsValid() && !installed {
 		// Nothing was installed for a source we cannot express, and deleting
-		// what is left after dropping the source would take out the ordinary
-		// route to the same destination. For an exit's "::/0 from <prefix>"
-		// that is the box's default route.
+		// what is left after dropping the source would take out whatever else
+		// holds that destination.
 		//
 		// The answer comes from what this process recorded at install rather
 		// than from asking the kernel which addresses are on the interface
@@ -536,7 +538,7 @@ func (p *routePlatform) Addrs() ([]netip.Prefix, error) {
 }
 
 // interfaceAddrs reports every address on the interface, whoever put it there,
-// which is what the reconciler needs to decide that a configured address is
+// which the reconciler needs to decide that a configured address is
 // already present. It removes nothing and decides nothing.
 func (p *routePlatform) interfaceAddrs(rib []byte) ([]netip.Prefix, error) {
 	messages, err := route.ParseRIB(route.RIBTypeInterface, rib)

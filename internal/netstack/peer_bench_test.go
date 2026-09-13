@@ -87,8 +87,9 @@ func BenchmarkPeerEnqueueParallelBatched(b *testing.B) {
 	benchmarkPeerEnqueue(b, runtime.GOMAXPROCS(0), 128)
 }
 
-// The control path, which Babel uses through SendRaw: one packet, and the
-// caller waits for the ordered sender to report the result.
+// One packet, with the caller waiting for the ordered sender to report the
+// result. Babel no longer waits, but the compatibility peers do, and this is
+// what that costs.
 func BenchmarkPeerTransmitSerial(b *testing.B) {
 	peer, _ := benchPeer(b)
 	payload := make([]byte, 1400)

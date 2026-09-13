@@ -143,7 +143,7 @@ func TestUpdateWithZeroIntervalIsIgnored(t *testing.T) {
 // validTimestampGap reject every sample from then on. Without an expiry the
 // neighbor keeps the last cost it computed for the life of the session, and
 // nothing can correct it.
-func TestAnRTTMeasurementThatStoppedArrivingStopsBeingUsed(t *testing.T) {
+func TestRTTMeasurementThatStoppedArrivingStopsBeingUsed(t *testing.T) {
 	s, neighbor, _ := captureSpeaker(t, Config{})
 	now := time.Now()
 	s.helloAction(neighbor, 2, now)

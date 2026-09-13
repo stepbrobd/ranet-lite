@@ -1,4 +1,4 @@
-// Package kernel mirrors the mesh forwarding table into a Linux routing
+// Package kernel mirrors the mesh forwarding table into the host's routing
 // table, taking over from the BIRD kernel protocols a ranet deployment runs
 // today. It is a one-way reconciler: internal/netstack keeps owning the
 // forwarding decision and this package only teaches the kernel which packets
@@ -7,9 +7,11 @@
 //
 // # Ownership
 //
-// Every route this package installs lives in Config.Table, carries rt_proto
-// Config.Protocol and points out of Config.Interface. Those three together
-// are the ownership marker. The reconciler reads back only routes matching
+// On linux, every route this package installs lives in Config.Table, carries
+// rt_proto Config.Protocol and points out of Config.Interface. Those three
+// together are the ownership marker. darwin has neither tables nor rt_proto,
+// so ownership there is the interface and the shape of the route; see
+// platform_darwin.go. The reconciler reads back only routes matching
 // all three, deletes only routes it read back that way, and stamps
 // rtm_protocol on every RTM_DELROUTE so the kernel itself refuses to remove a
 // route belonging to another protocol. It never touches another table, a
@@ -87,7 +89,7 @@ const (
 )
 
 // ErrUnsupported is returned by New on every platform without an
-// implementation. A darwin backend is separate work.
+// implementation, which is everything but linux and darwin.
 var ErrUnsupported = errors.New("kernel: route reconciliation is unsupported on this platform")
 
 // errRouteSkipped distinguishes a route that was deliberately not installed
@@ -152,7 +154,7 @@ type Route struct {
 	// Metric is RTA_PRIORITY as the kernel holds it, never the zero that
 	// means "your default" on the way in.
 	Metric uint32
-	// Unreachable holds a prefix rather than carrying it, which is what
+	// Unreachable holds a prefix rather than carrying it, as
 	// RFC 8966 section 3.5.4 requires of a retracted route until it is
 	// flushed. Without it the entry leaves the table and a packet for that
 	// prefix follows a shorter one instead, which on a node holding a default
@@ -182,7 +184,7 @@ type auditor interface {
 }
 
 // platform is the kernel surface the reconciler drives. Everything above it is
-// portable and syscall-free, which is what makes the diff testable against a
+// portable and syscall-free, so the diff is testable against a
 // fake kernel.
 type platform interface {
 	// Routes returns only the routes carrying the reconciler's protocol, in
@@ -301,17 +303,18 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	slog.Info("kernel reconciler started", "interface", r.cfg.Interface,
 		"table", r.cfg.Table, "protocol", r.cfg.Protocol)
 
-	// Installing takes over a same-key route rather than failing, so sharing a
-	// table with another daemon loses its routes with no error. Say so once at
-	// startup: on a fleet node mid-migration the other writer is BIRD in table
-	// 200, which is the intended overlap and still worth seeing.
+	// An install refuses a key another writer already holds, so sharing a table
+	// with another daemon means the routes it refuses are routes the mesh
+	// wanted. Say so once at startup: on a fleet node mid-migration the other
+	// writer is BIRD in table 200, which is the intended overlap and still
+	// worth seeing.
 	if audit, ok := r.plat.(auditor); ok {
 		if writers, err := audit.foreignWriters(); err != nil {
 			slog.Warn("kernel could not check the table for other writers", "err", err)
 		} else if len(writers) > 0 {
 			slog.Warn("kernel is sharing its table with another routing protocol",
 				"table", r.cfg.Table, "protocols", strings.Join(writers, ", "),
-				"detail", "an install replaces a same-key route, so give this reconciler a table of its own")
+				"detail", "an install refuses a key another writer already holds, so give this reconciler a table of its own")
 		}
 	}
 

@@ -14,11 +14,17 @@ import (
 
 // serveSession runs one established IKE SA until it ends, whichever side
 // opened it: ESP keying, mesh and Babel registration, inbound delivery and the
-// IKE control loop. Only the handshake differs between dialing and answering.
+// IKE control loop. Only the handshake differs between dialing and answering,
+// which is also why the resolution against a competing session happens here
+// rather than in each caller: the babel registration has to go in under the
+// same decision, and this is where the peer exists.
 //
-// name appears in logs; sessionName identifies this peer to the mesh and to
-// Babel, so it must be stable and unique per peer.
-func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sessionName string) error {
+// It returns errSessionEstablished when another session already holds the
+// path, which is not a failure. name appears in logs; sessionName identifies
+// this peer to the mesh and to babel, so it must be stable and unique per
+// peer. initiator and responder are this SA's own roles, the end that opened
+// it and the end that answered.
+func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sessionName string, initiator, responder ike.Identity) error {
 	defer sess.Mux().Close()
 	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
 
@@ -49,8 +55,13 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 		return sealer, err
 	}, sess.Mux().SendESPBatch)
 	defer peer.Close()
-	handle := c.speaker.AddPeer(peer)
-	defer handle.Close()
+	release, adopted := c.sessions.adopt(sessionName, sess, initiator, responder, func() func() {
+		return c.speaker.AddPeer(peer).Close
+	})
+	defer release()
+	if !adopted {
+		return errSessionEstablished
+	}
 
 	plain := make([][]byte, 0, 128)
 	emit := func(results []inboundDecrypted) {
@@ -75,7 +86,7 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 			}
 		}
 		if dropped > 0 {
-			log.Printf("peer %s: dropped %d ESP packets in batch; last error: %v", name, dropped, lastError)
+			log.Printf("peer %s: dropped %d ESP packets in batch, last error: %v", name, dropped, lastError)
 		}
 		c.countInbound(len(results)-dropped, dropped)
 		c.Mesh.DeliverInboundBatch(plain)
@@ -146,7 +157,7 @@ func newSessionSet() *sessionSet {
 
 // preferInitiator reports whether, of the two nodes, the first is the end that
 // should be the initiator. Both ends compute it from the same pair of names
-// and reach the same answer, which is what makes the choice agree.
+// and reach the same answer, so the choice agrees.
 func preferInitiator(initiator, responder ike.Identity) bool {
 	return identityOrder(initiator) < identityOrder(responder)
 }
@@ -167,7 +178,7 @@ func identityOrder(id ike.Identity) string {
 // on a clock the two ends are not obliged to agree about: each would keep the
 // session the other closed, both SAs would die, both ends would redial, and
 // every route through that peer would be withdrawn on each flap. A stale
-// incumbent is handled where it belongs instead, in holds, which is what lets
+// incumbent is handled where it belongs instead, in holds, which lets
 // this node's own dialer take over rather than wait behind a dead session.
 //
 // It reports whether the session was adopted. A caller told false has lost and
@@ -179,13 +190,13 @@ func identityOrder(id ike.Identity) string {
 // end that opened it and the end that answered. Naming them that way is what
 // keeps a dialer and a responder from deriving opposite answers for one SA,
 // which is invisible from either end alone.
-func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder ike.Identity) (func(), bool) {
-	return s.adoptPreferred(path, sess, preferInitiator(initiator, responder))
+func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder ike.Identity, attach func() func()) (func(), bool) {
+	return s.adoptPreferred(path, sess, preferInitiator(initiator, responder), attach)
 }
 
 // adoptPreferred is adopt with the rule already applied, for a test that drives
 // the resolution without two identities to derive it from.
-func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bool) (func(), bool) {
+func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bool, attach func() func()) (func(), bool) {
 	s.mu.Lock()
 	if s.shut {
 		s.mu.Unlock()
@@ -202,6 +213,16 @@ func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bo
 		s.close(sess)
 		return func() {}, false
 	}
+	// Whatever else this session registers under the path's name registers
+	// here, while the decision is still held. Two sessions resolving against
+	// each other reach this in the order they take the path, so a session
+	// already replaced cannot take the babel neighbor away from the one that
+	// replaced it, which would leave the speaker holding a peer whose mux is
+	// closed and the adjacency down until that session unwound.
+	var detach func()
+	if attach != nil {
+		detach = attach()
+	}
 	s.live[path] = &liveSession{session: sess, preferred: preferred}
 	s.mu.Unlock()
 	if previous != nil && previous.session != sess {
@@ -214,6 +235,9 @@ func (s *sessionSet) adoptPreferred(path string, sess *ike.Session, preferred bo
 			delete(s.live, path)
 		}
 		s.mu.Unlock()
+		if detach != nil {
+			detach()
+		}
 	}, true
 }
 
@@ -236,11 +260,11 @@ func closeSession(sess *ike.Session) {
 	_ = sess.Mux().Close()
 }
 
-// holds reports whether a session that is actually carrying traffic serves this
-// path, which is what lets a dialer stand down instead of opening a second one
-// that would only be resolved away. A session that has stopped proving the peer
-// is there does not count, so a dialer takes over from a dead one rather than
-// waiting out dead peer detection behind it.
+// holds reports whether a session that has recently proved the peer is there
+// serves this path, which lets a dialer stand down instead of opening a second
+// one that would only be resolved away. A session that has stopped proving it
+// does not count, so a dialer takes over from a dead one instead of waiting
+// out dead peer detection behind it.
 func (s *sessionSet) holds(path string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

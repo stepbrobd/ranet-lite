@@ -71,7 +71,7 @@ func TestLosingLocalIKERekeyAcceptsDeleteResponse(t *testing.T) {
 // that the other peer did not detect the simultaneous rekey, and the first
 // peer can forget its own rekey attempt." Closing the session instead throws
 // away an SA the peer believes is current.
-func TestOneSidedIKERekeyCollisionAdoptsThePeersSA(t *testing.T) {
+func TestOneSidedIKERekeyCollisionAdoptsPeersSA(t *testing.T) {
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	old := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: make([]byte, 32), skei: make([]byte, 20), sker: make([]byte, 20)}
 	peerSA := &ikeContext{suite: suite, spiI: 31, spiR: 32, responder: true}
@@ -99,7 +99,7 @@ func TestOneSidedIKERekeyCollisionAdoptsThePeersSA(t *testing.T) {
 
 // The same case driven through the path a real Delete takes, because the
 // resolution above is only reached if dispatch asks for it.
-func TestPeerDeleteOnAOneSidedCollisionKeepsTheSessionOpen(t *testing.T) {
+func TestPeerDeleteOnOneSidedCollisionKeepsSessionOpen(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
 	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
@@ -146,7 +146,7 @@ func TestPeerDeleteOnAOneSidedCollisionKeepsTheSessionOpen(t *testing.T) {
 // An exchange whose IKE SA has gone can never be answered, and IKEv2 permits
 // one outstanding local request at a time, so leaving it pending stops every
 // later rekey and the Delete on teardown for the life of the session.
-func TestARequestOnARetiredIKESAIsFailedRatherThanLeftPending(t *testing.T) {
+func TestRequestOnRetiredIKESAFailsRatherThanPends(t *testing.T) {
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	current := &ikeContext{suite: suite, spiI: 11, spiR: 12}
 	retired := &ikeContext{suite: suite, spiI: 21, spiR: 22}

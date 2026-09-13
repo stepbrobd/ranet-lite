@@ -234,7 +234,7 @@ func TestConfigRejectsPort500(t *testing.T) {
 // speaker it replaces. Nothing else reads these four fields, so without this
 // they could all be dropped from SpeakerConfig with every check still green,
 // and a node configured to match its peers would silently run on defaults.
-func TestBabelCostFieldsReachTheSpeaker(t *testing.T) {
+func TestBabelCostFieldsReachSpeaker(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	body := testConfig + `babel:
   rxcost: 42
@@ -269,7 +269,7 @@ func TestBabelCostFieldsReachTheSpeaker(t *testing.T) {
 			speaker.HelloInterval, speaker.UpdateInterval)
 	}
 
-	// Omitted, the speaker's own defaults stand, which is what matches BIRD.
+	// Omitted, the speaker's own defaults stand, matching BIRD.
 	bare := Babel{}.SpeakerConfig()
 	if bare.Cost != babel.DefaultCostParams() {
 		t.Errorf("an empty block changed the defaults to %+v", bare.Cost)

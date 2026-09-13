@@ -16,7 +16,7 @@ import (
 // landed; this is the same test for the platform the fleet actually runs, where
 // the only other coverage needs root and /dev/net/tun and so never runs in the
 // nix sandbox.
-func TestLinuxDumpKeepsOnlyTheRoutesItOwns(t *testing.T) {
+func TestLinuxDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 	const ourIndex, ourTable, ourProtocol = 7, 200, DefaultProtocol
 	plat := &netlinkPlatform{
 		cfg:      Config{Interface: "ranet0", Table: ourTable, Protocol: ourProtocol},

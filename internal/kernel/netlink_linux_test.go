@@ -356,7 +356,7 @@ func drain(signal <-chan struct{}) {
 // The RFC 8966 section 3.5.4 hold has to reach the kernel as a route that
 // answers with an error, naming no output device, and has to come back from a
 // dump the same way or every pass would delete and reinstall it.
-func TestNetlinkHoldsARetractedPrefix(t *testing.T) {
+func TestNetlinkHoldsRetractedPrefix(t *testing.T) {
 	if runtime.GOOS != "linux" || os.Getuid() != 0 {
 		t.Skip("the real netlink path needs root on linux")
 	}

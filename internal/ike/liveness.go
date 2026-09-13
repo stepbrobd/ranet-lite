@@ -341,7 +341,7 @@ func (s *Session) Run(ctx context.Context) error {
 			if pending != nil && !time.Now().Before(pending.deadline) {
 				if pendingRetransmitsExhausted(pending, time.Since(lastAuthenticated) < dpdInterval) {
 					s.mux.Close()
-					return fmt.Errorf("ike: peer unresponsive after %d attempts", maxRetransmits)
+					return fmt.Errorf("ike: peer unresponsive after %d attempts", pending.sent)
 				}
 				// RFC 7296 §2.1 requires retaining and retransmitting the
 				// bitwise-identical request until a response arrives or the IKE SA

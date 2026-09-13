@@ -254,9 +254,8 @@ func validRekeyTiming(interval, margin, jitter time.Duration) bool {
 
 // NoteTraffic records successfully authenticated ESP traffic for the DPD
 // policy. RFC 7296 section 2.4 treats it as proof that the IKE SA is alive.
-// Run consumes this edge and timestamps it at its existing 100 ms poll, so
-// the data plane only pays for an atomic store rather than a clock read for
-// every packet.
+// Run consumes this edge the next time it wakes, so the data plane pays an
+// atomic store rather than a clock read per packet.
 func (s *Session) NoteTraffic() { s.trafficSeen.Store(true) }
 
 const (

@@ -268,19 +268,25 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			}
 		}
 		h.mu.Unlock()
-		// The queue is tested before the datagram is copied, not after. This
-		// loop is each queue's only producer, so room seen here is still there
-		// at the send, and a flood from an unauthenticated peer is refused
-		// without allocating for it.
+		// The queue is tested before the datagram is copied, not after, so a
+		// flood from an unauthenticated peer is refused without allocating for
+		// it. The send still cannot block: a hub runs one receive loop per
+		// bound socket, IPv4 and IPv6 separately on linux, so room seen here
+		// may be gone by the time this one gets there.
 		for _, pending := range ikeDatagrams {
 			if len(pending.mux.ikeCh) == cap(pending.mux.ikeCh) {
 				log.Printf("transport: ikeCh full, dropping IKE message")
 				continue
 			}
 			raw := bufs[pending.index][:sizes[pending.index]]
-			pending.mux.ikeCh <- Datagram{
+			datagram := Datagram{
 				Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
 				Endpoint: eps[pending.index],
+			}
+			select {
+			case pending.mux.ikeCh <- datagram:
+			default:
+				log.Printf("transport: ikeCh full, dropping IKE message")
 			}
 		}
 		for _, i := range unclaimed {
@@ -289,9 +295,14 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 				continue
 			}
 			raw := bufs[i][:sizes[i]]
-			h.listen <- Unclaimed{
+			datagram := Unclaimed{
 				Raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
 				Endpoint: eps[i],
+			}
+			select {
+			case h.listen <- datagram:
+			default:
+				log.Printf("transport: listen queue full, dropping unclaimed IKE message")
 			}
 		}
 		for m, packets := range espBatches {
@@ -358,6 +369,10 @@ func (m *Mux) hasRoomForESP(bytes int) bool {
 	return len(m.espCh) < cap(m.espCh) && m.espQueued.Load()+int64(bytes) <= espQueueBytes
 }
 
+// dispatchESP hands one demultiplexed batch to this peer's receive queue under
+// the ticket that fixes its order, and reports whether the queue took it. A
+// dropped batch consumes no ticket, because a hub may have separate IPv4 and
+// IPv6 receive loops and the gap would stall whichever emitter waits for it.
 func (m *Mux) dispatchESP(packets [][]byte, bytes int) bool {
 	m.espDispatchMu.Lock()
 	defer m.espDispatchMu.Unlock()

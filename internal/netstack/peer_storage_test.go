@@ -81,7 +81,7 @@ func TestReservedPeerKeepsCiphertextUntilSendCompletes(t *testing.T) {
 // sending peer's decrypt path, so a control send that waits on a backed-up
 // peer stops every other neighbor with it and lets two such peers hold each
 // other's emitter. Dropping keeps the stall local.
-func TestSendRawOrDropDoesNotWaitForABackedUpPeer(t *testing.T) {
+func TestSendRawOrDropDoesNotWaitForBackedUpPeer(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
@@ -142,7 +142,7 @@ func TestSendRawOrDropDoesNotWaitForABackedUpPeer(t *testing.T) {
 // starves the control traffic keeping the adjacency up. Refusing outright cost
 // the integration VM its babel routes twice during an iperf3 run: the queue was
 // full of data, every hello and update was dropped, and the neighbor flapped.
-func TestControlPacketsSurviveAQueueFullOfData(t *testing.T) {
+func TestControlPacketsSurviveQueueFullOfData(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	var sent atomic.Int64

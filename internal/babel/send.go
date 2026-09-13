@@ -154,7 +154,7 @@ func (s *Speaker) advertisementFor(key routeKey) (advertisement, *neighborState,
 }
 
 // advertiseTo builds the Update TLVs for one prefix toward one neighbor. Every
-// advertisement this node sends goes through here, which is what keeps the
+// advertisement this node sends goes through here, keeping the
 // feasibility distance of RFC 8966 section 3.7.3 an upper bound on what the
 // mesh has been told. force answers a route request, which must produce a
 // retraction even for a prefix we know nothing about (section 3.8.1.1).

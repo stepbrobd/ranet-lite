@@ -24,7 +24,7 @@ func BenchmarkCoalesceOneTarget(b *testing.B) {
 // Merging must preserve order within a neighbor. A Babel packet carries
 // parser state, the router-id and the default prefix, that later TLVs read, so
 // reordering them changes what the receiver decodes.
-func TestCoalescePreservesOrderWithinANeighbor(t *testing.T) {
+func TestCoalescePreservesOrderWithinNeighbor(t *testing.T) {
 	first, second := &neighborState{}, &neighborState{}
 	tlv := func(seqno uint16) RawTLV {
 		return RawTLV{Type: TLVUpdate, Body: []byte{byte(seqno >> 8), byte(seqno)}}

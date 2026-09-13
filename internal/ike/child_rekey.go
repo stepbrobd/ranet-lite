@@ -212,7 +212,7 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 			// nonexistent SA by copying the Protocol ID and SPI from REKEY_SA.
 			return s.responseNotifySA(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND, rekey.Protocol, rekey.SPI)
 		}
-		// Checked before the Diffie-Hellman and the keymat, which is what the
+		// Checked before the Diffie-Hellman and the keymat, the work the
 		// peer is really asking us to spend.
 		if !s.allowPeerChildRekey() {
 			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)

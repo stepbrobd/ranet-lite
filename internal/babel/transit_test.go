@@ -301,7 +301,7 @@ func TestRetractionPropagatesThroughTransit(t *testing.T) {
 
 // A seqno request that the relay cannot satisfy has to reach the origin, and a
 // repeat of it must not.
-func TestSeqnoRequestIsForwardedOnceTowardTheOrigin(t *testing.T) {
+func TestSeqnoRequestIsForwardedOnceTowardOrigin(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
 	dest := netip.MustParsePrefix("fd00:c::/64")
 	key := routeKey{dest: dest}
@@ -338,7 +338,7 @@ func TestSeqnoRequestIsForwardedOnceTowardTheOrigin(t *testing.T) {
 // An unfeasible update for the selected route must produce a request for a
 // sequence number that would make it usable again, or the route stays
 // unselectable until it expires.
-func TestUnfeasibleUpdateAsksTheOriginForANewSeqno(t *testing.T) {
+func TestUnfeasibleUpdateAsksOriginForNewSeqno(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "b-c")
 	dest := netip.MustParsePrefix("fd00:c::/64")
 	key := routeKey{dest: dest}
@@ -422,7 +422,7 @@ func TestSourceSpecificOriginationAndSelection(t *testing.T) {
 
 // Requests carry a source prefix too, so an exit's default route can be asked
 // for by name rather than answered with the ordinary route's state.
-func TestRequestsCarryTheSourcePrefix(t *testing.T) {
+func TestRequestsCarrySourcePrefix(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b")
 	dest, source := netip.MustParsePrefix("::/0"), netip.MustParsePrefix("2602:f590::/36")
 	fabric.speakers["a"].OriginateFrom(dest, source)
@@ -446,7 +446,7 @@ func TestRequestsCarryTheSourcePrefix(t *testing.T) {
 
 // Seqno requests reach the origin only if every hop can be trusted to stop
 // forwarding them, so the hop count has to run out.
-func TestSeqnoRequestStopsAtTheHopCount(t *testing.T) {
+func TestSeqnoRequestStopsAtHopCount(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
 	dest := netip.MustParsePrefix("fd00:c::/64")
 	fabric.speakers["c"].Originate(dest)
@@ -507,7 +507,7 @@ func TestWildcardRouteRequestDumpsAtMostOncePerInterval(t *testing.T) {
 	fabric.flush("a")
 	fabric.reset()
 
-	// One packet carrying many wildcard requests, which is what fits in a
+	// One packet carrying many wildcard requests, as fits in a
 	// single MTU and is the shape that amplifies.
 	const requests = 64
 	wildcards := make([]RawTLV, 0, requests)
@@ -555,7 +555,7 @@ func TestWildcardRouteRequestDumpsAtMostOncePerInterval(t *testing.T) {
 // sending that prefix's traffic down the default the moment it is retracted,
 // and if the exit reaches it back through here the packet bounces until its
 // hop limit runs out.
-func TestRetractedPrefixDoesNotFallThroughToACoveringRoute(t *testing.T) {
+func TestRetractedPrefixDoesNotFallThroughToCoveringRoute(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "a-c")
 	specific := netip.MustParsePrefix("fd00:b::/64")
 	covering := netip.MustParsePrefix("fd00::/16")
@@ -660,7 +660,7 @@ func TestSourceTableRefusesAnUnknownOriginWhenFull(t *testing.T) {
 // RFC 8966 section 3.8.2.1 says to repeat the request a small number of times.
 func TestSeqnoRequestIsRepeatedWhileStarved(t *testing.T) {
 	// d is a leaf with no path of its own to the origin. It exists so that a
-	// has somewhere to advertise, which is what records the feasibility
+	// has somewhere to advertise, which records the feasibility
 	// distance the worsened update below has to fall foul of, without giving a
 	// a second route that would make the prefix not starved at all.
 	fabric := newMeshFabric(t, Config{}, "a-b", "b-c", "a-d")
@@ -736,7 +736,7 @@ func TestWithdrawnOriginationIsRetracted(t *testing.T) {
 // horizon compares its next hop against nil and never fires, and the node
 // advertises the prefix at metric 0 straight back to the neighbor it is still
 // forwarding to, which is a loop until the entry expires.
-func TestOriginatingALearnedPrefixDoesNotLoop(t *testing.T) {
+func TestOriginatingLearnedPrefixDoesNotLoop(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
 	dest := netip.MustParsePrefix("fd00:a::/64")
 	key := routeKey{dest: dest}
@@ -746,7 +746,7 @@ func TestOriginatingALearnedPrefixDoesNotLoop(t *testing.T) {
 		t.Fatalf("c reaches %s via %q, want \"b\"", dest, got)
 	}
 
-	// c now originates the same prefix, which is what a reload adding it to
+	// c now originates the same prefix, as a reload adding it to
 	// babel.originate does.
 	fabric.reset()
 	fabric.speakers["c"].SetOriginated([]OriginatedRoute{{Destination: dest}})
@@ -789,7 +789,7 @@ func TestOriginateAlsoDropsWhatThisNodeLearned(t *testing.T) {
 // unassigned address fall through to a covering route, which on a transit node
 // means back out to a neighbor that learned the prefix from this node at
 // metric 0 and forwards it straight here again.
-func TestAnOriginatedPrefixDoesNotFallThroughToACoveringRoute(t *testing.T) {
+func TestOriginatedPrefixDoesNotFallThroughToCoveringRoute(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b")
 	covering := netip.MustParsePrefix("fd00::/16")
 	own := netip.MustParsePrefix("fd00:a::/64")
@@ -824,7 +824,7 @@ func TestAnOriginatedPrefixDoesNotFallThroughToACoveringRoute(t *testing.T) {
 // it to all of them". The forwarding suppression table is indexed without the
 // neighbor, so consulting it here let the first neighbor in map order consume
 // the allowance and silently drop every other.
-func TestStarvationAsksEveryNeighborHoldingTheRoute(t *testing.T) {
+func TestStarvationAsksEveryNeighborHoldingRoute(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "a-d", "b-e", "c-e")
 	dest := netip.MustParsePrefix("fd00:e::/64")
 	key := routeKey{dest: dest}
@@ -904,7 +904,7 @@ func TestSeqnoSuppressionEntriesAreSweptAndDroppedWithTheirNeighbor(t *testing.T
 // Starvation recovery is what stops a lost seqno becoming a permanent black
 // hole, and the retry is reached only from Run. Deleting that one call left
 // the retry itself covered and unreachable.
-func TestRunRetriesAStarvedSeqnoRequest(t *testing.T) {
+func TestRunRetriesStarvedSeqnoRequest(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "b-e", "c-e")
 	dest := netip.MustParsePrefix("fd00:e::/64")
 	speaker := fabric.speakers["a"]
@@ -933,7 +933,7 @@ func TestRunRetriesAStarvedSeqnoRequest(t *testing.T) {
 	go func() { done <- speaker.Run(ctx) }()
 
 	// Bring the retry forward rather than waiting out its backoff, and clear
-	// the suppression window the first request opened, which is what the
+	// the suppression window the first request opened, as the
 	// passage of time would have done.
 	fabric.reset()
 	speaker.mu.Lock()

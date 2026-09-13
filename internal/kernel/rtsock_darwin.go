@@ -153,7 +153,7 @@ const (
 )
 
 // putSockaddrInet4 writes a sockaddr_in: length, family, a zero port and the
-// address. A netmask is carried in the same shape, which is what ifconfig
+// address. A netmask is carried in the same shape, the shape ifconfig
 // sends.
 func putSockaddrInet4(buf []byte, address netip.Addr) {
 	raw := address.As4()
@@ -241,7 +241,7 @@ func ioctlRequest(fd int, request uintptr, argument []byte) error {
 
 // routeMonitor turns unsolicited routing messages into one coalesced wake-up.
 // It parses just enough of each message to drop the ones for other interfaces,
-// which is what stops the rest of the box's route churn from waking the
+// which stops the rest of the box's route churn from waking the
 // reconciler. Its own writes still wake it once; the settle window in Run
 // absorbs the burst and the following pass finds nothing to do.
 type routeMonitor struct {

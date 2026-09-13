@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -10,7 +11,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/ike"
 )
 
-// acceptPeers answers peers that dial us, which is what a full mesh needs and
+// acceptPeers answers peers that dial us, as a full mesh needs and
 // what a node behind no reachable address cannot do without. It returns when
 // ctx ends or the hub's socket is gone.
 func (c *Client) acceptPeers(ctx context.Context) error {
@@ -49,13 +50,10 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 			// in sessionSet applies across both directions.
 			sessionName := fmt.Sprintf("%s/%s/%s@%s", peer.Organization, peer.CommonName, peer.SerialNumber, accepted.Local.SerialNumber)
 			// We answered, so the peer is this SA's initiator and we are its
-			// responder.
-			release, adopted := c.sessions.adopt(sessionName, sess, peer, accepted.Local)
-			defer release()
-			if !adopted {
-				return
-			}
-			if err := c.serveSession(ctx, sess, name, sessionName); err != nil && ctx.Err() == nil {
+			// responder. Losing to a session the other end also prefers is
+			// ordinary on a full mesh and is not worth a line in the log.
+			err := c.serveSession(ctx, sess, name, sessionName, peer, accepted.Local)
+			if err != nil && !errors.Is(err, errSessionEstablished) && ctx.Err() == nil {
 				log.Printf("peer %s: %v", name, err)
 			}
 		})

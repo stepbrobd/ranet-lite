@@ -534,6 +534,7 @@ func firstTestNotify(t *testing.T, raw []byte) Notify {
 }
 
 // buildTestSAInit produces a well-formed IKE_SA_INIT request, which is what
+// buildTestSAInit produces a well-formed IKE_SA_INIT request, the shape
 // the responder needs before it will park in awaitAuthRequest.
 func buildTestSAInit(t *testing.T) ([]byte, uint64) {
 	t.Helper()
@@ -572,7 +573,7 @@ func encodeTestSAInit(t *testing.T, spiI uint64, ni []byte, proposal Proposal, a
 // Delete through that loop's request queue sends nothing at all, and the peer
 // is left holding an SA it keeps transmitting into until its own dead peer
 // detection expires.
-func TestDeleteIKEReachesThePeerWithoutARunLoop(t *testing.T) {
+func TestDeleteIKEReachesPeerWithoutRunLoop(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	initiator, err := h.dial(t)
 	if err != nil {
@@ -615,7 +616,7 @@ func TestDeleteIKEReachesThePeerWithoutARunLoop(t *testing.T) {
 // the liveness clock, so an answered exchange has to count as proof on its
 // own. Without it Active()'s window silently becomes a function of
 // babel.hello_interval, which nothing validates against it.
-func TestAnAnsweredExchangeRefreshesTheLivenessClock(t *testing.T) {
+func TestAnsweredExchangeRefreshesLivenessClock(t *testing.T) {
 	h := newResponderHarness(t, nil)
 	initiator, err := h.dial(t)
 	if err != nil {
@@ -700,7 +701,7 @@ func observedEndpoint(t *testing.T, hub *transport.Hub, spi uint64) transport.En
 // with one and dropped. RFC 7296 section 2.6 is the whole point of the
 // mechanism: without it an off-path source can make the responder allocate for
 // an address it never has to receive at.
-func TestResponderDemandsACookieUnderPressure(t *testing.T) {
+func TestResponderDemandsCookieUnderPressure(t *testing.T) {
 	hub, err := transport.NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -718,7 +719,7 @@ func TestResponderDemandsACookieUnderPressure(t *testing.T) {
 		t.Fatal("a request under pressure was carried forward with no cookie at all")
 	}
 
-	// Below the threshold it does nothing at all, which is what keeps the
+	// Below the threshold it does nothing at all, keeping the
 	// ordinary case a two-message exchange.
 	quiet := &Responder{}
 	quiet.cfg.Hub = hub
@@ -731,7 +732,7 @@ func TestResponderDemandsACookieUnderPressure(t *testing.T) {
 	}
 }
 
-func TestResponderRefusesACookieItDidNotIssue(t *testing.T) {
+func TestResponderRefusesCookieItDidNotIssue(t *testing.T) {
 	hub, err := transport.NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

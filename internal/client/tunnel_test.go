@@ -191,7 +191,7 @@ func TestReceiveESPOrderAndShutdown(t *testing.T) {
 // Sending has to stop and ask for a replacement, not report the kind of error
 // that closes the session: the next babel hello would otherwise tear down the
 // adjacency and withdraw every route through the peer.
-func TestDeletedChildSAAsksForAReplacementInsteadOfFailingHard(t *testing.T) {
+func TestDeletedChildSAAsksForReplacementInsteadOfFailingHard(t *testing.T) {
 	child := tunnelChild(1)
 	tunnel := &tunnel{}
 	asked := make(chan struct{}, 4)

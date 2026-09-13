@@ -385,7 +385,7 @@ func (p *netlinkPlatform) setMaster(master uint32) error {
 
 // routeMonitor turns unsolicited route notifications into one coalesced
 // wake-up. It parses just enough of each message to drop notifications for
-// tables the reconciler does not own, which is what stops another daemon's
+// tables the reconciler does not own, which stops another daemon's
 // route churn from waking it. Its own writes still wake it once; the settle
 // window in Run absorbs the burst and the following pass finds nothing to do.
 type routeMonitor struct {
@@ -490,9 +490,10 @@ func notificationTable(message nlMessage) uint32 {
 // foreignWriters names the routing protocols other than this reconciler's that
 // already have unicast routes in the table it is about to take over.
 //
-// It exists because installation uses NLM_F_REPLACE, which takes over a
-// same-key route rather than failing, so a second writer in one table loses
-// routes silently. Everything else on a host keeps to its own table: Tailscale
+// It exists because an install asks for the route exclusively and reports a key
+// another writer already holds rather than taking it over, so a second writer
+// in one table means routes the mesh wanted are silently not installed.
+// Everything else on a host keeps to its own table: Tailscale
 // uses 52, and BIRD on a ranet fleet node uses 200, which is exactly the table
 // this reconciler is pointed at during a migration. Reporting it is the
 // difference between a migration that looks fine and one that is visibly

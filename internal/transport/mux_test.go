@@ -571,7 +571,7 @@ func TestEveryESPReceivePathReleasesItsBudget(t *testing.T) {
 // blocking the receive loop, because an unauthenticated peer must not be able
 // to stall the dataplane. The copy onto the heap has to come after that
 // decision, or the flood is paid for in allocation whether it is kept or not.
-func TestAFloodOfUnclaimedIKEDatagramsIsNotCopied(t *testing.T) {
+func TestFloodOfUnclaimedIKEDatagramsIsNotCopied(t *testing.T) {
 	hub, err := NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

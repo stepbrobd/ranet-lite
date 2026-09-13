@@ -9,7 +9,7 @@ import (
 
 // referenceWindow is the plain RFC 4303 section 3.4.3 window: a bitmap indexed
 // from the highest sequence seen, rebuilt from scratch on every step. It is
-// obviously correct and obviously slow, which is what makes it a reference.
+// obviously correct and obviously slow, so it serves as a reference.
 type referenceWindow struct {
 	window uint32
 	last   uint32
@@ -45,7 +45,7 @@ func (r *referenceWindow) commit(seq uint32) {
 
 // The word-wise clear has to agree with the reference at every window size and
 // every jump distance, including the wrap the circular index makes possible.
-func TestReplayWindowMatchesAReference(t *testing.T) {
+func TestReplayWindowMatchesReference(t *testing.T) {
 	for _, window := range []uint32{1, 2, 3, 32, 63, 64, 65, 100, 128, 4096} {
 		t.Run(fmt.Sprint(window), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(uint64(window), 7))
@@ -137,7 +137,7 @@ func TestClearRangeClearsExactlyItsBits(t *testing.T) {
 // be proportional to how far it jumped. Both figures are measured in the same
 // run on the same machine, and the threshold sits far below what a per-bit
 // loop costs, which was about three thousand times the in-order case.
-func TestReplayCommitCostDoesNotFollowTheJumpDistance(t *testing.T) {
+func TestReplayCommitCostDoesNotFollowJumpDistance(t *testing.T) {
 	const window = DefaultReplayWindow
 	measure := func(jump uint32) time.Duration {
 		const runs = 20000

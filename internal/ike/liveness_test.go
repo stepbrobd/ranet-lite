@@ -101,7 +101,7 @@ func TestRekeyRetryDelay(t *testing.T) {
 
 // Two ends of a simultaneous rekey fail at the same instant and reset the same
 // backoff, so an unjittered retry collides again on every attempt.
-func TestRekeyRetryDelayIsSpreadOverTheUpperHalfOfTheWindow(t *testing.T) {
+func TestRekeyRetryDelayIsSpreadOverUpperHalfOfWindow(t *testing.T) {
 	s := &Session{rekeyRetryInitial: 5 * time.Second, rekeyRetryMax: time.Minute}
 	seen := make(map[time.Duration]bool)
 	for range 64 {
@@ -649,7 +649,7 @@ func TestSetRekeyRetry(t *testing.T) {
 // cannot be produced in-process, so pin the representation instead. A unix
 // nanosecond timestamp is six orders of magnitude larger than any offset from
 // a session's own start.
-func TestLivenessClockIsAnOffsetRatherThanAWallTimestamp(t *testing.T) {
+func TestLivenessClockIsOffsetRatherThanWallTimestamp(t *testing.T) {
 	s := &Session{started: time.Now()}
 	s.noteEstablished()
 	if got := s.lastActive.Load(); got <= 0 || got > int64(time.Hour) {
@@ -677,7 +677,7 @@ func TestActiveExpiresAndComesBack(t *testing.T) {
 // detection, and the session reports up. A peer that keeps ESP flowing and
 // never answers IKE, which RFC 4303 section 2.6 dummy packets alone are enough
 // for, must not be able to pin it until the sequence space runs out.
-func TestAnExchangeAPeerNeverAnswersStillEnds(t *testing.T) {
+func TestUnansweredExchangeStillEnds(t *testing.T) {
 	ordinary := &pendingRequest{}
 	for range maxRetransmits {
 		ordinary.attempts = min(ordinary.attempts+1, maxRetransmits)

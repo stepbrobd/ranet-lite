@@ -65,7 +65,7 @@ type Config struct {
 type Kernel struct {
 	Enabled bool `yaml:"enabled"`
 	// Table is the routing table the reconciler owns; the fleet uses 200,
-	// which is what the policy rules and End.DT46 look up.
+	// the table the policy rules and End.DT46 look up.
 	Table uint32 `yaml:"table"`
 	// Protocol is the rt_proto stamped on every installed route, and the
 	// marker that separates this reconciler's routes from everyone else's.

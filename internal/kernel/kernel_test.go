@@ -278,7 +278,7 @@ func TestReconcileKeepsSourceSpecificAndOrdinaryApart(t *testing.T) {
 // The metric is part of a route's identity in the kernel, so changing it has
 // to withdraw the routes installed under the old one instead of leaving a
 // second copy of every prefix behind.
-func TestReconcileReplacesRoutesWhenTheMetricChanges(t *testing.T) {
+func TestReconcileReplacesRoutesWhenMetricChanges(t *testing.T) {
 	reconciler, table, fake := harness(t, Config{})
 	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
 	if err := reconciler.reconcile(); err != nil {
@@ -432,7 +432,7 @@ func TestReconcileDoesNotCountSkippedRoutes(t *testing.T) {
 
 // A dump that fails must not be read as an empty kernel, which would delete
 // nothing but would also install every route a second time.
-func TestReconcileReportsAFailedDump(t *testing.T) {
+func TestReconcileReportsFailedDump(t *testing.T) {
 	reconciler, table, fake := harness(t, Config{})
 	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
 	fake.failList = errors.New("netlink says no")
@@ -467,7 +467,7 @@ func TestApplyAddressesOnlyRemovesWhatItAdded(t *testing.T) {
 	}
 }
 
-func TestApplyMasterEnslavesOnlyAnUnclaimedLink(t *testing.T) {
+func TestApplyMasterEnslavesOnlyUnclaimedLink(t *testing.T) {
 	reconciler, _, fake := harness(t, Config{VRF: "gravity"})
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -539,7 +539,7 @@ func TestRunWithdrawsOnCancel(t *testing.T) {
 	}
 }
 
-func TestNewRejectsAReservedProtocol(t *testing.T) {
+func TestNewRejectsReservedProtocol(t *testing.T) {
 	if _, err := New(Config{Interface: "ranet0", Protocol: 2}, netstack.NewRouteTable()); err == nil {
 		t.Fatal("RTPROT_KERNEL must be rejected")
 	}
@@ -600,7 +600,7 @@ func waitFor(t *testing.T, done func() bool) {
 // as added makes the reconcile line report the opposite of what the kernel
 // holds, for as long as the other writer keeps the key, and the route stays in
 // the diff so the count repeats every pass.
-func TestSkippedRoutesAreNotCountedAndDoNotFailThePass(t *testing.T) {
+func TestSkippedRoutesAreNotCountedAndDoNotFailPass(t *testing.T) {
 	r, table, kernel := harness(t, Config{})
 	occupied := prefix("2001:db8::/48")
 	table.Set(netip.Prefix{}, occupied, nil)
@@ -635,7 +635,7 @@ func TestSkippedRoutesAreNotCountedAndDoNotFailThePass(t *testing.T) {
 // prefix match falls through to the covering route for the whole window, which
 // on a node holding a default is straight back out to the neighbor that just
 // retracted it.
-func TestRetractedPrefixIsHeldInTheKernelTable(t *testing.T) {
+func TestRetractedPrefixIsHeldInKernelTable(t *testing.T) {
 	r, table, kernel := harness(t, Config{})
 	peer := netstack.NewPeer("peer", nil, nil)
 	covering := prefix("2001:db8::/32")

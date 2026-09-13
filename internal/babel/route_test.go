@@ -175,7 +175,7 @@ func TestSelectionRechecksFeasibility(t *testing.T) {
 	}
 }
 
-func TestHysteresisIgnoresAFlappingChallenger(t *testing.T) {
+func TestHysteresisIgnoresFlappingChallenger(t *testing.T) {
 	now := time.Now()
 	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
 	steady := &neighborState{peer: netstack.NewPeer("steady", nil, nil)}
@@ -206,7 +206,7 @@ func TestHysteresisIgnoresAFlappingChallenger(t *testing.T) {
 // smoothed metric follows an increase immediately, so feeding it infinity when
 // a route is retracted pins ms(R) at 65535, and the cheap path then stays
 // unselected while that decays over several time constants.
-func TestRetractionDoesNotPoisonTheSmoothedMetric(t *testing.T) {
+func TestRetractionDoesNotPoisonSmoothedMetric(t *testing.T) {
 	rt := newRouteTable(func(routeKey, routeSelection) {})
 	rt.tau = time.Minute
 	good := &neighborState{peer: netstack.NewPeer("good", nil, nil)}

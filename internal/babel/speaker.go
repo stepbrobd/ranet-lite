@@ -232,7 +232,7 @@ func (s *Speaker) Originate(prefix netip.Prefix) {
 
 // OriginateFrom announces a source-specific prefix, BIRD's
 // `route <dest> from <source>`. A zero-length source prefix announces an
-// ordinary route, which is what RFC 9079 section 5 says such an entry means.
+// ordinary route, the meaning RFC 9079 section 5 gives such an entry.
 func (s *Speaker) OriginateFrom(dest, source netip.Prefix) {
 	key, ok := originatedKey(dest, source)
 	if !ok {
@@ -271,7 +271,7 @@ func (s *Speaker) releaseOriginatedLocked(key routeKey) {
 	s.mesh.Routes.Remove(key.source, key.dest)
 }
 
-// SetOriginated replaces the whole originated set, which is what a
+// SetOriginated replaces the whole originated set, as a
 // configuration reload needs: a prefix that is no longer configured has to be
 // retracted rather than announced forever, and adding one at a time cannot
 // express a removal. Each element is a destination and an optional source

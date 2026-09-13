@@ -230,7 +230,7 @@ func waitFor(t *testing.T, limit time.Duration, what string, done func() bool) {
 // SIGHUP announcing a new prefix has to reach the peer's forwarding table.
 // The existing reload test sets Originate and asserts peer and registry
 // counts, so deleting the SetOriginated call passes it.
-func TestReloadAnnouncesANewPrefixToThePeer(t *testing.T) {
+func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
 	run(t, alpha, bravo)
 	added := netip.MustParsePrefix("fd00:aa::/64")
@@ -255,7 +255,7 @@ func TestReloadAnnouncesANewPrefixToThePeer(t *testing.T) {
 // into an SPI we no longer accept until its own dead peer detection expires,
 // which is over a minute. closeAll and the Delete inside closeSession are both
 // unreachable from anything else in this package.
-func TestShutdownTellsThePeerBeforeGoing(t *testing.T) {
+func TestShutdownTellsPeerBeforeGoing(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
 	run(t, bravo)
 	_, stopAlpha := run(t, alpha)

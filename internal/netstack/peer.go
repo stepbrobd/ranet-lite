@@ -94,16 +94,6 @@ func (p *Peer) Close() {
 	<-p.senderDone
 }
 
-// SendRaw transmits a hand-built tunnel-mode IP packet directly through this
-// peer. Babel uses this path; reserving and transmitting through the same Peer
-// as routed traffic keeps its ESP packet ordered with concurrently encrypted
-// TUN batches.
-func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
-	b := p.reserveBatch(1)
-	b.append(raw, nextHeader)
-	return b.transmit()
-}
-
 // ErrSendQueueFull reports a packet dropped rather than queued, so the caller
 // can count it without treating the peer as broken.
 var ErrSendQueueFull = errors.New("netstack: peer send queue is full")

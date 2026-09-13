@@ -283,7 +283,7 @@ func TestChildNotFoundRecoveryCreatesNewChild(t *testing.T) {
 
 // requestMu orders callers queueing work for Run; it does not order Run
 // itself, which allocates Message IDs on its own goroutine. A session closed
-// the instant it is established runs both at once, which is what adopt's
+// the instant it is established runs both at once, as adopt's
 // replace path produces on a simultaneous open.
 func TestLocalMessageIDIsNotAllocatedTwiceAtOnce(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
@@ -383,7 +383,7 @@ func newRekeyableSession(t *testing.T, old ChildSA) *Session {
 // answer with no Delete payload at all. Treating that as a failure used to
 // leave the replaced SA latched in s.retiring, which locks out every later
 // rekey in both directions for the life of the session.
-func TestCrossedChildDeleteStillRetiresTheReplacedSA(t *testing.T) {
+func TestCrossedChildDeleteStillRetiresReplacedSA(t *testing.T) {
 	old := ChildSA{
 		EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128,
 		LocalSPI: 0x10203040, RemoteSPI: 0x50607080,
@@ -413,7 +413,7 @@ func TestCrossedChildDeleteStillRetiresTheReplacedSA(t *testing.T) {
 
 // A failed retire exchange has nobody left to send the Delete either, so the
 // replaced SA still has to come out of s.retiring.
-func TestFailedChildRetireExchangeStillClearsTheReplacedSA(t *testing.T) {
+func TestFailedChildRetireExchangeStillClearsReplacedSA(t *testing.T) {
 	old := ChildSA{
 		EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128,
 		LocalSPI: 0x11223344, RemoteSPI: 0x55667788,

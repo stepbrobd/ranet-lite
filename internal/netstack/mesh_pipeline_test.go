@@ -404,7 +404,7 @@ func (d *utunDevice) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	return 1, nil
 }
 
-func TestOutboundReaderLeavesRoomForThePlatformFrameHeader(t *testing.T) {
+func TestOutboundReaderLeavesRoomForPlatformFrameHeader(t *testing.T) {
 	dev := &utunDevice{
 		recordingDevice: recordingDevice{writes: make(chan recordedWrite, 1), events: make(chan tun.Event)},
 		reads:           make(chan []byte, 1),

@@ -49,7 +49,7 @@ var (
 )
 
 // tunOffset is how much leading space every Device.Read and Device.Write
-// needs in each buffer — the same offset wireguard-go's own device code uses
+// needs in each buffer, the same offset wireguard-go's own device code uses
 // (device.MessageTransportOffsetContent), and for the same reasons. A backend
 // slices backwards from it to reach its own framing: linux prepends a
 // virtio-net header (the tun package always requests IFF_VNET_HDR), darwin

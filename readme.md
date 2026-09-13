@@ -42,16 +42,16 @@ ranet's full N-to-N reconciliation.
 ## What it deliberately doesn't do
 
 **ranet-lite carries transit in this fork.** Upstream is an RFC 8966 Appendix E
-stub that never re-advertises a learned route, which is what made it loop-free
-by construction. The speaker here implements the source table and the
-feasibility condition instead, and redistributes its selected routes, so loop
-freedom comes from the mechanism the RFC provides rather than from an inability
-to relay. A node that advertises transit still has to be able to forward it,
-which is three things this binary does not do for you: `net.ipv4.ip_forward` and
+stub that never re-advertises a learned route, which made it loop-free by
+construction. The speaker here implements the source table and the feasibility
+condition instead, and redistributes its selected routes, so loop freedom comes
+from the mechanism the RFC provides rather than from an inability to relay. A
+node that advertises transit still has to be able to forward it, which is three
+things this binary does not do for you: `net.ipv4.ip_forward` and
 `net.ipv6.conf.all.forwarding` have to be on, the learned routes have to reach a
-kernel table the node actually consults, which is what the `kernel` block below
-is for, and the TUN has to be allowed to forward back out of itself. Advertising
-transit without them means announced paths blackhole.
+kernel table the node actually consults, which the `kernel` block below is for,
+and the TUN has to be allowed to forward back out of itself. Advertising transit
+without them means announced paths blackhole.
 
 It implements genuine source-specific routing
 ([SADR, RFC 9079](https://www.rfc-editor.org/rfc/rfc9079)): the mesh's route
@@ -149,7 +149,7 @@ both exchanges, temporarily retaining the redundant SAs, and using the four
 nonces to decide which new SA to delete. Returning the error keeps ranet-lite's
 single-Child-SA state machine simple. Both ends fail at the same instant and
 reset the same backoff, so the retry is drawn from the upper half of its window
-rather than run at the window's end; without that spread the retry reproduces
+rather than run at the window's end. Without that spread the retry reproduces
 the phase difference that caused the collision and collides again indefinitely,
 which is the jitter
 [RFC 7296 section 2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)
@@ -335,22 +335,21 @@ never touches another table, another device, or any policy rule.
 Installing is where a router daemon usually takes over from its neighbors, and
 this one does not. It asks for the route exclusively, and a key something else
 already holds is left alone and reported once. That matters most in a VRF table,
-which is what a gravity node hands it: a replace compares neither the protocol
-nor the route type, so it would have displaced the kernel's own local and
-connected entries for an address on an enslaved link, at the same priority an
-IPv4 route with no configured metric uses. The reconciler also names any other
-routing protocol it finds in the table at startup.
+which a gravity node hands it: a replace compares neither the protocol nor the
+route type, so it would have displaced the kernel's own local and connected
+entries for an address on an enslaved link, at the same priority an IPv4 route
+with no configured metric uses. The reconciler also names any other routing
+protocol it finds in the table at startup.
 
 On darwin there are no tables and no `rt_proto`, so ownership is by interface
 and by shape: a route out of its own utun whose gateway is a link address naming
-that interface. That condition is the whole guarantee, so it is worth stating
-plainly: nothing else writes routes out of our utun. Tailscale's `100.64.0.0/10`
-on its own utun has exactly the shape described above, so a reconciler pointed
-at that interface would adopt and withdraw it. Two things keep that from
-happening. The device is created by asking for the next free unit, so it is
-never one another tunnel is already using, and XNU allocates interface indices
-by incrementing a counter with no free list, so a destroyed utun's index is
-never handed out again.
+that interface. That condition is the whole guarantee: nothing else writes
+routes out of our utun. Tailscale's `100.64.0.0/10` on its own utun has exactly
+the shape described above, so a reconciler pointed at that interface would adopt
+and withdraw it. Two things keep that from happening. The device is created by
+asking for the next free unit, so it is never one another tunnel is already
+using, and XNU allocates interface indices by incrementing a counter with no
+free list, so a destroyed utun's index is never handed out again.
 
 Interface-scoped routes are narrower still, because a scoped route is what this
 reconciler installs for a source-specific announcement and also what other tools
@@ -376,12 +375,12 @@ applies to every unbound socket, so Safari, curl and ssh keep the address of
 whatever interface the machine was already using. macOS has no `ip rule`:
 selecting a scoped route means `bind()` to an address on the tun or
 `IP_BOUND_IF` to the tun itself, per application, and ranet-lite provides
-neither. There is a second-order effect worth knowing about too. Once the
-outgoing interface has no address of a family, which happens on an IPv4-only
-network where the mesh address is the box's only global IPv6, RFC 6724 rule 5
-makes the mesh address a candidate source for traffic that is not going through
-the mesh at all, and those packets die at the first BCP 38 filter with nothing
-to show for it locally.
+neither. There is a second-order effect too. Once the outgoing interface has no
+address of a family, which happens on an IPv4-only network where the mesh
+address is the box's only global IPv6, RFC 6724 rule 5 makes the mesh address a
+candidate source for traffic that is not going through the mesh at all, and
+those packets die at the first BCP 38 filter with nothing to show for it
+locally.
 
 An install that collides with a route another program holds is reported rather
 than retried in silence, since darwin has no replace and the collision does not

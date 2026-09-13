@@ -185,9 +185,9 @@ func TestQueuedChildRequestDoesNotUseRetiredIKE(t *testing.T) {
 }
 
 // The rate limit has to sit in handleChildRekey, before the Diffie-Hellman and
-// the keymat, which is what a peer rekeying in a loop is really asking us to
+// the keymat, the work a peer rekeying in a loop is really asking us to
 // spend.
-func TestHandleChildRekeyRefusesASecondRekeyInTheSameInterval(t *testing.T) {
+func TestHandleChildRekeyRefusesSecondRekeyInSameInterval(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	ctx := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: bytes.Repeat([]byte{1}, 32),

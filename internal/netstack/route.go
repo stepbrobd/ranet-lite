@@ -19,7 +19,7 @@ func NewRouteTable() *RouteTable { return &RouteTable{changed: make(chan struct{
 
 // Unreachable is installed for a prefix that is known and has no usable route.
 // A lookup that lands on it is answered rather than falling through to a
-// covering entry, which is what RFC 8966 section 3.5.4 requires while a
+// covering entry, as RFC 8966 section 3.5.4 requires while a
 // retracted prefix is still held: "packets destined to an address within P
 // MUST NOT be forwarded by following a route for a shorter prefix". Without it
 // a more specific prefix that has just been retracted immediately starts

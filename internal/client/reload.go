@@ -164,14 +164,11 @@ func reloadable(old, next *config.Config) error {
 }
 
 // sameKernelSettings compares the reconciler block, which is read once at
-// startup. An omitted list and an empty one mean the same thing, and
-// reflect.DeepEqual does not, so they are normalized first: refusing a reload
-// over "addresses: []" against no key at all would be a refusal over nothing.
-// sameKernelSettings compares the kernel block by what the reconciler was
-// given rather than by how the file was written. An omitted field and one
-// written out as its own default are the same configuration, and comparing
-// them as written refuses a reload that changes nothing: writing
-// "reconcile_interval: 30s" into the file would have been enough.
+// startup, by what it was given rather than by how the file was written. An
+// omitted list and an empty one mean the same thing, and so do an omitted
+// interval and one written out as its own default; comparing them as written
+// refuses a reload that changes nothing, which writing "reconcile_interval:
+// 30s" into the file would have been enough to cause.
 func sameKernelSettings(old, next config.Kernel) bool {
 	normalize := func(k *config.Kernel) {
 		if len(k.Addresses) == 0 {

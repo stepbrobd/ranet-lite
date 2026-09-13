@@ -296,7 +296,7 @@ func TestRouteTableTrieRemovePeerCompactsAcrossFamilies(t *testing.T) {
 // Leaving it out of the snapshot deleted it from the kernel table, where
 // longest-prefix match then fell through to the covering route for the whole
 // hold window.
-func TestSnapshotCarriesTheUnreachableHold(t *testing.T) {
+func TestSnapshotCarriesUnreachableHold(t *testing.T) {
 	rt := NewRouteTable()
 	peer := NewPeer("peer", nil, nil)
 	held := netip.MustParsePrefix("2001:db8:1::/48")
@@ -315,7 +315,7 @@ func TestSnapshotCarriesTheUnreachableHold(t *testing.T) {
 	if !found {
 		t.Errorf("the hold for %s was left out of the snapshot, so a mirror deletes it", held)
 	}
-	// It is still a hold for forwarding here, which is what keeping the entry
+	// It is still a hold for forwarding here, which keeping the entry
 	// rather than removing it is for.
 	if _, ok := rt.Lookup(netip.Addr{}, held.Addr().Next()); ok {
 		t.Error("a packet for a held prefix was routed rather than dropped")
@@ -325,7 +325,7 @@ func TestSnapshotCarriesTheUnreachableHold(t *testing.T) {
 // Changed is how the reconciler learns a route moved without waiting out its
 // periodic sweep, which at the default interval is thirty seconds of the
 // kernel disagreeing with the mesh.
-func TestEveryTableChangeWakesTheReconciler(t *testing.T) {
+func TestEveryTableChangeWakesReconciler(t *testing.T) {
 	rt := NewRouteTable()
 	peer := NewPeer("peer", nil, nil)
 	drain := func() {

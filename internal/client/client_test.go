@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/esp"
@@ -367,7 +368,7 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 // name at both ends. They have to pick the same survivor whichever order the
 // two handshakes finish in locally, or each keeps the SA the other tore down
 // and nothing crosses until dead peer detection notices.
-func TestSimultaneousOpenConvergesOnTheSameSession(t *testing.T) {
+func TestSimultaneousOpenConvergesOnSameSession(t *testing.T) {
 	a := ike.Identity{Organization: "example", CommonName: "alpha", SerialNumber: "1"}
 	b := ike.Identity{Organization: "example", CommonName: "bravo", SerialNumber: "1"}
 	if preferInitiator(a, b) == preferInitiator(b, a) {
@@ -395,7 +396,7 @@ func TestSimultaneousOpenConvergesOnTheSameSession(t *testing.T) {
 			if which == dialedByB {
 				initiator, responder = b, a
 			}
-			set.adopt("path", sessions[which], initiator, responder)
+			set.adopt("path", sessions[which], initiator, responder, nil)
 		}
 		for name, sess := range sessions {
 			if live := set.live["path"]; live != nil && live.session == sess {
@@ -435,7 +436,7 @@ func TestSimultaneousOpenConvergesOnTheSameSession(t *testing.T) {
 // stand-down the two ends take turns replacing each other's session every
 // reconnect delay for as long as the process runs, and every replacement
 // withdraws the routes learned through that peer.
-func TestSessionSetReportsAnEstablishedPath(t *testing.T) {
+func TestSessionSetReportsEstablishedPath(t *testing.T) {
 	set := newSessionSet()
 	set.close = func(*ike.Session) {}
 	set.active = func(*ike.Session) bool { return true }
@@ -443,7 +444,7 @@ func TestSessionSetReportsAnEstablishedPath(t *testing.T) {
 		t.Fatal("an empty set reports a session, so neither end would ever dial")
 	}
 	sess := &ike.Session{}
-	release, adopted := set.adoptPreferred("path", sess, true)
+	release, adopted := set.adoptPreferred("path", sess, true, nil)
 	if !adopted {
 		t.Fatal("the first session was not adopted")
 	}
@@ -465,13 +466,13 @@ func TestSessionSetReportsAnEstablishedPath(t *testing.T) {
 // dead peer detection reaps it a minute later. That entry must not stand this
 // node's dialer down, or neither end opens anything for the whole of that
 // minute: the peer has no session, and we are waiting behind one that is gone.
-func TestAStaleIncumbentDoesNotStandTheDialerDown(t *testing.T) {
+func TestStaleIncumbentDoesNotStandDialerDown(t *testing.T) {
 	set := newSessionSet()
 	set.close = func(*ike.Session) {}
 	stale, fresh := &ike.Session{}, &ike.Session{}
 	set.active = func(sess *ike.Session) bool { return sess != stale }
 
-	if _, adopted := set.adoptPreferred("path", stale, true); !adopted {
+	if _, adopted := set.adoptPreferred("path", stale, true, nil); !adopted {
 		t.Fatal("the first session was not adopted")
 	}
 	if set.holds("path") {
@@ -479,7 +480,7 @@ func TestAStaleIncumbentDoesNotStandTheDialerDown(t *testing.T) {
 	}
 	// The dialer then opens one, and this end prefers it because it is the one
 	// both ends agree should be dialed, so it takes over from the stale entry.
-	if _, adopted := set.adoptPreferred("path", fresh, true); !adopted {
+	if _, adopted := set.adoptPreferred("path", fresh, true, nil); !adopted {
 		t.Fatal("the dialer's own session was declined")
 	}
 	if live := set.live["path"]; live == nil || live.session != fresh {
@@ -492,13 +493,13 @@ func TestAStaleIncumbentDoesNotStandTheDialerDown(t *testing.T) {
 
 // The preference rule still has to hold when the incumbent really is alive, or
 // two nodes dialing each other at once keep different sessions.
-func TestSessionSetKeepsAnActivePreferredSession(t *testing.T) {
+func TestSessionSetKeepsActivePreferredSession(t *testing.T) {
 	set := newSessionSet()
 	set.close = func(*ike.Session) {}
 	set.active = func(*ike.Session) bool { return true }
 	winner, loser := &ike.Session{}, &ike.Session{}
-	set.adoptPreferred("path", winner, true)
-	if _, adopted := set.adoptPreferred("path", loser, false); adopted {
+	set.adoptPreferred("path", winner, true, nil)
+	if _, adopted := set.adoptPreferred("path", loser, false, nil); adopted {
 		t.Error("the session neither end prefers replaced the one both do")
 	}
 	if live := set.live["path"]; live == nil || live.session != winner {
@@ -510,7 +511,7 @@ func TestSessionSetKeepsAnActivePreferredSession(t *testing.T) {
 // registry is rewritten whenever any node joins the mesh, so a peer that is
 // briefly not in it is ordinary, and an entry that still says "running"
 // makes every later reload skip that peer until the process restarts.
-func TestSyncPeersRestartsADialerThatGaveUp(t *testing.T) {
+func TestSyncPeersRestartsDialerThatGaveUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := &Client{ctx: ctx, cancel: cancel, dialers: make(map[string]*dialer)}
@@ -550,7 +551,7 @@ func TestSyncPeersRestartsADialerThatGaveUp(t *testing.T) {
 // While the serial number was missing from the dialer's name it looked like no
 // change at all, and Reload reported success while the old dialer kept using
 // the value it captured when it started.
-func TestSyncPeersNoticesAChangedSerialNumber(t *testing.T) {
+func TestSyncPeersNoticesChangedSerialNumber(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := &Client{ctx: ctx, cancel: cancel, dialers: make(map[string]*dialer)}
@@ -596,9 +597,9 @@ func TestSyncPeersNoticesAChangedSerialNumber(t *testing.T) {
 }
 
 // A node joining the mesh must cost one dialer rather than a restart of every
-// other node's dataplane, which is what Reload is for. This drives it through
+// other node's dataplane, which Reload exists for. This drives it through
 // a file on disk, the way SIGHUP does.
-func TestReloadAppliesTheRegistryPeersAndOriginations(t *testing.T) {
+func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	cfg, privateKey, reg := runtimeFixture(t)
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
@@ -696,7 +697,7 @@ func writeKey(t *testing.T, path string, key ed25519.PrivateKey) {
 // The responder decides whether this node answers at all, and acceptPeers is
 // started once by Run. Accepting the change would report a reload that turned
 // the responder on while nobody answered.
-func TestReloadRefusesAResponderChange(t *testing.T) {
+func TestReloadRefusesResponderChange(t *testing.T) {
 	base := &config.Config{Organization: "example", CommonName: "node", Port: 13000}
 	next := *base
 	next.Responder = !base.Responder
@@ -709,7 +710,7 @@ func TestReloadRefusesAResponderChange(t *testing.T) {
 // omitted one. Comparing them as written refuses a reload that changes
 // nothing, so writing "rxcost: 96" into the file, the value the speaker
 // already uses, would have been enough to make every later SIGHUP fail.
-func TestReloadAcceptsADefaultWrittenOutInFull(t *testing.T) {
+func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 	base := &config.Config{
 		Organization: "example", CommonName: "node", Port: 13000,
 		Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
@@ -742,6 +743,51 @@ func TestReloadAcceptsADefaultWrittenOutInFull(t *testing.T) {
 	changed.Babel = config.Babel{RxCost: &louder}
 	if err := reloadable(base, &changed); err == nil {
 		t.Error("a changed link cost was accepted, which the speaker would never see")
+	}
+}
+
+// Whatever a session registers under the path's name has to go in under the
+// same decision that hands it the path. Two sessions resolving against each
+// other reach adopt in one order and everything after it in another, so a
+// session already replaced would otherwise take the babel neighbor away from
+// the one that replaced it: the speaker would hold a peer whose mux is closed
+// and the adjacency would stay down until that session unwound.
+func TestRegistrationCannotOutliveItsSession(t *testing.T) {
+	set := newSessionSet()
+	set.close = func(*ike.Session) {}
+	loser, winner := &ike.Session{}, &ike.Session{}
+
+	var mu sync.Mutex
+	registered := ""
+	attach := func(name string) func() func() {
+		return func() func() {
+			mu.Lock()
+			defer mu.Unlock()
+			registered = name
+			return func() {
+				mu.Lock()
+				defer mu.Unlock()
+				if registered == name {
+					registered = ""
+				}
+			}
+		}
+	}
+
+	releaseLoser, adopted := set.adoptPreferred("path", loser, false, attach("loser"))
+	if !adopted {
+		t.Fatal("the first session was not adopted")
+	}
+	if _, adopted := set.adoptPreferred("path", winner, true, attach("winner")); !adopted {
+		t.Fatal("the session both ends prefer was declined")
+	}
+	// The loser now unwinds, which is the ordering that used to clobber.
+	releaseLoser()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if registered != "winner" {
+		t.Errorf("the path is registered to %q, want the session that holds it", registered)
 	}
 }
 

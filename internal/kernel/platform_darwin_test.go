@@ -129,7 +129,7 @@ func dumpRIB(t *testing.T, entries ...dumpEntry) []byte {
 
 func ourGateway() route.Addr { return &route.LinkAddr{Index: testIndex} }
 
-func TestDarwinRouteMessageNamesTheInterfaceAsItsGateway(t *testing.T) {
+func TestDarwinRouteMessageNamesInterfaceAsItsGateway(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	if err := plat.AddRoute(Route{Destination: prefix("198.51.100.0/24")}); err != nil {
 		t.Fatalf("add a route: %v", err)
@@ -291,7 +291,7 @@ func TestDarwinAnnouncedDefaultDoesNotCaptureUnderlay(t *testing.T) {
 	}
 }
 
-func TestDarwinDumpKeepsOnlyTheRoutesItOwns(t *testing.T) {
+func TestDarwinDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 	plat, _ := testPlatform(t, Config{PrefSrc4: addr("198.51.100.1")})
 	elsewhere := &route.LinkAddr{Index: testIndex + 1}
 	// the host route an interface address creates: its gateway is the address,
@@ -342,7 +342,7 @@ func TestDarwinDumpKeepsOnlyTheRoutesItOwns(t *testing.T) {
 // The mirroring is what makes a pass converge: a dump that reported a metric
 // or a preferred source the reconciler did not ask for would leave every route
 // on both the add list and the delete list forever.
-func TestDarwinDumpMirrorsTheDiffKeyFields(t *testing.T) {
+func TestDarwinDumpMirrorsDiffKeyFields(t *testing.T) {
 	plat, _ := testPlatform(t, Config{Metric: 32, PrefSrc4: addr("198.51.100.1")})
 	rib := dumpRIB(t,
 		dumpEntry{index: testIndex, flags: unix.RTF_UP, dst: prefix("198.51.100.0/24"), gateway: ourGateway()},
@@ -546,7 +546,7 @@ func TestDarwinDeleteRequests(t *testing.T) {
 // A configuration written for the linux backend names a table, a protocol or a
 // VRF, none of which exists here. Refusing at startup is the difference
 // between a deployment that is wrong and one that looks like it works.
-func TestDarwinPlatformRejectsALinuxConfig(t *testing.T) {
+func TestDarwinPlatformRejectsLinuxConfig(t *testing.T) {
 	base := Config{Interface: "utun9", Table: DefaultTable, Protocol: DefaultProtocol}
 	for _, test := range []struct {
 		name    string
@@ -616,7 +616,7 @@ func TestDarwinPrefixMaskRoundTrip(t *testing.T) {
 // until the address seam existed no fast test could reach it: sourceIsOurs
 // asked the host about an interface index that names nothing, so every
 // source-specific route took the refusal path.
-func TestDarwinScopesASourceOfOurs(t *testing.T) {
+func TestDarwinScopesSourceOfOurs(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	local := prefix("198.51.100.0/24")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
@@ -655,7 +655,7 @@ func TestDarwinScopesASourceOfOurs(t *testing.T) {
 // route. Deciding ownership from a live query rather than from what was
 // recorded made DelRoute report success without deleting, and every later pass
 // then listed the same route for deletion and deleted nothing.
-func TestDarwinWithdrawsAScopedRouteAfterItsAddressIsGone(t *testing.T) {
+func TestDarwinWithdrawsScopedRouteAfterItsAddressIsGone(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	local := prefix("198.51.100.0/24")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
@@ -677,7 +677,7 @@ func TestDarwinWithdrawsAScopedRouteAfterItsAddressIsGone(t *testing.T) {
 // A dump failure is not an answer. Reporting it as "the source is not ours"
 // skipped the route, reported success, and never retried something a retry
 // would have fixed.
-func TestDarwinPropagatesAnAddressDumpFailure(t *testing.T) {
+func TestDarwinPropagatesAddressDumpFailure(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	wanted := errors.New("dump failed")
 	plat.addrs = func() ([]netip.Prefix, error) { return nil, wanted }
@@ -695,7 +695,7 @@ func TestDarwinPropagatesAnAddressDumpFailure(t *testing.T) {
 // route that was never installed makes the next dump report the unscoped route
 // to the same destination as carrying a source it does not have, and the diff
 // is then satisfied by a route that captures the whole machine.
-func TestDarwinDoesNotRecordAScopedRouteThatFailedToInstall(t *testing.T) {
+func TestDarwinDoesNotRecordScopedRouteThatFailedToInstall(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
 	sock.err = unix.EPERM
@@ -713,7 +713,7 @@ func TestDarwinDoesNotRecordAScopedRouteThatFailedToInstall(t *testing.T) {
 // destination, so both can be present. Reporting the source on both collapses
 // them into one entry, and the unscoped one, which for a default route is the
 // whole machine, is then never withdrawn.
-func TestDarwinDoesNotAttributeASourceToAnUnscopedRoute(t *testing.T) {
+func TestDarwinDoesNotAttributeSourceToUnscopedRoute(t *testing.T) {
 	plat, _ := testPlatform(t, Config{})
 	dest := prefix("::/0")
 	plat.scoped[dest] = prefix("2001:db8::/48")
@@ -747,7 +747,7 @@ func TestDarwinDoesNotAttributeASourceToAnUnscopedRoute(t *testing.T) {
 
 // A second source prefix for the same destination has nowhere to go: interface
 // scope is one route per destination per interface.
-func TestDarwinRefusesASecondSourceForOneDestination(t *testing.T) {
+func TestDarwinRefusesSecondSourceForOneDestination(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	plat.addrs = func() ([]netip.Prefix, error) {
 		return []netip.Prefix{prefix("198.51.100.1/24"), prefix("203.0.113.1/24")}, nil
@@ -819,7 +819,7 @@ func TestDarwinSpecificRouteStaysReachableWithoutBinding(t *testing.T) {
 // The scope on a delete comes from the route, not from a record keyed by
 // destination alone: an unscoped route and a scoped one can share a
 // destination, and withdrawing one must not take out the other.
-func TestDarwinDeleteSelectsTheScopeOfTheRouteItWithdraws(t *testing.T) {
+func TestDarwinDeleteSelectsScopeOfRouteItWithdraws(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	specific := Route{Destination: prefix("203.0.113.0/24")}
 	if err := plat.DelRoute(specific); err != nil {
@@ -842,7 +842,7 @@ func TestDarwinDeleteSelectsTheScopeOfTheRouteItWithdraws(t *testing.T) {
 // installed it would make the reconcile line say the opposite of what the
 // kernel holds, for as long as the other writer keeps the key; reported as a
 // failure it would put every pass into backoff over something no retry frees.
-func TestDarwinReportsAnOccupiedRouteAsSkipped(t *testing.T) {
+func TestDarwinReportsOccupiedRouteAsSkipped(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	announced := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
 	plat.addrs = func() ([]netip.Prefix, error) {
@@ -866,7 +866,7 @@ func TestDarwinReportsAnOccupiedRouteAsSkipped(t *testing.T) {
 // A hold answers with an error rather than carrying the packet out of the tun,
 // and keeps whatever scope its destination would have had: a held default must
 // no more be visible to an unbound socket than a real one.
-func TestDarwinHoldIsInstalledAsAReject(t *testing.T) {
+func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
 	plat, sock := testPlatform(t, Config{})
 	held := Route{Destination: prefix("2001:db8:1::/48"), Unreachable: true, Metric: defaultIPv6Metric}
 	if err := plat.AddRoute(held); err != nil {
