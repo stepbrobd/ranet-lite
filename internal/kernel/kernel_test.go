@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"runtime"
 	"slices"
 	"sync"
 	"syscall"
@@ -682,5 +683,23 @@ func TestRetractedPrefixIsHeldInKernelTable(t *testing.T) {
 		if route.Destination == retracted {
 			t.Errorf("the hold outlived the entry it was holding: %v", route)
 		}
+	}
+}
+
+// The startup line tells an operator where this reconciler's routes went. On a
+// platform with no routing tables it used to print table 0, the config's
+// zero value read before defaults were applied, on a machine that has no
+// tables at all.
+func TestWhereNamesTheSpaceThisPlatformHas(t *testing.T) {
+	r, _, _ := harness(t, Config{Interface: "utun9", Table: DefaultTable})
+	where := r.Where()
+	if runtime.GOOS == "darwin" {
+		if where != "interface utun9" {
+			t.Errorf("darwin reports %q, want the interface it owns", where)
+		}
+		return
+	}
+	if where != fmt.Sprintf("table %d", DefaultTable) {
+		t.Errorf("reports %q, want the table it owns", where)
 	}
 }

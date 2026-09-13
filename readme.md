@@ -65,9 +65,10 @@ it arrives on the TUN device, not an approximation based on a single configured
 it to.** It creates the device and brings it up, or attaches to the configured
 `tun` device, and by default assigning its addresses and kernel routes is
 external. This fork adds an optional reconciler, `internal/kernel`, which
-mirrors the learned routes into one routing table it owns, or into
-interface-scoped routes on darwin, and can assign the configured addresses. See
-the `kernel` block in the configuration below. It is off unless enabled.
+mirrors the learned routes into one routing table it owns, or on darwin into the
+single table that platform has, scoping the ones that would otherwise capture
+the machine, and can assign the configured addresses. See the `kernel` block in
+the configuration below. It is off unless enabled.
 
 Babel only exchanges control packets inside authenticated ESP tunnels; a local
 routing daemon cannot peer with the embedded speaker over the TUN. Learned
@@ -293,7 +294,7 @@ babel:
 #   table: 200                     # the table the policy rules look up
 #   protocol: 155                  # rt_proto marking this reconciler's routes
 #   metric: 32
-#   prefsrc4: 10.66.0.5            # RTA_PREFSRC on v4 routes, as krt_prefsrc does
+#   prefsrc4: 10.66.0.5            # linux only: RTA_PREFSRC on v4 routes, as krt_prefsrc
 #   addresses: ["10.66.0.5/32"]    # assigned to the TUN, removed again at exit
 #   assign_originated: false       # also assign every prefix in originate
 #   vrf: gravity                   # joined only while the link has no master
@@ -382,9 +383,11 @@ candidate source for traffic that is not going through the mesh at all, and
 those packets die at the first BCP 38 filter with nothing to show for it
 locally.
 
-An install that collides with a route another program holds is reported rather
-than retried in silence, since darwin has no replace and the collision does not
-resolve itself.
+An install that collides with a route another program holds is reported once and
+left alone. darwin has no replace, and the collision does not resolve itself, so
+the route stays in the diff and the install is attempted again on every pass,
+silently after that first report; the reconcile line counts it as not installed
+rather than as added.
 
 Addresses are narrower still: only an address this process added is ever
 removed, and one already on the link belongs to whoever put it there. That rule
@@ -437,8 +440,8 @@ reload that fails validation changes nothing.
   table.
 - `internal/babel` is the embedded Babel speaker.
 - `internal/kernel` is the optional reconciler. It mirrors learned routes into a
-  routing table it owns on linux, or into interface-scoped routes on darwin, and
-  assigns the TUN's addresses.
+  routing table it owns on linux, or on darwin into the single table that
+  platform has, and assigns the TUN's addresses.
 - `internal/packet` validates TUN and decrypted IP packets.
 - `sadr` is the immutable source and destination routing trie, with snapshot
   iteration.

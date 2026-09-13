@@ -118,8 +118,11 @@ func main() {
 				log.Printf("kernel: %v", err)
 			}
 		})
-		log.Printf("tun device %s ready with %d queues, reconciling its routes into table %d",
-			mesh.Name, mesh.QueueCount(), kernelCfg.Table)
+		// The table is read back from the reconciler rather than from the
+		// config, which has not had its defaults applied yet and reads zero on
+		// a platform that has no tables at all.
+		log.Printf("tun device %s ready with %d queues, reconciling its routes into %s",
+			mesh.Name, mesh.QueueCount(), routes.Where())
 	} else {
 		log.Printf("tun device %s ready with %d queues, configure its addresses and kernel routes externally",
 			mesh.Name, mesh.QueueCount())

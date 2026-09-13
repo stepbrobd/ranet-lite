@@ -55,6 +55,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -297,6 +298,16 @@ func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 // own when the TUN disappears, so a device that is already gone is not an
 // error. Run returns the withdrawal error, never a reconcile error: a failed
 // pass is logged and retried instead.
+// Where names the space this reconciler owns, for an operator reading a log
+// line: a routing table where the platform has them, and the interface itself
+// where it does not.
+func (r *Reconciler) Where() string {
+	if runtime.GOOS == "darwin" {
+		return "interface " + r.cfg.Interface
+	}
+	return fmt.Sprintf("table %d", r.cfg.Table)
+}
+
 func (r *Reconciler) Run(ctx context.Context) error {
 	changed := r.src.Changed()
 	notify := r.plat.Notify()
