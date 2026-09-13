@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/registry"
 )
 
 // acceptPeers answers peers that dial us, as a full mesh needs and
@@ -74,22 +75,43 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 // from, so a value the registry does not know means the registry and the peer
 // disagree about what exists.
 func (c *Client) lookupPeerKey(peer ike.Identity) (ed25519.PublicKey, bool) {
+	key, node, ok := c.peerKey(peer)
+	if !ok {
+		return nil, false
+	}
+	if _, named := node.FindEndpoint(peer.SerialNumber); !named {
+		return nil, false
+	}
+	return key, true
+}
+
+// stillTrusted reports whether the registry still stands behind a peer this
+// node has already authenticated, which a reload asks of every live session.
+// The endpoint serial is left out: it selects which endpoint a dial uses, and
+// renumbering one is a registry edit rather than a revocation, so asking for it
+// here closes a session whose peer has done nothing to lose it.
+func (c *Client) stillTrusted(peer ike.Identity) bool {
+	_, _, ok := c.peerKey(peer)
+	return ok
+}
+
+// peerKey is the organization key that must verify a peer's AUTH, with the
+// node the registry holds for it, and whether the registry stands behind the
+// identity at all.
+func (c *Client) peerKey(peer ike.Identity) (ed25519.PublicKey, registry.Node, bool) {
 	cfg := c.config()
 	organization, node, ok := c.registry().FindNode(peer.Organization, peer.CommonName)
 	if !ok {
-		return nil, false
+		return nil, registry.Node{}, false
 	}
 	if peer.Organization == cfg.Organization && peer.CommonName == cfg.CommonName {
 		// Our own name in another node's IDi is either a misconfiguration or
 		// an attempt to reuse the organization key under our identity.
-		return nil, false
-	}
-	if _, ok := node.FindEndpoint(peer.SerialNumber); !ok {
-		return nil, false
+		return nil, registry.Node{}, false
 	}
 	publicKey, err := organization.ParsePublicKey()
 	if err != nil {
-		return nil, false
+		return nil, registry.Node{}, false
 	}
-	return publicKey, true
+	return publicKey, node, true
 }

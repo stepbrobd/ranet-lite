@@ -141,6 +141,36 @@ func TestFindNodeContinuesAcrossDuplicateOrganizations(t *testing.T) {
 // Resolution has to be cancellable, because Client.Run waits for every dialer
 // before it returns and a dialer resolving a hostname whose resolver is
 // unreachable would otherwise hold SIGTERM for the resolver's own timeout.
+// Dialable decides without a resolver, so it has to refuse only what no
+// attempt could fix. A literal the resolver would take, including one carrying
+// a zone, is an endpoint a dialer must keep.
+func TestDialableRefusesOnlyWhatNoAttemptCanFix(t *testing.T) {
+	for address, want := range map[string]bool{
+		"198.51.100.9":        true,
+		"2001:db8::1":         false,
+		"fe80::1%en0":         false,
+		"gateway.example.com": true,
+		"":                    false,
+		"2400::/8":            false,
+	} {
+		endpoint := Endpoint{SerialNumber: "0", AddressFamily: "ip4", Address: &address}
+		if address == "2001:db8::1" || address == "fe80::1%en0" {
+			endpoint.AddressFamily = "ip6"
+			want = true
+		}
+		if got := endpoint.Dialable(); got != want {
+			t.Errorf("Dialable(%q as %s) = %v, want %v", address, endpoint.AddressFamily, got, want)
+		}
+	}
+	if (Endpoint{SerialNumber: "0", AddressFamily: "ip4"}).Dialable() {
+		t.Error("an endpoint with no address at all is dialable")
+	}
+	wrongFamily := "2001:db8::1"
+	if (Endpoint{SerialNumber: "0", AddressFamily: "ip4", Address: &wrongFamily}).Dialable() {
+		t.Error("a literal of the wrong family is dialable, and no lookup will fix it")
+	}
+}
+
 func TestResolveRemoteStopsWhenTheContextDoes(t *testing.T) {
 	address := "a-name-no-resolver-should-answer.invalid"
 	ep := Endpoint{SerialNumber: "0", AddressFamily: "ip4", Address: &address}

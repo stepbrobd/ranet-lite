@@ -116,18 +116,32 @@ func validatePeers(cfg *config.Config, reg registry.Registry, localFamilies map[
 			}
 			if _, ok := localFamilies[endpoint.AddressFamily]; !ok {
 				refuse = append(refuse, fmt.Errorf("config: peer endpoint %s/%s/%s has no matching local address family", peer.Organization, peer.CommonName, peer.SerialNumber))
+				continue
+			}
+			if !endpoint.Dialable() {
+				skip = append(skip, fmt.Errorf("config: peer endpoint %s/%s/%s carries no address", peer.Organization, peer.CommonName, peer.SerialNumber))
 			}
 			continue
 		}
-		compatible := false
+		// Dialable is part of the question, not a refinement of it: an
+		// endpoint the dialer will not take is reported here, once, rather
+		// than by the dialer on every attempt.
+		compatible, reachable := false, false
 		for _, endpoint := range node.Endpoints {
-			if _, ok := localFamilies[endpoint.AddressFamily]; ok {
-				compatible = true
+			if _, ok := localFamilies[endpoint.AddressFamily]; !ok {
+				continue
+			}
+			compatible = true
+			if endpoint.Dialable() {
+				reachable = true
 				break
 			}
 		}
-		if !compatible {
+		switch {
+		case !compatible:
 			skip = append(skip, fmt.Errorf("config: peer %s/%s has no endpoint matching a local address family", peer.Organization, peer.CommonName))
+		case !reachable:
+			skip = append(skip, fmt.Errorf("config: peer %s/%s has no endpoint carrying an address", peer.Organization, peer.CommonName))
 		}
 	}
 	return refuse, skip

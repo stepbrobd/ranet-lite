@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http/httptest"
 	"net/netip"
@@ -443,6 +444,7 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 	// policies at the same time.
 	for name, change := range map[string]func(*config.Config){
 		"identity":  func(c *config.Config) { c.CommonName = "other" },
+		"fwmark":    func(c *config.Config) { c.FWMark = 0x726c },
 		"port":      func(c *config.Config) { c.Port = 14000 },
 		"tun":       func(c *config.Config) { c.TUN = "ranet9" },
 		"responder": func(c *config.Config) { c.Responder = !c.Responder },
@@ -463,6 +465,95 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 	unchanged.Peers = []config.Peer{{Organization: "example", CommonName: "a"}}
 	if err := reloadable(base, &unchanged); err != nil {
 		t.Fatalf("adding a peer was refused: %v", err)
+	}
+}
+
+// The babel intervals default inside the speaker rather than in
+// SpeakerConfig, so a node started from a config that omits them compares
+// against zero. Writing out the value already running, which is the value
+// examples/config.yaml ships, then reads as a change and refuses this reload
+// and every later one, and with it every registry the node would have picked
+// up.
+func TestReloadTakesABabelDefaultWrittenOut(t *testing.T) {
+	omitted := &config.Config{Organization: "example", CommonName: "node", Port: 13000}
+	hello := config.Duration(4 * time.Second)
+	update := config.Duration(16 * time.Second)
+	written := *omitted
+	written.Babel.HelloInterval, written.Babel.UpdateInterval = hello, update
+	if err := reloadable(omitted, &written); err != nil {
+		t.Errorf("writing out the intervals already running was refused: %v", err)
+	}
+	other := config.Duration(8 * time.Second)
+	written.Babel.HelloInterval = other
+	if err := reloadable(omitted, &written); err == nil {
+		t.Error("a changed hello interval was accepted, and the speaker is built once")
+	}
+}
+
+// The key is read once, in New, and the responder captured it when Run built
+// it. A rotation is staged by writing the new key where the old one was, so
+// comparing the configured path would report a reload that changed nothing
+// while the node kept signing with the key it started on.
+func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
+	dir := t.TempDir()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := registry.Registry{{
+		Organization: "ysun",
+		PublicKey:    string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})),
+		Nodes: []registry.Node{{CommonName: "framework",
+			Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}}},
+	}}
+	registryPath := filepath.Join(dir, "registry.json")
+	writeRegistry(t, registryPath, reg)
+	keyPath := filepath.Join(dir, "key.pem")
+	writeKey(t, keyPath, privateKey)
+	configPath := filepath.Join(dir, "config.json")
+	body := `{"organization":"ysun","common_name":"framework","full_mesh":true,
+		"endpoints":[{"serial_number":"1","address_family":"ip4","port":13000}]}`
+	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath, registryPath, keyPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := babel.New(babel.Config{}, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{ctx: ctx, cancel: cancel, privateKey: privateKey,
+		speaker: speaker, dialers: make(map[string]*dialer)}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+	defer func() { cancel(); c.peers.Wait() }()
+
+	if err := c.Reload(configPath, registryPath, keyPath, false); err != nil {
+		t.Fatalf("reloading on the key this node started with: %v", err)
+	}
+	// Rotated in place, which is how one is staged, so the path in the config
+	// says nothing about it.
+	_, rotated, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeKey(t, keyPath, rotated)
+	if err := c.Reload(configPath, registryPath, keyPath, false); err == nil {
+		t.Error("a reload reported success while the node kept signing with the key it started on")
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Reload(configPath, registryPath, keyPath, false); err == nil {
+		t.Error("a key file that no longer exists reported a successful reload")
 	}
 }
 
@@ -967,7 +1058,7 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	defer func() { cancel(); c.peers.Wait() }()
 
 	// A second node joins and this node starts announcing another prefix,
-	// which is exactly what a registry rewrite plus a config edit looks like.
+	// the shape of a registry rewrite together with a config edit.
 	next := *cfg
 	next.Peers = append(slices.Clone(cfg.Peers),
 		config.Peer{Organization: "example", CommonName: "third", SerialNumber: "1"})
@@ -1522,6 +1613,240 @@ func TestReloadClosesASessionTheRegistryNoLongerNames(t *testing.T) {
 	}
 }
 
+// A reason is not a category. The one a resolver gives carries the ephemeral
+// source port of its query, so a dialer retrying a name that does not resolve
+// never sees the same string twice and comparing the text alone suppresses
+// nothing at all.
+func TestRepeatedDialFailuresAreSpacedThroughAChangingReason(t *testing.T) {
+	var failure repeatedFailure
+	said := 0
+	for i := range 64 {
+		if !failure.alreadySaid(fmt.Errorf("resolve gateway.invalid: read udp [::1]:%d: connection refused", 40000+i)) {
+			said++
+		}
+	}
+	if said != 1 {
+		t.Errorf("64 attempts whose reason never repeats wrote %d lines, want 1", said)
+	}
+
+	// And the reason recorded is the one said, not the one last seen. A new
+	// reason first seen under the floor is otherwise recorded as said, and
+	// then compares equal once the floor passes and waits out the interval
+	// against itself.
+	var changing repeatedFailure
+	changing.alreadySaid(errors.New("dial: connection refused"))
+	changing.said = time.Now().Add(-dialFailureFloor / 2)
+	if !changing.alreadySaid(errors.New("handshake: authentication failed")) {
+		t.Fatal("a second reason inside the floor was said, so this proves nothing")
+	}
+	changing.said = time.Now().Add(-dialFailureFloor)
+	if changing.alreadySaid(errors.New("handshake: authentication failed")) {
+		t.Error("a reason first seen under the floor is never said, because it was recorded as said")
+	}
+}
+
+// A dialer that keeps failing says so once rather than every reconnect delay.
+// Against the community registry 25 peers whose names do not resolve wrote 250
+// lines in 93 seconds, measured. The reason a resolver gives carries the
+// ephemeral source port of its query, so it is not the same string twice: this
+// runs where that is true, which is any host whose resolver refuses.
+func TestDialerRepeatingOneFailureSaysItOnce(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	unresolvable := "gateway.invalid"
+	reg[0].Nodes[1].Endpoints[0].Address = &unresolvable
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{ctx: ctx, cancel: cancel, privateKey: privateKey,
+		dialers: make(map[string]*dialer), dialRetry: time.Millisecond}
+	c.cfg.Store(cfg)
+	c.storeRegistry(reg)
+
+	written := &syncBuffer{}
+	previous := log.Writer()
+	log.SetOutput(written)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	done := make(chan struct{})
+	go func() { c.runPeer(ctx, cfg.Endpoints[0], cfg.Peers[0]); close(done) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for written.count("reconnecting in") == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the dialer did not stop when the node did")
+	}
+	if got := written.count("reconnecting in"); got != 1 {
+		t.Errorf("one failure repeated for a hundred milliseconds wrote %d lines, want 1", got)
+	}
+}
+
+// syncBuffer is a log sink a test reads while the goroutine under test writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) count(phrase string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return bytes.Count(b.buf.Bytes(), []byte(phrase))
+}
+
+// The registry is the trust root a handshake is checked against, so a node
+// taken out of it stops being carried. A serial number is not part of that
+// question: it selects which endpoint a dial uses, and renumbering one is a
+// registry edit. Asking for it closes a live session whose peer has done
+// nothing to lose it, and the registry is rewritten whenever any node joins.
+func TestRenumberedSerialDoesNotRevokeASession(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	c := &Client{privateKey: privateKey}
+	c.cfg.Store(cfg)
+	c.storeRegistry(reg)
+	peer := ike.Identity{Organization: "example", CommonName: "gateway", SerialNumber: "1"}
+	if !c.stillTrusted(peer) {
+		t.Fatal("a peer the registry names outright is not trusted, so this proves nothing")
+	}
+
+	renumbered := registry.Registry{{Organization: reg[0].Organization, PublicKey: reg[0].PublicKey,
+		Nodes: []registry.Node{reg[0].Nodes[0], {CommonName: "gateway",
+			Endpoints: []registry.Endpoint{{SerialNumber: "2", AddressFamily: "ip4", Port: 13000}}}}}}
+	c.storeRegistry(renumbered)
+	if !c.stillTrusted(peer) {
+		t.Error("renumbering an endpoint closed the session the peer holds")
+	}
+	if _, ok := c.lookupPeerKey(peer); ok {
+		t.Error("a handshake asserting an endpoint the registry no longer names was accepted")
+	}
+
+	c.storeRegistry(registry.Registry{})
+	if c.stillTrusted(peer) {
+		t.Error("a node the registry no longer names is still carried")
+	}
+}
+
+// An endpoint with no address says where a node listens, not where to reach
+// it, and most of a community registry is that shape: 94 of 139 peers on the
+// live mesh, and the retry for them was 78% of the log. resolveEndpoint
+// refuses such an endpoint on every pass and nothing about it changes while
+// the process runs, so the dialer has to recognize it before the loop.
+func TestDialerGivesUpOnAPeerWithNoAddress(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{ctx: ctx, cancel: cancel, privateKey: privateKey,
+		dialers: make(map[string]*dialer), dialRetry: time.Millisecond}
+	c.cfg.Store(cfg)
+	c.reg.Store(&reg)
+
+	// The registry names the node and the address family matches this local
+	// endpoint. Only the address is absent.
+	for name, peer := range map[string]config.Peer{
+		"pinned to a serial": cfg.Peers[0],
+		"unpinned":           {Organization: "example", CommonName: "gateway"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{})
+			go func() { c.runPeer(ctx, cfg.Endpoints[0], peer); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Error("the dialer retries a peer it can never reach for the life of the process")
+			}
+		})
+	}
+}
+
+// resolveEndpoint answers with the address it resolved, so the caller does not
+// ask again: a name costs a resolver round trip and an unpinned dial made two
+// of them.
+func TestResolveEndpointAnswersWithTheAddress(t *testing.T) {
+	address := "192.0.2.7"
+	node := registry.Node{CommonName: "gateway", Endpoints: []registry.Endpoint{
+		{SerialNumber: "0", AddressFamily: "ip6"},
+		{SerialNumber: "1", AddressFamily: "ip4", Address: &address, Port: 13000},
+	}}
+	for name, serial := range map[string]string{"pinned to a serial": "1", "unpinned": ""} {
+		t.Run(name, func(t *testing.T) {
+			endpoint, resolved, err := resolveEndpoint(context.Background(), node, serial, "ip4")
+			if err != nil {
+				t.Fatalf("resolving an endpoint carrying a literal: %v", err)
+			}
+			if endpoint.SerialNumber != "1" {
+				t.Errorf("resolved endpoint %q, want the one of the local family", endpoint.SerialNumber)
+			}
+			if got := resolved.String(); got != address {
+				t.Errorf("resolved to %s, want %s", got, address)
+			}
+		})
+	}
+}
+
+// The reconciler asks which addresses this node's own transport has to keep
+// reaching, so a route covering one is not installed where the transport would
+// then follow it into its own tunnel. It holds the literals of every endpoint
+// a dialer would accept, and nothing else.
+func TestUnderlayHoldsTheEndpointsADialerWouldTake(t *testing.T) {
+	literal, name, empty := "198.51.100.9", "gateway.example", ""
+	wrongFamily := "2001:db8::1"
+	reg := registry.Registry{{Organization: "example", Nodes: []registry.Node{{
+		CommonName: "gateway",
+		Endpoints: []registry.Endpoint{
+			{SerialNumber: "0", AddressFamily: "ip4", Address: &literal},
+			{SerialNumber: "1", AddressFamily: "ip4", Address: &name},
+			{SerialNumber: "2", AddressFamily: "ip4", Address: &empty},
+			{SerialNumber: "3", AddressFamily: "ip4"},
+			// Parses, and no dialer will take it, so the transport never has
+			// to reach it either. The set and the dialers ask one question.
+			{SerialNumber: "4", AddressFamily: "ip4", Address: &wrongFamily},
+		},
+	}}}}
+	c := &Client{}
+	if got := c.Underlay(); len(got) != 0 {
+		t.Errorf("a client with no registry answered %v, and the reconciler asks before one is stored", got)
+	}
+	c.storeRegistry(reg)
+	got := c.Underlay()
+	if len(got) != 1 || got[0].String() != literal {
+		t.Errorf("the underlay set is %v, want just %s: a name needs a resolver and the rest cannot be dialed", got, literal)
+	}
+}
+
+// A peer whose registry entry carries no address is said once, where the
+// operator can act on it, rather than by the dialer every reconnect delay.
+func TestValidatePeersReportsAnEndpointWithNoAddress(t *testing.T) {
+	cfg, _, reg := runtimeFixture(t)
+	families := map[string]struct{}{"ip4": {}}
+	for name, peers := range map[string][]config.Peer{
+		"pinned to a serial": cfg.Peers,
+		"unpinned":           {{Organization: "example", CommonName: "gateway"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			named := *cfg
+			named.Peers = peers
+			refuse, skip := validatePeers(&named, reg, families)
+			if len(refuse) != 0 {
+				t.Errorf("a peer the registry describes but cannot reach stopped the startup: %v", refuse)
+			}
+			if len(skip) != 1 {
+				t.Fatalf("a peer with no address drew %d reports, want one", len(skip))
+			}
+			if !strings.Contains(skip[0].Error(), "address") {
+				t.Errorf("the report does not say what is wrong: %v", skip[0])
+			}
+		})
+	}
+}
+
 // A node taken out of the registry while its dialer is running stops being
 // dialed. The check before the loop covers a node that was already gone;
 // this one covers the reload that removes it afterwards, and without it the
@@ -1540,6 +1865,13 @@ func TestDialerGivesUpOnANodeAReloadRemoved(t *testing.T) {
 	if _, _, ok := reg.FindNode(named.Organization, named.CommonName); !ok {
 		t.Fatal("the fixture's own peer is not in its registry, so this proves nothing")
 	}
+	// A name the dialer takes and the resolver refuses, so the loop comes
+	// round again without the dial reaching the transport this fixture has no
+	// hub for. RFC 6761 reserves .invalid for exactly this. An endpoint the
+	// registry itself disqualifies is given up on before the loop, which is
+	// the case above this one.
+	unresolvable := "gateway.invalid"
+	reg[0].Nodes[1].Endpoints[0].Address = &unresolvable
 	done := make(chan struct{})
 	go func() { c.runPeer(ctx, local, named); close(done) }()
 

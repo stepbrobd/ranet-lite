@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log"
 	"net/netip"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
-	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
@@ -103,6 +103,9 @@ func (c *Client) Reload(path, registryPath, privateKeyPath string, fullMesh bool
 	if err != nil {
 		return err
 	}
+	if err := c.sameIdentityKey(cfg.PrivateKey); err != nil {
+		return err
+	}
 	families, err := validateLocalConfig(cfg, c.privateKey, reg)
 	if err != nil {
 		return err
@@ -126,15 +129,12 @@ func (c *Client) Reload(path, registryPath, privateKeyPath string, fullMesh bool
 		}
 	}
 
-	c.reg.Store(&reg)
+	c.storeRegistry(reg)
 	c.cfg.Store(cfg)
 	// The registry decides who may connect, so it decides who may stay. A node
 	// taken out of it keeps every tunnel it already holds until somebody says
 	// otherwise, and this is the only moment anybody does.
-	for _, path := range c.sessions.revoke(func(peer ike.Identity) bool {
-		_, ok := c.lookupPeerKey(peer)
-		return ok
-	}) {
+	for _, path := range c.sessions.revoke(c.stillTrusted) {
 		log.Printf("reload: %s is no longer in the registry, session closed", path)
 	}
 	originated, err := originatedRoutes(cfg)
@@ -148,6 +148,23 @@ func (c *Client) Reload(path, registryPath, privateKeyPath string, fullMesh bool
 		nodes += len(organization.Nodes)
 	}
 	log.Printf("reloaded %s: %d peers, %d nodes in the registry", path, len(effectivePeers(cfg, reg)), nodes)
+	return nil
+}
+
+// sameIdentityKey refuses a reload that would change the key this node signs
+// with. LoadPrivateKey runs once, in New, and the responder captured the
+// result when Run built it, so a new key here would reach the dialers and
+// leave every accepted session signing with the old one. The file is read
+// rather than the path compared, because a rotation is staged by writing the
+// new key where the old one was.
+func (c *Client) sameIdentityKey(path string) error {
+	key, err := registry.LoadPrivateKey(path)
+	if err != nil {
+		return err
+	}
+	if !key.Public().(ed25519.PublicKey).Equal(c.privateKey.Public()) {
+		return fmt.Errorf("config: private key changed, restart to apply")
+	}
 	return nil
 }
 
@@ -240,12 +257,13 @@ func sameKernelAddresses(old, next *config.Config) bool {
 
 // sameBabelSettings compares everything in the babel block that a reload
 // cannot apply, which is everything except the originated prefixes. The
-// comparison is on the speaker configuration each one produces rather than on
-// the fields as written: an omitted cost and one written out as its own
-// default are the same configuration, and comparing the pointers refuses a
-// reload that changes nothing.
+// comparison is on the speaker each one would run rather than on the fields as
+// written: an omitted cost or interval and one spelled out as its own default
+// are the same speaker, and comparing them as written refuses a reload that
+// changes nothing. The intervals default inside babel rather than in
+// SpeakerConfig, so WithDefaults is where the two spellings meet.
 func sameBabelSettings(old, next config.Babel) bool {
-	return old.SpeakerConfig() == next.SpeakerConfig()
+	return old.SpeakerConfig().WithDefaults() == next.SpeakerConfig().WithDefaults()
 }
 
 // sameRekeySettings compares the timers and the replay window that a session

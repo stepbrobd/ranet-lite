@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"log"
+	"net/netip"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ type Client struct {
 	// reader sees one consistent pair even while one is being installed.
 	cfg        atomic.Pointer[config.Config]
 	reg        atomic.Pointer[registry.Registry]
+	underlay   atomic.Pointer[[]netip.Addr]
 	privateKey ed25519.PrivateKey
 	speaker    *babel.Speaker
 	hub        *transport.Hub
@@ -57,6 +59,45 @@ type Client struct {
 
 func (c *Client) config() *config.Config      { return c.cfg.Load() }
 func (c *Client) registry() registry.Registry { return *c.reg.Load() }
+
+// storeRegistry installs a registry and the underlay set derived from it.
+// Nothing reads both, so the two need no common pointer: a reconciler asking
+// between the stores gets the previous addresses and asks again next pass.
+func (c *Client) storeRegistry(reg registry.Registry) {
+	addresses := underlayAddrs(reg)
+	c.reg.Store(&reg)
+	c.underlay.Store(&addresses)
+}
+
+// Underlay is every endpoint address in the registry this node could have to
+// reach, which the route reconciler consults so that a route covering one is
+// not installed where the transport would then follow it into its own tunnel.
+// A hostname endpoint is not in it, because resolving one is a network call.
+func (c *Client) Underlay() []netip.Addr {
+	if addresses := c.underlay.Load(); addresses != nil {
+		return *addresses
+	}
+	return nil
+}
+
+// underlayAddrs takes the literals out of every endpoint a dialer would accept,
+// so the set and the dialers agree on what this node may have to reach.
+func underlayAddrs(reg registry.Registry) []netip.Addr {
+	var out []netip.Addr
+	for _, organization := range reg {
+		for _, node := range organization.Nodes {
+			for _, endpoint := range node.Endpoints {
+				if !endpoint.Dialable() {
+					continue
+				}
+				if address, err := netip.ParseAddr(*endpoint.Address); err == nil {
+					out = append(out, address)
+				}
+			}
+		}
+	}
+	return out
+}
 
 func New(cfg *config.Config) (_ *Client, err error) {
 	privateKey, err := registry.LoadPrivateKey(cfg.PrivateKey)
@@ -118,7 +159,7 @@ func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.R
 	}
 	c.dropReported.Store(-int64(espDropReportInterval))
 	c.cfg.Store(cfg)
-	c.reg.Store(&reg)
+	c.storeRegistry(reg)
 	return c, nil
 }
 
@@ -130,6 +171,7 @@ func (c *Client) Run(ctx context.Context) error {
 	// detection expires. It runs before c.cancel because a canceled session
 	// has no loop left to carry the Delete.
 	stop := context.AfterFunc(ctx, func() {
+		c.stopDialers()
 		c.sessions.closeAll()
 		c.cancel()
 	})
@@ -147,6 +189,9 @@ func (c *Client) Run(ctx context.Context) error {
 		})
 	}
 	err := c.speaker.Run(c.ctx)
+	// Canceled before the hub closes, so a dialer reads the session ending as
+	// this node stopping. See stopping.
+	c.cancel()
 	_ = c.hub.Close()
 	c.stopDialers()
 	c.peers.Wait()
@@ -173,4 +218,15 @@ func (c *Client) stopDialers() {
 	c.dialersMu.Lock()
 	defer c.dialersMu.Unlock()
 	c.stopped = true
+}
+
+// stopping lets a dialer tell this node going down from a peer worth retrying.
+// The context does not: closeAll runs before c.cancel, deliberately, so a
+// Delete still has a loop to carry it, and every dialer whose session ends in
+// that window would otherwise say "reconnecting in 10s" at the one moment none
+// of them will.
+func (c *Client) stopping() bool {
+	c.dialersMu.Lock()
+	defer c.dialersMu.Unlock()
+	return c.stopped
 }

@@ -131,7 +131,14 @@ func TestReceiveESPOrderAndShutdown(t *testing.T) {
 			}
 			delivered := make(chan uint32, 2)
 			done := make(chan error, 1)
+			// Joined whatever the test does. The receiver reports through t,
+			// and a t.Fatal below would otherwise finish the test with it
+			// still running: its next log line panics the whole package binary
+			// instead of printing the failure that caused it.
+			finished := make(chan struct{})
+			t.Cleanup(func() { _ = mux.Close(); <-finished })
 			go func() {
+				defer close(finished)
 				done <- receiveESP(mux, workers, decrypt, func(results []inboundDecrypted) {
 					esp.CommitBatch(results)
 					for _, result := range results {

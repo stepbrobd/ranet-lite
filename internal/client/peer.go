@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"slices"
 	"time"
 
@@ -59,12 +60,17 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 			log.Printf("peer %s: endpoint serial %q is %s, not %s", name, p.SerialNumber, ep.AddressFamily, local.AddressFamily)
 			return
 		}
+		if !ep.Dialable() {
+			log.Printf("peer %s: endpoint serial %q carries no address", name, p.SerialNumber)
+			return
+		}
 	} else if !slices.ContainsFunc(node.Endpoints, func(ep registry.Endpoint) bool {
-		return ep.AddressFamily == local.AddressFamily
+		return ep.AddressFamily == local.AddressFamily && ep.Dialable()
 	}) {
-		slog.Debug("peer has no endpoint in this address family", "peer", name, "family", local.AddressFamily)
+		slog.Debug("peer has no endpoint carrying an address in this address family", "peer", name, "family", local.AddressFamily)
 		return
 	}
+	var failure repeatedFailure
 	for {
 		if ctx.Err() != nil {
 			return
@@ -80,12 +86,18 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 			log.Printf("peer %s: no longer in the registry, giving up", name)
 			return
 		}
-		switch err := c.connectPeer(ctx, local, p, name); {
+		err := c.connectPeer(ctx, local, p, name)
+		if ctx.Err() != nil || c.stopping() {
+			return
+		}
+		switch {
 		case err == nil:
 		case errors.Is(err, errSessionEstablished):
 			// Not a failure and not worth a log line every reconnect delay.
 			// The loop keeps running so this dialer takes over the moment the
 			// peer's session ends.
+		case failure.alreadySaid(err):
+			slog.Debug("peer dial failed again", "peer", name, "err", err)
 		default:
 			log.Printf("peer %s: %v, reconnecting in %s", name, err, c.reconnectDelay())
 		}
@@ -97,29 +109,66 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 	}
 }
 
-// resolveEndpoint picks which of a node's endpoints to dial: the
-// config-specified serial if given, otherwise the first one whose address
-// actually resolves (a node commonly has endpoints for address families or
-// links that aren't currently usable, e.g. address: null).
-func resolveEndpoint(ctx context.Context, node registry.Node, serial, family string) (registry.Endpoint, error) {
+// repeatedFailure spaces one dialer's repeats. A peer it cannot reach fails on
+// every attempt, and the ones it cannot refuse outright are the names, since
+// only a resolver can answer for one: 250 lines in 93 seconds from 25 of them,
+// measured. A changed reason is said as soon as the floor allows, and the
+// floor is there because a reason is not a category, a resolver failure
+// carrying the ephemeral source port of its own query.
+type repeatedFailure struct {
+	reason string
+	said   time.Time
+}
+
+const (
+	dialFailureInterval = 10 * time.Minute
+	dialFailureFloor    = time.Minute
+)
+
+// alreadySaid reports whether an equivalent failure has been said recently
+// enough to keep this one at debug, and records the one it says. What it
+// records is the reason last said out loud, not the reason last seen, so a
+// reason that changed under the floor is said when the floor passes rather
+// than waiting out the interval against itself.
+func (f *repeatedFailure) alreadySaid(err error) bool {
+	reason, since := err.Error(), time.Since(f.said)
+	if since >= dialFailureInterval || (reason != f.reason && since >= dialFailureFloor) {
+		f.reason, f.said = reason, time.Now()
+		return false
+	}
+	return true
+}
+
+// resolveEndpoint picks which of a node's endpoints to dial and the address it
+// resolved to: the config-specified serial if given, otherwise the first one
+// whose address actually resolves (a node commonly has endpoints for address
+// families or links that aren't currently usable, e.g. address: null). The
+// address is returned rather than looked up again by the caller, because a
+// name costs a resolver round trip and an unpinned dial made two of them.
+func resolveEndpoint(ctx context.Context, node registry.Node, serial, family string) (registry.Endpoint, net.IP, error) {
 	if serial != "" {
 		ep, ok := node.FindEndpoint(serial)
 		if !ok {
-			return registry.Endpoint{}, fmt.Errorf("no endpoint with serial %q", serial)
+			return registry.Endpoint{}, nil, fmt.Errorf("no endpoint with serial %q", serial)
 		}
 		if ep.AddressFamily != family {
-			return registry.Endpoint{}, fmt.Errorf("endpoint %q is %s, want %s", serial, ep.AddressFamily, family)
+			return registry.Endpoint{}, nil, fmt.Errorf("endpoint %q is %s, want %s", serial, ep.AddressFamily, family)
 		}
-		return ep, nil
+		address, err := ep.ResolveRemote(ctx)
+		if err != nil {
+			return registry.Endpoint{}, nil, err
+		}
+		return ep, address, nil
 	}
 	for _, ep := range node.Endpoints {
-		if ep.AddressFamily == family {
-			if _, err := ep.ResolveRemote(ctx); err == nil {
-				return ep, nil
-			}
+		if ep.AddressFamily != family || !ep.Dialable() {
+			continue
+		}
+		if address, err := ep.ResolveRemote(ctx); err == nil {
+			return ep, address, nil
 		}
 	}
-	return registry.Endpoint{}, fmt.Errorf("no endpoint currently resolves to an address")
+	return registry.Endpoint{}, nil, fmt.Errorf("no endpoint currently resolves to an address")
 }
 
 // connectPeer runs one IKE session against a peer end to end: handshake,
@@ -132,11 +181,7 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	if !ok {
 		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)
 	}
-	ep, err := resolveEndpoint(ctx, node, p.SerialNumber, local.AddressFamily)
-	if err != nil {
-		return err
-	}
-	remoteIP, err := ep.ResolveRemote(ctx)
+	ep, remoteIP, err := resolveEndpoint(ctx, node, p.SerialNumber, local.AddressFamily)
 	if err != nil {
 		return err
 	}

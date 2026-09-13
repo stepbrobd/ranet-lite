@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
+	"strings"
 )
 
 type Registry []Organization
@@ -214,6 +216,27 @@ func resolverNetwork(family string) string {
 	default:
 		return "ip"
 	}
+}
+
+// Dialable reports whether this endpoint could ever be reached, deciding it
+// without a resolver, so that a dialer is never started for one no attempt can
+// fix. On the community registry 94 of 139 peers carry no address at all, and
+// among the rest are an empty string and an address written as a prefix.
+//
+// A name is taken on trust, because only a resolver can answer for one and its
+// answer changes. A literal is not: an address of the wrong family is a
+// mistake in the registry that no lookup will fix.
+func (e Endpoint) Dialable() bool {
+	if e.Address == nil || *e.Address == "" {
+		return false
+	}
+	if address, err := netip.ParseAddr(*e.Address); err == nil {
+		// netip rather than net.ParseIP, which refuses a zone: a link-local
+		// with one is a literal the resolver takes, so refusing it here would
+		// give up on an endpoint a dial can use.
+		return addressFamilyMatches(e.AddressFamily, address.WithZone("").AsSlice())
+	}
+	return !strings.ContainsAny(*e.Address, ":/ ")
 }
 
 func addressFamilyMatches(family string, ip net.IP) bool {

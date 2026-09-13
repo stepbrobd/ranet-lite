@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
@@ -313,6 +315,37 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, added.Addr().Next())
 		return ok && peer != nil
 	})
+}
+
+// Shutting down closes the hub, which ends every dialed session at once. See
+// Client.stopping for what the dialers have to read that as.
+func TestShutdownSaysNothingAboutReconnecting(t *testing.T) {
+	alpha, bravo := newLoopbackMesh(t)
+	// closeAll runs before c.cancel, deliberately, and on a full mesh it takes
+	// long enough for a dialer to reach its own check while the context is
+	// still alive. Held open here so the window is the same size every time
+	// rather than whatever the scheduler gives, and set before either node
+	// runs because adoptFor reads this outside the set's own lock.
+	closeSession := alpha.client.sessions.close
+	alpha.client.sessions.close = func(sess *ike.Session) {
+		closeSession(sess)
+		time.Sleep(200 * time.Millisecond)
+	}
+	run(t, bravo)
+	_, stopAlpha := run(t, alpha)
+
+	waitFor(t, convergeBudget, "both ends established", func() bool {
+		return len(alpha.client.sessions.paths()) == 1 && len(bravo.client.sessions.paths()) == 1
+	})
+
+	written := &syncBuffer{}
+	previous := log.Writer()
+	log.SetOutput(written)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	stopAlpha()
+	if got := written.count("reconnecting in"); got != 0 {
+		t.Errorf("shutdown wrote %d reconnect lines, want none", got)
+	}
 }
 
 // Shutdown tells every peer the SA is gone rather than leaving it sending ESP
