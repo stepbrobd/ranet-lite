@@ -160,13 +160,17 @@ func parseTrailer(plain []byte) ([]byte, byte, error) {
 	if padLen+2 > len(plain) {
 		return nil, 0, fmt.Errorf("esp: invalid padding")
 	}
-	// RFC 4303 section 2.4: "The sender SHOULD initialize the padding with the
-	// monotonically increasing sequence [1, 2, 3, ...]" and "the receiver
-	// SHOULD check the padding values", unless the encryption algorithm
-	// specifies padding contents of its own. RFC 4106 specifies none for
-	// AES-GCM and RFC 7634 none for ChaCha20-Poly1305, which are the two this
-	// package has, so the sequence is what a conforming sender puts here and
-	// Linux's esp_output_fill_trailer is what produces it. Checked rather than
+	// RFC 4303 section 2.4: "If Padding bytes are needed but the encryption
+	// algorithm does not specify the padding contents, then the following
+	// default processing MUST be used. The Padding bytes are initialized with
+	// a series of (unsigned, 1-byte) integer values. The first padding byte
+	// appended to the plaintext is numbered 1, with subsequent padding bytes
+	// making up a monotonically increasing sequence: 1, 2, 3, .... When this
+	// padding scheme is employed, the receiver SHOULD inspect the Padding
+	// field." RFC 4106 specifies no contents for AES-GCM and RFC 7634 none for
+	// ChaCha20-Poly1305, which are the two this package has, so the sequence
+	// is what a conforming sender MUST put here and Linux's
+	// esp_output_fill_trailer is what produces it. Inspected rather than
 	// skipped because the bytes are inside the ICV: anything else here is a
 	// sender this end does not understand, not an attacker.
 	for i, value := range plain[len(plain)-2-padLen : len(plain)-2] {

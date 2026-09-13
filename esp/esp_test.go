@@ -686,12 +686,12 @@ func TestPlaintextMustBeFourByteAligned(t *testing.T) {
 	}
 }
 
-// RFC 4303 section 2.4 has the sender number the padding 1, 2, 3, ... when the
-// encryption algorithm specifies no contents of its own, which neither RFC
-// 4106 nor RFC 7634 does, and has the receiver check it. The check is inside
-// the ICV, so what it catches is a sender this end does not understand rather
-// than an attacker, and an interop failure here is far easier to read as
-// "invalid padding contents" than as a packet that decrypts to nonsense.
+// RFC 4303 section 2.4 makes the sender's numbering a MUST when the encryption
+// algorithm specifies no padding contents of its own, which neither RFC 4106
+// nor RFC 7634 does, and makes the receiver's inspection a SHOULD. The check is
+// inside the ICV, so what it catches is a sender this end does not understand
+// rather than an attacker, and an interop failure here is far easier to read
+// as "invalid padding contents" than as a packet that decrypts to nonsense.
 func TestPaddingContentsFollowTheSectionThatDefinesThem(t *testing.T) {
 	plaintext := func(pad ...byte) []byte {
 		out := make([]byte, 0, 4+len(pad)+2)
