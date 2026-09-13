@@ -196,14 +196,11 @@ func (s *Session) RekeyIKE() error {
 			// now current on and leaves the control channel deaf while ESP
 			// keeps flowing, and because the peer chooses when to try.
 			s.stateMu.Lock()
-			release := !s.stillHeldLocked(newContext, nil)
 			if s.collision == newContext {
 				s.collision = nil
 			}
+			s.releaseSPILocked(spiI)
 			s.stateMu.Unlock()
-			if release {
-				s.mux.UnregisterIKE(spiI)
-			}
 			if deleteErr != nil {
 				return fmt.Errorf("ike: delete redundant local IKE SA: %w", deleteErr)
 			}
@@ -242,11 +239,11 @@ func (s *Session) RekeyIKE() error {
 	if _, err := s.requestOnLocked(old, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
 		slog.Info("ike replaced IKE SA was not deleted by this end", "spi", old.spiI, "err", err)
 	}
-	s.mux.UnregisterIKE(old.spiI)
 	s.stateMu.Lock()
 	if s.old == old {
 		s.old = nil
 	}
+	s.releaseSPILocked(old.spiI)
 	s.stateMu.Unlock()
 	return nil
 }
@@ -338,12 +335,12 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	spiI := binary.BigEndian.Uint64(selectedProposal.SPI)
-	// The peer names the SPI for the SA it is creating, and the one this
-	// session already holds is not available: registering it succeeds, because
+	// The peer names the SPI for the SA it is creating, and any SPI this
+	// session already routes is unavailable: registering it succeeds, because
 	// the owner is this same mux, and the Delete that retires the replaced SA
-	// then unregisters an SPI the current one is still routed by, leaving the
+	// then unregisters an SPI another slot is still reached by, leaving the
 	// control channel deaf while ESP keeps flowing. RFC 7296 section 2.6 has
-	// the initiator choose its SPI; a conforming peer never picks this one.
+	// the initiator choose its SPI; a conforming peer never picks one of these.
 	//
 	// An in-flight local rekey's SPI is refused for the same reason and is the
 	// easier one to hit, because this end published it in its own request
@@ -351,12 +348,9 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	// candidates share an SPI, and the losing branch of RekeyIKE then
 	// unregisters the SPI the winning context was just installed under.
 	s.stateMu.RLock()
-	inFlight := uint64(0)
-	if s.localRekey != nil {
-		inFlight = s.localRekey.spiI
-	}
+	taken := s.routedLocked(spiI) || (s.localRekey != nil && s.localRekey.spiI == spiI)
 	s.stateMu.RUnlock()
-	if spiI == ctx.spiI || spiI == ctx.spiR || spiI == inFlight {
+	if taken || spiI == ctx.spiI || spiI == ctx.spiR {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	// A local failure from here on answers TEMPORARY_FAILURE rather than

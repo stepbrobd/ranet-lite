@@ -670,11 +670,7 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				if err != nil {
 					return nil, err
 				}
-				removed, releaseSPI := s.removeRetainedContext(ctx)
-				if removed || s.adoptCollisionOnPeerDelete(ctx) {
-					if !removed || releaseSPI {
-						s.mux.UnregisterIKE(ctx.spiI)
-					}
+				if s.removeRetainedContext(ctx) || s.adoptCollisionOnPeerDelete(ctx) {
 					return response, nil
 				}
 				return response, fmt.Errorf("peer deleted IKE SA")

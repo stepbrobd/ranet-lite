@@ -197,32 +197,48 @@ const retainedContextDeadline = 2 * time.Minute
 // expireRetainedContexts can never reach, and its SPI stays in the hub's map
 // for the life of the session.
 func (s *Session) retainOldLocked(ctx *ikeContext) {
-	s.releaseDisplacedLocked(s.old, ctx)
+	displaced := s.old
 	s.old, s.oldBy = ctx, time.Now().Add(retainedContextDeadline)
+	s.releaseDisplacedLocked(displaced)
 }
 
 // retainCollisionLocked does the same for the candidate a simultaneous rekey
 // decided against. It must be called with stateMu held.
 func (s *Session) retainCollisionLocked(ctx *ikeContext) {
-	s.releaseDisplacedLocked(s.collision, ctx)
+	displaced := s.collision
 	s.collision, s.collisionBy = ctx, time.Now().Add(retainedContextDeadline)
+	s.releaseDisplacedLocked(displaced)
 }
 
-// releaseDisplacedLocked gives back the SPI of a context that is about to stop
-// being held, unless something else still holds it.
-func (s *Session) releaseDisplacedLocked(displaced, replacement *ikeContext) {
-	if displaced == nil || displaced == replacement || s.stillHeldLocked(displaced, replacement) {
+// releaseSPILocked stops routing an SPI no slot dispatches on any more. Every
+// release goes through it, and every caller reassigns its slot first, so the
+// question is asked of the state the mux is about to serve rather than the one
+// it is leaving. It runs under stateMu, so a peer rekey cannot register the
+// same SPI between the answer and the call. The mux takes only its own lock.
+func (s *Session) releaseSPILocked(spi uint64) {
+	if !s.routedLocked(spi) {
+		s.mux.UnregisterIKE(spi)
+	}
+}
+
+// releaseDisplacedLocked is the same for a context a second rekey displaced,
+// which is the one release nothing in the session asked for.
+func (s *Session) releaseDisplacedLocked(displaced *ikeContext) {
+	if displaced == nil || s.routedLocked(displaced.spiI) {
 		return
 	}
 	slog.Warn("ike dropping an IKE SA a second rekey displaced", "spi", displaced.spiI)
-	s.mux.UnregisterIKE(displaced.spiI)
+	s.releaseSPILocked(displaced.spiI)
 }
 
-// stillHeldLocked reports whether any context other than the one being
-// displaced is routed by the same SPI, which makes unregistering it unsafe. It must be called with stateMu held.
-func (s *Session) stillHeldLocked(displaced, replacement *ikeContext) bool {
-	for _, held := range []*ikeContext{s.current, s.old, s.collision, replacement} {
-		if held != nil && held != displaced && held.spiI == displaced.spiI {
+// routedLocked reports whether any slot this session dispatches from is reached
+// by spi. Unregistering one the session still routes leaves the control channel
+// deaf while ESP keeps flowing, so every release consults this first. Two slots
+// can hold the same context, which is why this asks about the SPI rather than
+// about a pointer. It must be called with stateMu held.
+func (s *Session) routedLocked(spi uint64) bool {
+	for _, held := range []*ikeContext{s.current, s.old, s.collision} {
+		if held != nil && held.spiI == spi {
 			return true
 		}
 	}
@@ -250,11 +266,13 @@ func (s *Session) expireRetainedContexts(now time.Time) {
 			dropped, *held.out = append(dropped, held.ctx), nil
 		}
 	}
+	for _, ctx := range dropped {
+		s.releaseSPILocked(ctx.spiI)
+	}
 	s.stateMu.Unlock()
 	for _, ctx := range dropped {
 		slog.Warn("ike dropping an IKE SA the peer never deleted",
 			"spi", ctx.spiI, "after", retainedContextDeadline)
-		s.mux.UnregisterIKE(ctx.spiI)
 	}
 }
 
@@ -277,7 +295,7 @@ func (s *Session) nextRetainedExpiry() (time.Time, bool) {
 // whether its SPI may be unregistered: another context routed by the same SPI
 // would be made deaf by that, which is a session that keeps sending ESP into a
 // peer that answers nothing until its own liveness check expires.
-func (s *Session) removeRetainedContext(ctx *ikeContext) (removed, releaseSPI bool) {
+func (s *Session) removeRetainedContext(ctx *ikeContext) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	switch {
@@ -286,9 +304,10 @@ func (s *Session) removeRetainedContext(ctx *ikeContext) (removed, releaseSPI bo
 	case s.collision == ctx:
 		s.collision = nil
 	default:
-		return false, false
+		return false
 	}
-	return true, !s.stillHeldLocked(ctx, nil)
+	s.releaseSPILocked(ctx.spiI)
+	return true
 }
 
 // adoptCollisionOnPeerDelete is the second half of RFC 7296 section 2.8.2:
@@ -308,6 +327,7 @@ func (s *Session) adoptCollisionOnPeerDelete(ctx *ikeContext) bool {
 		return false
 	}
 	s.current, s.collision, s.localRekey = s.collision, nil, nil
+	s.releaseSPILocked(ctx.spiI)
 	return true
 }
 

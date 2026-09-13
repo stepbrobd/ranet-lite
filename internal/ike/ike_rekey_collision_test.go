@@ -13,7 +13,7 @@ import (
 )
 
 func TestLosingLocalIKERekeyAcceptsDeleteResponse(t *testing.T) {
-	mux, _ := lifecycleMuxes(t)
+	mux, other := lifecycleMuxes(t)
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	old := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: make([]byte, 32), skei: make([]byte, 20), sker: make([]byte, 20)}
 	s := &Session{mux: mux, current: old, requests: make(chan *localRequest, 1), ikeRekeyNonce: func(n []byte) error {
@@ -28,6 +28,12 @@ func TestLosingLocalIKERekeyAcceptsDeleteResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 	winner := &ikeContext{suite: suite, spiI: 31, spiR: 32, responder: true}
+	// The winner is routed by its own SPI the way handleIKERekey leaves it,
+	// so releasing the redundant candidate's registration can be told apart
+	// from releasing the SPI the session is about to be current on.
+	if err := mux.RegisterIKE(winner.spiI); err != nil {
+		t.Fatal(err)
+	}
 	s.stateMu.Lock()
 	s.collision = winner
 	s.localRekey.peerNonce = bytes.Repeat([]byte{2}, 32)
@@ -65,6 +71,14 @@ func TestLosingLocalIKERekeyAcceptsDeleteResponse(t *testing.T) {
 	if current != winner || retained != nil || s.collision != nil {
 		t.Fatal("collision did not retain only the winning IKE SA")
 	}
+	// Probed from a second mux on the same hub, because registering an SPI a
+	// mux already owns succeeds: only another mux can tell held from released.
+	if err := other.RegisterIKE(winner.spiI); err == nil {
+		t.Error("the losing branch released the SPI the session is now current on")
+	}
+	if err := other.RegisterIKE(22); err != nil {
+		t.Errorf("the redundant candidate kept its SPI registered: %v", err)
+	}
 }
 
 // RFC 7296 section 2.8.2: "If the peer that did notice the simultaneous rekey
@@ -76,7 +90,8 @@ func TestOneSidedIKERekeyCollisionAdoptsPeersSA(t *testing.T) {
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	old := &ikeContext{suite: suite, spiI: 11, spiR: 12, skD: make([]byte, 32), skei: make([]byte, 20), sker: make([]byte, 20)}
 	peerSA := &ikeContext{suite: suite, spiI: 31, spiR: 32, responder: true}
-	s := &Session{current: old}
+	mux, _ := lifecycleMuxes(t)
+	s := &Session{mux: mux, current: old}
 	// Only this end noticed: the peer's new SA is held as the collision
 	// candidate while this end's own rekey is still outstanding.
 	s.collision = peerSA
@@ -210,16 +225,17 @@ func TestRetainedIKESAThePeerNeverDeletesIsGivenUp(t *testing.T) {
 }
 
 // A peer that answers this end's rekey with one of its own may name any SPI
-// it likes, and the SPI this end drew is one it has already been told. Sharing
-// it makes the two collision candidates indistinguishable to the mux, and the
-// losing branch of RekeyIKE then unregisters the SPI the winner was just
-// installed under, which leaves the control channel deaf while ESP keeps
-// flowing. RFC 7296 section 2.6 leaves the choice to the initiator, so
-// refusing it costs a conforming peer nothing.
+// it likes, and every SPI this session routes is one it has already been told.
+// Sharing one makes two contexts indistinguishable to the mux, and whichever
+// of them is dropped first unregisters the SPI the other is still reached by,
+// which leaves the control channel deaf while ESP keeps flowing. RFC 7296
+// section 2.6 leaves the choice to the initiator, so refusing it costs a
+// conforming peer nothing.
 func TestPeerIKERekeyRefusesTheSPIThisEndAlreadyOffered(t *testing.T) {
 	const spiI, spiR = 0x0102030405060708, 0x1112131415161718
 	const inFlight = 0x2122232425262728
 	const free = 0x3132333435363738
+	const retained = 0x4142434445464748
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	dh, err := GenerateDH(DH_CURVE25519)
 	if err != nil {
@@ -229,13 +245,15 @@ func TestPeerIKERekeyRefusesTheSPIThisEndAlreadyOffered(t *testing.T) {
 		"the SPI this end has in flight": inFlight,
 		"the current SA's initiator SPI": spiI,
 		"the current SA's responder SPI": spiR,
+		"a retained SA's initiator SPI":  retained,
 		"an SPI nothing else holds":      free,
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := &ikeContext{suite: suite, spiI: spiI, spiR: spiR,
 				skD: make([]byte, 32), skei: make([]byte, 20), sker: make([]byte, 20)}
 			mux, _ := lifecycleMuxes(t)
-			s := &Session{mux: mux, current: ctx, localRekey: &ikeRekey{old: ctx, spiI: inFlight}}
+			s := &Session{mux: mux, current: ctx, old: &ikeContext{suite: suite, spiI: retained, spiR: retained + 1},
+				localRekey: &ikeRekey{old: ctx, spiI: inFlight}}
 			proposed := make([]byte, 8)
 			binary.BigEndian.PutUint64(proposed, offered)
 			raw, err := s.handleIKERekey(ctx, 0, []RawPayload{
@@ -418,35 +436,44 @@ func TestLocalFailureAnsweringARekeyIsTemporary(t *testing.T) {
 // either one must not take the registration with it, because the other is
 // still the session's way of receiving IKE, and a mux that has forgotten it
 // refuses every datagram for the session while ESP keeps flowing.
+//
+// Every case here probes from a second mux on the same hub, because
+// registering an SPI a mux already owns succeeds: only another mux can tell
+// held from released.
 func TestDroppingOneContextKeepsAnSPIAnotherStillUses(t *testing.T) {
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	ctx := func(spiI uint64) *ikeContext { return &ikeContext{suite: suite, spiI: spiI, spiR: spiI + 1} }
 
-	t.Run("a retained context shares the current one's SPI", func(t *testing.T) {
-		shared := ctx(0x1111)
-		s := &Session{current: ctx(0x1111), old: shared}
-		removed, release := s.removeRetainedContext(shared)
-		if !removed {
-			t.Fatal("the retained context was not dropped")
-		}
-		if release {
-			t.Error("dropping it released an SPI the current context is still routed by")
-		}
-	})
-	t.Run("a retained context has an SPI of its own", func(t *testing.T) {
-		alone := ctx(0x2222)
-		s := &Session{current: ctx(0x3333), old: alone}
-		removed, release := s.removeRetainedContext(alone)
-		if !removed || !release {
-			t.Errorf("dropping a context nothing else shares reported removed=%v release=%v", removed, release)
-		}
-	})
+	for name, shared := range map[string]bool{
+		"a retained context shares the current one's SPI": true,
+		"a retained context has an SPI of its own":        false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mux, other := lifecycleMuxes(t)
+			retained := ctx(0x1111)
+			current := ctx(0x3333)
+			if shared {
+				current = ctx(retained.spiI)
+			}
+			s := &Session{mux: mux, current: current, old: retained}
+			if err := mux.RegisterIKE(retained.spiI); err != nil {
+				t.Fatal(err)
+			}
+			if !s.removeRetainedContext(retained) {
+				t.Fatal("the retained context was not dropped")
+			}
+			err := other.RegisterIKE(retained.spiI)
+			if shared && err == nil {
+				t.Error("dropping it released an SPI the current context is still routed by")
+			}
+			if !shared && err != nil {
+				t.Errorf("dropping a context nothing else shares kept its SPI: %v", err)
+			}
+		})
+	}
 
-	// releaseDisplacedLocked is the same rule on the other path, where a
-	// second rekey displaces a retained context rather than a Delete dropping
-	// it.
-	// Probed from a second mux on the same hub, because registering an SPI a
-	// mux already owns succeeds: only another mux can tell held from released.
+	// retainOldLocked is the same rule on the other path, where a second rekey
+	// displaces a retained context rather than a Delete dropping it.
 	for name, shared := range map[string]bool{
 		"a displaced context shares the replacement's SPI": true,
 		"a displaced context has an SPI of its own":        false,
@@ -458,11 +485,11 @@ func TestDroppingOneContextKeepsAnSPIAnotherStillUses(t *testing.T) {
 			if shared {
 				replacement = ctx(displaced.spiI)
 			}
-			s := &Session{mux: mux, current: ctx(0x5555)}
+			s := &Session{mux: mux, current: ctx(0x5555), old: displaced}
 			if err := mux.RegisterIKE(displaced.spiI); err != nil {
 				t.Fatal(err)
 			}
-			s.releaseDisplacedLocked(displaced, replacement)
+			s.retainOldLocked(replacement)
 			err := other.RegisterIKE(displaced.spiI)
 			if shared && err == nil {
 				t.Error("displacing a context released an SPI its replacement is routed by")
