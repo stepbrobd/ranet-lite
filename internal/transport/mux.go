@@ -22,7 +22,7 @@ const (
 	// them. It counts socket batches, which is the datagram count only where
 	// the backend returns one datagram per batch, as darwin's does. The
 	// channel is allocated with the mux, so this is also what a half-open SA
-	// costs while its handshake runs: at 4096 it was 164 KiB a piece, and
+	// costs while its handshake runs: at 4096 it was 160 KiB a piece, and
 	// halfOpenLimit of them is what a flood can pin at once.
 	espChanSize = 1024
 	// espQueueBytes is what actually bounds that queue. A batch holds up to
@@ -417,6 +417,11 @@ func (m *Mux) Done() <-chan struct{} { return m.done }
 // RegisterIKE routes packets whose marked IKE header has spi as SPIi to m.
 func (m *Mux) RegisterIKE(spi uint64) error { return m.registerIKE(spi) }
 func (m *Mux) registerIKE(spi uint64) error {
+	if spi == 0 {
+		// RFC 7296 section 2.6 uses a zero SPI for a request that names no SA.
+		// Claiming it here would route every one of those to this mux.
+		return fmt.Errorf("transport: IKE SPI must be nonzero")
+	}
 	m.hub.mu.Lock()
 	defer m.hub.mu.Unlock()
 	if m.closed.Load() || m.hub.closed.Load() {

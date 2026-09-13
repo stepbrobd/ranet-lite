@@ -184,11 +184,22 @@ func (s *udpSocket) receiver() receiveFunc {
 			raw := m.Buffers[0][offset:end]
 			bufs[n], sizes[n], endpoints[n] = raw, len(raw), nil
 			if len(raw) >= 4 && binary.BigEndian.Uint32(raw[:4]) == 0 {
-				ep, err := s.replyEndpoint(m)
-				if err != nil {
-					return 0, err
+				// A datagram whose control message will not parse is dropped,
+				// not reported: receiveLoop fails the whole hub on an error,
+				// which closes every session on this node, and the GRO sizing
+				// two branches up already skips the same class of failure.
+				// Without the endpoint the responder cannot answer, so the
+				// datagram is of no use anyway.
+				if ep, err := s.replyEndpoint(m); err == nil {
+					endpoints[n] = ep
+				} else {
+					offset = end
+					if offset == m.N {
+						index++
+						offset = 0
+					}
+					continue
 				}
-				endpoints[n] = ep
 			}
 			n++
 			offset = end
