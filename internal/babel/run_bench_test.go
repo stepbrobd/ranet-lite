@@ -66,6 +66,19 @@ func BenchmarkRunLoopPass(b *testing.B) {
 			s := fillRouteTable(b, 8, prefixes)
 			b.ResetTimer()
 			for b.Loop() {
+				// The pass drains what it advertises, so without this every
+				// iteration after the first measures a pass with the
+				// advertise half absent: 20.7 ms against 77.6 ms at
+				// maxRouteKeys, and the figures quoted elsewhere are the
+				// second number.
+				b.StopTimer()
+				s.mu.Lock()
+				for key := range s.routes.entries {
+					s.routes.dirty[key] = struct{}{}
+				}
+				s.mu.Unlock()
+				b.StartTimer()
+
 				now := time.Now()
 				s.mu.Lock()
 				s.sweepExpiredLocked(now)
@@ -74,6 +87,37 @@ func BenchmarkRunLoopPass(b *testing.B) {
 				actions = append(actions, s.retryStarvedLocked(now)...)
 				_, _ = actions, s.deadlineLocked()
 				s.mu.Unlock()
+			}
+		})
+	}
+}
+
+// BenchmarkEmitDump is the other half of a pass: taking a place for every
+// packet of a full dump and recording the undo of every prefix in it. The
+// rollback is per packet, so the undos have to be split across the packets
+// that carry them, and the split walks the list rather than rescanning it for
+// each packet. See takeUndos.
+func BenchmarkEmitDump(b *testing.B) {
+	for _, prefixes := range []int{1000, maxRouteKeys} {
+		b.Run(fmt.Sprintf("prefixes=%d", prefixes), func(b *testing.B) {
+			s := fillRouteTable(b, 8, prefixes)
+			// fillRouteTable's peers carry no transport, because nothing else
+			// here sends. These do, so the reservation and the split across
+			// packets are measured rather than skipped.
+			s.mu.Lock()
+			for _, n := range s.neighbors {
+				n.peer = netstack.NewPeer(n.peer.ID,
+					func(raw []byte, _ byte) ([]byte, error) { return raw, nil },
+					func([]byte) error { return nil })
+			}
+			s.mu.Unlock()
+			b.ResetTimer()
+			for b.Loop() {
+				now := time.Now()
+				s.mu.Lock()
+				send := s.emitLocked(s.updateActions(now))
+				s.mu.Unlock()
+				send()
 			}
 		})
 	}

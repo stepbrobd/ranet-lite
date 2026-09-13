@@ -176,6 +176,27 @@ func BenchmarkFillOneDestination(b *testing.B) {
 // neighbor, so this is the product rather than either figure alone, and it is
 // inline on the TUN reader. The per-node figures beside byLen are for one
 // node; this is the cost of one packet.
+// assertIndexed refuses a fixture that has drifted below the index threshold.
+// Both of the shapes here are named for what the index costs or saves, and a
+// fixture whose sources collapse under the mask measures the scan instead
+// while the name and the figures in table.go say otherwise.
+func assertIndexed(b *testing.B, table *Table[int], dst netip.Prefix, want int) {
+	b.Helper()
+	for node := table.roots.Load().ipv6; node != nil; node = node.child[0] {
+		if int(node.prefixLen) != dst.Bits() {
+			continue
+		}
+		if got := len(node.srcs); got < want {
+			b.Fatalf("the node holds %d sources, want %d: the fixture collapsed under the mask", got, want)
+		}
+		if node.index() == nil {
+			b.Fatal("the node built no index, so this times the scan fallback")
+		}
+		return
+	}
+	b.Fatalf("no node for %v", dst)
+}
+
 func BenchmarkLookupDownADestinationChain(b *testing.B) {
 	for _, depth := range []int{1, 8, 32} {
 		for _, shape := range []string{"one length", "many lengths"} {
@@ -186,9 +207,14 @@ func BenchmarkLookupDownADestinationChain(b *testing.B) {
 					dst := netip.PrefixFrom(netip.MustParseAddr("2001:db8::"), 32+d*2).Masked()
 					for i := range perNode {
 						addr := netip.AddrFrom16([16]byte{0x20, 0x02, byte(i >> 8), byte(i), byte(d)})
+						// The lengths start where the varying bytes survive
+						// the mask. Shorter ones collapse distinct sources
+						// onto one prefix, which drops the count below the
+						// index threshold and times the scan fallback under a
+						// name that says otherwise.
 						bits := 64
 						if shape == "many lengths" {
-							bits = 17 + i%112
+							bits = 40 + i%88
 						}
 						table.Set(netip.PrefixFrom(addr, bits).Masked(), dst, d*perNode+i+1)
 					}
@@ -199,6 +225,7 @@ func BenchmarkLookupDownADestinationChain(b *testing.B) {
 				source := netip.MustParseAddr("2001:db8:1::1")
 				target := netip.MustParseAddr("2001:db8::1")
 				table.Lookup(source, target)
+				assertIndexed(b, &table, netip.PrefixFrom(netip.MustParseAddr("2001:db8::"), 32).Masked(), perNode)
 				b.ReportAllocs()
 				b.ResetTimer()
 				for b.Loop() {
