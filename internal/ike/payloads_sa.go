@@ -187,15 +187,3 @@ func DecodeSA(body []byte) ([]Proposal, error) {
 	}
 	return props, nil
 }
-
-// ChosenTransform returns the single transform of the given type from a
-// (already-selected, single-proposal) SA payload, as returned by a
-// well-behaved IKEv2 responder.
-func (p Proposal) ChosenTransform(t TransformType) (Transform, bool) {
-	for _, tr := range p.Transforms {
-		if tr.Type == t {
-			return tr, true
-		}
-	}
-	return Transform{}, false
-}
