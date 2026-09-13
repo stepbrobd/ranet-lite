@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 )
 
 // Metrics replaces what prometheus-bird-exporter reported while Babel lived in
@@ -20,22 +21,22 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprint(w, "# HELP ranet_lite_babel_neighbor_up Whether a babel neighbor is alive.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_neighbor_up gauge\n")
 	for _, neighbor := range babel.Neighbors {
-		fmt.Fprintf(w, "ranet_lite_babel_neighbor_up{peer=%q} %d\n", neighbor.Peer, boolValue(neighbor.Alive))
+		fmt.Fprintf(w, "ranet_lite_babel_neighbor_up{peer=\"%s\"} %d\n", label(neighbor.Peer), boolValue(neighbor.Alive))
 	}
 	fmt.Fprint(w, "# HELP ranet_lite_babel_neighbor_cost Link cost to a babel neighbor, where 65535 is infinity.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_neighbor_cost gauge\n")
 	for _, neighbor := range babel.Neighbors {
-		fmt.Fprintf(w, "ranet_lite_babel_neighbor_cost{peer=%q} %d\n", neighbor.Peer, neighbor.Cost)
+		fmt.Fprintf(w, "ranet_lite_babel_neighbor_cost{peer=\"%s\"} %d\n", label(neighbor.Peer), neighbor.Cost)
 	}
 	fmt.Fprint(w, "# HELP ranet_lite_babel_routes_received Routes learned from one neighbor, selected or not.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_routes_received gauge\n")
 	for _, neighbor := range babel.Neighbors {
-		fmt.Fprintf(w, "ranet_lite_babel_routes_received{peer=%q} %d\n", neighbor.Peer, neighbor.Routes)
+		fmt.Fprintf(w, "ranet_lite_babel_routes_received{peer=\"%s\"} %d\n", label(neighbor.Peer), neighbor.Routes)
 	}
 	fmt.Fprint(w, "# HELP ranet_lite_peer_send_dropped_total Packets a peer did not send: no transmission slot free, the peer closing, or its outbound SA unable to give out a sequence range.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_peer_send_dropped_total counter\n")
 	for _, neighbor := range babel.Neighbors {
-		fmt.Fprintf(w, "ranet_lite_peer_send_dropped_total{peer=%q} %d\n", neighbor.Peer, neighbor.Dropped)
+		fmt.Fprintf(w, "ranet_lite_peer_send_dropped_total{peer=\"%s\"} %d\n", label(neighbor.Peer), neighbor.Dropped)
 	}
 	fmt.Fprint(w, "# HELP ranet_lite_babel_routes_selected Routes currently installed in the forwarding table.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_babel_routes_selected gauge\n")
@@ -47,7 +48,7 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprint(w, "# HELP ranet_lite_session_up Whether an IKE session is established for one path.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_session_up gauge\n")
 	for _, path := range sessions {
-		fmt.Fprintf(w, "ranet_lite_session_up{path=%q} 1\n", path)
+		fmt.Fprintf(w, "ranet_lite_session_up{path=\"%s\"} 1\n", label(path))
 	}
 	fmt.Fprint(w, "# HELP ranet_lite_sessions Established IKE sessions.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_sessions gauge\n")
@@ -84,6 +85,30 @@ func (c *Client) MetricsHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		c.Metrics(w)
 	})
+}
+
+// label escapes a label value the way the Prometheus text exposition format
+// defines it, which is three sequences and no others: a backslash, a double
+// quote and a newline. Go's %q escapes every rune unicode.IsPrint rejects, as
+// \t or \u00a0, and a scrape carrying one of those is refused whole rather
+// than in part, so one tab or non-breaking space pasted into an organization
+// or common name takes every series on the node out of monitoring. The values
+// here are built from those names and from the identity a peer asserts.
+func label(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func boolValue(b bool) int {

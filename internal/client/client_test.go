@@ -408,7 +408,27 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	}
 	defer hub.Close()
 	c := &Client{speaker: speaker, sessions: newSessionSet(), hub: hub}
-	refused := fillUnclaimedQueue(t, hub)
+	if fillUnclaimedQueue(t, hub) == 0 {
+		t.Fatal("the queue refused nothing, so the counter would read zero either way")
+	}
+	// Closed before anything reads the counter: the receive loops are still
+	// draining the socket backlog of the last burst, and every datagram in it
+	// raises the count, so a snapshot taken while they run is smaller than
+	// what Metrics renders a moment later. The count that matters is the one
+	// that stops moving, not the one fillUnclaimedQueue saw on its way out.
+	hub.Close()
+	var refused uint64
+	for deadline := time.Now().Add(20 * time.Second); refused == 0; {
+		settled := hub.Dropped()
+		time.Sleep(10 * time.Millisecond)
+		if hub.Dropped() == settled {
+			refused = settled
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the drop counter never settled, so the metric would be read mid-flight")
+		}
+	}
 	c.sessions.close = func(*ike.Session) {}
 	c.sessions.active = func(*ike.Session) bool { return true }
 	release, adopted := c.sessions.adoptPreferred("example/gateway/1@0", &ike.Session{}, true, nil)
@@ -1162,7 +1182,7 @@ func fillUnclaimedQueue(t *testing.T, hub *transport.Hub) uint64 {
 	binary.BigEndian.PutUint32(header[24:28], uint32(len(header)))
 
 	deadline := time.Now().Add(20 * time.Second)
-	for hub.Dropped() == 0 {
+	for hub.Dropped() < 64 {
 		if time.Now().After(deadline) {
 			t.Fatal("the unclaimed queue never filled, so the drop counter proves nothing")
 		}
@@ -1174,4 +1194,57 @@ func fillUnclaimedQueue(t *testing.T, hub *transport.Hub) uint64 {
 		time.Sleep(time.Millisecond)
 	}
 	return hub.Dropped()
+}
+
+// The Prometheus text exposition format defines three escape sequences inside
+// a label value and no others, and a record carrying anything else is refused
+// whole rather than in part: one tab or non-breaking space pasted into an
+// organization or common name would take every series on this node out of
+// monitoring, with nothing in its own log. Go's %q writes \t and  .
+func TestMetricsLabelsUseOnlyTheEscapesTheFormatDefines(t *testing.T) {
+	for name, test := range map[string]struct{ in, want string }{
+		"plain":                 {"example/gateway/0@0", "example/gateway/0@0"},
+		"backslash":             {`a\b`, `a\\b`},
+		"quote":                 {`a"b`, `a\"b`},
+		"newline":               {"a\nb", `a\nb`},
+		"tab":                   {"a\tb", "a\tb"},
+		"non-breaking space":    {"a b", "a b"},
+		"printable non-ascii":   {"orgé", "orgé"},
+		"carriage return alone": {"a\rb", "a\rb"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := label(test.in); got != test.want {
+				t.Errorf("label(%q) = %q, want %q", test.in, got, test.want)
+			}
+		})
+	}
+
+	// And the rendered line carries it, so nothing above the helper reaches
+	// for %q again.
+	speaker, err := babel.New(babel.Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := netstack.NewPeer("gate\tway", func(raw []byte, _ byte) ([]byte, error) { return raw, nil },
+		func([]byte) error { return nil })
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	c := &Client{speaker: speaker, sessions: newSessionSet()}
+	// A live session too: the path label is the other value built from a name
+	// a peer chooses, and with no sessions its line is never rendered.
+	c.sessions.close = func(*ike.Session) {}
+	c.sessions.active = func(*ike.Session) bool { return true }
+	if _, adopted := c.sessions.adoptPreferred("example/gate\tway/0@0", &ike.Session{}, true, nil); !adopted {
+		t.Fatal("the session was not adopted, so the path line would be empty")
+	}
+	var out bytes.Buffer
+	c.Metrics(&out)
+	for _, want := range []string{"{peer=\"gate\tway\"}", "{path=\"example/gate\tway/0@0\"}"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the rendered line does not carry %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), `\t`) {
+		t.Error("a label value carries an escape the format does not define")
+	}
 }
