@@ -907,3 +907,52 @@ func TestAnUnclaimedFloodDoesNotReadAsBeingBehind(t *testing.T) {
 		t.Error("the flood raised nothing an operator can see")
 	}
 }
+
+// RFC 3948 section 2.3: "The sender MUST use a one-octet-long payload with the
+// value 0xFF. The receiver SHOULD ignore a received NAT-keepalive packet." A
+// peer behind a NAT sends one every twenty seconds by default, which is four
+// thousand a day, and sweeping them up with the short-datagram test spends a
+// counter an operator reads as traffic somebody is aiming at this node.
+//
+// Ignored is a rule about processing the datagram, not about counting it. Each
+// one still costs a read, a demultiplex under the hub lock and, coalesced by
+// GRO, up to forty iterations per read, so they go on a counter of their own:
+// an arm that reaches no Mux and raises nothing leaves an operator with an
+// accounting that does not add up.
+func TestANATKeepaliveIsIgnoredRatherThanCounted(t *testing.T) {
+	hub, err := NewHub("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	sender, err := net.Dial("udp", net.JoinHostPort("127.0.0.1",
+		strconv.Itoa(hub.LocalAddr().(*net.UDPAddr).Port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+
+	for range 64 {
+		if _, err := sender.Write([]byte{0xff}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A datagram that is refused, sent after them, so there is something to
+	// wait for rather than a sleep that proves nothing.
+	if _, err := sender.Write([]byte{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for hub.Refused() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the refused datagram was never counted, so this proves nothing")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := hub.Refused(); got != 1 {
+		t.Errorf("sixty-four keepalives and one refused datagram raised the counter by %d", got)
+	}
+	if got := hub.Keepalives(); got != 64 {
+		t.Errorf("sixty-four keepalives were counted as %d, so a flood of them is invisible", got)
+	}
+}

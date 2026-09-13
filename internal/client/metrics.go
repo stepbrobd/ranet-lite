@@ -71,20 +71,26 @@ func (c *Client) Metrics(w io.Writer) {
 	c.renderReceiveCounters(w)
 }
 
-// renderReceiveCounters writes the two the hub keeps. They are separate series
-// on purpose: a rising dropped means this node is behind on receive, which is
-// the only signal there is for that, while a rising refused means somebody is
-// sending it datagrams it has nowhere to put. Anyone who can reach the port
-// can raise either, so neither is a fault by itself, and mixing them would
-// make the first unreadable.
+// renderReceiveCounters writes the three the hub keeps. They are separate
+// series on purpose: a rising dropped means this node is behind on receive,
+// which is the only signal there is for that; a rising refused means somebody
+// is sending it datagrams it has nowhere to put; and keepalives are the RFC
+// 3948 section 2.3 datagrams a NATed peer sends to hold its mapping open,
+// which are expected rather than unwanted. Anyone who can reach the port can
+// raise any of them, so none is a fault by itself, and mixing them would make
+// the first two unreadable.
 func (c *Client) renderReceiveCounters(w io.Writer) {
 	fmt.Fprint(w, "# HELP ranet_lite_receive_dropped_total Inbound datagrams a full receive queue refused.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_receive_dropped_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_receive_dropped_total %d\n", c.hubDropped())
 
-	fmt.Fprint(w, "# HELP ranet_lite_receive_refused_total Inbound datagrams naming no SPI this node holds, or too short to name one.\n")
+	fmt.Fprint(w, "# HELP ranet_lite_receive_refused_total Inbound datagrams nothing here wanted: naming no SPI this node holds, too short or empty, for a full unclaimed queue, or with an unreadable control message or source.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_receive_refused_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_receive_refused_total %d\n", c.hubRefused())
+
+	fmt.Fprint(w, "# HELP ranet_lite_receive_keepalives_total Inbound RFC 3948 NAT keepalives, ignored on arrival.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_receive_keepalives_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_receive_keepalives_total %d\n", c.hubKeepalives())
 }
 
 // hubDropped and hubRefused are zero before the hub exists, which is every
@@ -101,6 +107,13 @@ func (c *Client) hubRefused() uint64 {
 		return 0
 	}
 	return c.hub.Refused()
+}
+
+func (c *Client) hubKeepalives() uint64 {
+	if c.hub == nil {
+		return 0
+	}
+	return c.hub.Keepalives()
 }
 
 // MetricsHandler serves Metrics, for mounting next to the pprof endpoint.

@@ -17,16 +17,31 @@ import (
 
 const (
 	// nonESPMarkerLen is the four zero octets of RFC 3948 section 2.2 that
-	// tell an IKE message from an ESP packet on one port. The same length test
-	// discards the one byte 0xff NAT keepalive of section 4, which satisfies
-	// "The receiver SHOULD ignore a received NAT-keepalive packet" by arriving
-	// at the same place rather than by name. This end never sends one: the
-	// mapping is refreshed far more often than the twenty second default by
-	// the babel hellos inside ESP, and internal/ike/natt.go says why nothing
-	// here acts on NAT detection either.
+	// tell an IKE message from an ESP packet on one port.
+	//
+	// A NAT keepalive is one octet of 0xff, section 2.3, which says "The
+	// receiver SHOULD ignore a received NAT-keepalive packet": recognized by
+	// name below rather than swept up by the length test, so a peer that sends
+	// one every twenty seconds does not spend the counter an operator reads
+	// for hostile traffic. It raises keepalives instead, because ignoring a
+	// datagram is a rule about processing it and not about counting it.
+	//
+	// This end sends none, which section 4 asks for: "A peer SHOULD send a
+	// NAT-keepalive packet if a need for it is detected according to [RFC3947]
+	// and if no other packet to the peer has been sent in M seconds. M is a
+	// locally configurable parameter with a default value of 20 seconds." What
+	// keeps the mapping open here is the babel hellos, and nothing else does:
+	// the liveness probe fires only once inbound traffic has stopped for its
+	// interval, so a peer that keeps sending draws no outbound IKE at all.
+	// babel.hello_interval is configurable and Validate accepts up to 655
+	// seconds, which is past the two minute mapping timer RFC 4787 REQ-5
+	// permits, so a NATed node at a long interval can lose the mapping while
+	// traffic is still arriving.
 	nonESPMarkerLen = 4
-	readBufferSize  = 65536
-	espSendBatch    = 128
+	// natKeepaliveByte is the payload of that one octet datagram.
+	natKeepaliveByte = 0xff
+	readBufferSize   = 65536
+	espSendBatch     = 128
 	// espChanSize absorbs receive bursts before a peer's workers can drain
 	// them. It counts socket batches, which is the datagram count only where
 	// the backend returns one datagram per batch, as darwin's does. The
@@ -70,12 +85,20 @@ type Hub struct {
 	// point at it.
 	dropped atomic.Uint64
 	// refused counts datagrams this node read and did not deliver because
-	// nothing here wanted them: too short to carry an SPI, or naming an SPI no
-	// Mux holds. Anyone who can reach the port can raise it, which is why it
-	// is a counter and not a log line, and why it is separate from dropped: a
+	// nothing here wanted them: too short to carry an SPI, zero length, naming
+	// an SPI no Mux holds, arriving for an unclaimed queue that is already
+	// full, or carrying a control message or source address the receiver could
+	// not read. Anyone who can reach the port can raise it, which is why it is
+	// a counter and not a log line, and why it is separate from dropped: a
 	// rising dropped means this node is behind on receive, and mixing the two
 	// would make the one number an operator watches unreadable.
 	refused atomic.Uint64
+	// keepalives counts the one-octet NAT keepalives of RFC 3948 section 2.3.
+	// They are ignored rather than delivered, but they are expected traffic
+	// from a NATed peer rather than traffic nothing wanted, so they stay off
+	// refused: an operator watching that number for a flood should not see it
+	// move because a peer is holding its mapping open.
+	keepalives atomic.Uint64
 	// reported is nanoseconds since started, which is read through time.Since
 	// so it comes from the monotonic clock: on the wall clock a step backwards
 	// silences the report for the length of the step. It starts one interval
@@ -97,6 +120,11 @@ func (h *Hub) Dropped() uint64 { return h.dropped.Load() }
 // Refused is how many inbound datagrams this node read and had nowhere to put:
 // see Hub.refused.
 func (h *Hub) Refused() uint64 { return h.refused.Load() }
+
+// Keepalives reports the RFC 3948 section 2.3 NAT keepalives this hub read and
+// ignored. They are separate from Refused because a NATed peer holding its
+// mapping open is expected traffic, not traffic nothing wanted.
+func (h *Hub) Keepalives() uint64 { return h.keepalives.Load() }
 
 // noteDrop counts refused datagrams and reports them at most once an interval.
 func (h *Hub) noteDrop(count int, reason string) {
@@ -312,6 +340,15 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			// Every arm that reaches no Mux is counted. The SPI is cleartext,
 			// so anyone who can reach the port can send these, which is the
 			// case an operator needs a number for rather than a log line.
+			if len(raw) == 1 && raw[0] == natKeepaliveByte {
+				// RFC 3948 section 2.3 has the receiver ignore these. Counted
+				// all the same, on its own counter: a flood of them costs a
+				// read, a demultiplex under this lock and, coalesced by GRO,
+				// up to forty iterations per read, and an arm that reaches no
+				// Mux and raises nothing is the one gap in the accounting.
+				h.keepalives.Add(1)
+				continue
+			}
 			if len(raw) < nonESPMarkerLen {
 				unwanted++
 				continue
