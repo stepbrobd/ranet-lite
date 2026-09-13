@@ -43,7 +43,7 @@ func encryptedRoundTripWithin(mux *transport.Mux, ctx *ikeContext, req []byte, a
 // timeout. accept is consulted for every response matching req's SPI and
 // Message ID: of an unauthenticated error notification, RFC 7815 §2.1 says an
 // implementation "can simply ignore" it and keep retransmitting until timeout,
-// which is what this does, since an IKE_SA_INIT response (and the outer,
+// which this does, since an IKE_SA_INIT response (and the outer,
 // pre-decryption layer of an IKE_AUTH response) carries no integrity
 // protection of its own -- anyone able to
 // spoof the initiator's SPI, visible in the plaintext request, can inject a

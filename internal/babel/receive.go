@@ -181,7 +181,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			// address of this packet if it belongs to the same address family
 			// as the prefix being announced; otherwise, this Update MUST be
 			// ignored." Every packet here is IPv6, so a plain AE 1 prefix has
-			// neither. RFC 9229's AE 4 is the spelling that does, and is what
+			// neither. RFC 9229's AE 4 is the spelling that does, and the one
 			// this node sends.
 			//
 			// A retraction is exempt, by the same section: "If the metric

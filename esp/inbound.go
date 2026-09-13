@@ -168,9 +168,9 @@ func parseTrailer(plain []byte) ([]byte, byte, error) {
 	// making up a monotonically increasing sequence: 1, 2, 3, .... When this
 	// padding scheme is employed, the receiver SHOULD inspect the Padding
 	// field." RFC 4106 specifies no contents for AES-GCM and RFC 7634 none for
-	// ChaCha20-Poly1305, which are the two this package has, so the sequence
-	// is what a conforming sender MUST put here and Linux's
-	// esp_output_fill_trailer is what produces it. Inspected rather than
+	// ChaCha20-Poly1305, which are the two this package has, so a conforming
+	// sender MUST put the sequence here, and Linux's esp_output_fill_trailer
+	// produces it. Inspected rather than
 	// skipped because the bytes are inside the ICV: anything else here is a
 	// sender this end does not understand, not an attacker.
 	for i, value := range plain[len(plain)-2-padLen : len(plain)-2] {

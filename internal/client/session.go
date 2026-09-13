@@ -66,7 +66,7 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	// Peer.Close waits with no deadline for a sender that may be inside
 	// SendESPBatch on this very mux, and the defer at the top of this function
 	// runs last, so on that ordering a send that would not return held the
-	// whole shutdown. Closing twice is what Mux.Close is written for.
+	// whole shutdown. Mux.Close is written to be called twice.
 	defer func() {
 		_ = sess.Mux().Close()
 		peer.Close()
@@ -79,12 +79,12 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 		return errSessionEstablished
 	}
 	// A dialer that a reload dropped cancels this context while the node keeps
-	// running, and this end then simply stops: the peer carries on sending ESP
+	// running, and this end then stops: the peer carries on sending ESP
 	// into an SPI nobody answers until its own liveness check expires, which
 	// is up to seventy seconds. closeAll does this for every session at
 	// shutdown, for exactly the reason its doc gives, and this is the same
 	// thing for one peer. Shutdown is not this case, because closeAll has
-	// already swept by the time c.ctx is cancelled.
+	// already swept by the time c.ctx is canceled.
 	defer func() {
 		if dialerWasDropped(ctx, c.ctx) {
 			closeSession(sess)
@@ -221,8 +221,8 @@ func identityOrder(id ike.Identity) string {
 // replaced cannot evict its replacement.
 //
 // The two identities are this SA's roles, not this node's point of view: the
-// end that opened it and the end that answered. Naming them that way is what
-// keeps a dialer and a responder from deriving opposite answers for one SA,
+// end that opened it and the end that answered. Naming them that way keeps a
+// dialer and a responder from deriving opposite answers for one SA,
 // which is invisible from either end alone.
 func (s *sessionSet) adopt(path string, sess *ike.Session, initiator, responder, remote ike.Identity, attach func() func()) (func(), bool) {
 	return s.adoptFor(path, sess, preferInitiator(initiator, responder), remote, attach)

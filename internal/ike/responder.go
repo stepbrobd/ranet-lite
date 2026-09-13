@@ -57,8 +57,8 @@ func identityFromID(body []byte) (Identity, error) {
 	return Identity{Organization: organization, CommonName: commonName, SerialNumber: serialNumber}, nil
 }
 
-// ResponderConfig is what answering an unsolicited peer needs, as against
-// PeerConfig which describes one peer we dial. A responder does not know who
+// ResponderConfig carries what answering an unsolicited peer needs, against
+// PeerConfig, which describes one peer this node dials. A responder does not know who
 // is calling until IDi arrives, so the peer's key and the local endpoint
 // identity are both resolved during the exchange rather than configured.
 type ResponderConfig struct {
@@ -105,7 +105,7 @@ const (
 	// A cookie proves return routability, not good behavior.
 	halfOpenLimit = 256
 
-	// halfOpenPerSource is what one address can hold of that. Without it the
+	// halfOpenPerSource bounds how much of that one address may hold. Without it the
 	// cap is first come from a single address: an initiator that sends
 	// IKE_SA_INIT and never IKE_AUTH holds a slot for the whole
 	// handshakeTimeout, so eight and a half packets a second park every slot
@@ -365,8 +365,8 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 		return nil, Accepted{}, err
 	}
 
-	// Per-SA state starts here; the half-open slot above is what bounds how
-	// many of these can exist at once.
+	// Per-SA state starts here. The half-open slot above bounds how many of
+	// these can exist at once.
 	mux, err := r.cfg.Hub.NewMuxTo(datagram.Endpoint)
 	if err != nil {
 		return nil, Accepted{}, err
@@ -639,8 +639,7 @@ func (s *Session) awaitAuthRequest(saInitRequest, saInitResponse []byte, deadlin
 		// SPI can send one, and acting on it would end a handshake this end
 		// has already paid for. It is the rule sendRecv follows for the rest
 		// of the session, RFC 7296 section 2.21 and RFC 7815 section 2.1:
-		// nothing unauthenticated changes state. The deadline is what ends
-		// the wait.
+		// nothing unauthenticated changes state. The deadline ends the wait.
 		outer, err := DecodeMessage(raw)
 		if err != nil {
 			continue
@@ -748,7 +747,7 @@ func (s *Session) selectResponderChild(request *Message, ni, nr []byte) (respond
 		sa: ChildSA{
 			EncrID: selection.encryption.ID, EncrKeyBits: selection.encryption.KeyLengthBits,
 			LocalSPI: randUint32Nonzero(), RemoteSPI: selection.remoteSPI,
-			// The initiator encrypts with the initiator key, so that is what
+			// The initiator encrypts with the initiator key, so that key
 			// arrives here, and our replies use the responder key.
 			InboundKey: initiatorKey, OutboundKey: responderKey,
 		},
@@ -762,7 +761,7 @@ func (s *Session) selectResponderChild(request *Message, ni, nr []byte) (respond
 // localIdentity resolves the IDr the initiator asked for, by name rather than
 // by its bytes, and returns our own encoding of it. Our AUTH signs the IDr we
 // send, and the initiator verifies against the IDr it receives, so answering
-// in our own encoding is what the signature covers either way.
+// in our own encoding leaves the signature over the same bytes either way.
 //
 // A request without IDr is answered under our only identity; with more than
 // one configured there is nothing to guess from, so it is rejected.
@@ -833,8 +832,8 @@ func (r *Responder) cookieRequired(request *Message, ni []byte, spiI uint64, end
 	source := endpoint.AddrPort().Addr()
 	r.mu.Lock()
 	// Under pressure globally, or past what one address may hold without
-	// having proved it can receive. The second is what stops a spoofer
-	// spending a named peer's whole share while the node is idle: with the
+	// having proved it can receive. The second stops a spoofer spending a
+	// named peer's whole share while the node is idle: with the
 	// global threshold alone, floor(cookieThreshold/halfOpenPerSource)
 	// addresses can be locked out by an off-path source, for sixteen packets
 	// every thirty seconds each, and the victim is then refused in silence.

@@ -44,7 +44,7 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 			t.Fatalf("install %s: %v", remote, err)
 		}
 		t.Cleanup(func() { _ = plat.DelRoute(Route{Destination: remote}) })
-		// An ordinary destination route is what every macOS VPN installs for
+		// An ordinary destination route is the kind every macOS VPN installs for
 		// split tunneling, and it is reached without scoping anything.
 		if !reaches(t, tun, target, netip.Addr{}, 0) {
 			t.Error("an unscoped route did not carry a packet from an unbound socket")

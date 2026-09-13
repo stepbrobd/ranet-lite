@@ -52,8 +52,8 @@ func Load(path string) (Registry, error) {
 		return nil, fmt.Errorf("registry: parse %s: %w", path, err)
 	}
 	// DisallowUnknownFields catches a stray field inside the document; this
-	// catches a second document after it, which is what a partial write or a
-	// bad concatenation leaves behind and which Decode would otherwise ignore
+	// catches a second document after it, which a partial write or a bad
+	// concatenation leaves behind and which Decode would otherwise ignore
 	// entirely. Token rather than More: More answers "is there another element
 	// in the array or object being parsed" and so reports false on a stray "]"
 	// or "}", which is one character of the concatenation this is here to
@@ -177,7 +177,7 @@ func (n Node) FindEndpoint(serial string) (Endpoint, bool) {
 // wildcard, which isn't a dialable address — callers must treat a failure
 // here as "endpoint not currently reachable", not retry with a wildcard.
 //
-// The context is what makes shutdown prompt: a hostname whose resolver is
+// The context makes shutdown prompt: a hostname whose resolver is
 // unreachable otherwise holds the dialer for the resolver's own timeout, and
 // the client waits for every dialer before it returns.
 func (e Endpoint) ResolveRemote(ctx context.Context) (net.IP, error) {

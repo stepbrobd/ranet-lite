@@ -75,8 +75,8 @@ type routePlatform struct {
 	// occupied remembers the keys another program already holds, so a
 	// route that can never install is reported once rather than every pass.
 	occupied map[occupiedKey]bool
-	// refused is what this pass has seen refused, which becomes occupied at
-	// the start of the next one.
+	// refused holds the keys this pass watched the kernel refuse, which
+	// become occupied at the start of the next one.
 	refused map[occupiedKey]bool
 	// ours is the keys the kernel holds for this interface: what the last dump
 	// reported as ours, plus what has installed since. EEXIST says only that
@@ -297,8 +297,8 @@ const skipRouteFlags = unix.RTF_MULTICAST | unix.RTF_BROADCAST |
 	unix.RTF_LOCAL | unix.RTF_WASCLONED | unix.RTF_LLINFO |
 	unix.RTF_BLACKHOLE | unix.RTF_GATEWAY
 
-// occupiedKey is what the darwin FIB keys a route by, which is the
-// destination and whether it is scoped to an interface. Recording only the
+// occupiedKey is the pair the darwin FIB keys a route by: the destination,
+// and whether it is scoped to an interface. Recording only the
 // destination let an unrelated write to the other key clear the record: a
 // plain route installing successfully would forget that a foreign scoped route
 // holds the same destination, and the next dump would then report that route
@@ -324,8 +324,8 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if len(rm.Addrs) <= unix.RTAX_NETMASK {
 		return Route{}, false
 	}
-	// the gateway is what is left of an ownership marker on a platform with no
-	// rt_proto: a route this reconciler installed leaves through the interface
+	// the gateway is all that is left of an ownership marker on a platform
+	// with no rt_proto: a route this reconciler installed leaves through the interface
 	// itself, so the kernel holds a sockaddr_dl there and never an address.
 	gateway, ok := rm.Addrs[unix.RTAX_GATEWAY].(*route.LinkAddr)
 	if !ok || (gateway.Index != 0 && gateway.Index != p.index) {
@@ -358,8 +358,8 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 	if _, tracked := p.scoped[prefix]; !tracked && p.occupied[occupiedKey{destination: prefix, scoped: scoped}] {
 		// An install this process watched the kernel refuse, so another writer
 		// holds this key and reporting the route as ours would withdraw it on
-		// the next pass. The row's own scope is what is checked, because that
-		// is what the kernel keys on: asking about the scoped key for every
+		// the next pass. The row's own scope is the one checked, because the
+		// kernel keys on it: asking about the scoped key for every
 		// row hid this reconciler's own unscoped route to the same
 		// destination, which it then reinstalled and warned about on every
 		// pass and never withdrew.

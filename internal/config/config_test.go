@@ -231,8 +231,8 @@ func TestConfigRejectsPort500(t *testing.T) {
 	}
 }
 
-// The link cost surface is what a node uses to look as expensive as the BIRD
-// speaker it replaces. Nothing else reads these four fields, so without this
+// A node uses the link cost surface to look as expensive as the BIRD speaker
+// it replaces. Nothing else reads these four fields, so without this
 // they could all be dropped from SpeakerConfig with every check still green,
 // and a node configured to match its peers would silently run on defaults.
 func TestBabelCostFieldsReachSpeaker(t *testing.T) {
@@ -383,8 +383,8 @@ func TestTopLevelListsRefuseWhatTheyCannotMean(t *testing.T) {
 		"originate masked default v4": "originate:\n  - 198.51.100.1/0\n",
 		"kernel address unspecified":  "kernel:\n  enabled: true\n  addresses:\n    - \"::/0\"\n",
 		// The same masked default, on the one list whose entries are assigned
-		// rather than announced: the length is what an interface carries the
-		// address under.
+		// rather than announced: an interface carries the address under a
+		// length.
 		"kernel address masked default": "kernel:\n  enabled: true\n  addresses:\n    - 2001:db8::1/0\n",
 	} {
 		t.Run(name, func(t *testing.T) {

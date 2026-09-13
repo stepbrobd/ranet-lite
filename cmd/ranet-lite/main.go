@@ -129,7 +129,7 @@ func run() int {
 	// second channel registered after it cancels. Shutdown closes every
 	// session with a grace period, withdraws the installed routes and waits
 	// for every dialer, and while that is slow an operator pressing Ctrl-C
-	// again has nothing to press; the second signal is what answers that.
+	// again has nothing to press; the second signal answers that.
 	//
 	// Registering the second channel only after the first signal leaves a
 	// window in which a signal reaches nobody: NotifyContext has stopped
@@ -257,8 +257,8 @@ func run() int {
 }
 
 // watchSignals starts the shutdown on the first signal and gives up on the
-// second. Both come off one channel in order, which is what keeps a signal
-// from reaching nobody; see the registration above.
+// second. Both come off one channel in order, which keeps a signal from
+// reaching nobody; see the registration above.
 func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force func()) {
 	<-signals
 	cancel()

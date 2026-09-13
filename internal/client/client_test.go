@@ -148,7 +148,7 @@ func TestValidateESPTunnelPayload(t *testing.T) {
 		{name: "unsupported", plain: ipv4, nh: 6, wantErr: true},
 		// RFC 4303 section 2.7: a sender may append Traffic Flow
 		// Confidentiality padding after the payload in tunnel mode, and the
-		// IP length field is what lets the receiver discard it. Refusing the
+		// IP length field lets the receiver discard it. Refusing the
 		// packet instead dropped every packet from a peer with tfcpad set,
 		// silently, since nothing above ESP reads the length.
 		{name: "IPv4 with TFC padding", plain: append(append([]byte(nil), ipv4...), 0, 0, 0), nh: esp.NextHeaderIPv4, deliver: true, want: ipv4},
@@ -402,8 +402,8 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	// A real hub with its unclaimed queue filled, so the refused counter reads
 	// something: nothing else in this test would give it a value other than
 	// the zero it has with the counting deleted. Overflowing that queue is not
-	// this node falling behind on receive, which is what the other counter
-	// says, so it is the refused one this drives.
+	// this node falling behind on receive, which the other counter reports,
+	// so it is the refused one this drives.
 	hub, err := transport.NewHub("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -493,8 +493,8 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 		}
 	}
 
-	// The handler is what a scrape actually reaches, and it is the only place
-	// the content type is set.
+	// A scrape reaches the handler, and it is the only place the content type
+	// is set.
 	recorder := httptest.NewRecorder()
 	c.MetricsHandler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
 	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
@@ -522,7 +522,7 @@ func TestSimultaneousOpenConvergesOnSameSession(t *testing.T) {
 	noneAlive := func(*ike.Session) bool { return false }
 	// resolve replays one node's arrival order and reports which session it
 	// keeps. local is that node's own identity.
-	// alive is what this node believes about each session. The two ends read
+	// alive records what this node believes about each session. The two ends read
 	// their own clocks, so they are not obliged to agree, and the rule has to
 	// converge anyway.
 	resolve := func(local, remote ike.Identity, order []string, alive func(*ike.Session) bool) string {
@@ -1188,8 +1188,8 @@ func babelPacket(t *testing.T, tlvs ...babel.RawTLV) []byte {
 func fillUnclaimedQueue(t *testing.T, hub *transport.Hub) uint64 {
 	t.Helper()
 	// The queue exists only once somebody asks to listen, and nothing drains
-	// it here, which is what a responder under load looks like from the
-	// receive loop's side.
+	// it here, which is how a responder under load looks from the receive
+	// loop's side.
 	_ = hub.Listen()
 	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -1274,8 +1274,8 @@ func TestMetricsLabelsUseOnlyTheEscapesTheFormatDefines(t *testing.T) {
 	}
 }
 
-// The registry is what a handshake is checked against, so it is what decides
-// who may stay. A node taken out of it kept every tunnel it already held,
+// A handshake is checked against the registry, so the registry decides who
+// may stay. A node taken out of it kept every tunnel it already held,
 // because the handshake check only refuses the next one and nothing revisited
 // the sessions already running. A reload is the only moment this node learns
 // that a node is gone.

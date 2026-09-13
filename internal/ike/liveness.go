@@ -106,7 +106,7 @@ func (s *Session) rekeyDelay(interval time.Duration) (time.Duration, error) {
 }
 
 // rekeyRetryDelay backs off exponentially and then spreads the result over the
-// upper half of that window. The spread is what breaks a simultaneous rekey:
+// upper half of that window. The spread breaks a simultaneous rekey:
 // both ends of a collision fail at the same instant and reset the same
 // deterministic backoff, so an unjittered retry reproduces the phase
 // difference that caused the collision and collides again, forever. RFC 7296
@@ -242,7 +242,7 @@ func (s *Session) Run(ctx context.Context) error {
 				result.schedule.failures++
 				delay := s.rekeyRetryDelay(result.schedule.failures)
 				result.schedule.reset(delay)
-				slog.Warn("ike scheduled rekey failed; retrying", "sa", result.schedule.name, "err", result.err, "retry_in", delay)
+				slog.Warn("ike scheduled rekey failed, retrying", "sa", result.schedule.name, "err", result.err, "retry_in", delay)
 				running = nil
 				startDueRekey()
 				continue
@@ -374,9 +374,9 @@ func (s *Session) Run(ctx context.Context) error {
 			// is being rewritten, which on a node running this reconciler and
 			// a routing daemon is an ordinary moment, and tearing the SA down
 			// for it takes every route through the peer with it. The attempt
-			// counter is what declares the peer dead, above.
+			// counter declares the peer dead, above.
 			if err := s.sendPending(pending); err != nil {
-				slog.Warn("ike request retransmission failed; retrying", "exchange", pending.exchange,
+				slog.Warn("ike request retransmission failed, retrying", "exchange", pending.exchange,
 					"message_id", pending.msgID, "dpd", pending.dpd, "err", err)
 			}
 			continue
@@ -399,7 +399,7 @@ func (s *Session) Run(ctx context.Context) error {
 				// same local errors, and a pending it did build carries its
 				// own attempt budget. Nothing is pending, so the next pass
 				// tries again at the next deadline.
-				slog.Warn("ike liveness probe not sent; retrying", "err", err)
+				slog.Warn("ike liveness probe not sent, retrying", "err", err)
 				lastAuthenticated = time.Now().Add(-s.dpdInterval()).Add(dpdRetryDelay)
 			}
 			pending = started

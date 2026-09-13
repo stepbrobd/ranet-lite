@@ -547,8 +547,8 @@ func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 		return Notify{}, false
 	}
 
-	// With the slots free the responder does answer, which is what makes the
-	// silence below mean anything.
+	// With the slots free the responder does answer, which gives the silence
+	// below its meaning.
 	answer, answered := offer(5*time.Second, 4)
 	if !answered {
 		t.Fatal("an unacceptable offer drew no answer at all")
@@ -557,8 +557,8 @@ func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 		t.Fatalf("an unacceptable offer drew notify %d, want NO_PROPOSAL_CHOSEN", answer.Type)
 	}
 
-	// Filled from enough distinct addresses that the global cap is what runs
-	// out rather than any one source's share.
+	// Filled from enough distinct addresses that the global cap runs out
+	// rather than any one source's share.
 	for i := range halfOpenLimit {
 		if !h.responder.enterHalfOpen(netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", i/halfOpenPerSource))) {
 			t.Fatal("the responder refused a slot below its own limit")
@@ -919,7 +919,7 @@ func TestResponderRefusesCookieItDidNotIssue(t *testing.T) {
 	}
 
 	// Bound to the attempt, so a cookie is useless for another nonce, another
-	// SPI, or another address: that binding is what stops an off-path source
+	// SPI, or another address: that binding stops an off-path source
 	// collecting one and spending it on addresses it cannot receive at.
 	for name, replay := range map[string]func() bool{
 		"another nonce":   func() bool { return accepted(t, withCookie(valid), bytes.Repeat([]byte{8}, 32), 1, endpoint) },
@@ -1167,7 +1167,7 @@ func TestResponderRefusesOfferItCannotAuthenticate(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Everything a working IKE_SA_INIT carries except the signature hash
-	// notify, which is what says this initiator can verify an Ed25519 AUTH.
+	// notify, which declares that this initiator can verify an Ed25519 AUTH.
 	dh, err := GenerateDH(DH_CURVE25519)
 	if err != nil {
 		t.Fatal(err)

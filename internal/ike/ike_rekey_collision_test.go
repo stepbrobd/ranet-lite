@@ -279,8 +279,7 @@ func TestPeerIKERekeyRefusesTheSPIThisEndAlreadyOffered(t *testing.T) {
 // derivation and a registration in the hub's SPI map, on the goroutine that
 // also runs this session's dead peer detection and its Delete handling, and
 // the request plus the Delete that lets the peer ask again are 282 bytes. The
-// gate is what keeps that from being about 33 Mbit/s of someone else's
-// bandwidth. Its Child-path sibling has had a test since the round that added
+// gate keeps that from being about 33 Mbit/s of someone else's bandwidth. Its Child-path sibling has had a test since the round that added
 // both; this one did not, so the asymmetry was an accident.
 func TestPeerIKERekeyIsRateLimited(t *testing.T) {
 	const spiI, spiR = 0x0102030405060708, 0x1112131415161718

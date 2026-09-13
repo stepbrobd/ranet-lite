@@ -72,8 +72,8 @@ func benchmarkPeerEnqueue(b *testing.B, workers, batch int) {
 func BenchmarkPeerEnqueueSerialSinglePacket(b *testing.B) { benchmarkPeerEnqueue(b, 1, 1) }
 func BenchmarkPeerEnqueueSerialBatched(b *testing.B)      { benchmarkPeerEnqueue(b, 1, 128) }
 
-// One packet per batch is the worst case for a per-batch cost, and it is what
-// a TCP ACK stream produces: each arrives as its own TUN read.
+// One packet per batch is the worst case for a per-batch cost, and a TCP ACK
+// stream produces it: each arrives as its own TUN read.
 func BenchmarkPeerEnqueueParallelSinglePacket(b *testing.B) {
 	benchmarkPeerEnqueue(b, runtime.GOMAXPROCS(0), 1)
 }

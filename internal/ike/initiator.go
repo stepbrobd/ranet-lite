@@ -186,7 +186,7 @@ func (s *Session) nextPeerMessageID(ctx *ikeContext) uint32 {
 // SHOULD, and handleIKERekey answers every peer-initiated rekey with
 // TEMPORARY_FAILURE while either is set, so a peer that rekeys once and never
 // sends the Delete would refuse every later rekey for the life of the session,
-// which is what retirementDeadline already stops for a Child SA. It sits above
+// which retirementDeadline already stops for a Child SA. It sits above
 // the 62 second retransmission budget of one exchange, so a Delete still in
 // flight is not answered by a session that has already forgotten the SA.
 const retainedContextDeadline = 2 * time.Minute
@@ -219,8 +219,7 @@ func (s *Session) releaseDisplacedLocked(displaced, replacement *ikeContext) {
 }
 
 // stillHeldLocked reports whether any context other than the one being
-// displaced is routed by the same SPI, which is what makes unregistering it
-// unsafe. It must be called with stateMu held.
+// displaced is routed by the same SPI, which makes unregistering it unsafe. It must be called with stateMu held.
 func (s *Session) stillHeldLocked(displaced, replacement *ikeContext) bool {
 	for _, held := range []*ikeContext{s.current, s.old, s.collision, replacement} {
 		if held != nil && held != displaced && held.spiI == displaced.spiI {
@@ -825,8 +824,8 @@ func (s *Session) completeIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni
 // initiator "MAY, of course, for reasons of policy later delete such an IKE
 // SA", which is this fork's policy: it has no use for an IKE SA without that
 // Child SA. Nothing here depends on the answer, and the ordinary reason for
-// silence is that the responder discarded the SA first, which is what it does
-// in exactly this case. Spending the full budget delayed the dial's failure by
+// silence is that the responder discarded the SA first, which it does in
+// exactly this case. Spending the full budget delayed the dial's failure by
 // sixty-two seconds for a result the response had already named.
 const teardownRetransmits = 2
 

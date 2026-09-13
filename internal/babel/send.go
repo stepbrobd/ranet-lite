@@ -260,8 +260,8 @@ func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 		EncodeIHU(ihu),
 	}, rollback: []func(){func() {
 		// The seqno is not given back: a Hello that was not sent is a Hello
-		// the neighbor lost, which is what the counter is for. What the next
-		// wake has to redo is the Hello itself.
+		// the neighbor lost, and that is the counter's subject. The next wake
+		// redoes the Hello itself.
 		n.sentHello = false
 	}}}
 }

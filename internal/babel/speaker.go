@@ -66,12 +66,12 @@ const seqnoRequestSuppress = 2 * time.Second
 // prefix this node has a route for, which bounds one half of the index. The
 // other half is the router id the requester wrote into the packet, which
 // nothing bounds, and eighty seqno requests fit in a single packet. Past a cap
-// the request is not forwarded, which is what the suppression above does with
-// a redundant one, and is the list of recently forwarded requests RFC 8966
+// the request is not forwarded, as the suppression above does with a
+// redundant one, and is the list of recently forwarded requests RFC 8966
 // section 3.8.1.2 asks a node to keep.
 //
-// The per-neighbor share is what keeps one of them from turning forwarding off
-// for the rest: a flood that filled a single global table would stop every
+// The per-neighbor share keeps one of them from turning forwarding off for
+// the rest: a flood that filled a single global table would stop every
 // other neighbor's requests being relayed, and a prefix that starves behind
 // this node would stop recovering until the flood did.
 const (
@@ -568,8 +568,8 @@ func (s *Speaker) Run(ctx context.Context) error {
 		}
 		actions = append(actions, s.starvedActions(now)...)
 		actions = append(actions, s.retryStarvedLocked(now)...)
-		// Emitted before the deadline is computed: emitLocked is what learns
-		// that a peer refused a packet, and the retry it schedules for that is
+		// Emitted before the deadline is computed: emitLocked is where a
+		// refused packet is learned about, and the retry it schedules for that is
 		// a term of the deadline. Recorded as sleepUntil before the lock goes,
 		// so a packet arriving between here and the select compares against
 		// the deadline this pass settled on.
@@ -732,11 +732,13 @@ type NeighborStat struct {
 	Alive  bool
 	Cost   uint16
 	Routes int
-	// Dropped is what the dataplane refused to queue for this neighbor, both
-	// its control traffic and whatever the mesh was forwarding through it.
+	// Dropped counts the packets the dataplane refused to queue for this
+	// neighbor, both its control traffic and whatever the mesh was forwarding
+	// through it.
 	Dropped uint64
-	// SendFailed is what the transport lost after this node had sealed it,
-	// which is the link failing rather than this node running out of room.
+	// SendFailed counts the packets the transport lost after this node had
+	// sealed them, which is the link failing rather than this node running
+	// out of room.
 	SendFailed uint64
 }
 

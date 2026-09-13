@@ -159,8 +159,8 @@ func TestCongestedPeerDoesNotStallOthers(t *testing.T) {
 		return nil
 	})
 	defer healthy.Close()
-	// Every slot spoken for and never returned, which is what a socket that
-	// cannot keep up looks like from this side.
+	// Every slot spoken for and never returned, which is how a socket that
+	// cannot keep up looks from this side.
 	for range cap(stuck.slots) {
 		stuck.reserveBatch(1)
 	}
@@ -198,8 +198,8 @@ func TestCongestedPeerDoesNotStallOthers(t *testing.T) {
 }
 
 // failingReadDevice returns one transient read error and would go on reading
-// afterwards, which is what a netlink failure on linux or a route-socket
-// overflow on darwin looks like from here. Neither is device closure.
+// afterwards, which is how a netlink failure on linux or a route-socket
+// overflow on darwin looks from here. Neither is device closure.
 type failingReadDevice struct {
 	recordingDevice
 	reads atomic.Int64

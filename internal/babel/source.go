@@ -20,10 +20,10 @@ type sourceEntry struct {
 	metric uint16
 	gcAt   time.Time
 	// owner is the neighbor whose route last caused this node to advertise
-	// the distance, or empty for a prefix this node originates, and is what
-	// the per-neighbor shares are charged to. It follows the latest
-	// advertisement rather than the first, because the latest is also what
-	// keeps refreshing gcAt. It is the peer's name rather than its state, so
+	// the distance, or empty for a prefix this node originates. The
+	// per-neighbor shares are charged to it. It follows the latest
+	// advertisement rather than the first, because the latest also keeps
+	// refreshing gcAt. It is the peer's name rather than its state, so
 	// an entry cannot pin a retired neighbor.
 	owner string
 }
@@ -40,11 +40,10 @@ const sourceGCTime = 3 * time.Minute
 // Past a cap an origin this node has never advertised is unfeasible. Refusing
 // a route can never close a loop, so routes already selected keep working and
 // the prefixes this node originates still record their distance. The
-// per-prefix share is what keeps the damage local: a global cap alone is first
+// per-prefix share keeps the damage local: a global cap alone is first
 // come, so one neighbor churning the origin of one prefix would stop this node
 // learning any new origin anywhere, including a peer that restarted and drew a
-// new router id, which is what a node that lost its sequence number state
-// does.
+// new router id, which a node that lost its sequence number state does.
 //
 // The numbers sit far above what a legitimate prefix or a restarting neighbor
 // produces and far below what a flood needs; see maxOriginsPerPrefixPerNeighbor
@@ -58,8 +57,8 @@ const (
 	// stops one neighbor spending the global budget and denying every other
 	// neighbor every prefix.
 	//
-	// Both are far above what a restart produces, which is what the first
-	// version of this bound got wrong. A node draws a new router id every time
+	// Both are far above what a restart produces, which the first version of
+	// this bound got wrong. A node draws a new router id every time
 	// it starts, so every restart is a new origin for every prefix it
 	// announces, charged to whichever neighbor this node reaches it through.
 	// At eight, nine restarts inside sourceGCTime made the prefix unfeasible,
@@ -93,9 +92,9 @@ func (rt *routeTable) feasible(key routeKey, adv advertisement, from string) boo
 	}
 	entry := rt.sources[sourceKey{route: key, routerID: adv.routerID}]
 	if entry == nil {
-		// A distance we have never recorded is feasible by definition, but
-		// recording it is what selecting the route would cost, so this is
-		// also where the table is bounded. See maxSources.
+		// A distance we have never recorded is feasible by definition, and
+		// recording it is the cost of selecting the route, so this is also
+		// where the table is bounded. See maxSources.
 		switch {
 		case len(rt.sources) >= maxSources:
 			rt.tooManyOrigins(key, adv.routerID, "the source table is full", maxSources)
@@ -175,8 +174,8 @@ func (rt *routeTable) requestSeqno(key routeKey, adv advertisement) uint16 {
 // the origin for a new sequence number, and if every request and reply is lost
 // it stops asking. The neighbor keeps refreshing the unfeasible route, so the
 // distance stays referenced, so it is never collected, so the route stays
-// unfeasible for the life of the process. Expiring it is what lets the path
-// come back.
+// unfeasible for the life of the process. Expiring it lets the path come
+// back.
 func (rt *routeTable) sweepSources(now time.Time) {
 	for index, entry := range rt.sources {
 		if now.Before(entry.gcAt) {

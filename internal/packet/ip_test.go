@@ -20,8 +20,8 @@ func ipv6(length int, payload int) []byte {
 	return raw
 }
 
-// Payload trims to the length the header declares, and that trim is what the
-// ESP path hands to the TUN. A packet claiming more than it carries must be
+// Payload trims to the length the header declares, and the ESP path hands
+// that trim to the TUN. A packet claiming more than it carries must be
 // refused rather than trimmed to something longer than itself: the buffer it
 // arrived in is a decrypt buffer with other peers' plaintext behind it, and
 // where the claim runs past the capacity it is not a buffer at all.

@@ -111,7 +111,7 @@ func (f *fakeKernel) Addrs() ([]netip.Prefix, error) {
 // AddAddr and DelAddr model what both platforms do rather than what a map
 // does: assignment is an upsert keyed on the address, and darwin's SIOCDIFADDR
 // matches on the address alone, so a delete takes whatever length the link is
-// carrying it under. That asymmetry is what the ownership checks exist for.
+// carrying it under. The ownership checks exist for that asymmetry.
 func (f *fakeKernel) AddAddr(address netip.Prefix) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

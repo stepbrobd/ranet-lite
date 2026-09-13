@@ -34,8 +34,8 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 	// A node the registry does not name is not dialed at all. The check runs
 	// whether or not the peer pins a serial number: without it a peer that
 	// pins none enters the retry loop and logs the same lookup failure every
-	// reconnect delay for the life of the process, which is what a
-	// decommissioned entry left in peers: does.
+	// reconnect delay for the life of the process, which a decommissioned
+	// entry left in peers: does.
 	_, node, ok := reg.FindNode(p.Organization, p.CommonName)
 	if !ok {
 		log.Printf("peer %s: node not found", name)

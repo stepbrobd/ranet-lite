@@ -58,9 +58,9 @@ type OutboundSA struct {
 }
 
 // ErrSequenceExhausted is returned once a non-ESN SA has no sequence numbers
-// left. Refusing to send is what RFC 4303 section 3.3.3 requires -- "the
-// sender MUST NOT send a packet on an SA if doing so would cause the sequence
-// number to cycle" -- but it says nothing about the IKE SA, and RFC 7296
+// left. RFC 4303 section 3.3.3 requires the refusal -- "the sender MUST NOT
+// send a packet on an SA if doing so would cause the sequence number to
+// cycle" -- but it says nothing about the IKE SA, and RFC 7296
 // section 1.3.1 does: "A failed attempt to create a Child SA SHOULD NOT tear
 // down the IKE SA." It is a sentinel so a caller can tell the one refusal a
 // replacement fixes from a real transport failure.

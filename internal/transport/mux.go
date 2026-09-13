@@ -45,12 +45,12 @@ const (
 	// espChanSize absorbs receive bursts before a peer's workers can drain
 	// them. It counts socket batches, which is the datagram count only where
 	// the backend returns one datagram per batch, as darwin's does. The
-	// channel is allocated with the mux, so this is also what a half-open SA
-	// costs while its handshake runs: 40 KiB a piece here, against 160 KiB at
-	// the 4096 this used to be, and halfOpenLimit of them is what a flood can
-	// pin at once.
+	// channel is allocated with the mux, so a half-open SA carries this cost
+	// while its handshake runs: 40 KiB a piece here, against 160 KiB at the
+	// 4096 this used to be, and a flood can pin halfOpenLimit of them at
+	// once.
 	espChanSize = 1024
-	// espQueueBytes is what actually bounds that queue. A batch holds up to
+	// espQueueBytes is the bound that actually holds that queue. A batch holds up to
 	// espSendBatch datagrams of up to readBufferSize each, so the batch count
 	// alone bounds nothing: even at 1024 that is 8.6 GB per peer at the UDP
 	// maximum.
@@ -81,8 +81,7 @@ type Hub struct {
 	// session on this hub, and anyone who can reach the port can fill a
 	// queue: at line rate a line per datagram is a synchronous write to
 	// stderr per packet, on the goroutine that receives for all of them.
-	// Reading the counter is what an operator needs; the log line only has to
-	// point at it.
+	// An operator reads the counter; the log line only has to point at it.
 	dropped atomic.Uint64
 	// refused counts datagrams this node read and did not deliver because
 	// nothing here wanted them: too short to carry an SPI, zero length, naming
@@ -179,8 +178,8 @@ type Datagram struct {
 type espDatagramBatch struct {
 	ticket  uint64
 	packets [][]byte
-	// bytes is what this batch holds against the queue's byte budget, kept
-	// with it so every receive path releases exactly what was reserved.
+	// bytes is this batch's charge against the queue's byte budget, kept with
+	// it so every receive path releases exactly what was reserved.
 	bytes int
 }
 
@@ -191,7 +190,7 @@ func NewHub(localAddr string) (*Hub, error) {
 		return nil, fmt.Errorf("transport: resolve local addr: %w", err)
 	}
 	if laddr.IP != nil && !laddr.IP.IsUnspecified() {
-		log.Printf("transport: binding to a specific local address (%s) isn't supported; binding all interfaces on port %d instead", laddr.IP, laddr.Port)
+		log.Printf("transport: binding to a specific local address (%s) is not supported, binding all interfaces on port %d instead", laddr.IP, laddr.Port)
 	}
 	bind, fns, port, err := openPacketBind(uint16(laddr.Port))
 	if err != nil {

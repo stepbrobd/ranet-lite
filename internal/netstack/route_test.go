@@ -291,8 +291,8 @@ func TestRouteTableTrieRemovePeerCompactsAcrossFamilies(t *testing.T) {
 	}
 }
 
-// The hold is what stops a packet for a retracted prefix following a shorter
-// one instead, and a mirror of this table has to hold it for the same reason.
+// The hold stops a packet for a retracted prefix following a shorter one
+// instead, and a mirror of this table has to hold it for the same reason.
 // Leaving it out of the snapshot deleted it from the kernel table, where
 // longest-prefix match then fell through to the covering route for the whole
 // hold window.

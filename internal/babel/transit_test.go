@@ -526,7 +526,7 @@ func TestWildcardRouteRequestDumpsAtMostOncePerInterval(t *testing.T) {
 		t.Fatal("a wildcard request drew no dump at all, so the reply path is broken")
 	}
 	// One dump is 40 prefixes plus whatever compression state each carries.
-	// The limit is what matters: 64 dumps would be 64 times this.
+	// The limit is the subject: 64 dumps would be 64 times this.
 	if updates > 2*40 {
 		t.Errorf("%d wildcard requests in one packet drew %d updates, which is more than one dump", requests, updates)
 	}
@@ -550,7 +550,7 @@ func TestWildcardRouteRequestDumpsAtMostOncePerInterval(t *testing.T) {
 
 // RFC 8966 section 3.5.4: while a retracted prefix is still held, "packets
 // destined to an address within P MUST NOT be forwarded by following a route
-// for a shorter prefix". Transit is what makes this reachable: a node carrying
+// for a shorter prefix". Transit makes this reachable: a node carrying
 // both an exit's default and a more specific prefix would otherwise start
 // sending that prefix's traffic down the default the moment it is retracted,
 // and if the exit reaches it back through here the packet bounces until its
@@ -665,8 +665,8 @@ func TestSourceTableRefusesUnknownOriginWhenFull(t *testing.T) {
 	// origin anywhere, a restarted peer's new router id included.
 	elsewhere := newRouteTable(func(routeKey, routeSelection) {})
 	crowded := routeKey{dest: netip.MustParsePrefix("fd00:2::/64")}
-	// Spread across enough neighbors that the prefix's own budget is what runs
-	// out rather than any one neighbor's share of it.
+	// Spread across enough neighbors that the prefix's own budget runs out
+	// rather than any one neighbor's share of it.
 	for i := range maxOriginsPerPrefix {
 		var id [8]byte
 		binary.BigEndian.PutUint64(id[:], uint64(i))
@@ -954,8 +954,7 @@ func TestSeqnoSuppressionEntriesAreSweptAndDroppedWithTheirNeighbor(t *testing.T
 	}
 }
 
-// Starvation recovery is what stops a lost seqno becoming a permanent black
-// hole, and the retry is reached only from Run. Deleting that one call left
+// Starvation recovery stops a lost seqno becoming a permanent black hole, and the retry is reached only from Run. Deleting that one call left
 // the retry itself covered and unreachable.
 func TestRunRetriesStarvedSeqnoRequest(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "a-c", "b-e", "c-e")
@@ -1232,8 +1231,8 @@ func TestSourceChargeFollowsWhoeverKeepsItAlive(t *testing.T) {
 
 // The per-prefix share stops one neighbor denying another the same prefix; it
 // does not stop one neighbor spending the whole table across many prefixes and
-// denying every other neighbor every prefix. That is what maxSourcesPerNeighbor
-// bounds, and refusing an origin refuses a route, because selectRoute rechecks
+// denying every other neighbor every prefix. maxSourcesPerNeighbor bounds
+// that, and refusing an origin refuses a route, because selectRoute rechecks
 // feasibility for routes already stored.
 func TestOneNeighborCannotSpendTheWholeSourceTable(t *testing.T) {
 	rt := newRouteTable(func(routeKey, routeSelection) {})
@@ -1291,8 +1290,8 @@ func TestSourceTableHasGlobalCeilingToo(t *testing.T) {
 }
 
 // The per-neighbor share keeps one neighbor from turning RFC 8966 section
-// 3.8.1.2 forwarding off for every other; the global cap is what keeps the
-// table bounded when many neighbors each stay inside their share. Its index
+// 3.8.1.2 forwarding off for every other; the global cap keeps the table
+// bounded when many neighbors each stay inside their share. Its index
 // carries a router id the sender writes into the packet, so nothing else
 // bounds it.
 func TestPendingSeqnoHasGlobalCeilingToo(t *testing.T) {

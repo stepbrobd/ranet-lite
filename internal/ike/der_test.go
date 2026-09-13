@@ -41,7 +41,7 @@ func TestDERLengthMustBeMinimal(t *testing.T) {
 // derElement deleted: the later length test produces the same message. On 386
 // it does not, and deleting the bound panics on the slice rather than
 // refusing. `CGO_ENABLED=0 GOARCH=386 go test ./internal/ike/ -run TestDER`
-// on x86_64-linux is what holds it; do not read a green run here as proof.
+// on x86_64-linux holds it; do not read a green run here as proof.
 func TestDERLengthBeyondTheBufferIsRefusedNotSliced(t *testing.T) {
 	for name, raw := range map[string][]byte{
 		"four octets, all ones": {0x04, 0x84, 0xff, 0xff, 0xff, 0xff, 1, 2, 3},
@@ -54,7 +54,7 @@ func TestDERLengthBeyondTheBufferIsRefusedNotSliced(t *testing.T) {
 			if err == nil {
 				t.Fatal("a length larger than the element was accepted")
 			}
-			// The message is the point: the pre-existing minimality test also
+			// The message matters here: the pre-existing minimality test also
 			// refuses these, but only on a build where the accumulator went
 			// negative, so one certificate was called non-minimal on a 32 bit
 			// build and truncated on a 64 bit one.

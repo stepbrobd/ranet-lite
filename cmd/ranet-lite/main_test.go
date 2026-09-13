@@ -60,7 +60,7 @@ func TestKernelConfigAddresses(t *testing.T) {
 
 // The first signal starts the shutdown and the second gives up on it. An
 // earlier shape registered the second channel only after the first signal had
-// cancelled the context, which left a window where a signal reached nobody:
+// canceled the context, which left a window where a signal reached nobody:
 // two with no gap lost the second and the process sat through the whole
 // shutdown. Registering up front instead delivered the first signal to both
 // readers, so the first Ctrl-C forced an exit rather than shutting down. One

@@ -669,8 +669,8 @@ func TestFloodOnMuxIKEQueueIsNotCopied(t *testing.T) {
 
 // The byte bound is enforced twice and the two are not interchangeable.
 // dispatchESP decides, under the same lock the receive-order ticket is taken
-// with, which is what makes it right when a hub's IPv4 and IPv6 receive loops
-// arrive at once. hasRoomForESP is consulted before packReceivedBatch copies,
+// with, which makes it right when a hub's IPv4 and IPv6 receive loops arrive
+// at once. hasRoomForESP is consulted before packReceivedBatch copies,
 // so a batch that is about to be dropped is never paid for. A test that calls
 // the two in sequence and stops on whichever refuses first cannot say which
 // one is enforcing, so each is driven alone here.
@@ -740,7 +740,7 @@ func TestZeroSPIIsRefusedOnBothProtocols(t *testing.T) {
 
 // A full receive queue is the only signal that this node is behind on receive
 // rather than losing packets on the wire, and anyone who can reach the port can
-// fill one. The count is what an operator reads; the log line is rate limited
+// fill one. An operator reads the count; the log line is rate limited
 // because one receive loop serves every session on the hub and a line per
 // datagram is a synchronous write to stderr per packet.
 func TestFullReceiveQueueIsCountedAndReportedOnce(t *testing.T) {

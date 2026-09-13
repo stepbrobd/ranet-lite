@@ -143,7 +143,7 @@ func TestTheSourceIndexIsBuiltOnlyWhereItPays(t *testing.T) {
 	if node := nodeFor(&spread); node.index() != nil {
 		t.Errorf("sixty-four sources at sixty-four lengths built %d groups, which costs more to build and to read than the scan", len(node.index()))
 	}
-	// And the answer is the same either way, which is what the linear model
+	// And the answer is the same either way, which the linear model
 	// test covers across every shape; this is the pair that motivated it.
 	spread.Set(netip.Prefix{}, dst, 999)
 	if got, ok := spread.Lookup(addr("fd7f:ffff::1"), addr("fd00::1")); !ok || got != 999 {

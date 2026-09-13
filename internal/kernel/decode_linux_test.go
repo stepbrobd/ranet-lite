@@ -10,7 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The ownership filter is what stands between this reconciler and another
+// The ownership filter stands between this reconciler and another
 // daemon's routes, and on linux it is a pure function over a dump message.
 // darwin's equivalent has been tested against a synthetic RIB since the backend
 // landed; this is the same test for the platform the fleet actually runs, where

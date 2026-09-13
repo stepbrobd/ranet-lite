@@ -92,7 +92,7 @@ func BenchmarkRunLoopDeadline(b *testing.B) {
 	}
 }
 
-// BenchmarkReceiveHello is what an arriving Hello costs, which is the figure
+// BenchmarkReceiveHello measures what an arriving Hello costs, the figure
 // the wake decision in wakeForPacketLocked trades against a full pass. It is
 // measured on the same eight-neighbor table BenchmarkRunLoopPass uses, because
 // a figure taken on a one-neighbor table and set against a pass taken on this

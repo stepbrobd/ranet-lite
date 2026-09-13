@@ -184,8 +184,8 @@ func TestReplayCommitCostDoesNotFollowJumpDistance(t *testing.T) {
 // rate, and this implementation's own measured rate left it at milliseconds.
 func TestProactiveRekeyLeavesTimeAndNotJustPackets(t *testing.T) {
 	margin := uint64(0xffffffff) - ProactiveRekeySequence
-	// A million packets per second is what 12.7 Gbit/s at path MTU comes to,
-	// and small packets go several times faster.
+	// A million packets per second is 12.7 Gbit/s at path MTU, and small
+	// packets go several times faster.
 	const perSecond = 1_000_000
 	if seconds := margin / perSecond; seconds < 60 {
 		t.Errorf("the rekey margin is %d packets, %d seconds at %d packets per second, "+

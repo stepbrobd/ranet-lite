@@ -73,8 +73,8 @@ func TestInfiniteLinkCostNeverBecomesReachable(t *testing.T) {
 	rt.update(n, key, advertisement{routerID: [8]byte{1}, seqno: 1, metric: 1}, time.Minute, time.Now())
 }
 
-// A worsened link is re-advertised, because the metric is what this node tells
-// the mesh, and is not reinstalled, because the metric is not part of the
+// A worsened link is re-advertised, because this node tells the mesh the
+// metric, and is not reinstalled, because the metric is not part of the
 // forwarding entry. Reinstalling on it wrote the same entry, logged a line and
 // woke the kernel reconciler once per prefix through that neighbor, which
 // under RFC 9616 costing is most IHUs.
@@ -130,7 +130,7 @@ func TestFeasibilityCondition(t *testing.T) {
 				rt.observe(key, *test.advertised, "peer", time.Now())
 			}
 			if got := rt.feasible(key, test.received, "peer"); got != test.want {
-				t.Fatalf("feasible = %v, want %v: selecting an unfeasible route is what closes a forwarding loop", got, test.want)
+				t.Fatalf("feasible = %v, want %v: selecting an unfeasible route closes a forwarding loop", got, test.want)
 			}
 		})
 	}

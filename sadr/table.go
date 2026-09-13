@@ -116,8 +116,8 @@ func indexSrcs[V comparable](srcs []srcEntry[V]) []srcIndex[V] {
 	if runs == 0 || specific < runs*indexThreshold {
 		return nil
 	}
-	// Sized per run rather than grown from one, which is what made a rebuild
-	// walk log2(n) growth rounds for every length it held.
+	// Sized per run rather than grown from one, which had a rebuild walking
+	// log2(n) growth rounds for every length it held.
 	byLen := make([]srcIndex[V], 0, runs)
 	for i := 0; i < len(srcs); {
 		if !srcs[i].src.IsValid() {
@@ -308,7 +308,7 @@ func (t *Table[V]) Set(src, dst netip.Prefix, value V) {
 			}
 		}
 		// Inserted in order rather than appended: srcs is sorted by prefix
-		// length, longest first, which is what lets Lookup stop at the first
+		// length, longest first, which lets Lookup stop at the first
 		// entry that contains the source instead of scoring every one of
 		// them. An invalid source matches everything and has Bits() -1, so
 		// the same rule puts it last. Remove and removeValue keep the order

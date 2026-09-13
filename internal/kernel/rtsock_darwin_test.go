@@ -138,8 +138,8 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 	}
 
 	// A repeated install reports the route as already held and changes
-	// nothing, which is what lets a pass repair a partial apply without
-	// counting what it did not do.
+	// nothing, which lets a pass repair a partial apply without counting
+	// what it did not do.
 	for _, r := range want {
 		if err := plat.AddRoute(r); !errors.Is(err, errRouteSkipped) {
 			t.Fatalf("reinstall %s reported %v", r, err)

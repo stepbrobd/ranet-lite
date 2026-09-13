@@ -209,7 +209,7 @@ func TestAZeroIHUIntervalIsIgnoredRatherThanHonored(t *testing.T) {
 }
 
 // What an operator reads on the metrics endpoint. Asserting these at zero,
-// which is what they are on a node with no neighbors, cannot tell a correct
+// their value on a node with no neighbors, cannot tell a correct
 // count from no counting at all: the loop that produces both can be deleted
 // with such an assertion still passing.
 func TestStatsCountWhatEachNeighborSent(t *testing.T) {

@@ -61,7 +61,7 @@ func freeUDPPort(t *testing.T) uint16 {
 // newLoopbackMesh retries, because the ports are chosen by binding to zero,
 // reading the port back and binding it again: anything else on the machine can
 // take it in between, and on a loaded one several tests are doing this at
-// once. The wait between attempts is what makes a run of losses unlikely
+// once. The wait between attempts makes a run of losses unlikely
 // rather than merely improbable; without it a busy machine lost every attempt
 // in the same handful of microseconds.
 func newLoopbackMesh(t *testing.T) (*loopbackNode, *loopbackNode) {
@@ -313,12 +313,12 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 // unreachable from anything else in this package.
 //
 // closeAll is driven directly rather than through the whole client stop,
-// because a node that is cancelled while it is dialing leaves the other end
+// because a node that is canceled while it is dialing leaves the other end
 // holding a session it was never told about: the responder commits at
 // IKE_AUTH and the initiator confirms a message later, so an initiator that
 // goes between the two has nothing to send a Delete on. That is the exchange's
 // own shape, not this sweep's, and the peer clears it on liveness. Driving the
-// sweep is what makes this deterministic; the redial that follows a resolved
+// sweep makes this deterministic; the redial that follows a resolved
 // simultaneous open is otherwise in flight whenever the machine is slow.
 func TestShutdownTellsPeerBeforeGoing(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)

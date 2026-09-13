@@ -23,7 +23,7 @@ type Peer struct {
 	reserved  uint64
 	dropped   atomic.Uint64
 	// sendFailed counts packets that were sealed, handed to the transport and
-	// lost in the syscall. Separate from dropped, which is what this peer
+	// lost in the syscall. Separate from dropped, which counts what this peer
 	// refused on purpose: one says the link or the socket is failing and the
 	// other says this node is out of room, and an operator reading the second
 	// needs it not to move for the first. The sender merges several batches
@@ -292,8 +292,8 @@ func (p *Peer) reserveNow(budget chan struct{}, count int, control bool) *peerBa
 
 // Dropped counts the packets this peer did not transmit on purpose: no
 // transmission slot was free, the peer was already closing, or the outbound SA
-// could not give out a sequence range, which is what a peer that deleted its
-// Child SA looks like from here. A peer whose path is congested or whose SA is
+// could not give out a sequence range, which is how a peer that deleted its
+// Child SA looks from here. A peer whose path is congested or whose SA is
 // gone shows up as a rising counter rather than as latency somewhere else.
 func (p *Peer) Dropped() uint64 { return p.dropped.Load() }
 
@@ -371,7 +371,7 @@ func (b *peerBatch) enqueue() error {
 	}
 	// Never blocks: p.completed holds every batch the two budgets can hand a
 	// ticket to, and every batch that reaches here holds one. The default arm
-	// is therefore unreachable, and giving the batch back is what to do if it
+	// is therefore unreachable, and giving the batch back is the answer if it
 	// ever is, rather than blocking with queueMu held.
 	select {
 	case p.completed <- b:

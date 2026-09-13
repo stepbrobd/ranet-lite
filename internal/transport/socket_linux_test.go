@@ -147,8 +147,8 @@ func TestUDPReceiveSkipsTruncatedMessagesAndPreservesGROTail(t *testing.T) {
 	if err != nil || n != 3 {
 		t.Fatalf("receive: n=%d err=%v, want three intact GRO segments", n, err)
 	}
-	// The two the kernel truncated went nowhere, and the hub's counter is what
-	// tells an operator that from an idle socket. Each carries one datagram
+	// The two the kernel truncated went nowhere, and an operator tells that
+	// from an idle socket only by the hub's counter. Each carries one datagram
 	// here; a coalesced one carries as many as it was cut into, which is the
 	// unit the third arm and the help text both use.
 	if refused != 2 {
@@ -232,13 +232,12 @@ func TestUDPReceiveDropsDatagramWithNoUsableSource(t *testing.T) {
 		for i := range 3 {
 			m := &messages[i]
 			m.N = 8
-			// The non-ESP marker, which is what makes this an IKE datagram and
-			// sends it looking for a reply endpoint.
+			// The non-ESP marker, which makes this an IKE datagram and sends
+			// it looking for a reply endpoint.
 			binary.BigEndian.PutUint32(m.Buffers[0][:4], 0)
 			m.Buffers[0][4] = byte(i)
 			m.NN = 0
-			// A raw sockaddr, which is what the native receive path hands
-			// back. The middle one names a family neither branch of
+			// A raw sockaddr, which the native receive path hands back. The middle one names a family neither branch of
 			// udpSource.endpoint knows, so it has no reply address at all.
 			var source udpSource
 			family := uint16(unix.AF_INET6)

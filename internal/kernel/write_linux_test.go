@@ -140,7 +140,7 @@ func TestLinuxWithdrawalNamesOurOwnProtocol(t *testing.T) {
 	}
 }
 
-// foreignWriters is what reports another routing daemon exporting into the
+// foreignWriters reports another routing daemon exporting into the
 // table this reconciler owns, which on the fleet means BIRD and this node
 // each displacing the other's routes and waking each other's scan. It dumps
 // both families and had no test of any kind: the classifier it calls was
@@ -150,7 +150,7 @@ func TestLinuxForeignWritersDumpsBothFamilies(t *testing.T) {
 	plat, conn := writePlatform(t)
 	const ourTable, ourProtocol = 200, DefaultProtocol
 	conn.replies = []nlMessage{
-		// Somebody else exporting into our table, which is what this reports.
+		// Somebody else exporting into our table, which this reports.
 		routeDump(ourTable, 187, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.0.0/24")),
 		// Our own routes, which are not foreign.
 		routeDump(ourTable, ourProtocol, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.1.0/24")),
@@ -217,7 +217,7 @@ func TestForeignWriterReportNamesAnUnclaimedProtocolByNumber(t *testing.T) {
 	}
 }
 
-// On linux the space this reconciler owns is a routing table, which is what an
+// On linux the space this reconciler owns is a routing table, which an
 // operator reads in the startup line and what the policy rules look up.
 func TestLinuxOwnsATable(t *testing.T) {
 	plat, _ := writePlatform(t)

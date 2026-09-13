@@ -116,7 +116,7 @@ func BenchmarkLookupByDistinctLengths(b *testing.B) {
 	}
 }
 
-// The edit path is what pays for the index, and the shape the index exists for
+// The edit path pays for the index, and the shape the index exists for
 // is the one a neighbor can force: a whole share of sources on one short
 // destination prefix.
 func BenchmarkRouteChangeOnOneDestination(b *testing.B) {

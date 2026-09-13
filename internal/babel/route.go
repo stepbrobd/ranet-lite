@@ -24,8 +24,8 @@ type advertisement struct {
 }
 
 // routeInfo is one route table entry, RFC 8966 section 3.2.6, indexed by
-// (routeKey, neighbor). rxMetric is the metric the neighbor advertised, which
-// is what the feasibility condition compares; the link cost is added only when
+// (routeKey, neighbor). rxMetric is the metric the neighbor advertised, the
+// one the feasibility condition compares; the link cost is added only when
 // computing this route's own metric.
 type routeInfo struct {
 	routerID  [8]byte
@@ -78,8 +78,8 @@ type starveRequest struct {
 //
 // Selected routes are re-advertised, so this is no longer the loop-free-by-
 // construction stub of RFC 8966 Appendix E: the feasibility condition in
-// source.go is what keeps the mesh loop free, and every advertisement this
-// node sends must pass through observe.
+// source.go keeps the mesh loop free, and every advertisement this node
+// sends must pass through observe.
 type routeTable struct {
 	entries map[routeKey]*keyEntry
 	sources map[sourceKey]*sourceEntry
@@ -251,9 +251,9 @@ func (rt *routeTable) selectRoute(key routeKey, entry *keyEntry, now time.Time) 
 	}
 
 	previous := entry.selected
-	// Only a changed next hop changes the forwarding table: the cost is what
-	// this node advertises, which significant below decides, and is not part
-	// of the entry. Reinstalling on a cost change alone logged a line, wrote
+	// Only a changed next hop changes the forwarding table: the cost is
+	// something this node advertises, which significant below decides, and is
+	// not part of the entry. Reinstalling on a cost change alone logged a line, wrote
 	// the same entry and woke the kernel reconciler for every prefix through
 	// a neighbor whose measured RTT moved, which under RFC 9616 costing is
 	// most IHUs.
@@ -412,7 +412,7 @@ func (rt *routeTable) retractNeighbor(n *neighborState, now time.Time) {
 }
 
 // forgetRetraction is called wherever a neighbor advertises a finite metric
-// again, which is what makes the next wildcard retraction from it real work.
+// again, which makes the next wildcard retraction from it real work.
 func (rt *routeTable) forgetRetraction(n *neighborState) {
 	delete(rt.retracted, n)
 }

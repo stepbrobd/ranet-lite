@@ -136,8 +136,8 @@ type Config struct {
 
 // RouteSource is the seam onto internal/netstack: one coalesced wake-up per
 // batch of changes, and one consistent view per reconcile pass. Reconciling
-// from snapshots rather than from an event stream is what lets a missed
-// wake-up, a restart and outside interference all converge on the same state.
+// from snapshots rather than from an event stream lets a missed wake-up, a
+// restart and outside interference all converge on the same state.
 type RouteSource interface {
 	Changed() <-chan struct{}
 	Snapshot() []sadr.Route[*netstack.Peer]
@@ -485,7 +485,7 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 			Unreachable: entry.Value == netstack.Unreachable,
 		}
 		// A source covering every address is not a source-specific route, and
-		// installing it as one is what the linux encoder cannot express: it
+		// installing it as one is beyond what the linux encoder can express: it
 		// derives rtm_src_len from the length and omits RTA_SRC at zero, so
 		// the route would install as a plain one, read back with no source,
 		// never match the diff, and be withdrawn and reinstalled on every pass
@@ -740,8 +740,8 @@ func (r *Reconciler) withdraw() error {
 	// installed. darwin's SIOCDIFADDR matches on the address alone, so another
 	// writer that rewrote ours under a different prefix length, which its
 	// SIOCAIFADDR upsert lets it do, would otherwise have its entry taken away
-	// by this shutdown. Reading the link back rather than trusting the record
-	// is what applyAddresses does for the same reason.
+	// by this shutdown. applyAddresses reads the link back rather than
+	// trusting the record for the same reason.
 	held, err := r.plat.Addrs()
 	if err != nil {
 		errs = append(errs, fmt.Errorf("list addresses: %w", err))
@@ -769,8 +769,8 @@ func (r *Reconciler) withdraw() error {
 			r.enslaved = false
 		}
 	}
-	// Both counts are what left, so a line reporting nothing removed is a
-	// shutdown that removed nothing.
+	// Both counts are of things that left, so a line reporting nothing removed
+	// is a shutdown that removed nothing.
 	slog.Info("kernel reconciler withdrawn", "routes", withdrawn, "addresses", removed)
 	return errors.Join(errs...)
 }

@@ -37,7 +37,7 @@ func TestInitiateCancellationLeavesSharedHubOpen(t *testing.T) {
 			t.Fatalf("cancellation returned %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("cancelled handshake is still waiting for retransmission")
+		t.Fatal("canceled handshake is still waiting for retransmission")
 	}
 	mux, err := hub.NewMux(address.IP, address.Port)
 	if err != nil {

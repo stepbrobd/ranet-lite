@@ -177,8 +177,8 @@ func TestIKEGroupPreferenceFollowsOfferOrder(t *testing.T) {
 	}
 }
 
-// The error is what tells the peer which group to come back with, so it has to
-// name it.
+// The error tells the peer which group to come back with, so it has to name
+// it.
 func TestInvalidKEErrorNamesGroup(t *testing.T) {
 	message := (&invalidKEError{group: DH_CURVE25519}).Error()
 	if !strings.Contains(message, strconv.Itoa(int(DH_CURVE25519))) {

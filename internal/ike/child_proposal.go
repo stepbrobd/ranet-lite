@@ -126,8 +126,8 @@ func validateCompleteChildExchange(payloads childExchangePayloads, prfID uint16)
 
 // validNonce is RFC 7296 section 2.10 without its second half: "Nonces used in
 // IKEv2 MUST be randomly chosen, MUST be at least 128 bits in size, and MUST
-// be at least half the key size of the negotiated pseudorandom function." It
-// is what the responder can check on an IKE_SA_INIT request, where the nonce
+// be at least half the key size of the negotiated pseudorandom function."
+// This much a responder can check on an IKE_SA_INIT request, where the nonce
 // arrives alongside the proposals the PRF is still to be chosen from.
 func validNonce(nonce []byte) bool { return len(nonce) >= 16 && len(nonce) <= 256 }
 

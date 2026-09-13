@@ -33,7 +33,7 @@ type CostParams struct {
 
 func DefaultCostParams() CostParams {
 	return CostParams{
-		// 96 is what RFC 8966 Appendix B gives for a wired link, what BIRD
+		// 96 is the value RFC 8966 Appendix B gives for a wired link, what BIRD
 		// uses as BABEL_RXCOST_WIRED, and what the fleet sets explicitly. At
 		// 32 a ranet-lite hop looks three times cheaper than a BIRD hop, so a
 		// mixed fleet pulls transit onto whichever nodes run this.

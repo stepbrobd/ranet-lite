@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-// The shipped example is what an operator copies, so a change to how a field
-// is spelled is checked against it rather than against a fixture written next
-// to the change. The integration test's own spelling, which is sub-second, is
+// An operator copies the shipped example, so a change to how a field is
+// spelled is checked against it rather than against a fixture written next to
+// the change. The integration test's own spelling, which is sub-second, is
 // checked the same way: both are durations written as Go duration strings,
 // which is the one spelling this file accepts.
 func TestTheShippedExampleParses(t *testing.T) {
@@ -47,8 +47,8 @@ func TestTheShippedExampleParses(t *testing.T) {
 		t.Errorf("hello_interval parsed as %v", got)
 	}
 
-	// Zero is what every other duration in this file takes for "leave the
-	// default alone", and yaml.v3 decodes a bare time.Duration from a duration
+	// Every other duration in this file takes zero for "leave the default
+	// alone", and yaml.v3 decodes a bare time.Duration from a duration
 	// string and from nothing else, so this one spelling was a parse error in
 	// the middle of a block that accepts it two lines below.
 	body = strings.Replace(string(raw), "hello_interval: 4s", "hello_interval: 0", 1)

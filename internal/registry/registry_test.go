@@ -148,10 +148,10 @@ func TestResolveRemoteStopsWhenTheContextDoes(t *testing.T) {
 	cancel()
 	start := time.Now()
 	if _, err := ep.ResolveRemote(ctx); err == nil {
-		t.Fatal("a cancelled lookup reported an address")
+		t.Fatal("a canceled lookup reported an address")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("a cancelled lookup took %s, so shutdown waits on the resolver", elapsed)
+		t.Errorf("a canceled lookup took %s, so shutdown waits on the resolver", elapsed)
 	}
 }
 
@@ -208,7 +208,8 @@ func TestValidateRefusesADuplicateNodeInOneBlock(t *testing.T) {
 }
 
 // DisallowUnknownFields catches a stray field inside the document. A second
-// document after it is what a partial write or a bad concatenation leaves, and
+// document after it is the residue of a partial write or a bad concatenation.
+// Decode reads the first and says nothing about the rest.
 // Decode reads the first and says nothing about the rest.
 func TestLoadRefusesTrailingData(t *testing.T) {
 	good, err := os.ReadFile("testdata/registry.json")

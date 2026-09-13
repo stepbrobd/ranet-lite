@@ -573,8 +573,8 @@ func TestARefusedRekeyResponseDeletesTheSAItLeftAtThePeer(t *testing.T) {
 	}
 }
 
-// narrowSelectors is a traffic selector pair this end refuses, which is what
-// makes the response above one it turns down after the exchange completed.
+// narrowSelectors is a traffic selector pair this end refuses, which makes
+// the response above one it turns down after the exchange completed.
 func narrowSelectors() []byte {
 	return EncodeTS([]TrafficSelector{{Type: TS_IPV4_ADDR_RANGE, EndPort: 0xffff,
 		StartAddr: net.IPv4(10, 0, 0, 1).To4(), EndAddr: net.IPv4(10, 0, 0, 1).To4()}})

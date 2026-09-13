@@ -43,8 +43,8 @@ type netlinkPlatform struct {
 	// would otherwise repeat the same warning. Only the reconcile loop touches
 	// this, and it runs one pass at a time.
 	//
-	// refused is what the current pass has seen refused, and Routes swaps it
-	// into occupied once the next one has dumped. A foreign route is filtered
+	// refused holds the keys the current pass watched the kernel refuse, and
+	// Routes swaps it into occupied once the next one has dumped. A foreign route is filtered
 	// out of the dump by protocol, so it never reaches a delete list and
 	// DelRoute is never called for it: when the mesh stops announcing that
 	// prefix the record would have no exit at all.
@@ -183,7 +183,7 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 	family, scope := uint8(unix.AF_INET6), uint8(unix.RT_SCOPE_UNIVERSE)
 	if route.Destination.Addr().Is4() {
 		// an IPv4 route out of a device with no gateway is link scope, which
-		// is what iproute2 sends and what fib_check_nh expects.
+		// iproute2 sends and fib_check_nh expects.
 		family, scope = unix.AF_INET, unix.RT_SCOPE_LINK
 	}
 	kind := uint8(unix.RTN_UNICAST)
@@ -235,7 +235,7 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 }
 
 // where is the routing table this reconciler owns and the protocol it stamps,
-// which together with the interface are what makes a route on linux its own.
+// which together with the interface make a route on linux its own.
 func (p *netlinkPlatform) where(cfg Config) string {
 	return fmt.Sprintf("table %d protocol %d", cfg.Table, cfg.Protocol)
 }
@@ -244,7 +244,7 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 	// EXCL rather than REPLACE. A replace takes over whatever sits first at the
 	// same prefix, tos and priority no matter who wrote it: fib_table_insert
 	// compares neither rtm_protocol nor the route type. In a VRF table, which
-	// is what a gravity node gives this reconciler, that first entry is the
+	// is the kind a gravity node gives this reconciler, that first entry is the
 	// kernel's own RTPROT_KERNEL local and connected route for an address on an
 	// enslaved link, sitting at priority 0 where an IPv4 route with no
 	// configured metric also sits. Replacing it would stop the node reaching

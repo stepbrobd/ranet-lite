@@ -270,8 +270,8 @@ func TestEspProposalOffersNoTypeTheAnswerReaderRefuses(t *testing.T) {
 
 // The responder answering somebody else's offer is the other direction, and it
 // does echo a type it was offered: a peer that names DH or INTEG gets it back,
-// RFC 7296 section 2.7. That is what selectChildRequestProposal builds, and it
-// is not what decodeChildProposal above reads.
+// RFC 7296 section 2.7. selectChildRequestProposal builds that, and it is not
+// what decodeChildProposal above reads.
 func TestTheResponderEchoesEveryTypeTheOfferNamed(t *testing.T) {
 	spi := []byte{0, 0, 0, 9}
 	base := []Transform{
@@ -369,8 +369,8 @@ func TestARekeyOffersOnlyTheCipherItsAnswerReaderWillTake(t *testing.T) {
 // one to use, so its retry is a guess. Every site that sends one has to carry
 // them.
 func TestEveryInvalidKENotifyNamesAGroup(t *testing.T) {
-	// A Child SA offer whose DH group this end does not have, which is what
-	// draws the notify from the selector all three sites read.
+	// A Child SA offer whose DH group this end does not have, which draws
+	// the notify from the selector all three sites read.
 	spi := []byte{0, 0, 0, 3}
 	offer := EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: spi, Transforms: []Transform{
 		{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
@@ -401,8 +401,8 @@ func TestEveryInvalidKENotifyNamesAGroup(t *testing.T) {
 	}
 }
 
-// preferredGroupFromNotify is what an initiator does with the data, spelled
-// out here so the two halves are checked against each other.
+// preferredGroupFromNotify spells out what an initiator does with the data,
+// so the two halves are checked against each other.
 func preferredGroupFromNotify(n Notify) (uint16, bool) {
 	if n.Type != N_INVALID_KE_PAYLOAD || len(n.Data) < 2 {
 		return 0, false

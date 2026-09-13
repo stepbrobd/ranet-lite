@@ -801,8 +801,8 @@ func TestPrefixNoLongerOriginatedCanBeReachedAgain(t *testing.T) {
 	}
 }
 
-// These four numbers are what a node announces itself as costing and how fast
-// it notices a neighbor has gone. They are not internal tuning: the fleet this
+// These four numbers set what a node announces itself as costing and how
+// fast it notices a neighbor has gone. They are not internal tuning: the fleet this
 // replaces runs BIRD, and a ranet-lite node whose hop looks cheaper than a BIRD
 // hop pulls transit onto itself across the whole mesh, while one that takes
 // seventy seconds to notice a silent peer is a different network from the one
@@ -864,8 +864,8 @@ func TestRouteTableTakesHysteresisFromConfig(t *testing.T) {
 }
 
 // A prefix flushed from the route table has to take its unreachable hold with
-// it. The hold is what RFC 8966 section 3.5.4 asks for while a retracted
-// prefix is still remembered, and it deliberately stops a covering route from
+// it. RFC 8966 section 3.5.4 asks for the hold while a retracted prefix is
+// still remembered, and it deliberately stops a covering route from
 // serving the destination. Once the entry is gone there is nothing left to
 // hold, and nothing else ever removes it: no later selection will name a
 // prefix the table no longer has, so the destination stays black-holed for the
@@ -1280,8 +1280,8 @@ func TestOneJammedNeighborDoesNotRepeatTheUpdateToTheRest(t *testing.T) {
 	for pass := range passes {
 		speaker.mu.Lock()
 		// Seeded on the first pass only: Originate wakes the run loop rather
-		// than leaving the key for the next pass to pick up, and what is being
-		// measured is what the later passes repeat on their own.
+		// than leaving the key for the next pass to pick up, and the measurement
+		// is of what the later passes repeat on their own.
 		if pass == 0 {
 			speaker.routes.dirty[routeKey{dest: prefix}] = struct{}{}
 		}
@@ -1699,8 +1699,7 @@ func TestTheStarveRetryDeadlineIsNeverLate(t *testing.T) {
 	speaker.retryStarvedLocked(now.Add(time.Minute))
 	check("a pass in which every retry was due")
 
-	// Passes until every retry has spent its attempts, which is what empties
-	// the map. A kept deadline that survives that is one the rebuild did not
+	// Passes until every retry has spent its attempts, which empties the map. A kept deadline that survives that is one the rebuild did not
 	// clear, and the run loop then wakes for a retry that no longer exists.
 	at := now
 	for range seqnoRequestRetries + 2 {
@@ -1732,7 +1731,7 @@ func TestACongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
 	makeNeighborReachable(stuck)
 
 	// A pass that builds a Hello for the stuck peer and cannot send it, which
-	// is what leaves sentHello false from here on.
+	// leaves sentHello false from here on.
 	speaker.mu.Lock()
 	send := speaker.emitLocked([]sendAction{speaker.helloAction(stuck, time.Now())})
 	speaker.mu.Unlock()
@@ -2197,8 +2196,8 @@ func TestARefusedDumpIsStillOwed(t *testing.T) {
 }
 
 // The same amplification through the other rollback. A dump the transport
-// refuses leaves that neighbor owing every key it carried, which is what the
-// retry rebuilds. Recording a speaker-wide pending dump alongside it makes
+// refuses leaves that neighbor owing every key it carried, and the retry
+// rebuilds those. Recording a speaker-wide pending dump alongside it makes
 // pendingWorkLocked true for as long as that one peer stays stuck, so every
 // packet from every other neighbor wakes a full sweep -- and takes the
 // updateActions branch, so each of those wakes rebuilds and resends the whole
@@ -2270,7 +2269,7 @@ func TestACongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
 // accepts. A pass that could not send its Hello has until deadTimeout, three
 // and a half intervals, before the remote withdraws every route through this
 // node; the retry has to fit several attempts inside that. A fifty millisecond
-// floor, which is what this replaced, puts the first attempt after the remote
+// floor, the value this replaced, puts the first attempt after the remote
 // has already given up.
 func TestTheSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
 	const shortest = 10 * time.Millisecond

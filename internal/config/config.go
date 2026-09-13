@@ -281,7 +281,7 @@ func maskedDefault(prefix netip.Prefix) error {
 	if prefix.Addr().Is4() {
 		unspecified = "0.0.0.0"
 	}
-	return fmt.Errorf("announces a default route, write %s/0 if that is what you mean", unspecified)
+	return fmt.Errorf("announces a default route, write %s/0 to mean that", unspecified)
 }
 
 // OriginatePrefix is either a bare CIDR prefix or a mapping carrying a source
@@ -500,8 +500,8 @@ func (c *Config) validate() error {
 		// do, and KernelAddresses skips it, so accepting the entry and
 		// dropping it silently is the one outcome that tells the operator
 		// nothing. A masked default is refused for the same reason it is in
-		// originate: the length is what an interface carries the address
-		// under, and zero is not one an operator can have meant.
+		// originate: an interface carries the address under a length, and
+		// zero is not one an operator can have meant.
 		if prefix.Addr().IsUnspecified() {
 			return fmt.Errorf("config: kernel.addresses %q is not an address an interface can carry", raw)
 		}
@@ -509,7 +509,7 @@ func (c *Config) validate() error {
 		// assigned to an interface, never announced, so "write ::/0 if that is
 		// what you mean" is advice the check above rejects.
 		if prefix.Bits() == 0 {
-			return fmt.Errorf("config: kernel.addresses %q has no prefix length, which is what an interface carries an address under", raw)
+			return fmt.Errorf("config: kernel.addresses %q has no prefix length, and an interface carries an address under one", raw)
 		}
 	}
 	return nil

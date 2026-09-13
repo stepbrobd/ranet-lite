@@ -98,7 +98,7 @@ type dumpEntry struct {
 }
 
 // dumpRIB encodes entries as a NET_RT_DUMP snapshot. Every entry the kernel
-// returns is an RTM_GET, so that is what these are.
+// returns is an RTM_GET, so these are too.
 func dumpRIB(t *testing.T, entries ...dumpEntry) []byte {
 	t.Helper()
 	var rib []byte
@@ -158,7 +158,7 @@ func TestDarwinRouteMessageNamesInterfaceAsItsGateway(t *testing.T) {
 		if message.Index != testIndex {
 			t.Errorf("rtm_index is %d, want %d", message.Index, testIndex)
 		}
-		// the gateway is what decides ownership on darwin: it has to be the
+		// the gateway decides ownership on darwin: it has to be the
 		// interface itself, never an address.
 		gateway, ok := message.Addrs[unix.RTAX_GATEWAY].(*route.LinkAddr)
 		if !ok {
@@ -341,7 +341,7 @@ func TestDarwinDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 	}
 }
 
-// The mirroring is what makes a pass converge: a dump that reported a metric
+// The mirroring makes a pass converge: a dump that reported a metric
 // or a preferred source the reconciler did not ask for would leave every route
 // on both the add list and the delete list forever.
 func TestDarwinDumpMirrorsDiffKeyFields(t *testing.T) {
@@ -614,7 +614,7 @@ func TestDarwinPrefixMaskRoundTrip(t *testing.T) {
 	}
 }
 
-// The scoped install is what lets a Mac hold an address an exit announces, and
+// The scoped install lets a Mac hold an address an exit announces, and
 // until the address seam existed no fast test could reach it: sourceIsOurs
 // asked the host about an interface index that names nothing, so every
 // source-specific route took the refusal path.
@@ -1007,8 +1007,8 @@ func TestDarwinRefusesWhatItsOwnDumpWouldNeverReport(t *testing.T) {
 	}
 }
 
-// The record of which destinations this process scoped is what the dump reads
-// a scoped route's source back from, so it may only be dropped once the kernel
+// The dump reads a scoped route's source back from the record of which
+// destinations this process scoped, so it may only be dropped once the kernel
 // has actually forgotten the route. Dropping it first loses the source of a
 // route that is still installed, and the next pass withdraws and reinstalls it
 // instead of recognizing it.
@@ -1174,7 +1174,7 @@ func TestDarwinOccupiedRecordIsReadWithTheRowsOwnScope(t *testing.T) {
 	}
 	sock.err = nil
 
-	// One dump carrying both rows, which is what the kernel returns: the
+	// One dump carrying both rows, as the kernel returns them: the
 	// plain route to the same destination is a different key, so it has to be
 	// reported or nothing can ever withdraw it, and the scoped one is still
 	// somebody else's.
@@ -1217,8 +1217,8 @@ func TestDarwinWithdrawingUnscopedKeepsTheScopedSource(t *testing.T) {
 	}
 }
 
-// The space this reconciler owns is what an operator reads in the startup
-// line, and on darwin it is the interface: there is one FIB and Config.Table
+// An operator reads the space this reconciler owns in the startup line, and
+// on darwin it is the interface: there is one FIB and Config.Table
 // means nothing here.
 func TestDarwinOwnsAnInterfaceRatherThanATable(t *testing.T) {
 	plat, _ := testPlatform(t, Config{Interface: "utun9", Table: DefaultTable})
@@ -1241,7 +1241,7 @@ func TestDarwinKnowsItsOwnRouteFromOneAnotherProgramHolds(t *testing.T) {
 		t.Fatalf("install %s: %v", dest, err)
 	}
 
-	// The same route again, which is what a repair pass does. The kernel
+	// The same route again, as a repair pass sends it. The kernel
 	// refuses it because this reconciler already installed it.
 	sock.err = unix.EEXIST
 	if err := plat.AddRoute(installed); !errors.Is(err, errRouteSkipped) {
@@ -1287,7 +1287,7 @@ func TestDarwinMonitorIgnoresItsOwnRefusedWrites(t *testing.T) {
 		return raw
 	}
 	if monitor.interesting(echo(unix.RTM_ADD, monitor.self, unix.EEXIST)) {
-		t.Error("the monitor woke on this reconciler's own refused install, which is what it made")
+		t.Error("the monitor woke on this reconciler's own refused install")
 	}
 	if !monitor.interesting(echo(unix.RTM_ADD, monitor.self, 0)) {
 		t.Error("a write of ours that landed did not wake the pass that has to see it")

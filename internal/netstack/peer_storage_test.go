@@ -180,7 +180,7 @@ func TestControlPacketDropsAreReported(t *testing.T) {
 }
 
 // A peer whose outbound SA cannot give out a sequence range transmits nothing,
-// which is what a peer that has just deleted its Child SA looks like from this
+// which is how a peer that has just deleted its Child SA looks from this
 // side. Counting only the slot refusals would leave the drop counter reading
 // zero through exactly that window.
 func TestReservationFailureCountsAsADrop(t *testing.T) {
@@ -218,8 +218,8 @@ func TestControlTrafficHasItsOwnBudget(t *testing.T) {
 		func([][]byte) error { <-release; return nil })
 	defer func() { unblock(); peer.Close() }()
 
-	// The dataplane takes everything it is allowed, which is what a bulk
-	// transfer through a backpressured socket looks like from here.
+	// The dataplane takes everything it is allowed, which is how a bulk
+	// transfer through a backpressured socket looks from here.
 	for i := range cap(peer.slots) {
 		if peer.reserveBatchNow(1) == nil {
 			t.Fatalf("the dataplane was refused place %d below its own budget", i)
@@ -529,8 +529,8 @@ func TestATransportFailureIsSaidRarely(t *testing.T) {
 	}
 }
 
-// countingWriter counts writes rather than keeping them, which is what a
-// report that must not be one line per batch is measured in.
+// countingWriter counts writes rather than keeping them, the unit a report
+// that must not be one line per batch is measured in.
 type countingWriter struct{ n *atomic.Int64 }
 
 func (w countingWriter) Write(b []byte) (int, error) { w.n.Add(1); return len(b), nil }

@@ -167,8 +167,8 @@ func (s *udpSocket) receiver() receiveFunc {
 		for index < count && n < len(bufs) {
 			m := &messages[index]
 			if offset == 0 {
-				// Counted in datagrams, which is what the counter's help text
-				// says and what the third arm below already does: one GRO
+				// Counted in datagrams, the unit the counter's help text names
+				// and the third arm below already uses: one GRO
 				// buffer is up to forty of them, so counting the message would
 				// undercount by that much. A zero-length datagram is refused
 				// too -- it arrived and goes nowhere, and leaving it out is

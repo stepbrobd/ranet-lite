@@ -14,8 +14,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
-// countingWriter counts writes rather than keeping them, which is what a
-// report that must not be one line per packet is measured in.
+// countingWriter counts writes rather than keeping them, the unit a report
+// that must not be one line per packet is measured in.
 type countingWriter struct{ n *atomic.Int64 }
 
 func (w countingWriter) Write(b []byte) (int, error) { w.n.Add(1); return len(b), nil }
@@ -46,8 +46,8 @@ func TestRefusedESPPacketsAreCountedExactlyAndSaidRarely(t *testing.T) {
 		t.Errorf("%d refused batches wrote %d log lines, want the one the interval allows", batches, got)
 	}
 
-	// The interval is what bounds it, not a once-ever flag: an operator has to
-	// hear about a flood that is still going.
+	// The interval bounds it, not a once-ever flag: an operator has to hear
+	// about a flood that is still going.
 	c.dropReported.Store(int64(time.Since(c.started)) - int64(espDropReportInterval))
 	c.noteInboundDropped("peer", 1, errors.New("replayed"))
 	if got := lines.Load(); got != 2 {
@@ -70,8 +70,8 @@ func TestMetricsRendersWhatTheHubRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sender.Close()
-	// An ESP SPI no Mux holds, which is what anyone who can reach the port can
-	// send and what an operator needs to be able to see.
+	// An ESP SPI no Mux holds, which anyone who can reach the port can send
+	// and which an operator needs to be able to see.
 	if _, err := sender.Write([]byte{9, 9, 9, 9, 0, 0, 0, 1, 0, 0, 0, 0}); err != nil {
 		t.Fatal(err)
 	}

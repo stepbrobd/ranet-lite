@@ -489,7 +489,7 @@ func (m *Mesh) writeInbound(lane int, bufs [][]byte) {
 // innerFlowHash assigns both directions of an inner TCP/UDP flow to the same
 // lane. The commutative endpoint mix is useful for request/response workloads,
 // while the final avalanche avoids the sequential-port clustering produced by
-// simply taking low hash bits.
+// taking low hash bits.
 func innerFlowHash(packet []byte) uint64 {
 	var src, dst []byte
 	var protocol byte

@@ -21,8 +21,8 @@ func (p *Peer) reserveBatch(count int) *peerBatch {
 	return p.reserveBatchWithSlot(count, hasSlot, false)
 }
 
-// sendOrDrop takes a place and sends it in one step, which is what a caller
-// with nothing to decide under a lock does.
+// sendOrDrop takes a place and sends it in one step, as a caller with
+// nothing to decide under a lock does.
 func sendOrDrop(p *Peer, raw []byte, nextHeader byte) error {
 	place, err := p.ReserveRawOrDrop(raw, nextHeader)
 	if err != nil {

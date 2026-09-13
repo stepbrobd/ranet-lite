@@ -28,7 +28,7 @@ func NewRouteTable() *RouteTable { return &RouteTable{changed: make(chan struct{
 // It is a sentinel rather than a usable Peer: nothing in it is initialized, so
 // anything that sends through it instead of comparing against it dereferences
 // a nil. Lookup answers it as "no route", and Snapshot hands it out as a value
-// a caller has to recognize, which is what the doc there says.
+// a caller has to recognize, as the doc there says.
 var Unreachable = &Peer{ID: "unreachable"}
 
 // IsUnreachable reports whether a peer from Snapshot or Lookup is the hold a

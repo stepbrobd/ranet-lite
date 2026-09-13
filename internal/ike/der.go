@@ -108,8 +108,8 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 		// which is here for something else, so one certificate was refused as
 		// a non-minimal length on a 32 bit build and as truncated content on a
 		// 64 bit one. With the accumulator unsigned that test no longer sees
-		// it at all, so this one is what keeps int(value) from going negative
-		// and the slice below from panicking. Verified on a 386 build; see
+		// it at all, so this one keeps int(value) from going negative and the
+		// slice below from panicking. Verified on a 386 build; see
 		// TestDERLengthBeyondTheBufferIsRefusedNotSliced.
 		if value > uint64(len(b)) {
 			return 0, nil, nil, fmt.Errorf("ike: truncated DER content")
@@ -131,8 +131,8 @@ func derElement(b []byte) (tag byte, content, rest []byte, err error) {
 // same name reaches the wire in either form. The name is not what
 // authenticates a peer: AUTH signs the bytes actually received, so a
 // re-encoded name still needs that peer's key to be accepted. Identities are
-// compared as parsed names rather than as bytes, which is what makes that
-// tolerance safe.
+// compared as parsed names rather than as bytes, which makes that tolerance
+// safe.
 func derAttribute(rdn []byte) (oid []byte, value string, err error) {
 	setTag, set, rest, err := derElement(rdn)
 	if err != nil {

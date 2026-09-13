@@ -31,8 +31,8 @@ type neighborState struct {
 	// neighbors repeated a seqno to whichever neighbor drew an extra Hello
 	// between two intervals, which is every neighbor on the pass it joins.
 	helloSeqno uint16
-	// owed is what this neighbor still needs a triggered update for, RFC 8966
-	// section 3.7.2. It is per neighbor rather than one set for the speaker,
+	// owed holds the prefixes this neighbor still needs a triggered update
+	// for, RFC 8966 section 3.7.2. It is per neighbor rather than one set for the speaker,
 	// because a packet is dropped per neighbor: putting a shared set back
 	// re-sent the whole triggered update to every healthy neighbor on every
 	// wake for as long as one was congested. Bounded by the route table, like

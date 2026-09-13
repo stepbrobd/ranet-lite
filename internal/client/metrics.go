@@ -64,8 +64,8 @@ func (c *Client) Metrics(w io.Writer) {
 	// Authenticated and validated, which is not the same as delivered: the
 	// count includes babel control packets the speaker consumed, RFC 4303
 	// section 2.6 dummy packets that carry nothing, and packets a closing mesh
-	// discards. The name is what a dashboard already references, so the help
-	// text is what says so.
+	// discards. A dashboard already references the name, so the help text
+	// carries the qualification instead.
 	fmt.Fprint(w, "# HELP ranet_lite_esp_inbound_packets_total ESP packets that authenticated and passed validation, including babel control traffic and dummy packets.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_esp_inbound_packets_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_esp_inbound_packets_total %d\n", c.inboundPackets.Load())
@@ -183,7 +183,7 @@ func (c *Client) countInbound(delivered int) {
 }
 
 // espDropReportInterval bounds how often refused ESP packets are said out
-// loud. The counter behind it is exact and is what an operator reads; the log
+// loud. The counter behind it is exact, and an operator reads that; the log
 // line only has to point at it.
 const espDropReportInterval = 10 * time.Second
 
