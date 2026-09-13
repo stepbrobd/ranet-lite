@@ -186,11 +186,11 @@ sends the rekey response rather than just after.
 permits sending on the new SA "as soon as it sends its response", so the
 difference is the time to encrypt one message. What the same section also offers
 is the conservative option, continuing on the old SA until the peer proves it
-has the new one, and that is what would close the gap outright: either way the
-peer cannot decrypt until the response reaches it, so a peer-initiated rekey
-costs the response's flight time of outbound traffic. Since the end with the
-shorter lifetime drives rekeying, on a mixed fleet that is strongSwan, hourly,
-per peer, and babel's own traffic is periodic enough not to notice.
+has the new one, and that would close the gap outright: either way the peer
+cannot decrypt until the response reaches it, so a peer-initiated rekey costs
+the response's flight time of outbound traffic. Since the end with the shorter
+lifetime drives rekeying, on a mixed fleet that is strongSwan, hourly, per peer,
+and babel's own traffic is periodic enough not to notice.
 
 The remaining narrow feature set is not counted as RFC non-compliance.
 Raw-public-key authentication without certificates or EAP and refusal to create
@@ -362,7 +362,7 @@ happened rather than a sampled snapshot.
 
 ranet-lite is built to run next to Tailscale, NetBird, ZeroTier, an SD-WAN
 agent, or anything else that owns interfaces and routes on the same box, and the
-reconciler's ownership rules are what make that true rather than a hope.
+reconciler's ownership rules make that true rather than a hope.
 
 On Linux it reads back only routes whose table, `rt_proto` and output interface
 all match its own, so a delete list can never contain another writer's route,
@@ -388,12 +388,12 @@ asking for the next free unit, so it is never one another tunnel is already
 using, and XNU allocates interface indices by incrementing a counter with no
 free list, so a destroyed utun's index is never handed out again.
 
-Interface-scoped routes are narrower still, because a scoped route is what this
-reconciler installs for a source-specific announcement and also what other tools
-install. A macOS host running Tailscale carries a scoped `255.255.255.255` entry
-with a link gateway and `RTF_STATIC`, so a scoped route counts as this
-reconciler's only when this process scoped that destination. One left behind by
-a crash is left alone rather than deleted on a guess.
+Interface-scoped routes are narrower still, because this reconciler installs a
+scoped route for a source-specific announcement, and so do other tools. A macOS
+host running Tailscale carries a scoped `255.255.255.255` entry with a link
+gateway and `RTF_STATIC`, so a scoped route counts as this reconciler's only
+when this process scoped that destination. One left behind by a crash is left
+alone rather than deleted on a guess.
 
 Two kinds of route are scoped, for two different reasons. A source-specific
 announcement is scoped because interface scope is the only thing on this

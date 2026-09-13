@@ -71,7 +71,7 @@ peers:
     serial_number: "0"          # optional, picks a specific endpoint if the node has several
 
 babel:
-  # Omitted these default to 4s and 16s, which is what BIRD and RFC 8966
+  # Omitted these default to 4s and 16s, which BIRD and RFC 8966
   # Appendix B use and what the fleet configures. Raise them on a node that
   # would rather wake less often.
   hello_interval: 4s

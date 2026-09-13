@@ -22,6 +22,9 @@ buildGoApplication (
           # the example is parsed by a test, so it has to be in the source the
           # checks see or that test passes only outside the sandbox
           ./examples
+          # and the readme is read by the prose checks, for the same reason:
+          # without it here they walk the go files alone and say nothing
+          ./readme.md
           # meta
           ./go.mod
           ./go.sum

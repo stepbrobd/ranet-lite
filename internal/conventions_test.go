@@ -15,9 +15,24 @@ import (
 )
 
 // goFiles walks the tree from its root, which is one directory up.
-func goFiles(t *testing.T) []string {
+func goFiles(t *testing.T) []string { return treeFiles(t, map[string]int{".go": 50}) }
+
+// prose covers the go files and the two documents an operator reads. The rules
+// are about writing rather than about Go, and scanning only the source left
+// the readme with three instances of the phrasing the sweep had removed
+// everywhere else, because nothing looked there.
+func proseFiles(t *testing.T) []string {
+	return treeFiles(t, map[string]int{".go": 50, ".md": 1, ".yaml": 1})
+}
+
+// least is per suffix rather than a total. The tree holds well over a hundred
+// go files against one markdown and a handful of yaml, so any total a go-only
+// walk already meets would let the documents silently drop out of the checks
+// that were widened to reach them.
+func treeFiles(t *testing.T, least map[string]int) []string {
 	t.Helper()
 	var out []string
+	seen := make(map[string]int, len(least))
 	root := ".."
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -26,16 +41,25 @@ func goFiles(t *testing.T) []string {
 		if d.IsDir() && (d.Name() == "vendor" || d.Name() == ".git") {
 			return filepath.SkipDir
 		}
-		if !d.IsDir() && strings.HasSuffix(path, ".go") {
-			out = append(out, path)
+		if d.IsDir() {
+			return nil
+		}
+		for suffix := range least {
+			if strings.HasSuffix(path, suffix) {
+				out = append(out, path)
+				seen[suffix]++
+				return nil
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) < 50 {
-		t.Fatalf("found %d go files, so the walk is not reaching the tree", len(out))
+	for suffix, want := range least {
+		if seen[suffix] < want {
+			t.Fatalf("found %d %s files, want at least %d, so the walk is not reaching them", seen[suffix], suffix, want)
+		}
 	}
 	return out
 }
@@ -45,7 +69,7 @@ func goFiles(t *testing.T) []string {
 // "doesn't care what order", so the pattern requires the whole phrase.
 func TestNoFramingPhrase(t *testing.T) {
 	banned := regexp.MustCompile(`\b(is|are|was|were) what\b|\bis the point\b`)
-	for _, path := range goFiles(t) {
+	for _, path := range proseFiles(t) {
 		body, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -75,6 +99,23 @@ func TestNoArticleLeadingTestName(t *testing.T) {
 			if m := article.FindStringSubmatch(line); m != nil {
 				t.Errorf("%s:%d opens with an article, want %s%s", path, i+1, m[1], m[3])
 			}
+		}
+	}
+}
+
+// Counting files cannot tell a narrowed walk from a tree that grew, because
+// the go files alone satisfy any total the documents were added to. The walk
+// that was widened past them is guarded by naming them.
+func TestProseChecksReachTheDocuments(t *testing.T) {
+	want := map[string]bool{"../readme.md": false, "../examples/config.yaml": false}
+	for _, path := range proseFiles(t) {
+		if _, named := want[path]; named {
+			want[path] = true
+		}
+	}
+	for path, reached := range want {
+		if !reached {
+			t.Errorf("the prose checks do not read %s, so its wording is unchecked", path)
 		}
 	}
 }
