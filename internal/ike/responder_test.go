@@ -1112,6 +1112,52 @@ func TestHalfOpenShareIsPerAddressNotPerFlow(t *testing.T) {
 	}
 }
 
+// An initiator that does not advertise the Ed25519 Identity hash is offering
+// an authentication method this responder cannot use, which RFC 7296 section
+// 3.10.1 calls NO_PROPOSAL_CHOSEN: "any case where the offered proposals
+// (including but not limited to SA payload values, USE_TRANSPORT_MODE notify,
+// IPCOMP_SUPPORTED notify) are not acceptable for the responder".
+// AUTHENTICATION_FAILED is defined there as
+// the answer to an IKE_AUTH message, and this exchange has not reached one.
+func TestResponderRefusesAnOfferItCannotAuthenticate(t *testing.T) {
+	h := newResponderHarness(t, nil)
+	mux, err := h.initiator.NewMux(net.ParseIP("127.0.0.1"), h.remotePort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mux.Close() })
+	spiI := randUint64Nonzero()
+	ni := make([]byte, 32)
+	rand.Read(ni)
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	// Everything a working IKE_SA_INIT carries except the signature hash
+	// notify, which is what says this initiator can verify an Ed25519 AUTH.
+	dh, err := GenerateDH(DH_CURVE25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := (&Message{
+		Header: Header{SPIInitiator: spiI, ExchangeType: IKE_SA_INIT, Flags: FlagInitiator},
+		Payloads: []RawPayload{
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{ikeProposal()})},
+			{Type: PayloadKE, Body: EncodeKE(DH_CURVE25519, dh.PublicBytes())},
+			{Type: PayloadNonce, Body: EncodeNonce(ni)},
+		},
+	}).Encode()
+	if err := mux.SendIKE(request); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := mux.RecvIKEUntil(time.Now().Add(10 * time.Second))
+	if err != nil {
+		t.Fatalf("an offer this responder cannot authenticate drew no answer: %v", err)
+	}
+	if got := firstTestNotify(t, reply).Type; got != N_NO_PROPOSAL_CHOSEN {
+		t.Errorf("the responder answered notify %d, want NO_PROPOSAL_CHOSEN", got)
+	}
+}
+
 // A spoofer must not be able to spend a named peer's share while the node is
 // idle. With the cookie demanded on the global count alone, an off-path source
 // forging a victim's address takes the victim's whole share below the

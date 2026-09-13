@@ -284,7 +284,16 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 		return nil, Accepted{}, err
 	}
 	if !supportsIdentity {
-		r.sendStatelessNotify(datagram, spiI, N_AUTHENTICATION_FAILED, nil)
+		// NO_PROPOSAL_CHOSEN rather than AUTHENTICATION_FAILED: RFC 7296
+		// section 3.10.1 defines the latter as "sent in the response to an
+		// IKE_AUTH message", and an authentication method this responder
+		// cannot use is exactly what the former is for, "any case where the
+		// offered proposals (including but not limited to SA payload values,
+		// USE_TRANSPORT_MODE notify, IPCOMP_SUPPORTED notify) are not
+		// acceptable for the responder". Section
+		// 2.21.1 makes either end the exchange, so the peer behaves the same
+		// way and the registry is the tiebreak.
+		r.sendStatelessNotify(datagram, spiI, N_NO_PROPOSAL_CHOSEN, nil)
 		return nil, Accepted{}, fmt.Errorf("ike: initiator did not advertise Ed25519 Identity hash support")
 	}
 
