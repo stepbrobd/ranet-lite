@@ -106,8 +106,13 @@ func (c *Client) Reload(path string) error {
 	// is unreachable whatever happens here. The dialer already gives up on a
 	// node the registry does not name and is started again by the next
 	// reload.
-	for _, problem := range validatePeers(cfg, reg, families) {
-		log.Printf("reload: %v, so nothing will dial it", problem)
+	// Both halves are advisory here, but appending one to the other would
+	// write into whichever backing array had the room.
+	refuse, skip := validatePeers(cfg, reg, families)
+	for _, problems := range [][]error{refuse, skip} {
+		for _, problem := range problems {
+			log.Printf("reload: %v, so nothing will dial it", problem)
+		}
 	}
 
 	c.reg.Store(&reg)

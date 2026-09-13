@@ -123,6 +123,37 @@ func TestValidateRuntimeConfig(t *testing.T) {
 	}
 }
 
+// A community registry holds nodes reachable over one address family only, so
+// a v4-only host always finds peers it cannot dial. Refusing to start over
+// them leaves that host no way to run at all. A Mac with no IPv6 hit exactly
+// that against the real registry: six v6-only nodes, six fatal errors, no
+// startup. The peer is skipped and named instead, while a peer the registry
+// does not name stays fatal.
+func TestStartupSkipsAPeerNoLocalFamilyCanDial(t *testing.T) {
+	cfg, privateKey, reg := runtimeFixture(t)
+	reg[0].Nodes = append(reg[0].Nodes, registry.Node{
+		CommonName: "v6only",
+		Endpoints:  []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip6", Port: 13000}},
+	})
+	cfg.Peers = append(cfg.Peers, config.Peer{Organization: "example", CommonName: "v6only"})
+	if err := validateRuntimeConfig(cfg, privateKey, reg); err != nil {
+		t.Fatalf("a v6-only peer stopped a v4-only node from starting: %v", err)
+	}
+
+	// The same peer named by a serial is somebody writing the wrong thing
+	// down rather than the shape of the registry, and still refuses.
+	cfg.Peers[len(cfg.Peers)-1].SerialNumber = "0"
+	if err := validateRuntimeConfig(cfg, privateKey, reg); err == nil {
+		t.Error("a peer endpoint named by serial in a family this node has not is accepted")
+	}
+
+	// And a node the registry has never heard of still refuses.
+	cfg.Peers[len(cfg.Peers)-1] = config.Peer{Organization: "example", CommonName: "absent"}
+	if err := validateRuntimeConfig(cfg, privateKey, reg); err == nil {
+		t.Error("a peer the registry does not name is accepted")
+	}
+}
+
 func TestValidateESPTunnelPayload(t *testing.T) {
 	ipv4 := make([]byte, 20)
 	ipv4[0], ipv4[3] = 0x45, 20
