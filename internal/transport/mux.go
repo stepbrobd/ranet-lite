@@ -6,6 +6,7 @@ package transport
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
@@ -22,12 +23,14 @@ const (
 	// them. It counts socket batches, which is the datagram count only where
 	// the backend returns one datagram per batch, as darwin's does. The
 	// channel is allocated with the mux, so this is also what a half-open SA
-	// costs while its handshake runs: at 4096 it was 160 KiB a piece, and
-	// halfOpenLimit of them is what a flood can pin at once.
+	// costs while its handshake runs: 40 KiB a piece here, against 160 KiB at
+	// the 4096 this used to be, and halfOpenLimit of them is what a flood can
+	// pin at once.
 	espChanSize = 1024
 	// espQueueBytes is what actually bounds that queue. A batch holds up to
 	// espSendBatch datagrams of up to readBufferSize each, so the batch count
-	// alone bounds nothing: 4096 of them is 34 GB per peer at the UDP maximum.
+	// alone bounds nothing: even at 1024 that is 8.6 GB per peer at the UDP
+	// maximum.
 	// An ESP SPI is cleartext on the wire and the queue is filled before
 	// anything is authenticated, so whoever has seen one packet from a peer
 	// can aim that at us. Steady-state occupancy is a handful of batches
@@ -49,6 +52,36 @@ type Hub struct {
 	done      chan struct{}
 	closed    atomic.Bool
 	closeOnce sync.Once
+
+	// dropped counts every datagram a full receive queue refused, and reported
+	// bounds how often that is said out loud. One receive loop serves every
+	// session on this hub, and anyone who can reach the port can fill a
+	// queue: at line rate a line per datagram is a synchronous write to
+	// stderr per packet, on the goroutine that receives for all of them.
+	// Reading the counter is what an operator needs; the log line only has to
+	// point at it.
+	dropped  atomic.Uint64
+	reported atomic.Int64
+}
+
+// dropReportInterval bounds how often a full receive queue is logged. The
+// counter behind it is exact.
+const dropReportInterval = 10 * time.Second
+
+// Dropped is how many inbound datagrams a full receive queue has refused. It
+// is the inbound counterpart of Peer.Dropped, and the only signal that this
+// node is behind on receive rather than losing packets on the wire.
+func (h *Hub) Dropped() uint64 { return h.dropped.Load() }
+
+// noteDrop counts refused datagrams and reports them at most once an interval.
+func (h *Hub) noteDrop(count int, reason string) {
+	total := h.dropped.Add(uint64(count))
+	now := time.Now().UnixNano()
+	last := h.reported.Load()
+	if now-last < int64(dropReportInterval) || !h.reported.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("transport receive queue full", "detail", reason, "dropped_total", total)
 }
 
 // Unclaimed is one IKE datagram whose SPI belongs to no registered Mux, which
@@ -275,7 +308,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 		// may be gone by the time this one gets there.
 		for _, pending := range ikeDatagrams {
 			if len(pending.mux.ikeCh) == cap(pending.mux.ikeCh) {
-				log.Printf("transport: ikeCh full, dropping IKE message")
+				h.noteDrop(1, "an IKE SA's receive queue")
 				continue
 			}
 			raw := bufs[pending.index][:sizes[pending.index]]
@@ -286,12 +319,12 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			select {
 			case pending.mux.ikeCh <- datagram:
 			default:
-				log.Printf("transport: ikeCh full, dropping IKE message")
+				h.noteDrop(1, "an IKE SA's receive queue")
 			}
 		}
 		for _, i := range unclaimed {
 			if len(h.listen) == cap(h.listen) {
-				log.Printf("transport: listen queue full, dropping unclaimed IKE message")
+				h.noteDrop(1, "the queue of IKE messages from peers that have not dialed us")
 				continue
 			}
 			raw := bufs[i][:sizes[i]]
@@ -302,7 +335,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			select {
 			case h.listen <- datagram:
 			default:
-				log.Printf("transport: listen queue full, dropping unclaimed IKE message")
+				h.noteDrop(1, "the queue of IKE messages from peers that have not dialed us")
 			}
 		}
 		for m, packets := range espBatches {
@@ -313,7 +346,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 			// Tested before packReceivedBatch copies, so a flood is refused
 			// without allocating for it.
 			if !m.hasRoomForESP(total) || !m.dispatchESP(packReceivedBatch(packets), total) {
-				log.Printf("transport: esp receive queue full, dropping %d ESP packets", len(packets))
+				h.noteDrop(len(packets), "a peer's ESP receive queue")
 			}
 		}
 	}
@@ -418,8 +451,9 @@ func (m *Mux) Done() <-chan struct{} { return m.done }
 func (m *Mux) RegisterIKE(spi uint64) error { return m.registerIKE(spi) }
 func (m *Mux) registerIKE(spi uint64) error {
 	if spi == 0 {
-		// RFC 7296 section 2.6 uses a zero SPI for a request that names no SA.
-		// Claiming it here would route every one of those to this mux.
+		// RFC 7296 section 3.1 on the initiator's SPI: "This value MUST NOT be
+		// zero." Claiming it here would route every datagram carrying one to
+		// this mux, which is the same reason RegisterESP refuses it.
 		return fmt.Errorf("transport: IKE SPI must be nonzero")
 	}
 	m.hub.mu.Lock()

@@ -59,6 +59,23 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprint(w, "# HELP ranet_lite_esp_inbound_dropped_total ESP packets that failed to decrypt or validate.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_esp_inbound_dropped_total counter\n")
 	fmt.Fprintf(w, "ranet_lite_esp_inbound_dropped_total %d\n", c.inboundDropped.Load())
+
+	// The inbound counterpart of ranet_lite_peer_send_dropped_total, and the
+	// only signal that this node is behind on receive rather than losing
+	// packets on the wire. Anyone who can reach the port can raise it, so a
+	// rising count is not by itself a fault.
+	fmt.Fprint(w, "# HELP ranet_lite_receive_dropped_total Inbound datagrams a full receive queue refused.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_receive_dropped_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_receive_dropped_total %d\n", c.hubDropped())
+}
+
+// hubDropped is zero before the hub exists, which is every call from a test
+// that builds a Client by hand.
+func (c *Client) hubDropped() uint64 {
+	if c.hub == nil {
+		return 0
+	}
+	return c.hub.Dropped()
 }
 
 // MetricsHandler serves Metrics, for mounting next to the pprof endpoint.

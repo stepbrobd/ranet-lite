@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -372,10 +373,31 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	speaker.Originate(netip.MustParsePrefix("10.66.0.5/32"))
 	// A neighbor and a session, or every per-peer and per-path line below is
 	// a loop over nothing and only the scalars are ever written.
-	peer := netstack.NewPeer("gateway", func(raw []byte, _ byte) ([]byte, error) { return raw, nil },
-		func([]byte) error { return nil })
+	// A reserved peer whose transport never returns, so its drop counter is
+	// something other than zero: a per-neighbor line asserted at zero cannot
+	// tell the count from no counting at all.
+	blocked := make(chan struct{})
+	var drain sync.Once
+	peer := netstack.NewPeerReserved("gateway",
+		func(int) (netstack.BatchSealer, error) {
+			return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+				return append(out[:0], raw...), nil
+			}, nil
+		},
+		func([][]byte) error { <-blocked; return nil })
+	defer func() { drain.Do(func() { close(blocked) }); peer.Close() }()
 	handle := speaker.AddPeer(peer)
 	defer handle.Close()
+	for {
+		place, err := peer.ReserveRawOrDrop([]byte("bulk"), 41)
+		if err != nil {
+			break
+		}
+		place.Send()
+	}
+	if _, err := peer.ReserveRawOrDrop([]byte("one more"), 41); err == nil {
+		t.Fatal("the peer took a packet past its budget, so its drop counter proves nothing")
+	}
 	c := &Client{speaker: speaker, sessions: newSessionSet()}
 	c.sessions.close = func(*ike.Session) {}
 	c.sessions.active = func(*ike.Session) bool { return true }
@@ -386,6 +408,10 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	defer release()
 	c.countInbound(7, 2)
 
+	stats := speaker.Stats()
+	if len(stats.Neighbors) != 1 || stats.Neighbors[0].Cost == 0 || stats.Neighbors[0].Dropped == 0 {
+		t.Fatalf("the fixture leaves %+v, so asserting the per-neighbor lines proves nothing", stats.Neighbors)
+	}
 	var out bytes.Buffer
 	c.Metrics(&out)
 	text := out.String()
@@ -398,7 +424,10 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 		`ranet_lite_session_up{path="example/gateway/1@0"} 1`,
 		`ranet_lite_babel_neighbor_up{peer="gateway"} 0`,
 		`ranet_lite_babel_routes_received{peer="gateway"} 0`,
-		`ranet_lite_peer_send_dropped_total{peer="gateway"} 0`,
+		// A neighbor that has said nothing costs infinity, and the peer above
+		// refused at least one packet, so neither line is zero either way.
+		fmt.Sprintf(`ranet_lite_babel_neighbor_cost{peer="gateway"} %d`, stats.Neighbors[0].Cost),
+		fmt.Sprintf(`ranet_lite_peer_send_dropped_total{peer="gateway"} %d`, stats.Neighbors[0].Dropped),
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("metrics output is missing %q:\n%s", want, text)
@@ -409,7 +438,7 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 		"ranet_lite_sessions", "ranet_lite_esp_inbound_packets_total",
 		"ranet_lite_session_up", "ranet_lite_babel_neighbor_up",
 		"ranet_lite_babel_neighbor_cost", "ranet_lite_babel_routes_received",
-		"ranet_lite_peer_send_dropped_total",
+		"ranet_lite_peer_send_dropped_total", "ranet_lite_receive_dropped_total",
 	} {
 		if !strings.Contains(text, "# HELP "+name+" ") || !strings.Contains(text, "# TYPE "+name+" ") {
 			t.Errorf("metric %s has no HELP or TYPE", name)

@@ -708,3 +708,29 @@ func TestEachESPByteBoundRefusesOnItsOwn(t *testing.T) {
 		}
 	})
 }
+
+// RFC 7296 section 3.1 on the initiator's SPI: "This value MUST NOT be zero."
+// A mux claiming it would be handed every datagram carrying one, which is the
+// same reason the ESP side refuses a zero SPI.
+func TestZeroSPIIsRefusedOnBothProtocols(t *testing.T) {
+	hub, err := NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	mux, err := hub.NewMux(net.IPv4(127, 0, 0, 1), 4500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.RegisterIKE(0); err == nil {
+		t.Error("a mux claimed IKE SPI zero, which RFC 7296 section 3.1 forbids a peer from sending")
+	}
+	if err := mux.RegisterESP(0); err == nil {
+		t.Error("a mux claimed ESP SPI zero")
+	}
+	// A real SPI is still taken, so the refusal is the zero rather than the
+	// registration.
+	if err := mux.RegisterIKE(1); err != nil {
+		t.Errorf("a nonzero IKE SPI was refused: %v", err)
+	}
+}

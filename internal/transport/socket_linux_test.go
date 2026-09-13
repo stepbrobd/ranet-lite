@@ -214,3 +214,52 @@ func TestUDPKernelGSORoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// A datagram whose control message will not parse is dropped, not reported:
+// the error used to propagate out of the receive function into receiveLoop,
+// which fails the whole hub and closes every session on the node. The GRO
+// sizing two branches up already skips the same class of failure, and without
+// a reply endpoint the responder could not answer this datagram anyway.
+func TestUDPReceiveDropsDatagramWithNoUsableSource(t *testing.T) {
+	socket := &udpSocket{ipv6: true, pc: scriptedUDP{read: func(messages []ipv4.Message) (int, error) {
+		for i := range 3 {
+			m := &messages[i]
+			m.N = 8
+			// The non-ESP marker, which is what makes this an IKE datagram and
+			// sends it looking for a reply endpoint.
+			binary.BigEndian.PutUint32(m.Buffers[0][:4], 0)
+			m.Buffers[0][4] = byte(i)
+			m.NN = 0
+			// A raw sockaddr, which is what the native receive path hands
+			// back. The middle one names a family neither branch of
+			// udpSource.endpoint knows, so it has no reply address at all.
+			var source udpSource
+			family := uint16(unix.AF_INET6)
+			if i == 1 {
+				family = 0xffff
+			}
+			binary.NativeEndian.PutUint16(source[:2], family)
+			binary.BigEndian.PutUint16(source[2:4], 500)
+			copy(source[8:24], net.ParseIP("2001:db8::1").To16())
+			m.Addr = &source
+		}
+		return 3, nil
+	}}}
+	receive := socket.receiver()
+	packets, sizes, endpoints := make([][]byte, 8), make([]int, 8), make([]Endpoint, 8)
+	n, err := receive(packets, sizes, endpoints)
+	if err != nil {
+		t.Fatalf("one unparseable control message failed the whole receive: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("the receive returned %d datagrams, want the two whose source could be read", n)
+	}
+	for i := range n {
+		if endpoints[i] == nil {
+			t.Errorf("datagram %d came back with no reply endpoint", i)
+		}
+	}
+	if packets[0][4] == packets[1][4] {
+		t.Error("the same datagram was returned twice, so the drop lost the loop's place")
+	}
+}
