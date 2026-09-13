@@ -191,7 +191,7 @@ func TestAddrsOfRejectsShortOrUnknownPackets(t *testing.T) {
 // TestRouteTableTrieRealBranching forces the destination trie to actually
 // fork: several prefixes share increasingly long common prefixes, which
 // the old linear scan never had to distinguish (it just compared each
-// entry independently) but which exercises insertDest's branch-node
+// entry independently) but which exercises the trie's branch-node
 // creation directly. Every prefix here differs in its *installed*
 // specificity, so each must resolve to exactly the one that covers it
 // most precisely, regardless of how the trie chose to structure itself
@@ -231,9 +231,9 @@ func TestRouteTableTrieRealBranching(t *testing.T) {
 // TestRouteTableTrieCompactionPreservesSiblings removes one of two
 // routes that fork from a shared synthetic branch node (neither 10.0.0.0/9
 // nor 10.128.0.0/9 has an ancestor/descendant relationship with the
-// other -- inserting both forces insertDest to create a branch node with
+// other -- inserting both forces the trie to create a branch node with
 // no route of its own, just to fork them apart) and verifies the
-// remaining sibling still resolves correctly afterward, i.e. removeNode's
+// remaining sibling still resolves correctly afterward, i.e. compact's
 // splice-and-recurse-upward compaction doesn't corrupt anything besides
 // the route actually being removed.
 func TestRouteTableTrieCompactionPreservesSiblings(t *testing.T) {

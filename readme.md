@@ -520,12 +520,13 @@ are removed when the namespaces exit.
 
 `--cores` sets GOMAXPROCS; `--affinity` restricts the client to actual CPUs. Use
 `--cores 1 --affinity 0` for a pinned single-core comparison. Keep flow ports,
-stream counts, affinity, MTU, and replay windows identical between versions. The
-default gateway replay window is strongSwan's 32 packets; `--replay-window 4096`
-can distinguish replay drops from processing limits. `--protocol udp --rate 10`
-offers an aggregate 10 Gbit/s per direction with UDP GSO/GRO and 4 MiB iperf
-socket buffers; inspect received throughput and loss, not just the offered rate.
-The Nix development shell uses the `iperf3-benchmark` package, which changes
+stream counts, affinity, MTU, and replay windows identical between versions.
+`--replay-window` sets it for every instance in the run, on both sides, and
+defaults to 4096 rather than strongSwan's own 32 so replay drops are
+distinguishable from processing limits. `--protocol udp --rate 10` offers an
+aggregate 10 Gbit/s per direction with UDP GSO/GRO and 4 MiB iperf socket
+buffers; inspect received throughput and loss, not just the offered rate. The
+Nix development shell uses the `iperf3-benchmark` package, which changes
 [iperf 3.21's GRO receive call](https://github.com/esnet/iperf/blob/3.21/src/net.c#L521-L595)
 to block instead of busy-polling. With the upstream receive loop, eight
 bidirectional streams can occupy every CPU even when waiting for packets,

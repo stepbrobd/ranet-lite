@@ -449,7 +449,7 @@ func TestAuthenticatedPacketCommitRejectsReplay(t *testing.T) {
 // of order, as observed in practice under highly parallel real-world
 // traffic (e.g. iperf3 -P 8 sharing one SA's sequence space across
 // multiple flows/CPU cores), must still be accepted as long as they're
-// within windowSize — and exact duplicates, even far apart across a large
+// within the replay window — and exact duplicates, even far apart across a large
 // window advance, must still be rejected.
 func TestReplayWindowWideReordering(t *testing.T) {
 	const window = 4096
@@ -474,13 +474,13 @@ func TestReplayWindowWideReordering(t *testing.T) {
 		t.Fatal("exact duplicate of a far-behind packet was accepted")
 	}
 
-	// A packet beyond windowSize behind must be rejected as too old.
+	// A packet further behind than the window must be rejected as too old.
 	tooOld := uint32(10000 - window - 1)
 	if err := w.check(tooOld); err == nil {
 		t.Fatal("packet beyond the window was accepted")
 	}
 
-	// Advancing last by more than windowSize (a large jump forward, e.g.
+	// Advancing last by more than the window (a large jump forward, e.g.
 	// after a burst) must not retain stale bits from before the jump: a
 	// sequence that was legitimately received just before the jump must
 	// now correctly read as "too old" rather than incorrectly "already
