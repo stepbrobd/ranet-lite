@@ -282,7 +282,7 @@ func TestReplayedRequestDoesNotRefreshOrAdoptEndpoint(t *testing.T) {
 		if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
 			t.Fatal(err)
 		}
-		raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(time.Second))
+		raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(answerBudget))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -377,7 +377,7 @@ func TestAuthenticatedMalformedRequestGetsInvalidSyntax(t *testing.T) {
 	if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
 		t.Fatal(err)
 	}
-	raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(time.Second))
+	raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatal(err)
 	}

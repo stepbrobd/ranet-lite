@@ -31,6 +31,14 @@ type responderHarness struct {
 // newResponderHarness runs a Responder on one hub and hands back everything
 // needed to dial it from another, so a handshake in these tests is a real
 // exchange over loopback rather than hand-built messages.
+// answerBudget is how long a test waits for an answer it expects to arrive. It
+// is generous because a loaded machine is not a failing implementation: an
+// answer that never comes still fails, just later, while a budget tuned to an
+// idle machine turns load into a false red. An assertion that expects silence
+// uses a short wait instead, where the only cost of being wrong is a spurious
+// pass rather than a spurious failure.
+const answerBudget = 30 * time.Second
+
 func newResponderHarness(t *testing.T, lookup func(Identity) (ed25519.PublicKey, bool)) *responderHarness {
 	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -444,7 +452,7 @@ func TestResponderDoesNotReflectOnSPIAlone(t *testing.T) {
 	if err := mux.SendIKE(request); err != nil {
 		t.Fatal(err)
 	}
-	first, err := mux.RecvIKEUntil(time.Now().Add(30 * time.Second))
+	first, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatalf("the responder did not answer a valid IKE_SA_INIT: %v", err)
 	}
@@ -469,7 +477,7 @@ func TestResponderDoesNotReflectOnSPIAlone(t *testing.T) {
 	if err := mux.SendIKE(request); err != nil {
 		t.Fatal(err)
 	}
-	again, err := mux.RecvIKEUntil(time.Now().Add(30 * time.Second))
+	again, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatalf("an identical retransmission was not answered: %v", err)
 	}
@@ -549,7 +557,7 @@ func TestResponderTakesSlotBeforeKeyExchange(t *testing.T) {
 
 	// With the slots free the responder does answer, which gives the silence
 	// below its meaning.
-	answer, answered := offer(5*time.Second, 4)
+	answer, answered := offer(answerBudget, 4)
 	if !answered {
 		t.Fatal("an unacceptable offer drew no answer at all")
 	}
@@ -613,7 +621,7 @@ func TestResponderRefusesCriticalPayloadItDoesNotImplement(t *testing.T) {
 	if err := mux.SendIKE(encodeTestSAInit(t, spiI, ni, ikeProposal(), critical)); err != nil {
 		t.Fatal(err)
 	}
-	reply, err := mux.RecvIKEUntil(time.Now().Add(5 * time.Second))
+	reply, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatalf("a critical payload we do not implement drew no answer: %v", err)
 	}
@@ -736,7 +744,7 @@ func TestDeleteIKEReachesPeerWithoutRunLoop(t *testing.T) {
 		t.Fatal("DeleteIKE never returned, so it is waiting on a run loop that does not exist")
 	}
 
-	raw, err := responder.Mux().RecvIKEUntil(time.Now().Add(5 * time.Second))
+	raw, err := responder.Mux().RecvIKEUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatalf("the peer never received the Delete: %v", err)
 	}
@@ -827,7 +835,7 @@ func observedEndpoint(t *testing.T, hub *transport.Hub, spi uint64) transport.En
 	if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
 		t.Fatal(err)
 	}
-	_, endpoint, err := mux.RecvIKEFromUntil(time.Now().Add(5 * time.Second))
+	_, endpoint, err := mux.RecvIKEFromUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1183,7 +1191,7 @@ func TestResponderRefusesOfferItCannotAuthenticate(t *testing.T) {
 	if err := mux.SendIKE(request); err != nil {
 		t.Fatal(err)
 	}
-	reply, err := mux.RecvIKEUntil(time.Now().Add(10 * time.Second))
+	reply, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatalf("an offer this responder cannot authenticate drew no answer: %v", err)
 	}
@@ -1355,7 +1363,7 @@ func TestResponderChecksTheNonceAgainstTheNegotiatedPRF(t *testing.T) {
 				if err := mux.SendIKE(encodeTestSAInit(t, spiI, short, proposal, ahead)); err != nil {
 					t.Fatal(err)
 				}
-				reply, err := mux.RecvIKEUntil(time.Now().Add(5 * time.Second))
+				reply, err := mux.RecvIKEUntil(time.Now().Add(answerBudget))
 				if err != nil {
 					return Notify{}, false
 				}

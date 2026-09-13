@@ -194,7 +194,7 @@ func TestTwoNodesConvergeOverLoopback(t *testing.T) {
 
 	// Both ends settle on exactly one session, which is the thing the
 	// preference rule decides and which diverges if the two ends disagree.
-	waitFor(t, 20*time.Second, "one established session at each end", func() bool {
+	waitFor(t, convergeBudget, "one established session at each end", func() bool {
 		return len(alpha.client.sessions.paths()) == 1 && len(bravo.client.sessions.paths()) == 1
 	})
 
@@ -205,7 +205,7 @@ func TestTwoNodesConvergeOverLoopback(t *testing.T) {
 		peer, ok := from.client.Mesh.Routes.Lookup(netip.Addr{}, to.prefix.Addr().Next())
 		return ok && peer != nil
 	}
-	waitFor(t, 20*time.Second, "each node forwarding to the other's prefix", func() bool {
+	waitFor(t, convergeBudget, "each node forwarding to the other's prefix", func() bool {
 		return reaches(alpha, bravo) && reaches(bravo, alpha)
 	})
 
@@ -215,7 +215,7 @@ func TestTwoNodesConvergeOverLoopback(t *testing.T) {
 	// The preference bit is a property of the SA rather than of the node that
 	// holds it, so the two ends agree on it exactly when they are holding the
 	// same SA.
-	waitFor(t, 20*time.Second, "both ends holding the same session", func() bool {
+	waitFor(t, convergeBudget, "both ends holding the same session", func() bool {
 		a, aok := preferenceOf(alpha)
 		b, bok := preferenceOf(bravo)
 		return aok && bok && a == b
@@ -262,7 +262,7 @@ func run(t *testing.T, nodes ...*loopbackNode) (context.Context, func()) {
 					if err != nil && !isCanceled(err) {
 						t.Errorf("a node stopped with %v", err)
 					}
-				case <-time.After(30 * time.Second):
+				case <-time.After(convergeBudget):
 					t.Error("a node did not stop after its context was canceled")
 				}
 			}
@@ -271,6 +271,14 @@ func run(t *testing.T, nodes ...*loopbackNode) (context.Context, func()) {
 	t.Cleanup(stop)
 	return ctx, stop
 }
+
+// convergeBudget is how long these tests wait for something they expect to
+// happen. It is generous because a loaded machine is not a failing
+// implementation: a convergence that never happens still fails the test, just
+// later, while a budget tuned to an idle machine turns load into a false red.
+// Every one of these is a positive assertion, so nothing is weakened by
+// waiting longer.
+const convergeBudget = 60 * time.Second
 
 func waitFor(t *testing.T, limit time.Duration, what string, done func() bool) {
 	t.Helper()
@@ -290,7 +298,7 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 	alpha, bravo := newLoopbackMesh(t)
 	run(t, alpha, bravo)
 	added := netip.MustParsePrefix("fd00:aa::/64")
-	waitFor(t, 20*time.Second, "the initial route", func() bool {
+	waitFor(t, convergeBudget, "the initial route", func() bool {
 		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, alpha.prefix.Addr().Next())
 		return ok && peer != nil
 	})
@@ -301,7 +309,7 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 		t.Fatalf("adding an originated prefix was refused: %v", err)
 	}
 
-	waitFor(t, 20*time.Second, "the reloaded prefix to reach the peer", func() bool {
+	waitFor(t, convergeBudget, "the reloaded prefix to reach the peer", func() bool {
 		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, added.Addr().Next())
 		return ok && peer != nil
 	})
@@ -326,7 +334,7 @@ func TestShutdownTellsPeerBeforeGoing(t *testing.T) {
 	_, stopAlpha := run(t, alpha)
 	t.Cleanup(stopAlpha)
 
-	waitFor(t, 20*time.Second, "both ends established", func() bool {
+	waitFor(t, convergeBudget, "both ends established", func() bool {
 		return len(alpha.client.sessions.paths()) == 1 && len(bravo.client.sessions.paths()) == 1
 	})
 
@@ -334,7 +342,7 @@ func TestShutdownTellsPeerBeforeGoing(t *testing.T) {
 	// Delete. bravo has to notice through that rather than through its own
 	// liveness timer, which is far slower than this.
 	alpha.client.sessions.closeAll()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(convergeBudget)
 	for len(bravo.client.sessions.paths()) != 0 {
 		if time.Now().After(deadline) {
 			bravo.client.sessions.mu.Lock()

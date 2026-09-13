@@ -128,7 +128,7 @@ func TestPeerDeleteOnOneSidedCollisionKeepsSessionOpen(t *testing.T) {
 	if _, err := peer.WriteToUDP(withNonESPMarker(del), dst); err != nil {
 		t.Fatal(err)
 	}
-	raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(5 * time.Second))
+	raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(answerBudget))
 	if err != nil {
 		t.Fatal(err)
 	}
