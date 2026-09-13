@@ -143,9 +143,14 @@ func TestUDPReceiveSkipsTruncatedMessagesAndPreservesGROTail(t *testing.T) {
 		return 3, nil
 	}}}
 	packets, sizes, endpoints := make([][]byte, 128), make([]int, 128), make([]Endpoint, 128)
-	n, _, err := socket.receiver()(packets, sizes, endpoints)
+	n, refused, err := socket.receiver()(packets, sizes, endpoints)
 	if err != nil || n != 3 {
 		t.Fatalf("receive: n=%d err=%v, want three intact GRO segments", n, err)
+	}
+	// The two the kernel truncated went nowhere, and the hub's counter is what
+	// tells an operator that from an idle socket.
+	if refused != 2 {
+		t.Errorf("the receiver reported %d refused, want the two truncated messages", refused)
 	}
 	for i, want := range []int{8, 8, 4} {
 		if sizes[i] != want || len(packets[i]) != want {
@@ -247,12 +252,15 @@ func TestUDPReceiveDropsDatagramWithNoUsableSource(t *testing.T) {
 	}}}
 	receive := socket.receiver()
 	packets, sizes, endpoints := make([][]byte, 8), make([]int, 8), make([]Endpoint, 8)
-	n, _, err := receive(packets, sizes, endpoints)
+	n, refused, err := receive(packets, sizes, endpoints)
 	if err != nil {
 		t.Fatalf("one unparseable control message failed the whole receive: %v", err)
 	}
 	if n != 2 {
 		t.Fatalf("the receive returned %d datagrams, want the two whose source could be read", n)
+	}
+	if refused != 1 {
+		t.Errorf("the receiver reported %d refused, want the one whose source it could not read", refused)
 	}
 	for i := range n {
 		if endpoints[i] == nil {
