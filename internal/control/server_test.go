@@ -1,7 +1,9 @@
 package control
 
 import (
+	"bufio"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -253,3 +255,74 @@ func TestDurationRoundTripsAsText(t *testing.T) {
 		t.Errorf("decoded as %s", back)
 	}
 }
+
+// A live daemon owns its socket even when nothing can dial it. Deciding
+// staleness by dialing unlinks a running node's socket whenever the dial fails
+// for any reason but a refused connection, and a daemon out of descriptors,
+// one whose backlog is full and one whose socket this user cannot open all
+// fail that way.
+func TestListenRefusesALiveSocketItCannotDial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	listener, err := Listen(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// connect needs write permission on a unix socket, so this is one a live
+	// daemon is serving and nothing can reach.
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Listen(path); err == nil {
+		t.Fatal("a second daemon took over a live socket it could not dial")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the live daemon's socket was unlinked: %v", err)
+	}
+}
+
+// An idle connection costs the daemon a goroutine and a descriptor until
+// something closes it. net/http clears the read deadline between requests, so
+// ReadHeaderTimeout does not bound one that has finished a request and gone
+// quiet.
+func TestIdleConnectionsAreBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for an idle timeout")
+	}
+	server := newServer(&fakeSource{})
+	if server.IdleTimeout == 0 {
+		t.Fatal("an idle connection is bounded by IdleTimeout and by nothing else")
+	}
+	server.IdleTimeout = 100 * time.Millisecond
+	client, daemon := net.Pipe()
+	defer client.Close()
+	go server.Serve(&onePipe{daemon: daemon})
+
+	if _, err := client.Write([]byte("GET " + PathStatus + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bufio.NewReader(client).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadAll(client); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("an idle connection was not closed: %v", err)
+	}
+}
+
+// onePipe hands a server one connection and then blocks, which is enough to
+// watch what the server does with that one.
+type onePipe struct {
+	daemon net.Conn
+	done   bool
+}
+
+func (p *onePipe) Accept() (net.Conn, error) {
+	if p.done {
+		select {}
+	}
+	p.done = true
+	return p.daemon, nil
+}
+func (p *onePipe) Close() error   { return nil }
+func (p *onePipe) Addr() net.Addr { return p.daemon.LocalAddr() }
