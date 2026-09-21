@@ -333,10 +333,23 @@ babel:
 #   vrf: gravity                   # joined only while the link has no master
 #   vrf_create: true               # linux only: make it rather than expect networkd to have
 #   reconcile_interval: 30s
-#   rules:                         # linux only, see the platform notes above
+#   rules:                         # linux only, see the platform notes below
 #     - { fwmark: 0x726c, table: main, priority: 40, family: both }
 #     - { to: "2a0c:b641:69c::/48", table: 200, priority: 100 }
 #     - { from: "10.66.0.5/32", table: 200, priority: 150 }
+
+# Optional: segment routing, performed here rather than by a kernel, so it is
+# the same on every platform. local names the segments this node answers for,
+# steer which of this node's own packets go through a segment list. Every
+# steered packet carries its list inside the tunnel, so the device's MTU comes
+# down by the longest list configured.
+# segments:
+#   source: "2a0c:b641:69c:8c0::1" # the outer source, as `ip sr tunsrc` sets it
+#   local:
+#     - { sid: "2a0c:b641:69c:8c6::1", behavior: "End.DT46" }
+#     - { sid: "2a0c:b641:69c:8c6::2", behavior: "End" }
+#   steer:
+#     - { from: "2602:f590::23:161:104:117/128", via: ["2a0c:b641:69c:98d6::1"] }
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
@@ -408,16 +421,24 @@ produced.
 
 Every steered packet carries its segment list inside the tunnel, so the device
 comes up with the longest configured list taken off its MTU, and a list long
-enough to take it under the 1280 IPv6 requires is refused rather than installed.
-Steering happens before the route lookup, because a steered packet is routed by
-the segment it is going to rather than by the address it was addressed to. A
-packet a policy claims and cannot encapsulate goes out unencapsulated and is
-counted, which is the more conservative of the two failures.
+enough to take it under the 1280 byte minimum IPv6 requires is refused rather
+than installed. Steering happens before the route lookup, because a steered
+packet is routed by the segment it is going to rather than by the address it was
+addressed to. A packet a policy claims and cannot encapsulate goes out
+unencapsulated and is counted as `unsteered`, which is the more conservative of
+the two failures. Every reason it can fail is refused when the configuration is
+read, so the only one left needs a packet larger than the device MTU the daemon
+itself set, and the counter stays at zero on a node whose MTU nothing else has
+raised.
 
-It interoperates with the kernel's own implementation in both directions, which
-the `segments` VM check holds: the client steers through a SID the gateway
-answers for with `seg6local`, and removing that route breaks exactly the steered
-destination and leaves the unsteered one alone.
+A header this tree writes is one the kernel acts on, which the `segments` VM
+check holds: the client steers through a SID the gateway answers for with
+`seg6local`, `tcpdump` parses the header as `RT6 (len=2, type=4, segleft=0)`,
+and removing the SID leaves the encapsulated packet arriving with nothing coming
+out of it. The other direction, a header the kernel writes and this tree acts
+on, is held by the unit tests in `internal/srv6` against a reconstruction of
+what `__seg6_do_srh_encap` produces, and by no VM arm: no arm configures
+`segments.local`, so `End` and `End.DT46` have no end-to-end coverage.
 
 ## What each platform gives the reconciler
 
@@ -432,18 +453,20 @@ which is the failure that reads as a routing problem for a day.
 carry, so a dump reads back only this reconciler's and a delete can never reach
 another writer's. systemd-networkd stamps `RTPROT_STATIC` on the rules it
 writes, so a node mid-migration keeps the two sets apart on its own.
-`kernel.vrf_create` makes the master device the mesh table is bound to, and one
-this process created is removed again at shutdown, while one it found is left
-alone with everything in its table.
+`kernel.vrf_create` makes the master device the mesh table is bound to when no
+device of that name exists. One this process created is removed again at
+shutdown. One it found is left alone with everything in its table, whatever
+table that is: a device somebody else bound to another table is adopted as it
+stands, so the tun's lookups go there rather than to `kernel.table`.
 
 **darwin** has one forwarding table, no rules and no VRFs, and refuses
-`kernel.rules`, `kernel.vrf_create` and `prefsrc4` by name. It reaches the two
-ends the rules exist for with interface scope instead: an announced default and
-a source-specific route are installed scoped to the tun, so no unbound socket
-can select either, which keeps the machine from being captured and the ESP
-underlay out of the tunnel carrying it. `fwmark` is refused there for the same
-reason, since there is nothing for a mark to select and nothing to select it
-with.
+`kernel.rules`, `kernel.vrf`, `kernel.vrf_create` and `prefsrc4` by name. It
+reaches the two ends the rules exist for with interface scope instead: an
+announced default and a source-specific route are installed scoped to the tun,
+so no unbound socket can select either, which keeps the machine from being
+captured and the ESP underlay out of the tunnel carrying it. `fwmark` is refused
+there for the same reason, since there is nothing for a mark to select and
+nothing to select it with.
 
 **iOS and Android**, planned rather than present, have less again: the tunnel is
 a `NEPacketTunnelProvider` or a `VpnService`, the process is handed a list of
@@ -463,11 +486,20 @@ over the extension's own channel.
 
 `-control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
 the default, so a node is askable without having been configured to be.
-`-control ""` turns it off. The socket is mode 0660, which is the whole
-authorization story: nothing on it writes, so read access is the whole grant. A
-path that cannot be bound refuses the startup rather than leaving a node nobody
-can ask, a socket a dead instance left behind is cleared, and one a live daemon
-is listening on is refused by name.
+`-control ""` turns it off. The socket is mode 0660 and the unit names the group
+that can read it. Nothing on the socket writes, and a reader is bounded by an
+idle timeout and by a limit on how many connections one may hold at once,
+because a client that accumulates them costs the daemon a descriptor apiece and
+a node out of descriptors is one that cannot be asked anything at all.
+
+Which process owns the path is settled by an exclusive lock on a sibling file
+rather than by dialing the socket to see whether anything answers, since a live
+daemon out of descriptors and one whose socket the caller cannot open both fail
+to answer and neither has stopped owning its path. A socket a dead instance left
+behind is cleared under that lock, a path that is not a socket is refused by
+name, and a path an operator named and this node cannot bind refuses the
+startup. The default path warns and carries on instead, because it is on without
+having been asked for.
 
 The subcommands read it and print a table, or the wire form with `-json`:
 
@@ -482,22 +514,24 @@ tun         ranet0 mtu 1400 queues 16
 role        initiator, responder, full mesh, no transit
 forwarding  ipv4 on ipv6 on
 registry    /etc/ranet/registry.json, 142 nodes in 31 organizations
-kernel      table 200 protocol 155, 609 installed, last pass 12s ago
+kernel      table 200 protocol 155, 609 installed, last pass 12 seconds ago
 dialers     117 running
 sessions    83
 neighbors   83, 81 alive
 routes      611 prefixes, 604 selected, 3 originated
 originate   23.161.104.117/32 2602:f590::23:161:104:117/128 2a0c:b641:69c:8c0::/60
+segments    2a0c:b641:69c:8c6::1 End.DT46 (0 forwarded, 5 delivered, 0 dropped)
+steering    from 2602:f590::23:161:104:117/128 via 2a0c:b641:69c:98d6::1 (12 steered)
 esp         41822931 in, 0 dropped, 14 refused
 
 $ ranet-lite neighbors
-peer            state  cost  rxcost  rtt       routes  expires  dropped  failed
-ysun/toompea@0  up       116      96  27.2ms       15    11.3s        0       0
-ysun/isere@1    up       194      96  176.7ms     130     9.8s        0       0
+peer            state  cost  rxcost  rtt      routes  expires  dropped  failed
+ysun/toompea@0  up     116   96      27.2ms   15      11.3s    0        0
+ysun/isere@1    up     194   96      176.7ms  130     9.8s     0        0
 
 $ ranet-lite routes
 destination  from            via             metric  router-id         seqno  paths
-::/0         2602:f590::/36  ysun/toompea@0     212   0a1b2c3d4e5f6071     42      7
+::/0         2602:f590::/36  ysun/toompea@0  212     0a1b2c3d4e5f6071  42     7
 ```
 
 `neighbors` answers `birdc show babel neighbors`, with the neighbor's own

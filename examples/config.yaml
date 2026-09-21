@@ -137,12 +137,14 @@ babel:
 #   # list, which `gv` installs by hand today: the traffic sourced from this
 #   # node's announced address, through the waypoints and out at a chosen exit.
 #   # from and to select the packets, the same pair the forwarding table is
-#   # keyed by, and an entry naming neither is refused because it would claim
-#   # its own encapsulation. via is in the order the packet visits.
+#   # keyed by, and an entry naming neither is refused because it would steer
+#   # every packet this node sends, babel's own included. via is in the order
+#   # the packet visits.
 #   #
 #   # Every steered packet carries the list inside the tunnel, so the device's
 #   # MTU comes down by the longest list configured, and one long enough to
-#   # take it under the 1280 IPv6 requires is refused rather than installed.
+#   # take it under the 1280 byte minimum IPv6 requires is refused rather than
+#   # installed.
 #   steer:
 #     - { from: "2602:f590::23:161:104:117/128", via: ["2a0c:b641:69c:98d6::1"] }
 
