@@ -71,6 +71,12 @@ const (
 	// routingTypeSegment is Routing Type 4, the SRH, RFC 8754 section 2.
 	routingTypeSegment = 4
 
+	// MinimumIPv6MTU is RFC 8200 section 5: "IPv6 requires that every link in
+	// the Internet have an MTU of 1280 octets or greater." A device steering
+	// through a list is refused below it, and an ICMP error stays inside it so
+	// it reaches the sender without fragmenting.
+	MinimumIPv6MTU = 1280
+
 	// MaxSegments bounds a segment list this node will build or act on. The
 	// fleet's longest path is a handful of waypoints, and the cap exists so
 	// the number is ours rather than a peer's: every segment is 16 bytes in
@@ -89,6 +95,12 @@ var (
 	// drops it, as get_and_validate_srh does, because a waypoint SID is not
 	// an address this node terminates traffic on.
 	ErrExhausted = errors.New("srv6: End reached the last segment and there is nowhere to forward to")
+	// ErrHopLimit and ErrHeaderInvalid name the two refusals RFC 8986 section
+	// 4.1 answers with an ICMP message rather than with silence, S06 and S10.
+	// A caller that can reach the sender tells them apart with errors.Is and
+	// builds the answer with TimeExceeded or ParameterProblem.
+	ErrHopLimit      = errors.New("srv6: the hop limit reached zero at this waypoint")
+	ErrHeaderInvalid = errors.New("srv6: the routing header does not describe itself")
 )
 
 // Header is one segment routing header as this package reads and writes it.
@@ -335,7 +347,7 @@ func Parse(raw []byte) (Header, error) {
 	// segments have to fit and everything past them is somebody else's.
 	count := int(srh[4]) + 1
 	if 2*count > extLen {
-		return Header{}, fmt.Errorf("srv6: last entry %d needs %d bytes of segments and the header carries %d", srh[4], addrLen*count, 8*extLen)
+		return Header{}, fmt.Errorf("%w: last entry %d needs %d bytes of segments and the header carries %d", ErrHeaderInvalid, srh[4], addrLen*count, 8*extLen)
 	}
 	if count > MaxSegments {
 		return Header{}, fmt.Errorf("srv6: %d segments is more than the %d this node will act on", count, MaxSegments)
@@ -358,7 +370,7 @@ func Parse(raw []byte) (Header, error) {
 	// what a kernel writes for `encap.red`, so refusing it black-holes a path
 	// rather than rejecting a malformed packet.
 	if int(header.SegmentsLeft) > count {
-		return Header{}, fmt.Errorf("srv6: segments left %d is past the last entry %d", header.SegmentsLeft, count-1)
+		return Header{}, fmt.Errorf("%w: segments left %d is past the last entry %d", ErrHeaderInvalid, header.SegmentsLeft, count-1)
 	}
 	return header, nil
 }
@@ -379,7 +391,7 @@ func End(raw []byte) (netip.Addr, error) {
 		return netip.Addr{}, ErrExhausted
 	}
 	if raw[7] <= 1 {
-		return netip.Addr{}, errors.New("srv6: the hop limit reached zero at this waypoint")
+		return netip.Addr{}, ErrHopLimit
 	}
 	raw[7]--
 	srh := raw[ipv6HeaderLen:]

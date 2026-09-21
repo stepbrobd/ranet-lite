@@ -172,16 +172,12 @@ func steeredMTU(steering *srv6.SteerTable) (int, error) {
 		return 0, nil
 	}
 	mtu := netstack.DefaultMTU - overhead
-	if mtu < minimumIPv6MTU {
+	if mtu < srv6.MinimumIPv6MTU {
 		return 0, fmt.Errorf("config: the longest segment list takes %d bytes, leaving a %d byte device under the %d byte minimum IPv6 requires",
-			overhead, mtu, minimumIPv6MTU)
+			overhead, mtu, srv6.MinimumIPv6MTU)
 	}
 	return mtu, nil
 }
-
-// minimumIPv6MTU is RFC 8200 section 5: "IPv6 requires that every link in the
-// Internet have an MTU of 1280 octets or greater."
-const minimumIPv6MTU = 1280
 
 // newClient is New with the loading done, so a test can stand up a client
 // around a mesh it built itself rather than a privileged TUN.

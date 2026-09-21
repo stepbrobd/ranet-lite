@@ -132,6 +132,9 @@ type SegmentCounters struct {
 	// unencapsulated and took the route they would have taken anyway.
 	Steered   uint64 `json:"steered"`
 	Unsteered uint64 `json:"unsteered"`
+	// Answered counts the ICMP errors sent for refused packets, which is the
+	// half of Dropped whose sender was told why.
+	Answered uint64 `json:"answered"`
 }
 
 // RegistryInfo is the trust root as this node last read it. A reload replaces

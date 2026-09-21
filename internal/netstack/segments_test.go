@@ -336,3 +336,58 @@ func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
 		t.Errorf("the batch forwarded %d and dropped %d of %d", got.Forwarded, got.Dropped, count)
 	}
 }
+
+// An ICMP error is a packet a peer's packet made this node send, which is the
+// shape of every amplification this tree has had. RFC 4443 section 2.4 (f)
+// requires a limit for that reason, so a peer sending refused headers in a
+// loop gets the refill rate and no more, while the counters keep the whole
+// record.
+func TestRefusedPacketsAreAnsweredAtABoundedRate(t *testing.T) {
+	waypoint := segAddr("2a0c:b641:69c:8c6::2")
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingPeer{}
+	m := &Mesh{Routes: NewRouteTable()}
+	m.startSegmentReports()
+	m.SetSegments(table)
+	// The error goes back to the node that encapsulated the packet, so the
+	// route that has to exist is the one to its tunnel source.
+	m.Routes.Set(netip.Prefix{}, segPrefix("2a0c:b641:69c::/48"), recorder.peer("sender"))
+
+	// A segment list this node will not act on, which is the refusal RFC 8986
+	// section 4.1 S10 answers with a Parameter Problem.
+	const flood = 500
+	batch := make([][]byte, 0, flood)
+	for range flood {
+		outer, err := srv6.Encapsulate(
+			plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload"),
+			segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, segAddr("2a0c:b641:69c:98d6::1")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		outer[ipv6HeaderOffsetSegmentsLeft] = 9 // past the last entry
+		batch = append(batch, outer)
+	}
+	m.applySegments(batch)
+
+	counters := m.SegmentCounters()
+	if counters.Dropped != flood {
+		t.Errorf("%d of %d refused packets were counted", counters.Dropped, flood)
+	}
+	if counters.Answered > icmpBurst {
+		t.Errorf("%d answers went out for %d refused packets, over the burst of %d",
+			counters.Answered, flood, icmpBurst)
+	}
+	if counters.Answered == 0 {
+		t.Error("nothing was answered, so a traceroute through this node sees nothing")
+	}
+	if sent := len(recorder.packets()); uint64(sent) != counters.Answered {
+		t.Errorf("%d packets went to the peer against %d counted", sent, counters.Answered)
+	}
+}
+
+// ipv6HeaderOffsetSegmentsLeft is where Segments Left sits in a packet whose
+// routing header follows the fixed header.
+const ipv6HeaderOffsetSegmentsLeft = 40 + 3

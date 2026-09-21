@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/srv6"
 )
 
@@ -28,6 +29,15 @@ var errNotIP = errors.New("netstack: a forwarded segment is not an IP packet")
 // choosing to send malformed headers should cost this node a counter, not a
 // log line per packet.
 const segmentDropInterval = 30 * time.Second
+
+// icmpBurst and icmpRefill bound the ICMP errors this node answers refused
+// packets with. A traceroute sends three probes per hop, so the burst carries
+// two hops' worth without waiting, and the refill bounds what a peer sending
+// refused headers in a loop gets out of this node.
+const (
+	icmpBurst  = 8
+	icmpRefill = 250 * time.Millisecond
+)
 
 // SetSteering installs the table deciding which of this node's own packets go
 // through a segment list, or nil for none. Like SetSegments it is called
@@ -84,6 +94,9 @@ type SegmentCounters struct {
 	// they were.
 	Steered   uint64
 	Unsteered uint64
+	// Answered counts the ICMP errors sent for refused packets, which is the
+	// half of Dropped a sender was told about.
+	Answered uint64
 }
 
 func (m *Mesh) SegmentCounters() SegmentCounters {
@@ -93,6 +106,7 @@ func (m *Mesh) SegmentCounters() SegmentCounters {
 		Dropped:   m.segmentsDropped.Load(),
 		Steered:   m.segmentsSteered.Load(),
 		Unsteered: m.segmentsUnsteered.Load(),
+		Answered:  m.segmentsAnswered.Load(),
 	}
 }
 
@@ -135,6 +149,7 @@ func (m *Mesh) applySegments(raw [][]byte) [][]byte {
 		case srv6.ActionDrop:
 			take(i)
 			m.noteSegmentDrop(result.Err)
+			m.answerRefused(packet, result.Err)
 		}
 	}
 	m.forwardSegments(forward)
@@ -228,6 +243,63 @@ func (m *Mesh) noteSegmentDrop(err error) {
 	m.reportSegmentDrop("a packet addressed to one of this node's segments was refused", "err", err)
 }
 
+// answerRefused sends the ICMP error RFC 8986 section 4.1 answers a refused
+// packet with, S06 for a hop limit that ran out here and S10 for a header this
+// node will not act on. Everything else is dropped in silence, because an
+// error is only worth sending where it names something the sender can fix.
+//
+// The budget is the whole of the bound. An error is a packet a peer's packet
+// caused this node to send, which is the shape every amplification this tree
+// has had took, and RFC 4443 section 2.4 (f) requires a limit for that reason.
+// A burst covers a traceroute's three probes per hop, and the refill bounds a
+// node sending refused headers in a loop.
+func (m *Mesh) answerRefused(offending []byte, reason error) {
+	var answer []byte
+	var ok bool
+	source := netip.AddrFrom16([16]byte(offending[24:40]))
+	switch {
+	case errors.Is(reason, srv6.ErrHopLimit):
+		answer, ok = srv6.TimeExceeded(offending, source)
+	case errors.Is(reason, srv6.ErrHeaderInvalid):
+		answer, ok = srv6.ParameterProblem(offending, source)
+	}
+	if !ok || !m.takeICMPToken() {
+		return
+	}
+	peer, ok := m.Routes.Lookup(source, netip.AddrFrom16([16]byte(offending[8:24])))
+	if !ok || peer == nil {
+		return
+	}
+	batch := peer.reserveBatchNow(1)
+	if batch == nil {
+		return
+	}
+	batch.append(answer, esp.NextHeaderIPv6)
+	if err := batch.enqueue(); err != nil {
+		m.reportSegmentDrop("the transport lost an icmp error", "err", err)
+		return
+	}
+	m.segmentsAnswered.Add(1)
+}
+
+// takeICMPToken reports whether this node may answer one more refused packet.
+// The bucket holds icmpBurst and refills at icmpRefill, so a traceroute gets
+// its probes answered and a flood gets the refill rate.
+func (m *Mesh) takeICMPToken() bool {
+	now := int64(time.Since(m.segmentsStarted))
+	for {
+		last := m.icmpFilled.Load()
+		tokens := min(icmpBurst, m.icmpTokens.Load()+(now-last)/int64(icmpRefill))
+		if tokens < 1 {
+			return false
+		}
+		if m.icmpFilled.CompareAndSwap(last, now) {
+			m.icmpTokens.Store(tokens - 1)
+			return true
+		}
+	}
+}
+
 // reportSegmentDrop writes at most one line per interval, whatever the reason,
 // so a peer sending a stream of refused headers costs a counter rather than a
 // log. The counter is the record; the line is there to say what kind.
@@ -249,6 +321,11 @@ type segmentCounters struct {
 	steerTable        atomic.Pointer[srv6.SteerTable]
 	segmentsSteered   atomic.Uint64
 	segmentsUnsteered atomic.Uint64
+	segmentsAnswered  atomic.Uint64
+	// icmpTokens and icmpFilled are the bucket answerRefused draws from, in
+	// tokens and in nanoseconds since segmentsStarted.
+	icmpTokens atomic.Int64
+	icmpFilled atomic.Int64
 	// segmentsStarted and segmentReported space the drop reports on the
 	// monotonic clock, as Peer.sendErrReported does, so a backward step of the
 	// wall clock cannot suppress every report until it catches up.
@@ -261,4 +338,5 @@ type segmentCounters struct {
 func (c *segmentCounters) startSegmentReports() {
 	c.segmentsStarted = time.Now()
 	c.segmentReported.Store(-int64(segmentDropInterval))
+	c.icmpTokens.Store(icmpBurst)
 }

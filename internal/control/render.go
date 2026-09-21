@@ -98,9 +98,13 @@ func segmentLine(s Status) string {
 	if len(s.Segments) == 0 {
 		return "off"
 	}
-	return fmt.Sprintf("%s (%d forwarded, %d delivered, %d dropped)",
+	line := fmt.Sprintf("%s (%d forwarded, %d delivered, %d dropped",
 		strings.Join(s.Segments, ", "),
 		s.SegmentCounters.Forwarded, s.SegmentCounters.Delivered, s.SegmentCounters.Dropped)
+	if s.SegmentCounters.Answered > 0 {
+		line += fmt.Sprintf(", %d answered", s.SegmentCounters.Answered)
+	}
+	return line + ")"
 }
 
 // steeringLine says "off" on a node that steers nothing, which is most of
