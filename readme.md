@@ -381,10 +381,20 @@ own listener, separate from `-pprof` so a fleet node can be scraped without
 exposing a profiler. It reports what `prometheus-bird-exporter` reported while
 Babel lived in BIRD: neighbor liveness and link cost, routes received per
 neighbor, routes selected and originated, established sessions per path, packets
-each peer refused to queue, and inbound ESP packet and drop counters. Everything
-is read from live state at scrape time, so a scrape reflects the instant it
-happened rather than a sampled snapshot. What a counter cannot carry, the
-per-neighbor route lists, the route table and the reconciler's last pass, is on
+each peer refused to queue, and inbound ESP packet and drop counters.
+
+It also reports the two subsystems that have no exporter anywhere, because on a
+fleet node they were the kernel's: the route reconciler, which replaced BIRD's
+kernel protocols, as routes installed and skipped, when its last pass finished
+and whether that pass failed; and segment routing, which replaced `seg6local`,
+as what this node did for peers (forwarded, delivered, dropped, answered) and
+what it did with its own traffic (steered, and dropped with a reason). A node
+with the reconciler off writes none of its series rather than zeroes that read
+as a reconciler installing nothing.
+
+Everything is read from live state at scrape time, so a scrape reflects the
+instant it happened rather than a sampled snapshot. What a counter cannot carry,
+the per-neighbor route lists and the route table, is on
 [the control socket](#control-socket) instead.
 
 ## Segment routing, in this process
@@ -428,11 +438,15 @@ addressed to. The outer header takes its traffic class, flow label and hop limit
 from the packet it carries, as `__seg6_do_srh_encap` does, so a steered path
 costs the packet one hop per waypoint and a packet that arrives with nothing
 left to spend is answered with an ICMP Time Exceeded rather than dropped in
-silence. A packet a policy claims and cannot encapsulate goes out unencapsulated
-and is counted as `unsteered`, which is the more conservative of the two
-failures. Every reason it can fail is refused when the configuration is read, so
-the only one left needs a packet larger than the device MTU the daemon itself
-set, and the counter stays at zero on a node whose MTU nothing else has raised.
+silence. A packet a policy claims and this node does not send is dropped rather
+than put out by the route the policy exists to override, because a policy here
+selects an exit and that route puts the packet out of another node under a
+source it does not announce, which is a wrong path rather than a degraded one.
+There are two ways to lose one and `status` counts them apart: too large to
+encapsulate, which every other reason being refused when the configuration is
+read leaves as the only one, and no route to the first segment, which is the
+mesh rather than the configuration. Neither is counted against the segments this
+node answers for, since neither is anything a peer did.
 
 A header this tree writes is one the kernel acts on, which the `segments` VM
 check holds: the client steers through a SID the gateway answers for with
@@ -532,7 +546,7 @@ neighbors   83, 81 alive
 routes      611 prefixes, 604 selected, 3 originated
 originate   198.18.104.117/32 3fff:a::198:18:104:117/128 3fff:1:69c:8c0::/60
 segments    3fff:1:69c:8c6::1 End.DT46 (0 forwarded, 5 delivered, 0 dropped)
-steering    from 3fff:a::198:18:104:117/128 via 3fff:1:69c:98d6::1 (12 steered)
+steering    from 3fff:a::198:18:104:117/128 via 3fff:1:69c:98d6::1 (12 steered, 2 with no route to their first segment)
 esp         41822931 in, 0 dropped, 14 refused
 
 $ ranet-lite neighbors
