@@ -202,6 +202,17 @@ type Runtime struct {
 	// Table.AssignAnnounced puts on the device beside the addresses written
 	// here.
 	Announced []netip.Prefix
+	// BoundUnderlay says the transport's own socket no longer consults the
+	// forwarding table, because it is bound to the interface the host's
+	// default route leaves by. The darwin backend then installs an announced
+	// default as a real default rather than scoping it out of every socket's
+	// reach, which is the difference between a node that can hold a mesh
+	// address and one that can use a mesh exit. Leaving it off keeps the
+	// scoping. Nothing reads it on linux, where a socket mark and a policy
+	// rule do the same job and a default is installed unscoped either way.
+	// It is set from link.underlay, so it is handed here rather than written
+	// in cap.table: one setting decides both halves and they cannot disagree.
+	BoundUnderlay bool
 	// Sessions reports how many of this node's mesh sessions have recently
 	// proved their peer is there. Until one has, and once none has for
 	// Table.CaptureGrace, no route that would carry this machine's own

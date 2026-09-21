@@ -579,8 +579,21 @@ func (p *routePlatform) AddRoute(r Route) error {
 // on the same machine: its exit-node default is scoped to its utun, its
 // 100.64/10 is not.
 func (p *routePlatform) scopeRoute(r Route) bool {
-	return standsInForASource(r) || capturesTheMachine(r) || holdsAgainstTheFIB(r) ||
-		coversAny(r.Destination, p.underlay)
+	if standsInForASource(r) || holdsAgainstTheFIB(r) {
+		return true
+	}
+	// A socket bound with IP_BOUND_IF does not consult this FIB at all, so
+	// once the transport has bound its own to the interface the host's default
+	// route leaves by, a default out of the tun can no longer take the
+	// underlay carrying it. Keeping the underlay out is the only reason those
+	// two were scoped, and a scoped default is reached by nothing that did not
+	// name this interface, so leaving the scope on is a Mac that holds a mesh
+	// address and cannot use a mesh exit. See Config.BoundUnderlay, which is
+	// set from the same configuration that binds the socket.
+	if p.rt.BoundUnderlay {
+		return false
+	}
+	return capturesTheMachine(r) || coversAny(r.Destination, p.underlay)
 }
 
 // interface scope is the only thing on this platform that draws the
