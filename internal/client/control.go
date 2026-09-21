@@ -101,10 +101,11 @@ func (c *Client) Status() control.Status {
 	}
 }
 
-// segmentCounters carries the dataplane's counters onto the wire. The two
-// structs are written out rather than converted, so adding a field to one
-// without the other is a compile error rather than a number that silently
-// stops being reported.
+// segmentCounters carries the dataplane's counters onto the wire, field by
+// field rather than by a type conversion, so the wire form can change without
+// the dataplane's having to. Writing them out catches a renamed field and not
+// an added one, which is the drift that once made a counter stop being
+// reported here; TestSegmentCountersDoNotDrift catches the rest.
 func segmentCounters(counters netstack.SegmentCounters) control.SegmentCounters {
 	return control.SegmentCounters{
 		Forwarded: counters.Forwarded,

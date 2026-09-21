@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -81,7 +82,31 @@ func localSegments(cfg *config.Config) (*srv6.LocalTable, error) {
 		}
 		segments = append(segments, srv6.Segment{SID: sid, Behavior: behavior})
 	}
+	if err := refuseSegmentOnOwnAddress(cfg, segments); err != nil {
+		return nil, err
+	}
 	return srv6.NewLocalTable(segments)
+}
+
+// refuseSegmentOnOwnAddress rejects a SID this node also carries as an
+// ordinary address. The inbound seam acts on a packet by its destination
+// before the tun sees it, so every packet to that address would be refused as
+// carrying no routing header, and the address would go dark with nothing but a
+// rate-limited warning to say why. On linux the two coexist because the SID is
+// a route rather than an address; here they cannot.
+func refuseSegmentOnOwnAddress(cfg *config.Config, segments []srv6.Segment) error {
+	carried := make(map[netip.Addr]bool, len(cfg.Kernel.Addresses))
+	for _, raw := range cfg.Kernel.Addresses {
+		if prefix, err := netip.ParsePrefix(raw); err == nil {
+			carried[prefix.Addr()] = true
+		}
+	}
+	for _, segment := range segments {
+		if carried[segment.SID] {
+			return fmt.Errorf("config: segments.local %s is also a kernel.addresses entry, so every packet to it would be taken as a segment", segment.SID)
+		}
+	}
+	return nil
 }
 
 // steerTable builds the table deciding which of this node's own packets go
@@ -100,10 +125,7 @@ func steerTable(cfg *config.Config) (*srv6.SteerTable, error) {
 		if err != nil {
 			return nil, err
 		}
-		raw := entry.Source
-		if raw == "" {
-			raw = cfg.Segments.Source
-		}
+		raw := cmp.Or(entry.Source, cfg.Segments.Source)
 		if raw == "" {
 			return nil, fmt.Errorf("config: segments.steer %q needs a source, either its own or segments.source", entry.Via)
 		}
@@ -132,7 +154,13 @@ func steerPrefix(name, raw string) (netip.Prefix, error) {
 	if err != nil {
 		return netip.Prefix{}, fmt.Errorf("config: segments.steer %s %q: %w", name, raw, err)
 	}
-	return prefix.Masked(), nil
+	// Refused rather than masked, as kernel.Rule.validate refuses the same
+	// typo. Masking a host address written with the wrong length steers a
+	// whole prefix where one address was meant, and says nothing.
+	if prefix.Masked() != prefix {
+		return netip.Prefix{}, fmt.Errorf("config: segments.steer %s %s has bits set below its prefix length", name, prefix)
+	}
+	return prefix, nil
 }
 
 // effectivePeers is who this node dials: the configured list, or every node

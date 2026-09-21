@@ -100,6 +100,14 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 		"duplicate peer":        "peers:\n  - common_name: gateway\n  - common_name: gateway\n",
 		"unrepresentable babel": "babel:\n  update_interval: 11m\n",
 		"a second document":     "---\nresponder: false\npeers: []\n",
+		// Nothing below kernel.enabled is read at all while it is off, so a
+		// node that configured the reconciler and forgot the one line would
+		// otherwise come up with no rules and no message.
+		"rules while the reconciler is off": "kernel:\n  enabled: false\n  rules:\n    - { fwmark: 0x726c, table: main, priority: 40, family: both }\n",
+		"a vrf while the reconciler is off": "kernel:\n  enabled: false\n  vrf: gravity\n",
+		// Nothing reads segments.source until a steer entry needs it, so a
+		// typo in it survives a start on a node that steers nothing yet.
+		"an unparseable segment source": "segments:\n  source: \"not an address\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yaml")

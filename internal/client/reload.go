@@ -214,12 +214,6 @@ func reloadable(old, next *config.Config) error {
 	return nil
 }
 
-// sameKernelSettings compares the reconciler block, which is read once at
-// startup, by what it was given rather than by how the file was written. An
-// omitted list and an empty one mean the same thing, and so do an omitted
-// interval and one written out as its own default; comparing them as written
-// refuses a reload that changes nothing, which writing "reconcile_interval:
-// 30s" into the file would have been enough to cause.
 // normalizeSegments compares the block by what it was given rather than by how
 // the file was written, so an omitted list and an empty one are the same.
 func normalizeSegments(segments config.Segments) config.Segments {
@@ -242,6 +236,12 @@ func normalizeSegments(segments config.Segments) config.Segments {
 	return segments
 }
 
+// sameKernelSettings compares the reconciler block, which is read once at
+// startup, by what it was given rather than by how the file was written. An
+// omitted list and an empty one mean the same thing, and so do an omitted
+// interval and one written out as its own default. Comparing them as written
+// refuses a reload that changes nothing, which writing "reconcile_interval:
+// 30s" into the file would have been enough to cause.
 func sameKernelSettings(old, next config.Kernel) bool {
 	normalize := func(k *config.Kernel) {
 		if len(k.Addresses) == 0 {

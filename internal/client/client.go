@@ -173,7 +173,7 @@ func steeredMTU(steering *srv6.SteerTable) (int, error) {
 	}
 	mtu := netstack.DefaultMTU - overhead
 	if mtu < minimumIPv6MTU {
-		return 0, fmt.Errorf("config: the longest segment list takes %d bytes, leaving a %d byte device under the %d IPv6 requires",
+		return 0, fmt.Errorf("config: the longest segment list takes %d bytes, leaving a %d byte device under the %d byte minimum IPv6 requires",
 			overhead, mtu, minimumIPv6MTU)
 	}
 	return mtu, nil

@@ -299,11 +299,6 @@ func closeSession(sess *ike.Session) {
 	_ = sess.Mux().Close()
 }
 
-// holds reports whether a session that has recently proved the peer is there
-// serves this path, which lets a dialer stand down instead of opening a second
-// one that would only be resolved away. A session that has stopped proving it
-// does not count, so a dialer takes over from a dead one instead of waiting
-// out dead peer detection behind it.
 // liveSessionView is one entry of the set, copied out so that a caller reads
 // it without holding the lock every handshake and every teardown needs.
 type liveSessionView struct {
@@ -326,6 +321,11 @@ func (s *sessionSet) snapshot() []liveSessionView {
 	return out
 }
 
+// holds reports whether a session that has recently proved the peer is there
+// serves this path, which lets a dialer stand down instead of opening a second
+// one that would only be resolved away. A session that has stopped proving it
+// does not count, so a dialer takes over from a dead one instead of waiting
+// out dead peer detection behind it.
 func (s *sessionSet) holds(path string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

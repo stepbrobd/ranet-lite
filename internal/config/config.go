@@ -136,6 +136,48 @@ type Kernel struct {
 	ReconcileInterval *Duration `yaml:"reconcile_interval"`
 }
 
+// refuseWhatDisablingIgnores stops a start that configured the reconciler and
+// left it off. Nothing below Enabled is read at all in that case, so a node
+// that meant to write rules and forgot the one line comes up with a working
+// mesh, no rules and no message, which is the outage that reads as a routing
+// problem for a day.
+func (k Kernel) refuseWhatDisablingIgnores() error {
+	if k.Enabled {
+		return nil
+	}
+	if set := k.configured(); set != "" {
+		return fmt.Errorf("config: kernel.%s is set and kernel.enabled is false, so nothing would be written", set)
+	}
+	return nil
+}
+
+// configured names the first field that only the reconciler reads.
+func (k Kernel) configured() string {
+	switch {
+	case len(k.Rules) > 0:
+		return "rules"
+	case len(k.Addresses) > 0:
+		return "addresses"
+	case k.VRF != "":
+		return "vrf"
+	case k.CreateVRF:
+		return "vrf_create"
+	case k.PrefSrc4 != "":
+		return "prefsrc4"
+	case k.Table != 0:
+		return "table"
+	case k.Protocol != 0:
+		return "protocol"
+	case k.Metric != 0:
+		return "metric"
+	case k.AssignOriginated:
+		return "assign_originated"
+	case k.ReconcileInterval != nil:
+		return "reconcile_interval"
+	}
+	return ""
+}
+
 // Segments configures segment routing, RFC 8986, which this tree performs in
 // the dataplane rather than in a kernel. That makes it the one piece of the
 // fleet's steering that works the same on every platform: darwin has no
@@ -793,6 +835,14 @@ func (c *Config) validate() error {
 		}
 		if err := maskedDefault(prefix); err != nil {
 			return fmt.Errorf("config: originate %q %w", raw, err)
+		}
+	}
+	if err := c.Kernel.refuseWhatDisablingIgnores(); err != nil {
+		return err
+	}
+	if c.Segments.Source != "" {
+		if _, err := netip.ParseAddr(c.Segments.Source); err != nil {
+			return fmt.Errorf("config: segments.source %q: %w", c.Segments.Source, err)
 		}
 	}
 	for _, raw := range c.Kernel.Addresses {
