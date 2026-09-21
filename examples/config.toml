@@ -4,8 +4,8 @@
 # are the same under both.
 #
 # The top level says what this node is. Everything it does lives under cap, one
-# block per capability, and the block being there is what turns that capability
-# on. A default deployment writes node, auth, link and dial and stops.
+# block per capability, and writing a block turns that capability on. A default
+# deployment writes node, auth, link and dial and stops.
 #
 # An optional line starts with "# " followed by a key or a table header. Enable
 # one by removing the "# " and nothing else, together with the headers above
@@ -24,9 +24,9 @@ trust = "/etc/ranet-lite/trust.json"
 
 [link]
 port = 13000
-# Each entry has to match an endpoint the trust document gives this node,
-# because that is what a peer dials. The transport binds every interface and
-# lets the kernel pick the source by route.
+# Each entry has to match an endpoint the trust document gives this node, since
+# a peer dials that entry. The transport binds every interface and lets the
+# kernel pick the source by route.
 endpoints = [{ serial = "0", family = "ip4" }]
 
 # Answer peers that dial this node, rather than only dialing. Off by default: a
@@ -75,7 +75,7 @@ announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
 # transit = false
 
 # The babel speaker's own timers and costs. Omitted, each keeps the default
-# below, which is what RFC 8966 Appendix B and BIRD use.
+# below, the value RFC 8966 Appendix B and BIRD use.
 [cap.babel]
 # hello = "4s"
 # update = "16s"
@@ -125,8 +125,8 @@ announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
 #
 # A rule naming an address takes that address's family. One selecting on a mark
 # alone says which family it is for, and "both" installs it once per family,
-# which is what keeping the underlay out of the mesh table needs. table takes a
-# number or one of main, local and default.
+# which keeping the underlay out of the mesh table needs. table takes a number
+# or one of main, local and default.
 # [[cap.table.rules]]
 # fwmark = 0x726c
 # table = "main"
