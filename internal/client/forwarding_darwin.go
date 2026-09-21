@@ -19,3 +19,7 @@ func sysctlIsOne(name string) bool {
 	}
 	return value != 0
 }
+
+// l3mdevAccept is a linux question. darwin has no VRFs, and the reconciler
+// refuses a configuration that asks for one, so nothing here consults this.
+func l3mdevAccept() bool { return true }

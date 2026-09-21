@@ -77,6 +77,15 @@ func kernelLine(k KernelStatus) string {
 		return "off, routes configured externally"
 	}
 	line := fmt.Sprintf("%s, %d installed", k.Where, k.Installed)
+	if k.VRF != "" {
+		line += ", vrf " + k.VRF
+		// Only when it is off, and named rather than described, because it is
+		// the one thing that leaves a correct mesh with nothing able to use
+		// it and the startup warning has the whole sentence.
+		if k.L3mdevAccept != nil && !*k.L3mdevAccept {
+			line += " without l3mdev accept"
+		}
+	}
 	if k.Skipped > 0 {
 		line += fmt.Sprintf(", %d skipped", k.Skipped)
 	}

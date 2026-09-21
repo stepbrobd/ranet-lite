@@ -118,3 +118,30 @@ func TestShortDurationRoundsToWhatIsReadable(t *testing.T) {
 		}
 	}
 }
+
+// The kernel line names the VRF the mesh is in, and says when a socket
+// outside it will not be matched by a reply that arrived through it. Only
+// then: on a node whose host is set up for it the line would otherwise carry
+// a clause that is true of every fleet node and tells a reader nothing.
+func TestKernelLineNamesAVRFAndWhatItIsMissing(t *testing.T) {
+	on, off := true, false
+	for name, test := range map[string]struct {
+		status   KernelStatus
+		want     string
+		unwanted string
+	}{
+		"no vrf":        {status: KernelStatus{Enabled: true, Where: "table 200 protocol 155"}, want: "table 200 protocol 155", unwanted: "vrf"},
+		"vrf, accepted": {status: KernelStatus{Enabled: true, VRF: "mesh", L3mdevAccept: &on}, want: "vrf mesh", unwanted: "l3mdev"},
+		"vrf, refused":  {status: KernelStatus{Enabled: true, VRF: "mesh", L3mdevAccept: &off}, want: "vrf mesh without l3mdev accept"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			line := kernelLine(test.status)
+			if !strings.Contains(line, test.want) {
+				t.Errorf("the kernel line reads %q, want it to carry %q", line, test.want)
+			}
+			if test.unwanted != "" && strings.Contains(line, test.unwanted) {
+				t.Errorf("the kernel line reads %q, want it not to mention %q", line, test.unwanted)
+			}
+		})
+	}
+}

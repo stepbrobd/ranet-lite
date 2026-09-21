@@ -257,6 +257,22 @@ func validatePeers(cfg *config.Config, reg registry.Registry, localFamilies map[
 	return refuse, skip
 }
 
+// warnVRFWithoutL3mdev says so when this node's mesh lives in a VRF and no
+// socket outside it will see a reply. See l3mdevAccept for what that costs.
+//
+// A warning rather than a refusal, as with forwarding: the sysctls can be set
+// after this process starts, and a deployment that runs its services inside
+// the VRF with "ip vrf exec" needs neither. What it must not be is silent,
+// because the mesh comes up correct, the routes are right, and every service
+// on the node is unreachable over it.
+func warnVRFWithoutL3mdev(cfg *config.Config) {
+	if !cfg.Kernel.Enabled || cfg.Kernel.VRF == "" || l3mdevAccept() {
+		return
+	}
+	log.Printf("config: the mesh is in vrf %s and net.ipv4.tcp_l3mdev_accept or net.ipv4.udp_l3mdev_accept is off, so a socket outside that vrf will not be matched by a reply arriving through it: every TCP and UDP flow to and from a mesh address fails while ping answers. Set both to 1, or run the services that use the mesh inside the vrf",
+		cfg.Kernel.VRF)
+}
+
 // warnUnforwardableTransit says so when this node offers to carry the mesh and
 // the kernel will not.
 //

@@ -27,3 +27,18 @@ func sysctlIsOne(path string) bool {
 	}
 	return strings.TrimSpace(string(body)) != "0"
 }
+
+// l3mdevAccept reports whether a socket outside a VRF is matched by traffic
+// that arrived through one. It is off by default, and with a VRF holding the
+// mesh addresses that decides whether anything on this node can use them: a
+// reply arriving through the master is looked up only against sockets bound to
+// that master, so every TCP and UDP flow to and from a mesh address fails
+// while ICMP, which is matched differently, answers. Measured on a fleet node
+// on 2026-09-21, where it read as a routing problem for an afternoon.
+//
+// Both halves have to be on to say yes, since a node with one of them is half
+// broken in a way that is harder to find than a node with neither.
+func l3mdevAccept() bool {
+	return sysctlIsOne("/proc/sys/net/ipv4/tcp_l3mdev_accept") &&
+		sysctlIsOne("/proc/sys/net/ipv4/udp_l3mdev_accept")
+}

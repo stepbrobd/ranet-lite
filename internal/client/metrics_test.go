@@ -160,3 +160,19 @@ func TestMetricsExposesSegmentsAndTheReconciler(t *testing.T) {
 		t.Errorf("before the first pass the scrape reads:\n%s", first.String())
 	}
 }
+
+// The kernel line says whether a socket outside the VRF will see a reply,
+// because a mesh in a VRF whose host has l3mdev accept off comes up correct
+// and carries nothing. The field is filled in here rather than by whoever
+// supplies the status, so a caller cannot leave it empty by forgetting.
+func TestStatusAnswersL3mdevOnlyWhereThereIsAVRF(t *testing.T) {
+	c := &Client{}
+	c.SetKernelStatus(func() control.KernelStatus { return control.KernelStatus{Enabled: true, VRF: "mesh"} })
+	if got := c.kernel().L3mdevAccept; got == nil {
+		t.Error("a node whose mesh is in a vrf does not say whether anything can use it")
+	}
+	c.SetKernelStatus(func() control.KernelStatus { return control.KernelStatus{Enabled: true} })
+	if got := c.kernel().L3mdevAccept; got != nil {
+		t.Errorf("a node with no vrf answered a question that does not arise: %v", *got)
+	}
+}

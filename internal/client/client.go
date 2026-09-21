@@ -124,6 +124,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 		return nil, err
 	}
 	warnUnforwardableTransit(cfg)
+	warnVRFWithoutL3mdev(cfg)
 	// Before the tun exists, so a segment this node could not answer for
 	// refuses the startup without a device to clean up.
 	segments, err := localSegments(cfg)
