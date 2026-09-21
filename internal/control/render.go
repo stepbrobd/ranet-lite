@@ -43,6 +43,7 @@ func RenderStatus(w io.Writer, s Status) {
 		{"neighbors", fmt.Sprintf("%d, %d alive", s.Counts.Neighbors, s.Counts.NeighborsAlive)},
 		{"routes", fmt.Sprintf("%d prefixes, %d selected, %d originated", s.Counts.Prefixes, s.Counts.Selected, s.Counts.Originated)},
 		{"originate", originateLine(s.Originate)},
+		{"segments", segmentLine(s)},
 		{"esp", fmt.Sprintf("%d in, %d dropped, %d refused", s.ESP.InboundPackets, s.ESP.InboundDropped, s.ESP.ReceiveRefused)},
 	}
 	out := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -87,6 +88,18 @@ func kernelLine(k KernelStatus) string {
 		line += ", " + k.Err
 	}
 	return line
+}
+
+// segmentLine says nothing but "off" on a node that configures no segment
+// routing, which is most of them, rather than three zeroes an operator has to
+// read as an absence.
+func segmentLine(s Status) string {
+	if len(s.Segments) == 0 {
+		return "off"
+	}
+	return fmt.Sprintf("%s (%d forwarded, %d delivered, %d dropped)",
+		strings.Join(s.Segments, ", "),
+		s.SegmentCounters.Forwarded, s.SegmentCounters.Delivered, s.SegmentCounters.Dropped)
 }
 
 func originateLine(routes []Originated) string {

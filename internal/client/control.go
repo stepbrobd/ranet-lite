@@ -10,6 +10,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/internal/version"
 )
 
@@ -92,8 +94,36 @@ func (c *Client) Status() control.Status {
 			ReceiveRefused: c.hubRefused(),
 			Keepalives:     c.hubKeepalives(),
 		},
-		Originate: announced,
+		Originate:       announced,
+		Segments:        segmentText(c.Mesh.Segments()),
+		SegmentCounters: segmentCounters(c.Mesh.SegmentCounters()),
 	}
+}
+
+// segmentCounters carries the dataplane's counters onto the wire. The two
+// structs are written out rather than converted, so a field added to one
+// without the other is a compile error rather than a number that silently
+// stops being reported.
+func segmentCounters(counters netstack.SegmentCounters) control.SegmentCounters {
+	return control.SegmentCounters{
+		Forwarded: counters.Forwarded,
+		Delivered: counters.Delivered,
+		Dropped:   counters.Dropped,
+	}
+}
+
+// segmentText is the local segment table as an operator reads it, and nil on a
+// node that configures none so the field is absent rather than empty.
+func segmentText(table *srv6.LocalTable) []string {
+	segments := table.Segments()
+	if len(segments) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		out = append(out, segment.String())
+	}
+	return out
 }
 
 // kernel reports the reconciler, or that there is none. The configured half

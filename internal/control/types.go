@@ -104,6 +104,23 @@ type Status struct {
 	Counts       Counts       `json:"counts"`
 	ESP          ESPCounters  `json:"esp"`
 	Originate    []Originated `json:"originate"`
+	// Segments lists the addresses this node answers for as a waypoint or an
+	// exit, each written as the address and the behavior, and SegmentCounters
+	// records how it has acted on them. Both are absent on a node that
+	// configures no segment routing, which is most of them.
+	Segments        []string        `json:"segments,omitempty"`
+	SegmentCounters SegmentCounters `json:"segment_counters,omitzero"`
+}
+
+// SegmentCounters is this node's segment routing, counted since startup.
+// Forwarded is packets an End sent on to their next segment, Delivered is
+// packets an End.DT46 took the outer header off and handed to the stack, and
+// Dropped is packets addressed to one of this node's segments that it would
+// not act on.
+type SegmentCounters struct {
+	Forwarded uint64 `json:"forwarded"`
+	Delivered uint64 `json:"delivered"`
+	Dropped   uint64 `json:"dropped"`
 }
 
 // RegistryInfo is the trust root as this node last read it. A reload replaces
