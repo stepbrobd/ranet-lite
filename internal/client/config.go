@@ -84,6 +84,57 @@ func localSegments(cfg *config.Config) (*srv6.LocalTable, error) {
 	return srv6.NewLocalTable(segments)
 }
 
+// steerTable builds the table deciding which of this node's own packets go
+// through a segment list.
+func steerTable(cfg *config.Config) (*srv6.SteerTable, error) {
+	if len(cfg.Segments.Steer) == 0 {
+		return nil, nil
+	}
+	entries := make([]srv6.Steer, 0, len(cfg.Segments.Steer))
+	for _, entry := range cfg.Segments.Steer {
+		from, err := steerPrefix("from", entry.From)
+		if err != nil {
+			return nil, err
+		}
+		to, err := steerPrefix("to", entry.To)
+		if err != nil {
+			return nil, err
+		}
+		raw := entry.Source
+		if raw == "" {
+			raw = cfg.Segments.Source
+		}
+		if raw == "" {
+			return nil, fmt.Errorf("config: segments.steer %q needs a source, either its own or segments.source", entry.Via)
+		}
+		source, err := netip.ParseAddr(raw)
+		if err != nil {
+			return nil, fmt.Errorf("config: segments source %q: %w", raw, err)
+		}
+		path := make([]netip.Addr, 0, len(entry.Via))
+		for _, hop := range entry.Via {
+			segment, err := netip.ParseAddr(hop)
+			if err != nil {
+				return nil, fmt.Errorf("config: segments.steer via %q: %w", hop, err)
+			}
+			path = append(path, segment)
+		}
+		entries = append(entries, srv6.Steer{From: from, To: to, Policy: srv6.Policy{Source: source, Path: path}})
+	}
+	return srv6.NewSteerTable(entries)
+}
+
+func steerPrefix(name, raw string) (netip.Prefix, error) {
+	if raw == "" {
+		return netip.Prefix{}, nil
+	}
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("config: segments.steer %s %q: %w", name, raw, err)
+	}
+	return prefix.Masked(), nil
+}
+
 // effectivePeers is who this node dials: the configured list, or every node
 // the registry names when full_mesh is set, which is the N-to-N reconciliation
 // ranet does, with the configured entries kept ahead of the generated ones.

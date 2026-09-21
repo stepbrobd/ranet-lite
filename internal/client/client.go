@@ -18,6 +18,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
+	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
@@ -129,11 +130,26 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	if err != nil {
 		return nil, err
 	}
-	mesh, err := netstack.NewNamed(0, cfg.TUN)
+	steering, err := steerTable(cfg)
+	if err != nil {
+		return nil, err
+	}
+	// Every steered packet carries its segment list inside the tunnel, so the
+	// device has to hand over packets small enough to still fit once it is
+	// there. Taking it off the MTU is ordinary tunnel behavior, and the
+	// alternative is a large packet arriving that cannot be encapsulated and
+	// going out unsteered, which is a silent hole in the steering rather than
+	// a smaller MSS.
+	mtu, err := steeredMTU(steering)
+	if err != nil {
+		return nil, err
+	}
+	mesh, err := netstack.NewNamed(mtu, cfg.TUN)
 	if err != nil {
 		return nil, err
 	}
 	mesh.SetSegments(segments)
+	mesh.SetSteering(steering)
 	defer func() {
 		if err != nil {
 			mesh.Close()
@@ -141,6 +157,31 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	}()
 	return newClient(cfg, privateKey, reg, mesh)
 }
+
+// steeredMTU is the device MTU once the largest configured segment list has
+// been taken off it, and zero for a node that steers nothing, which leaves the
+// device's own default.
+//
+// A list long enough to take the MTU under the IPv6 minimum is refused rather
+// than installed: the device would come up unable to carry a packet the
+// protocol says every link must, and the failure would show up as unreachable
+// hosts rather than as a configuration this node would not run.
+func steeredMTU(steering *srv6.SteerTable) (int, error) {
+	overhead := steering.Overhead()
+	if overhead == 0 {
+		return 0, nil
+	}
+	mtu := netstack.DefaultMTU - overhead
+	if mtu < minimumIPv6MTU {
+		return 0, fmt.Errorf("config: the longest segment list takes %d bytes, leaving a %d byte device under the %d IPv6 requires",
+			overhead, mtu, minimumIPv6MTU)
+	}
+	return mtu, nil
+}
+
+// minimumIPv6MTU is RFC 8200 section 5: "IPv6 requires that every link in the
+// Internet have an MTU of 1280 octets or greater."
+const minimumIPv6MTU = 1280
 
 // newClient is New with the loading done, so a test can stand up a client
 // around a mesh it built itself rather than a privileged TUN.

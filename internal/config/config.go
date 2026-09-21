@@ -143,10 +143,32 @@ type Kernel struct {
 // and neither needs one when the process carrying the packet is the one acting
 // on the header.
 type Segments struct {
+	// Source is the outer source address an encapsulation is sent from, which
+	// the fleet sets once per node with `ip sr tunsrc`. A steering entry
+	// inherits it unless it names its own.
+	Source string `yaml:"source"`
 	// Local is the segments this node answers for. The fleet spells them as
 	// seg6local routes under its own /60, `<base>6::1` for End.DT46 and
 	// `<base>6::2` for End, and the same two addresses go here unchanged.
 	Local []LocalSegment `yaml:"local"`
+	// Steer decides which of this node's own packets go through a segment
+	// list, which `gv` installs by hand today: the traffic sourced from this
+	// node's announced address, through the waypoints and out at a chosen
+	// exit.
+	Steer []SteerEntry `yaml:"steer"`
+}
+
+// SteerEntry is one steering decision. From and To select the packets, the
+// same pair the forwarding table is keyed by, and an entry naming neither is
+// refused because it would steer its own encapsulation.
+type SteerEntry struct {
+	From string `yaml:"from"`
+	To   string `yaml:"to"`
+	// Source overrides the block's own for this entry alone.
+	Source string `yaml:"source"`
+	// Via is the segments the packet visits, in that order, so an operator
+	// writes the waypoints and then the exit.
+	Via []string `yaml:"via"`
 }
 
 // LocalSegment is one address this node answers for and what it does with a

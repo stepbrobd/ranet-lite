@@ -226,6 +226,19 @@ func normalizeSegments(segments config.Segments) config.Segments {
 	if len(segments.Local) == 0 {
 		segments.Local = nil
 	}
+	// Cloned before the entries are touched: the struct is a shallow copy, so
+	// normalizing in place would reach through the shared backing array and
+	// edit the configuration this comparison is only supposed to read.
+	if len(segments.Steer) == 0 {
+		segments.Steer = nil
+	} else {
+		segments.Steer = slices.Clone(segments.Steer)
+		for i := range segments.Steer {
+			if len(segments.Steer[i].Via) == 0 {
+				segments.Steer[i].Via = nil
+			}
+		}
+	}
 	return segments
 }
 
