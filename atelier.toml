@@ -12,6 +12,7 @@ exclude = [
   "checks.aarch64-linux.integration-multicore",
   "checks.aarch64-linux.responder",
   "checks.aarch64-linux.kernel",
+  "checks.aarch64-linux.egress",
   "packages.*.integration-profile",             # built on demand, not checked
   "packages.*.namespace-profile",
 ]

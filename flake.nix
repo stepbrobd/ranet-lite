@@ -125,6 +125,7 @@
               responder = integration { responder = true; };
               kernel = integration { kernel = true; };
               segments = integration { segments = true; };
+              egress = integration { egress = true; };
               netlink = pkgs.testers.runNixOSTest (
                 import ./integration/netlink-test.nix { inherit pkgs netlinkTests; }
               );
