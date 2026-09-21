@@ -129,32 +129,84 @@ func (h Header) Active() (netip.Addr, bool) {
 // encapsulated packet is carried, not forwarded, so the hop count it is
 // spending is the outer one.
 func Encapsulate(inner []byte, source netip.Addr, path []netip.Addr, hopLimit uint8) ([]byte, error) {
-	if len(path) == 0 {
-		return nil, errors.New("srv6: a segment list needs at least one segment")
-	}
-	if len(path) > MaxSegments {
-		return nil, fmt.Errorf("srv6: %d segments is more than the %d this node will build", len(path), MaxSegments)
-	}
-	if !source.Is6() || source.Is4In6() {
-		return nil, fmt.Errorf("srv6: tunnel source %s is not an IPv6 address", source)
-	}
-	for _, segment := range path {
-		if !segment.Is6() || segment.Is4In6() {
-			return nil, fmt.Errorf("srv6: segment %s is not an IPv6 address", segment)
-		}
-	}
-	innerNext, err := innerNextHeader(inner)
+	overhead, err := checkEncapsulation(inner, source, path)
 	if err != nil {
 		return nil, err
 	}
+	out := make([]byte, overhead+len(inner))
+	copy(out[overhead:], inner)
+	writeOuter(out[:overhead], inner, source, path, hopLimit)
+	return out, nil
+}
+
+// Overhead is the bytes an encapsulation puts in front of a packet for a path
+// of n segments, which a tunnel takes off its own MTU so the dataplane keeps
+// being handed packets that still fit once the header is there.
+func Overhead(segments int) int {
+	return ipv6HeaderLen + srhFixedLen + addrLen*segments
+}
+
+// EncapsulateInPlace is Encapsulate for a dataplane that already owns the
+// buffer. The packet at buf[offset:offset+size] is moved along to make room
+// and the outer header is written in front of it, so an encapsulation costs a
+// copy of the packet rather than an allocation per packet.
+//
+// It returns the new size, with the encapsulated packet at buf[offset:] as
+// before. A buffer too short to hold the result is refused rather than
+// truncated. The tun's MTU keeps that from happening, so a packet reaching
+// here anyway belongs to a deployment that has the MTU wrong.
+func EncapsulateInPlace(buf []byte, offset, size int, source netip.Addr, path []netip.Addr, hopLimit uint8) (int, error) {
+	if offset < 0 || size < 0 || offset+size > len(buf) {
+		return 0, fmt.Errorf("srv6: a packet at %d+%d is not inside a %d byte buffer", offset, size, len(buf))
+	}
+	inner := buf[offset : offset+size]
+	overhead, err := checkEncapsulation(inner, source, path)
+	if err != nil {
+		return 0, err
+	}
+	if offset+overhead+size > len(buf) {
+		return 0, fmt.Errorf("srv6: encapsulating %d bytes needs %d more and the buffer has %d",
+			size, overhead, len(buf)-offset-size)
+	}
+	copy(buf[offset+overhead:], inner)
+	writeOuter(buf[offset:offset+overhead], buf[offset+overhead:offset+overhead+size], source, path, hopLimit)
+	return overhead + size, nil
+}
+
+// checkEncapsulation refuses what this node will not encapsulate and returns
+// the bytes the header will take. Both entry points run it, so the two cannot
+// come to disagree about what is acceptable.
+func checkEncapsulation(inner []byte, source netip.Addr, path []netip.Addr) (int, error) {
+	if len(path) == 0 {
+		return 0, errors.New("srv6: a segment list needs at least one segment")
+	}
+	if len(path) > MaxSegments {
+		return 0, fmt.Errorf("srv6: %d segments is more than the %d this node will build", len(path), MaxSegments)
+	}
+	if !source.Is6() || source.Is4In6() {
+		return 0, fmt.Errorf("srv6: tunnel source %s is not an IPv6 address", source)
+	}
+	for _, segment := range path {
+		if !segment.Is6() || segment.Is4In6() {
+			return 0, fmt.Errorf("srv6: segment %s is not an IPv6 address", segment)
+		}
+	}
+	if _, err := innerNextHeader(inner); err != nil {
+		return 0, err
+	}
+	return Overhead(len(path)), nil
+}
+
+// writeOuter fills a header of exactly Overhead(len(path)) bytes. Its caller
+// has already checked everything, so it cannot fail and never reports.
+func writeOuter(out, inner []byte, source netip.Addr, path []netip.Addr, hopLimit uint8) {
 	if hopLimit == 0 {
 		hopLimit = DefaultHopLimit
 	}
-
+	innerNext, _ := innerNextHeader(inner)
 	segments := reversed(path)
 	last := uint8(len(segments) - 1)
 	srhLen := srhFixedLen + addrLen*len(segments)
-	out := make([]byte, ipv6HeaderLen+srhLen+len(inner))
 
 	out[0] = 0x60 // version 6, traffic class and flow label left at zero
 	binary.BigEndian.PutUint16(out[4:], uint16(srhLen+len(inner)))
@@ -173,11 +225,10 @@ func Encapsulate(inner []byte, source netip.Addr, path []netip.Addr, hopLimit ui
 	srh[2] = routingTypeSegment
 	srh[3] = last // Segments Left starts at the last index
 	srh[4] = last // Last Entry is that index too
+	srh[5], srh[6], srh[7] = 0, 0, 0
 	for i, segment := range segments {
 		copy(srh[srhFixedLen+addrLen*i:], addr16(segment))
 	}
-	copy(out[ipv6HeaderLen+srhLen:], inner)
-	return out, nil
 }
 
 // DefaultHopLimit applies when a caller names none. It takes the RFC 8200
