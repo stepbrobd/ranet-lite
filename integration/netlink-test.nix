@@ -22,6 +22,16 @@
   testScript = ''
     machine.wait_for_unit("multi-user.target")
 
+    # The host's own nftables tables, whatever they are. This machine runs the
+    # NixOS firewall through iptables-nft, so four of them are here before
+    # anything under test has run, and the assertion below has to be about this
+    # tool's own name rather than about the ruleset being empty.
+    def foreign():
+        return [t for t in machine.succeed("nft list tables").splitlines() if "ranet-lite" not in t]
+
+    before = foreign()
+    print("the host's own tables:", before)
+
     # -test.v so a failure names the round trip rather than the package, and
     # the count so a pass here means the binary ran them rather than skipping
     # them for the same reason the go check does.
@@ -49,6 +59,10 @@
     # behind is a leak this check is the only thing positioned to see.
     assert "proto 155" not in machine.succeed("ip rule show; ip -6 rule show")
     machine.fail("ip link show mesh")
-    assert machine.succeed("nft list tables").strip() == "", "a table outlived the namespace it was written in"
+    tables = machine.succeed("nft list tables")
+    assert "ranet-lite" not in tables, f"a table outlived the namespace it was written in:\n{tables}"
+    # And nothing of the host's went with it: the tests write into a namespace
+    # of their own, so the four tables the firewall had are still here.
+    assert foreign() == before, f"the host's own tables changed under the tests: {before} then {foreign()}"
   '';
 }

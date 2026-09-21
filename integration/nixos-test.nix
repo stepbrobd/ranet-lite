@@ -622,7 +622,14 @@ in
             gateway.wait_for_unit("systemd-networkd-wait-online.service")
             gateway.wait_for_unit("strongswan-swanctl.service")
             gateway.wait_for_unit("bird.service")
-            behind.wait_for_unit("systemd-networkd-wait-online.service")
+            # The addresses rather than the unit: networkd's wait-online is
+            # WantedBy network-online.target, a passive target nothing on this
+            # node pulls in, so it never becomes active here however configured
+            # the link is. This arm needs the far side answering instead, so it
+            # waits for the addresses themselves.
+            print(behind.execute("systemctl list-units --all 'systemd-networkd*'")[1])
+            for address in ["${behindV4}", "${behindV6}"]:
+                behind.wait_until_succeeds(f"ip addr show dev eth1 | grep -qF {address}", timeout=timeout)
             client.wait_for_unit("ranet-lite.service")
 
             # The mesh first, so a failure below is the exit rather than the tunnel.
@@ -645,26 +652,34 @@ in
             gateway.wait_until_succeeds("ip -4 route show ${exitNetV4} | grep -q swan0", timeout=timeout)
             gateway.wait_until_succeeds("ip -6 route show ${exitNetV6} | grep -q swan0", timeout=timeout)
 
-            def carried(name, source, destination):
-                """What the far side saw of three pings through the exit."""
-                behind.succeed(f"rm -f /tmp/{name}.pcap")
-                behind.execute(f"tcpdump -ni eth1 -w /tmp/{name}.pcap icmp or icmp6 >/dev/null 2>&1 &")
-                behind.wait_until_succeeds("pgrep -x tcpdump", timeout=timeout)
-                gateway.execute(f"ping -c 3 -i 0.3 -W 2 -I {source} {destination}")
-                behind.succeed("pkill -x tcpdump")
+            def carried(name, filter, source, destination):
+                """What the far side saw of three pings through the exit.
+
+                tcpdump counts the three it wants and exits on its own, rather
+                than being killed once the pings are done: a kill races the
+                write, and measured here it lost, reporting six packets past
+                the filter and none written. The filter is the echo request
+                alone, so neighbor discovery cannot make up the count.
+                """
+                behind.succeed(f"rm -f /tmp/{name}.pcap /tmp/{name}.log")
+                behind.execute(
+                    f"tcpdump -Uni eth1 -c 3 -w /tmp/{name}.pcap '{filter}' >/tmp/{name}.log 2>&1 &")
+                behind.wait_until_succeeds(f"grep -q 'listening on' /tmp/{name}.log", timeout=timeout)
+                print(gateway.succeed(f"ping -c 3 -i 0.3 -W 2 -I {source} {destination}"))
                 behind.wait_until_fails("pgrep -x tcpdump", timeout=timeout)
+                print(behind.succeed(f"cat /tmp/{name}.log"))
                 return behind.succeed(f"tcpdump -nr /tmp/{name}.pcap")
 
-            for name, source, destination, translated in [
-                ("v4", "${gatewayTunnelV4}", "${behindV4}", "${exitV4}"),
-                ("v6", "${gatewayTunnel}", "${behindV6}", "${exitV6}"),
+            for name, filter, source, destination, translated in [
+                ("v4", "icmp[icmptype] = icmp-echo", "${gatewayTunnelV4}", "${behindV4}", "${exitV4}"),
+                ("v6", "icmp6 and ip6[40] = 128", "${gatewayTunnel}", "${behindV6}", "${exitV6}"),
             ]:
                 # The round trip first: behind has no route to the tunnel
                 # prefixes, so a reply that comes back at all is one the exit
                 # translated and then put back.
                 gateway.wait_until_succeeds(
                     f"ping -c 1 -W 2 -I {source} {destination}", timeout=timeout)
-                capture = carried(name, source, destination)
+                capture = carried(name, filter, source, destination)
                 print(capture)
                 assert f"{translated} > {destination}" in capture, (
                     f"the far side did not see the exit's own address:\n{capture}")
