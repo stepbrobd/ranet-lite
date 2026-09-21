@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -15,13 +17,14 @@ import (
 )
 
 // This backend exists for one option the portable one cannot offer:
-// IP_BOUND_IF and IPV6_BOUND_IF, which take the socket carrying IKE and ESP
-// out of the forwarding table entirely. Nothing else on darwin does: there are
-// no marks, no policy rules and one table shared by every program, so a real
-// default route out of the mesh tun would otherwise carry this node's own ESP
-// into the tunnel that ESP is carrying. With the socket bound, the route can
-// be a real default, which is the difference between a Mac that holds a mesh
-// address and a Mac that can send its traffic through a mesh exit.
+// IP_BOUND_IF and IPV6_BOUND_IF, which scope the socket carrying IKE and ESP
+// to one interface. Nothing else on darwin keeps an underlay out of the mesh's
+// own routing: there are no marks, no policy rules and one table shared by
+// every program, so a real default route out of the mesh tun would otherwise
+// carry this node's own ESP into the tunnel that ESP is carrying.
+//
+// Scoping the socket is necessary and, on this kernel, not sufficient. See
+// reportBoundReach for what else the host needs and for the measurement.
 //
 // The portable bind is wireguard's StdNetBind, which keeps its descriptors to
 // itself, so there is no seam to set a socket option through. The socket work
@@ -117,7 +120,85 @@ func (b *darwinBind) bindInterface(index int) error {
 			errs = append(errs, fmt.Errorf("transport: bind the underlay socket to interface %d: %w", index, err))
 		}
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	reportBoundReach(index)
+	return nil
+}
+
+// offLinkProbes are the destinations a bound socket is asked about, one per
+// family, both from the documentation ranges so nothing is ever sent to a real
+// host. connect on a UDP socket resolves a route and sends no packet, so this
+// reads the forwarding table without touching the network.
+var offLinkProbes = []netip.Addr{
+	netip.MustParseAddr("192.0.2.1"),
+	netip.MustParseAddr("2001:db8::1"),
+}
+
+// reportBoundReach says out loud when a bound socket can no longer reach
+// anything off its own link, which is the failure this platform has and linux
+// does not.
+//
+// IP_BOUND_IF does not take a socket out of the forwarding table. Measured on
+// Darwin 27.2.0 by TestDarwinBoundSocketNeedsAScopedDefault: a scoped lookup
+// still finds the most specific route, and where that route leaves another
+// interface, the lookup falls back only to a route already on the bound one.
+// So an unscoped default out of the tun, the thing binding the socket is meant
+// to make safe, takes the underlay with it unless the underlay's own interface
+// carries a default of its own scoped to it:
+//
+//	route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>
+//
+// macOS writes exactly that for every interface but the primary one, which is
+// why this is reachable at all and why it goes unnoticed until the mesh takes
+// the default. It is a warning rather than a refusal because the remedy is on
+// the host and a node that cannot reach its peers stops holding the default
+// anyway: see the capture gate in internal/kernel.
+func reportBoundReach(index int) {
+	if index == 0 {
+		return
+	}
+	var unreachable []string
+	for _, probe := range offLinkProbes {
+		if err := reachesWhenBound(index, probe); err != nil {
+			unreachable = append(unreachable, probe.String())
+		}
+	}
+	// Only when neither family can get off the link. A node on an IPv4-only
+	// or IPv6-only uplink has one of these failing as a matter of course.
+	if len(unreachable) < len(offLinkProbes) {
+		return
+	}
+	slog.Warn("transport bound the underlay socket to an interface it cannot reach off",
+		"interface_index", index, "probes", strings.Join(unreachable, " "),
+		"detail", "give that interface a default route scoped to it, route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>, or the mesh's own default takes the underlay with it")
+}
+
+// reachesWhenBound resolves one route the way the bound socket would. It opens
+// its own descriptor rather than using the live one, because connect on the
+// live socket would fix its destination.
+func reachesWhenBound(index int, target netip.Addr) error {
+	// Built in the branch rather than in an assignment the other branch
+	// overwrites: As4 panics on an IPv6 address, and a composite literal is
+	// evaluated whether or not its value survives.
+	family, level, option := unix.AF_INET, unix.IPPROTO_IP, unix.IP_BOUND_IF
+	var sa unix.Sockaddr
+	if target.Is4() {
+		sa = &unix.SockaddrInet4{Addr: target.As4(), Port: 9}
+	} else {
+		family, level, option = unix.AF_INET6, unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF
+		sa = &unix.SockaddrInet6{Addr: target.As16(), Port: 9}
+	}
+	fd, err := unix.Socket(family, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := unix.SetsockoptInt(fd, level, option, index); err != nil {
+		return err
+	}
+	return unix.Connect(fd, sa)
 }
 
 func (b *darwinBind) Send(packets [][]byte, endpoint Endpoint) error {
@@ -178,6 +259,13 @@ func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []re
 		var bound uint16
 		bind, receivers, bound, err = listenPacketBind(port, index)
 		if port != 0 || !errors.Is(err, unix.EADDRINUSE) {
+			if err == nil {
+				// The first binding goes through the listen hook rather than
+				// bindInterface, and it is the one that matters most: a node
+				// starting next to the default a previous run installed has no
+				// working underlay from its first datagram.
+				reportBoundReach(index)
+			}
 			return bind, receivers, bound, err
 		}
 	}
