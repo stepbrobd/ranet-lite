@@ -13,6 +13,11 @@ import (
 // ever gets is the advertisement itself. A node that redistributes with
 // forwarding off therefore attracts traffic it drops, and nothing tells the
 // sender.
+//
+// It is read here rather than in each package that needs it, so that transit
+// and the egress capability answer the question the same way. Forwarding
+// exports it; internal/egress withholds an advertisement over the same fact
+// this warns about.
 func forwardingEnabled() (v4, v6 bool) {
 	return sysctlIsOne("/proc/sys/net/ipv4/ip_forward"),
 		sysctlIsOne("/proc/sys/net/ipv6/conf/all/forwarding")

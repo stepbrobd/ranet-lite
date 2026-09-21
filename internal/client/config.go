@@ -27,6 +27,9 @@ func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, re
 	if err != nil {
 		return err
 	}
+	if err := refuseEgressAdvertisedUnconditionally(cfg); err != nil {
+		return err
+	}
 	refuse, skip := validatePeers(cfg, reg, families)
 	for _, problem := range skip {
 		log.Printf("%v, so nothing will dial it", problem)
@@ -60,6 +63,31 @@ func validateLocalConfig(cfg *config.Config, privateKey ed25519.PrivateKey, reg 
 		localFamilies[endpoint.AddressFamily] = struct{}{}
 	}
 	return localFamilies, nil
+}
+
+// refuseEgressAdvertisedUnconditionally rejects a prefix that the egress
+// capability offers to carry and the plain announcement lists name as well.
+// The capability withholds a prefix whose translation rule is not installed,
+// so that this node stops attracting traffic it would have to drop; an
+// unconditional announcement of the same prefix takes that back and leaves the
+// withholding reporting as working while changing nothing on the wire.
+func refuseEgressAdvertisedUnconditionally(cfg *config.Config) error {
+	if !cfg.Egress.Enable {
+		return nil
+	}
+	announced, err := originatedRoutes(cfg)
+	if err != nil {
+		return err
+	}
+	for _, prefix := range cfg.Egress.Advertise {
+		for _, route := range announced {
+			if route.Destination.Masked() != prefix {
+				continue
+			}
+			return fmt.Errorf("config: egress.advertise %s is announced by originate as well, which would advertise it whether or not its translation rule is installed", prefix)
+		}
+	}
+	return nil
 }
 
 // localSegments builds the table this node answers segment routing with, and

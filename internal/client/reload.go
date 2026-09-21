@@ -12,6 +12,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
@@ -137,7 +138,7 @@ func (c *Client) Reload(path, registryPath, privateKeyPath string, fullMesh bool
 	for _, path := range c.sessions.revoke(c.stillTrusted) {
 		log.Printf("reload: %s is no longer in the registry, session closed", path)
 	}
-	originated, err := originatedRoutes(cfg)
+	originated, err := c.originated(cfg)
 	if err != nil {
 		return err
 	}
@@ -205,6 +206,12 @@ func reloadable(old, next *config.Config) error {
 		// assign_originated expands into, so none of this block can be applied
 		// here.
 		return fmt.Errorf("config: kernel settings changed, restart to apply")
+	case !sameEgressSettings(old.Egress, next.Egress):
+		// The translator is built once in main and owns the tables it created
+		// under the families the old block named, so a new one here would
+		// leave the host holding rules from a configuration nothing is running
+		// any more.
+		return fmt.Errorf("config: egress settings changed, restart to apply")
 	case !sameRekeySettings(old, next):
 		// Accepted sessions take these from the responder built at startup, so
 		// applying them to newly dialed sessions alone would leave the node
@@ -256,6 +263,24 @@ func sameKernelSettings(old, next config.Kernel) bool {
 		}
 		effective := config.Duration(interval)
 		k.ReconcileInterval = &effective
+	}
+	normalize(&old)
+	normalize(&next)
+	return reflect.DeepEqual(old, next)
+}
+
+// sameEgressSettings compares the capability by what it was given rather than
+// by how the file was written, as sameKernelSettings does: an omitted list and
+// an empty one ask for the same thing, and so do an omitted interval and one
+// written out as its own default.
+func sameEgressSettings(old, next egress.Config) bool {
+	normalize := func(c *egress.Config) {
+		if len(c.Advertise) == 0 {
+			c.Advertise = nil
+		}
+		if c.Interval == 0 {
+			c.Interval = egress.Duration(egress.DefaultInterval)
+		}
 	}
 	normalize(&old)
 	normalize(&next)
@@ -323,6 +348,53 @@ func sameEndpoints(old, next []config.Endpoint) bool {
 		}
 	}
 	return true
+}
+
+// originated is every announcement this node is making right now: the ones the
+// configuration asks for unconditionally, plus the prefixes the egress
+// capability is currently willing to stand behind. The second set is read from
+// the translator on every call rather than from the file, because an exit
+// withholds a prefix whose rule is not installed and that answer changes under
+// a running node.
+func (c *Client) originated(cfg *config.Config) ([]babel.OriginatedRoute, error) {
+	routes, err := originatedRoutes(cfg)
+	if err != nil {
+		return nil, err
+	}
+	for _, prefix := range c.egressAdvertised() {
+		routes = append(routes, babel.OriginatedRoute{Destination: prefix})
+	}
+	return routes, nil
+}
+
+// SetEgressAnnounce hands the runtime the egress capability's own view of what
+// it may advertise. See originated.
+func (c *Client) SetEgressAnnounce(read func() []netip.Prefix) {
+	c.egressAnnounce.Store(&read)
+}
+
+func (c *Client) egressAdvertised() []netip.Prefix {
+	if read := c.egressAnnounce.Load(); read != nil {
+		return (*read)()
+	}
+	return nil
+}
+
+// RepublishOriginated rebuilds the announcement set and hands it to the
+// speaker. The egress capability calls it whenever the prefixes it may
+// advertise change, which is how an exit whose rule stopped being installed
+// retracts rather than going on attracting traffic it would have to drop.
+func (c *Client) RepublishOriginated() {
+	routes, err := c.originated(c.config())
+	if err != nil {
+		// Reported rather than dropped: the configured half parsed once at
+		// startup, so a failure here is a reload that has already replaced it
+		// with something that does not, and leaving the old set in place
+		// silently would announce prefixes the file no longer names.
+		log.Printf("egress: the announcement could not be rebuilt: %v", err)
+		return
+	}
+	c.speaker.SetOriginated(routes)
 }
 
 // originatedRoutes is every announcement the configuration asks for, the plain

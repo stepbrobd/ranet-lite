@@ -1,10 +1,12 @@
 package client
 
 import (
+	"net/netip"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
@@ -59,5 +61,55 @@ func TestSteerSelectorWithHostBitsIsRefused(t *testing.T) {
 	cfg.Segments.Steer[0].From = "3fff:a::198:18:104:117/128"
 	if _, err := steerTable(cfg); err != nil {
 		t.Errorf("a host selector was refused: %v", err)
+	}
+}
+
+// An exit withholds a prefix whose translation rule is not installed, so that
+// this node stops attracting traffic it would have to drop. A second,
+// unconditional announcement of the same prefix takes that back and leaves the
+// withholding reporting as working while changing nothing on the wire.
+func TestEgressPrefixAnnouncedUnconditionallyIsRefused(t *testing.T) {
+	exit := netip.MustParsePrefix("198.51.100.0/24")
+	cfg := &config.Config{
+		Originate: []string{"198.51.100.0/24"},
+		Egress:    egress.Config{Enable: true, Advertise: []netip.Prefix{exit}},
+	}
+	if err := refuseEgressAdvertisedUnconditionally(cfg); err == nil {
+		t.Error("a prefix announced both by the capability and unconditionally was accepted")
+	}
+	cfg.Originate = []string{"10.88.0.2/32"}
+	if err := refuseEgressAdvertisedUnconditionally(cfg); err != nil {
+		t.Errorf("an unrelated announcement was refused: %v", err)
+	}
+
+	// babel.originate is the other half of the same list, so it has to be
+	// covered too: the source-specific spelling of an exit's own default is
+	// written there and nowhere else.
+	cfg.Babel.Originate = []config.OriginatePrefix{{Prefix: exit}}
+	if err := refuseEgressAdvertisedUnconditionally(cfg); err == nil {
+		t.Error("a prefix announced through babel.originate as well was accepted")
+	}
+}
+
+// The capability announces nothing until the translator says it may, so a node
+// whose command never built one announces exactly the configured list.
+func TestOriginatedSetTakesTheEgressPrefixesFromTheTranslator(t *testing.T) {
+	cfg := &config.Config{Originate: []string{"10.88.0.2/32"}}
+	c := &Client{}
+	routes, err := c.originated(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("announced %v with no translator, want the configured list alone", routes)
+	}
+	exit := netip.MustParsePrefix("0.0.0.0/0")
+	c.SetEgressAnnounce(func() []netip.Prefix { return []netip.Prefix{exit} })
+	routes, err = c.originated(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 2 || routes[1].Destination != exit {
+		t.Errorf("announced %v, want the configured list and the exit's own prefix", routes)
 	}
 }

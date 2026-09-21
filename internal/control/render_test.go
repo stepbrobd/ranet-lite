@@ -145,3 +145,49 @@ func TestKernelLineNamesAVRFAndWhatItIsMissing(t *testing.T) {
 		})
 	}
 }
+
+// The egress line leads with the prefixes being announced rather than with the
+// ones configured. The two differ exactly when the capability is not working,
+// since a prefix is announced only while its rule is installed and the kernel
+// forwards it, and that difference is the reason to read the line at all.
+func TestEgressLineNamesTheWithheldPrefixes(t *testing.T) {
+	carried := netip.MustParsePrefix("198.51.100.0/24")
+	withheld := netip.MustParsePrefix("2001:db8:1::/48")
+	for name, test := range map[string]struct {
+		status   EgressStatus
+		want     string
+		unwanted string
+	}{
+		"off": {
+			status:   EgressStatus{},
+			want:     "carries no traffic for others",
+			unwanted: "announcing",
+		},
+		"everything announced": {
+			status: EgressStatus{Enabled: true, Where: "a table", Installed: 2,
+				Advertise: []netip.Prefix{carried}, Announced: []netip.Prefix{carried}},
+			want:     "announcing 198.51.100.0/24",
+			unwanted: "withholding",
+		},
+		"half withheld": {
+			status: EgressStatus{Enabled: true, Where: "a table", Installed: 1,
+				Advertise: []netip.Prefix{carried, withheld}, Announced: []netip.Prefix{carried}},
+			want: "withholding 2001:db8:1::/48",
+		},
+		"sharing the hook": {
+			status: EgressStatus{Enabled: true, Where: "a table",
+				Conflicts: []string{"ip table nat chain POSTROUTING at priority 100"}},
+			want: "sharing the hook with ip table nat chain POSTROUTING",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			line := egressLine(test.status)
+			if !strings.Contains(line, test.want) {
+				t.Errorf("the egress line reads %q, want it to carry %q", line, test.want)
+			}
+			if test.unwanted != "" && strings.Contains(line, test.unwanted) {
+				t.Errorf("the egress line reads %q, want it not to mention %q", line, test.unwanted)
+			}
+		})
+	}
+}

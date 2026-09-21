@@ -101,6 +101,7 @@ type Status struct {
 	ForwardsIPv6 bool         `json:"forwards_ipv6"`
 	Registry     RegistryInfo `json:"registry"`
 	Kernel       KernelStatus `json:"kernel"`
+	Egress       EgressStatus `json:"egress"`
 	Counts       Counts       `json:"counts"`
 	ESP          ESPCounters  `json:"esp"`
 	Originate    []Originated `json:"originate"`
@@ -174,6 +175,44 @@ type KernelStatus struct {
 	Added     int       `json:"added"`
 	Removed   int       `json:"removed"`
 	Err       string    `json:"err,omitempty"`
+}
+
+// EgressStatus is the exit node and subnet router capability: what this node
+// was configured to carry, what it is carrying right now, and the difference
+// between the two.
+//
+// Advertise and Announced are separate fields because they disagree exactly
+// when something is wrong. A prefix is announced only while its translation
+// rule is installed and the kernel forwards its family, so a configured prefix
+// missing from Announced is this node declining to attract traffic it would
+// have to drop, and it is the line to read when a customer's exit node has
+// stopped being selected.
+type EgressStatus struct {
+	Enabled bool `json:"enabled"`
+	// Where names the tables this node owns, as the backend spells them.
+	Where string `json:"where,omitempty"`
+	// Source4 and Source6 are the address a translated packet leaves under,
+	// or "auto" where the host's own routes decide it per packet.
+	Source4 string `json:"source4,omitempty"`
+	Source6 string `json:"source6,omitempty"`
+	// Return is whether this node also translates into the mesh, which a
+	// subnet router needs and an exit node does not.
+	Return    bool           `json:"return,omitempty"`
+	Advertise []netip.Prefix `json:"advertise,omitempty"`
+	Announced []netip.Prefix `json:"announced,omitempty"`
+	// PassAt is zero until the first pass has run.
+	PassAt    time.Time `json:"pass_at,omitzero"`
+	Installed int       `json:"installed"`
+	// Flows counts the connections the rules have translated. A nat chain is
+	// consulted once per connection and never again, so this is flows rather
+	// than packets, and Bytes is the first packet of each.
+	Flows uint64 `json:"flows"`
+	Bytes uint64 `json:"bytes"`
+	// Conflicts names other source translation at the same hook, which is
+	// reported rather than fought over: the first chain to translate a
+	// connection keeps it.
+	Conflicts []string `json:"conflicts,omitempty"`
+	Err       string   `json:"err,omitempty"`
 }
 
 // Counts is the mesh in six numbers, which is the first thing to read when

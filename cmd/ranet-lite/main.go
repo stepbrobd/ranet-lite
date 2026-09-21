@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/client"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/version"
 )
@@ -246,6 +248,40 @@ func run() int {
 			mesh.Name, mesh.QueueCount())
 	}
 
+	// The egress capability is opt-in the same way, and is built after the
+	// reconciler because the two share a shutdown order: the translator
+	// withdraws its tables while the tun still exists, as the reconciler
+	// withdraws its routes.
+	if cfg.Egress.Enable {
+		translator, err := egress.New(cfg.Egress, egress.Runtime{
+			Interface:     mesh.Name,
+			MeshAddresses: meshAddresses(cfg),
+			Forwarding:    client.Forwarding,
+			// Published through the runtime rather than read out of the
+			// config, which is how an exit whose rule is not installed
+			// withholds its advertisement instead of attracting traffic it
+			// would drop. The prefixes are read back from the translator, so
+			// this callback only has to say that they changed.
+			Announce: func([]netip.Prefix) { node.RepublishOriginated() },
+		})
+		if err != nil {
+			return refuseToStart(err)
+		}
+		node.SetEgressAnnounce(translator.Announce)
+		node.SetEgressStatus(func() control.EgressStatus { return egressStatus(translator) })
+		reconciler.Go(func() {
+			// As with the reconciler, this error is the withdrawal failing as
+			// often as the pass: a translation rule left in the host's packet
+			// filter after shutdown must never be reported to an operator as a
+			// clean exit.
+			if err := translator.Run(ctx); err != nil {
+				log.Printf("egress: %v", err)
+				failed.Store(true)
+			}
+		})
+		log.Printf("egress translating for %d prefixes in %s", len(cfg.Egress.Advertise), translator.Where())
+	}
+
 	// The control socket is bound rather than served here, so a path an
 	// operator named and this node cannot bind refuses the startup instead of
 	// leaving a node nobody has a way to ask anything. The default path is the
@@ -436,6 +472,67 @@ func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
 		Removed:   stats.Removed,
 		Err:       stats.Err,
 	}
+}
+
+// egressStatus is the egress capability as the control surface reports it. The
+// configured half comes from the translator rather than from the config file,
+// so a block that never became a translator reports as off rather than
+// describing rules nobody installed.
+func egressStatus(translator *egress.Translator) control.EgressStatus {
+	cfg, stats := translator.Config(), translator.Stats()
+	return control.EgressStatus{
+		Enabled:   true,
+		Where:     translator.Where(),
+		Source4:   cfg.Source4.String(),
+		Source6:   cfg.Source6.String(),
+		Return:    cfg.Return,
+		Advertise: cfg.Advertise,
+		Announced: stats.Announced,
+		PassAt:    stats.At,
+		Installed: stats.Installed,
+		Flows:     stats.Packets,
+		Bytes:     stats.Bytes,
+		Conflicts: stats.Conflicts,
+		Err:       stats.Err,
+	}
+}
+
+// meshAddresses is every address this node carries on the mesh, which the
+// egress capability translates into the mesh under. It is the reconciler's
+// assigned set plus the host prefixes this node announces, because a node that
+// configures its tun externally assigns nothing here and still has exactly one
+// address the mesh returns to.
+func meshAddresses(cfg *config.Config) []netip.Addr {
+	assigned, err := cfg.KernelAddresses()
+	if err != nil {
+		// Reported by KernelAddresses' own caller in kernelConfig, and by
+		// config.validate before either. Returning nothing here leaves the
+		// capability to refuse by name rather than to translate to an address
+		// this node does not hold.
+		return nil
+	}
+	var out []netip.Addr
+	add := func(prefix netip.Prefix) {
+		// Only a host prefix. A shorter one is a range this node carries
+		// traffic for rather than an address it answers at, and translating
+		// to its base address would send replies to a host that may not exist.
+		if prefix.Bits() != prefix.Addr().BitLen() || slices.Contains(out, prefix.Addr()) {
+			return
+		}
+		out = append(out, prefix.Addr())
+	}
+	for _, prefix := range assigned {
+		add(prefix)
+	}
+	for _, raw := range cfg.Originate {
+		if prefix, err := netip.ParsePrefix(raw); err == nil {
+			add(prefix)
+		}
+	}
+	for _, entry := range cfg.Babel.Originate {
+		add(entry.Prefix)
+	}
+	return out
 }
 
 // kernelConfig resolves the config file's kernel block against the device the

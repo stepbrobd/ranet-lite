@@ -26,6 +26,7 @@ import (
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -455,6 +456,9 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 		"babel":     func(c *config.Config) { c.Babel.RxCost = &rxcost },
 		"kernel":    func(c *config.Config) { c.Kernel.Table = 201 },
 		"rekey":     func(c *config.Config) { c.ReplayWindow = &window },
+		"egress": func(c *config.Config) {
+			c.Egress = egress.Config{Enable: true, Advertise: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			next := *base
