@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/NickCao/ranet-lite/internal/control"
 )
 
 // Metrics replaces what prometheus-bird-exporter reported while Babel lived in
@@ -74,6 +76,76 @@ func (c *Client) Metrics(w io.Writer) {
 	fmt.Fprintf(w, "ranet_lite_esp_inbound_dropped_total %d\n", c.inboundDropped.Load())
 
 	c.renderReceiveCounters(w)
+	c.renderSegmentCounters(w)
+	c.renderKernel(w)
+}
+
+// renderSegmentCounters writes the segment routing half. Nothing exported it
+// before, and on a fleet node there was nothing to export: the behaviors were
+// seg6local routes and the kernel counted them. Here the dataplane is this
+// process, so a scrape is the only place from which a steered path that
+// stopped working can be seen.
+//
+// What this node did for a peer and what it did with its own traffic are
+// separate series, because they fail for different reasons: a rising dropped
+// means peers are sending headers this node will not act on, and a rising
+// steer_dropped means this node's own policy is pointing somewhere the mesh
+// cannot reach.
+func (c *Client) renderSegmentCounters(w io.Writer) {
+	segments := c.Mesh.SegmentCounters()
+	fmt.Fprint(w, "# HELP ranet_lite_segments_forwarded_total Packets an End behavior sent on to their next segment.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_segments_forwarded_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_segments_forwarded_total %d\n", segments.Forwarded)
+	fmt.Fprint(w, "# HELP ranet_lite_segments_delivered_total Packets an End.DT46 behavior took the outer header off and handed to the stack.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_segments_delivered_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_segments_delivered_total %d\n", segments.Delivered)
+	fmt.Fprint(w, "# HELP ranet_lite_segments_dropped_total Packets addressed to one of this node's segments that it would not act on.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_segments_dropped_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_segments_dropped_total %d\n", segments.Dropped)
+	fmt.Fprint(w, "# HELP ranet_lite_segments_answered_total ICMP errors sent for refused packets, which is the half of the dropped ones whose sender was told why.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_segments_answered_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_segments_answered_total %d\n", segments.Answered)
+	fmt.Fprint(w, "# HELP ranet_lite_steered_total This node's own packets a steering policy encapsulated.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_steered_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_steered_total %d\n", segments.Steered)
+	fmt.Fprint(w, "# HELP ranet_lite_steer_dropped_total Packets a steering policy claimed and this node did not send: too large to encapsulate, or with no route to their first segment.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_steer_dropped_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_steer_dropped_total{reason=\"too_large\"} %d\n", segments.Unsteered)
+	fmt.Fprintf(w, "ranet_lite_steer_dropped_total{reason=\"no_route\"} %d\n", segments.Unrouted)
+}
+
+// renderKernel writes the route reconciler's last pass, the half of a node
+// that bird_protocol_* reported for kbabel4 and kbabel6 while BIRD still ran
+// here. A node whose reconciler is off writes none of it, rather than four
+// zeroes that read as a reconciler doing nothing.
+func (c *Client) renderKernel(w io.Writer) {
+	kernel := c.kernel()
+	if !kernel.Enabled {
+		return
+	}
+	fmt.Fprint(w, "# HELP ranet_lite_kernel_routes_installed Routes the kernel holds for this reconciler as of its last pass.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_kernel_routes_installed gauge\n")
+	fmt.Fprintf(w, "ranet_lite_kernel_routes_installed %d\n", kernel.Installed)
+	fmt.Fprint(w, "# HELP ranet_lite_kernel_routes_skipped Routes the mesh selected that the last pass did not install: one the platform cannot represent, or one whose key another writer holds.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_kernel_routes_skipped gauge\n")
+	fmt.Fprintf(w, "ranet_lite_kernel_routes_skipped %d\n", kernel.Skipped)
+	fmt.Fprint(w, "# HELP ranet_lite_kernel_pass_timestamp_seconds When the last pass finished, and zero before the first one has.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_kernel_pass_timestamp_seconds gauge\n")
+	fmt.Fprintf(w, "ranet_lite_kernel_pass_timestamp_seconds %d\n", passSeconds(kernel))
+	fmt.Fprint(w, "# HELP ranet_lite_kernel_pass_failed Whether the last pass reported an error.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_kernel_pass_failed gauge\n")
+	fmt.Fprintf(w, "ranet_lite_kernel_pass_failed %d\n", boolValue(kernel.Err != ""))
+}
+
+// passSeconds is the unix time of the last pass, and zero rather than a
+// negative number before the first one, since the zero time predates the
+// epoch by two millennia and an alert reading "older than five minutes" would
+// be true of it either way.
+func passSeconds(kernel control.KernelStatus) int64 {
+	if kernel.PassAt.IsZero() {
+		return 0
+	}
+	return kernel.PassAt.Unix()
 }
 
 // renderReceiveCounters writes the three the hub keeps. They are separate

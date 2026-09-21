@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
@@ -94,5 +96,67 @@ func TestMetricsRendersWhatTheHubRefused(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("the scrape does not carry %q:\n%s", want, out.String())
 		}
+	}
+}
+
+// The segment routing half and the reconciler are the two subsystems that
+// replaced something a scrape used to carry: seg6local routes the kernel
+// counted, and the kernel protocols prometheus-bird-exporter read out of
+// BIRD. Neither was exported here until a live run went looking for a steered
+// path that had stopped working and found the counter only on a socket.
+func TestMetricsExposesSegmentsAndTheReconciler(t *testing.T) {
+	c := &Client{Mesh: &netstack.Mesh{Routes: netstack.NewRouteTable()}}
+	var segments strings.Builder
+	c.renderSegmentCounters(&segments)
+	for _, want := range []string{
+		"# TYPE ranet_lite_segments_forwarded_total counter",
+		"ranet_lite_segments_delivered_total 0",
+		"ranet_lite_segments_dropped_total 0",
+		"ranet_lite_segments_answered_total 0",
+		"ranet_lite_steered_total 0",
+		// The two ways this node's own steering loses a packet are one series
+		// with a reason, since an alert wants their sum and a reader wants
+		// which one.
+		`ranet_lite_steer_dropped_total{reason="too_large"} 0`,
+		`ranet_lite_steer_dropped_total{reason="no_route"} 0`,
+	} {
+		if !strings.Contains(segments.String(), want) {
+			t.Errorf("the scrape does not carry %q:\n%s", want, segments.String())
+		}
+	}
+
+	pass := time.Date(2026, 9, 21, 19, 3, 0, 0, time.UTC)
+	c.SetKernelStatus(func() control.KernelStatus {
+		return control.KernelStatus{Enabled: true, Installed: 150, Skipped: 8, PassAt: pass, Err: "list routes: bad"}
+	})
+	var kernel strings.Builder
+	c.renderKernel(&kernel)
+	for _, want := range []string{
+		"ranet_lite_kernel_routes_installed 150",
+		"ranet_lite_kernel_routes_skipped 8",
+		fmt.Sprintf("ranet_lite_kernel_pass_timestamp_seconds %d", pass.Unix()),
+		"ranet_lite_kernel_pass_failed 1",
+	} {
+		if !strings.Contains(kernel.String(), want) {
+			t.Errorf("the scrape does not carry %q:\n%s", want, kernel.String())
+		}
+	}
+
+	// A node whose reconciler is off writes none of it, rather than four
+	// zeroes that read as a reconciler installing nothing.
+	c.SetKernelStatus(func() control.KernelStatus { return control.KernelStatus{} })
+	var off strings.Builder
+	c.renderKernel(&off)
+	if off.Len() != 0 {
+		t.Errorf("a node with no reconciler wrote %q", off.String())
+	}
+
+	// And a reconciler that has not finished a pass reports zero rather than
+	// a timestamp two millennia before the epoch.
+	c.SetKernelStatus(func() control.KernelStatus { return control.KernelStatus{Enabled: true} })
+	var first strings.Builder
+	c.renderKernel(&first)
+	if !strings.Contains(first.String(), "ranet_lite_kernel_pass_timestamp_seconds 0") {
+		t.Errorf("before the first pass the scrape reads:\n%s", first.String())
 	}
 }

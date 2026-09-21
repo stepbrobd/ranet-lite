@@ -298,7 +298,8 @@ func TestReloadKeepsThePathsTheCommandLineSupplied(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	speaker, err := babel.New(babel.Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := babel.New(babel.Config{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +700,7 @@ func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer hub.Close()
-	c := &Client{speaker: speaker, sessions: newSessionSet(), hub: hub}
+	c := &Client{speaker: speaker, sessions: newSessionSet(), hub: hub, Mesh: mesh}
 	if fillUnclaimedQueue(t, hub) == 0 {
 		t.Fatal("the queue refused nothing, so the counter would read zero either way")
 	}
@@ -1545,7 +1546,7 @@ func TestMetricsLabelsUseOnlyTheEscapesTheFormatDefines(t *testing.T) {
 		func([]byte) error { return nil })
 	handle := speaker.AddPeer(peer)
 	defer handle.Close()
-	c := &Client{speaker: speaker, sessions: newSessionSet()}
+	c := &Client{speaker: speaker, sessions: newSessionSet(), Mesh: mesh}
 	// A live session too: the path label is the other value built from a name
 	// a peer chooses, and with no sessions its line is never rendered.
 	c.sessions.close = func(*ike.Session) {}
