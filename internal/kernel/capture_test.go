@@ -269,3 +269,115 @@ func TestReconcilerAsksToBeWokenWhenTheGraceExpires(t *testing.T) {
 		t.Errorf("it asked to be woken at %s, want %s", at, want)
 	}
 }
+
+// recordingCapture is the routing a capturing route depends on, which on
+// darwin is the underlay's own default. It records what the kernel held at
+// each call, because the ordering is the property: the underlay's route has to
+// be in before the route that would strand it and out after.
+type recordingCapture struct {
+	fake *fakeKernel
+	at   []string
+	held bool
+}
+
+func (c *recordingCapture) Hold() error {
+	c.held = true
+	c.at = append(c.at, "hold with "+c.capturing())
+	return nil
+}
+
+func (c *recordingCapture) Release() error {
+	c.held = false
+	c.at = append(c.at, "release with "+c.capturing())
+	return nil
+}
+
+// capturing describes whether the kernel currently holds a route that would
+// carry this machine's own traffic.
+func (c *recordingCapture) capturing() string {
+	for _, route := range c.fake.snapshot() {
+		if capturesTheMachine(route) {
+			return "the default installed"
+		}
+	}
+	return "no default installed"
+}
+
+// The underlay's own routing goes in before the route that would strand it and
+// comes out after the last one is gone. Any other order leaves a window in
+// which this machine's traffic is in the tun while the socket carrying the tun
+// has nothing to fall back on, which is the outage the whole arrangement
+// exists to avoid.
+func TestReconcileHoldsTheUnderlayRouteAroundTheCapture(t *testing.T) {
+	live := 1
+	reconciler, table, fake := harness(t,
+		Table{CaptureGrace: schema.Duration(10 * time.Second)},
+		Runtime{Sessions: func() int { return live }})
+	capture := &recordingCapture{fake: fake}
+	reconciler.rt.Capture = capture
+	clock := start
+	reconciler.now = func() time.Time { return clock }
+	table.Set(netip.Prefix{}, prefix("::/0"), nil)
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
+
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if !capture.held {
+		t.Fatal("the underlay route was not held while the mesh carries the default")
+	}
+
+	// The mesh goes and the grace expires, which withdraws both together.
+	live = 0
+	clock = start.Add(11 * time.Second)
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if capture.held {
+		t.Fatal("the underlay route was still held after the default was withdrawn")
+	}
+
+	want := []string{"hold with no default installed", "release with no default installed"}
+	if !slices.Equal(capture.at, want) {
+		t.Errorf("the calls landed as %v, want %v", capture.at, want)
+	}
+}
+
+// A node whose mesh never announces a default never touches the routing of the
+// interface it reaches its peers through.
+func TestReconcileLeavesTheUnderlayAloneWithoutADefault(t *testing.T) {
+	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
+	capture := &recordingCapture{fake: fake}
+	reconciler.rt.Capture = capture
+	reconciler.now = func() time.Time { return start }
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if capture.held {
+		t.Error("an ordinary mesh prefix held the underlay route")
+	}
+}
+
+// Shutdown withdraws the routes first and the underlay's own route after, for
+// the same reason a pass does.
+func TestWithdrawReleasesTheUnderlayRouteLast(t *testing.T) {
+	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
+	capture := &recordingCapture{fake: fake}
+	reconciler.rt.Capture = capture
+	reconciler.now = func() time.Time { return start }
+	table.Set(netip.Prefix{}, prefix("::/0"), nil)
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.withdraw(); err != nil {
+		t.Fatal(err)
+	}
+	if capture.held {
+		t.Error("shutdown left the underlay route held")
+	}
+	last := capture.at[len(capture.at)-1]
+	if last != "release with no default installed" {
+		t.Errorf("the last call was %q, so the underlay route went while the default was still in the kernel", last)
+	}
+}

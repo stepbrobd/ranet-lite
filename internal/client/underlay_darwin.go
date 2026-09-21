@@ -9,18 +9,36 @@ import (
 
 // underlayRuntime opens what the transport needs to keep the one UDP socket
 // out of the mesh's own routing. On darwin that means binding the socket to
-// the interface the host's default route leaves by, which only the routing
-// table knows and only the route socket can say, so internal/kernel answers
-// it: this package wires the two together and speaks neither.
+// the interface the host's default route leaves by, and writing that
+// interface a default of its own scoped to it, because a bound socket still
+// reads the shared forwarding table. Only the route socket can answer either
+// question, so internal/kernel does both; this package wires the two together
+// and speaks neither.
+//
+// mesh is this node's own tun, which the lookup must never answer with: once
+// the mesh holds a route covering the address space, an ordinary lookup for
+// the unspecified address names the tun, and binding to that would put every
+// datagram this node sends inside its own tunnel.
 //
 // The returned close is always safe to call.
-func underlayRuntime(underlay transport.Underlay) (transport.Runtime, func(), error) {
+func underlayRuntime(underlay transport.Underlay, mesh string) (transport.Runtime, kernel.CaptureRoutes, func(), error) {
 	if !underlay.Bind {
-		return transport.Runtime{}, func() {}, nil
+		return transport.Runtime{}, nil, func() {}, nil
 	}
-	links, err := kernel.WatchLinks()
+	links, err := kernel.WatchLinksOn(mesh)
 	if err != nil {
-		return transport.Runtime{}, func() {}, err
+		return transport.Runtime{}, nil, func() {}, err
 	}
-	return transport.Runtime{Links: links}, func() { _ = links.Close() }, nil
+	routes, err := kernel.NewUnderlayDefaults(links)
+	if err != nil {
+		_ = links.Close()
+		return transport.Runtime{}, nil, func() {}, err
+	}
+	close := func() {
+		// The routes first: they are withdrawn through the route socket this
+		// owns, and the link watcher is only a notification channel.
+		_ = routes.Close()
+		_ = links.Close()
+	}
+	return transport.Runtime{Links: links, Routes: routes}, routes, close, nil
 }

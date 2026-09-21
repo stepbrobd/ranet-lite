@@ -222,6 +222,12 @@ type Runtime struct {
 	// sessions. It is here rather than in the capability because no operator
 	// writes it down.
 	Sessions func() int
+	// Capture holds the rest of the routing a capturing route needs to be
+	// safe, which on darwin is a default scoped to the underlay interface.
+	// Nil where the platform needs nothing, which is everywhere but there.
+	// It is opened by whatever owns the link watcher, so it is handed here
+	// rather than written in cap.table.
+	Capture CaptureRoutes
 }
 
 // Name is the master device, empty for a table bound to none.
@@ -1113,6 +1119,10 @@ func (r *Reconciler) applyRoutes() error {
 	add, del := diffRoutes(desired, actual, r.platformScopes())
 	var errs []error
 	added, removed, skipped := 0, 0, 0
+	// Whether this pass leaves the mesh carrying this machine's own traffic.
+	// The gate has already decided it: desired holds a capturing route only
+	// while the gate is open, so this needs no second opinion about liveness.
+	capturing := slices.ContainsFunc(desired, capturesTheMachine)
 	// Withdraw before installing. An install refuses a key another writer
 	// already holds rather than taking it over, so a route of ours that
 	// changed only in an attribute the kernel does not key on, a preferred
@@ -1124,6 +1134,18 @@ func (r *Reconciler) applyRoutes() error {
 			errs = append(errs, fmt.Errorf("delete route %s: %w", route, err))
 		} else {
 			removed++
+		}
+	}
+	// Between the withdrawals and the installs, which is the only ordering
+	// that holds on both edges: what the underlay needs goes in before the
+	// route that would strand it, and comes out after the last one is gone.
+	if r.rt.Capture != nil {
+		if capturing {
+			if err := r.rt.Capture.Hold(); err != nil {
+				errs = append(errs, fmt.Errorf("hold the underlay route: %w", err))
+			}
+		} else if err := r.rt.Capture.Release(); err != nil {
+			errs = append(errs, fmt.Errorf("release the underlay route: %w", err))
 		}
 	}
 	for _, route := range add {
@@ -1470,6 +1492,13 @@ func (r *Reconciler) withdraw() error {
 			errs = append(errs, fmt.Errorf("delete route %s: %w", route, err))
 		} else {
 			withdrawn++
+		}
+	}
+	// After the routes, never before: the underlay's own route keeps the
+	// socket working while a capturing route is still in the kernel.
+	if r.rt.Capture != nil {
+		if err := r.rt.Capture.Release(); err != nil {
+			errs = append(errs, fmt.Errorf("release the underlay route: %w", err))
 		}
 	}
 	// An address is removed only while the link still carries exactly what was

@@ -202,12 +202,20 @@ func runDaemon(opts options) int {
 	var reconciler sync.WaitGroup
 	if table := cfg.Cap.Table; table != nil {
 		// What the file could not say: the device the mesh actually got, the
-		// addresses the transport has to keep reaching, and the prefixes
-		// cap.route announces, which assign_announced puts on that device.
+		// addresses the transport has to keep reaching, the prefixes
+		// cap.route announces, which assign_announced puts on that device,
+		// and the two halves of link.underlay that only the runtime knows.
 		runtime := kernel.Runtime{
 			Interface: mesh.Name,
 			Underlay:  node.Underlay,
 			Announced: cfg.Routes().Announced(),
+			Sessions:  node.LiveSessions,
+			// One setting decides both halves, so they cannot be set against
+			// each other: the transport binds its socket off the forwarding
+			// table, and the reconciler stops hiding an announced default
+			// from every socket that did not ask for the tun by name.
+			BoundUnderlay: cfg.Link.Underlay.Bind,
+			Capture:       node.CaptureRoutes(),
 		}
 		routes, err := kernel.New(*table, runtime, mesh.Routes)
 		if err != nil {

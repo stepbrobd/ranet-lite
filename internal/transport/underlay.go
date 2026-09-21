@@ -57,6 +57,26 @@ type Runtime struct {
 	// Links answers which interface the host's own traffic leaves by. Nil is
 	// allowed only where Underlay.Bind is unset.
 	Links LinkSource
+	// Routes writes whatever the host needs before a socket bound to an
+	// interface can reach anything off it. Nil leaves that to the operator,
+	// and the probe after each binding says so.
+	Routes UnderlayRoutes
+}
+
+// UnderlayRoutes is the seam onto the routing this socket depends on.
+// internal/kernel implements it on darwin, where a socket bound to an
+// interface still reads the shared forwarding table and therefore needs that
+// interface to carry a default of its own.
+//
+// The two calls exist separately so a move leaves no window: Prepare makes the
+// interface usable, then the socket moves onto it, then Settle takes down what
+// the interface it left needed. Doing it in one call would either strand the
+// socket on an interface whose route has gone, or leave the route behind.
+type UnderlayRoutes interface {
+	// Prepare makes index usable by a socket bound to it.
+	Prepare(index int) error
+	// Settle removes what was prepared for every interface but index.
+	Settle(index int) error
 }
 
 // LinkSource is the seam onto the host's own routing. internal/kernel
@@ -96,7 +116,9 @@ func (u Underlay) refuse() error {
 // never saw.
 type interfaceBinder interface {
 	// bindInterface sets the socket's interface index, where zero unbinds.
-	bindInterface(index int) error
+	// routed says the caller has written the routing a bound socket needs on
+	// that interface, which decides what an unreachable socket is reported as.
+	bindInterface(index int, routed bool) error
 }
 
 // bindUnderlay resolves the interface a bound socket starts on. An error is
@@ -125,7 +147,7 @@ func bindUnderlay(underlay Underlay, rt Runtime) (int, error) {
 
 // follow rebinds the socket whenever the host's default route moves to another
 // interface. It runs for the life of the hub.
-func (h *Hub) follow(links LinkSource) {
+func (h *Hub) follow(links LinkSource, routes UnderlayRoutes) {
 	changed := links.Changed()
 	for {
 		select {
@@ -142,27 +164,57 @@ func (h *Hub) follow(links LinkSource) {
 			slog.Warn("transport cannot tell which interface the host's traffic leaves by", "err", err)
 			continue
 		}
-		if err := h.BindUnderlay(index); err != nil {
+		if err := h.moveUnderlay(index, routes); err != nil {
 			slog.Warn("transport could not follow the host's default route", "interface_index", index, "err", err)
 		}
 	}
 }
 
+// moveUnderlay puts the socket on one interface in the order that leaves it
+// usable throughout: the interface it is going to is made ready first, then
+// the socket moves, then whatever the interface it left needed comes down. A
+// Prepare that fails stops the move, because moving onto an interface that is
+// not ready is the outage this sequence exists to avoid.
+func (h *Hub) moveUnderlay(index int, routes UnderlayRoutes) error {
+	if routes != nil {
+		if err := routes.Prepare(index); err != nil {
+			return fmt.Errorf("transport: prepare interface %d: %w", index, err)
+		}
+	}
+	if err := h.bindUnderlayTo(index, routes != nil); err != nil {
+		return err
+	}
+	if routes != nil {
+		if err := routes.Settle(index); err != nil {
+			return fmt.Errorf("transport: settle on interface %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
 // BindUnderlay moves the socket carrying IKE and ESP onto one interface, where
-// zero unbinds it. It reports whether the binding changed nothing, so a link
-// notification that moved something else costs no syscall.
+// zero unbinds it. A binding that would change nothing costs no syscall, so a
+// link notification about some other interface is free.
 func (h *Hub) BindUnderlay(index int) error {
+	return h.bindUnderlayTo(index, false)
+}
+
+// bindUnderlayTo is BindUnderlay with what the caller knows about the routing.
+// routed says this node writes the route a bound socket needs, which changes
+// the probe afterwards from advice for an operator into a check that the
+// mechanism worked.
+func (h *Hub) bindUnderlayTo(index int, routed bool) error {
 	binder, ok := h.bind.(interfaceBinder)
 	if !ok {
 		return fmt.Errorf("transport: this platform cannot bind a socket to an interface")
 	}
 	h.mu.Lock()
-	if h.boundTo == index {
-		h.mu.Unlock()
+	unchanged := h.boundTo == index
+	h.mu.Unlock()
+	if unchanged {
 		return nil
 	}
-	h.mu.Unlock()
-	if err := binder.bindInterface(index); err != nil {
+	if err := binder.bindInterface(index, routed); err != nil {
 		return err
 	}
 	h.mu.Lock()
