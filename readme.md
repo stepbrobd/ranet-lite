@@ -241,6 +241,12 @@ ip addr add 10.66.0.5/32 dev ranet0
 ip route add 10.66.0.0/16 dev ranet0
 ```
 
+The same binary is also the client. A first argument that is not a flag asks a
+running daemon a question over its control socket rather than starting a node,
+so `ranet-lite status` and its siblings work alongside a deployment's own
+`ranet-lite -config ...` with no second binary and no second unit. See
+[Control socket](#control-socket).
+
 ## Configuration
 
 ranet-lite needs two files:
@@ -359,7 +365,66 @@ Babel lived in BIRD: neighbor liveness and link cost, routes received per
 neighbor, routes selected and originated, established sessions per path, packets
 each peer refused to queue, and inbound ESP packet and drop counters. Everything
 is read from live state at scrape time, so a scrape reflects the instant it
-happened rather than a sampled snapshot.
+happened rather than a sampled snapshot. What a counter cannot carry, the
+per-neighbor route lists, the route table and the reconciler's last pass, is on
+[the control socket](#control-socket) instead.
+
+## Control socket
+
+`-control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
+the default, so a node is askable without having been configured to be.
+`-control ""` turns it off. The socket is mode 0660, which is the whole
+authorization story: nothing on it writes, so read access is the whole grant. A
+path that cannot be bound refuses the startup rather than leaving a node nobody
+can ask, a socket a dead instance left behind is cleared, and one a live daemon
+is listening on is refused by name.
+
+The subcommands read it and print a table, or the wire form with `-json`:
+
+```
+$ ranet-lite status
+node        ysun/framework
+version     2026.912.0
+uptime      3h12m0s
+port        13000
+endpoints   0/ip6 1/ip4
+tun         ranet0 mtu 1400 queues 16
+role        initiator, responder, full mesh, no transit
+forwarding  ipv4 on ipv6 on
+registry    /etc/ranet/registry.json, 142 nodes in 31 organizations
+kernel      table 200 protocol 155, 609 installed, last pass 12s ago
+dialers     117 running
+sessions    83
+neighbors   83, 81 alive
+routes      611 prefixes, 604 selected, 3 originated
+originate   23.161.104.117/32 2602:f590::23:161:104:117/128 2a0c:b641:69c:8c0::/60
+esp         41822931 in, 0 dropped, 14 refused
+
+$ ranet-lite neighbors
+peer            state  cost  rxcost  rtt       routes  expires  dropped  failed
+ysun/toompea@0  up       116      96  27.2ms       15    11.3s        0       0
+ysun/isere@1    up       194      96  176.7ms     130     9.8s        0       0
+
+$ ranet-lite routes
+destination  from            via             metric  router-id         seqno  paths
+::/0         2602:f590::/36  ysun/toompea@0     212   0a1b2c3d4e5f6071     42      7
+```
+
+`neighbors` answers `birdc show babel neighbors`, with the neighbor's own
+reported rxcost beside this node's cost so a link that carries one way can be
+told from one that carries neither, and with the two dataplane counters BIRD has
+no equivalent of. `routes` answers `birdc show route`, over the Babel route
+table rather than the forwarding table, so a prefix every neighbor has retracted
+is still a row, which is the case an operator is looking for. `sessions` answers
+`swanctl --list-sas`. `peers` lists who this node dials, from the config file or
+from the registry under `full_mesh`, and whether it got there.
+
+No subcommand changes anything. A node's configuration is its file, a reload is
+SIGHUP, and a socket that could write would need an authorization story to
+replace the one the file's permissions already are. That is also why this is not
+the daemon and client split tailscale has: there is no login flow here, identity
+being a static key and a registry entry that nix and sops put in place before
+the process starts.
 
 ## Sharing a host with other networking
 
@@ -498,6 +563,8 @@ reload that fails validation changes nothing.
 - `internal/registry` reads a ranet-compatible `registry.json` and Ed25519 key
   loading.
 - `internal/config` is ranet-lite's own config format.
+- `internal/control` is the read-only control socket, its wire types, and the
+  client the subcommands read it with.
 - `cmd/ranet-lite` is the production binary.
 - `cmd/*test` are standalone interop and smoke-test binaries used during
   development (IKE, ESP, babel tests).
