@@ -488,6 +488,23 @@ func TestAnnouncementsRefuseWhatTheyCannotMean(t *testing.T) {
 	}
 }
 
+// An address is assigned to a device and never announced, so the refusal for
+// one written with no prefix length must not tell the operator to write a
+// default instead: that is the advice for an announcement, and the check above
+// it refuses exactly what it would produce.
+func TestAssignedAddressRefusalDoesNotAdviseADefault(t *testing.T) {
+	_, err := loadYAML(t, nodeYAML+"cap:\n  table:\n    addresses: [\"2001:db8::1/0\"]\n")
+	if err == nil {
+		t.Fatal("a masked default was accepted as an address")
+	}
+	if strings.Contains(err.Error(), "announces a default route") {
+		t.Errorf("the refusal tells the operator to write a default: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cap.table addresses") {
+		t.Errorf("the refusal reads %q and does not name the field", err)
+	}
+}
+
 // Both fields of one entry can be wrong, and which one the refusal names has
 // to be the same on every load: iterating a map named a random one, so an
 // operator fixing what the message pointed at got a different message next
