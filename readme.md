@@ -51,7 +51,10 @@ things this binary does not do for you: `net.ipv4.ip_forward` and
 `net.ipv6.conf.all.forwarding` have to be on, the learned routes have to reach a
 kernel table the node actually consults, which the `kernel` block below is for,
 and the TUN has to be allowed to forward back out of itself. Advertising transit
-without them means announced paths blackhole.
+without them means announced paths blackhole. The `egress` block below acts on
+the same fact rather than warning about it: a prefix an exit node offers to
+carry is advertised only while its translation rule is installed and the kernel
+forwards its family, and is retracted the moment either stops being true.
 
 `full_mesh` dials every node the registry names, the N-to-N reconciliation ranet
 performs. Entries in `peers` still apply and win for their node, which is the
@@ -350,6 +353,18 @@ babel:
 #     - { sid: "3fff:1:69c:8c6::2", behavior: "End" }
 #   steer:
 #     - { from: "3fff:a::198:18:104:117/128", via: ["3fff:1:69c:98d6::1"] }
+
+# Optional: carry other nodes' traffic out of the mesh, the one action behind an
+# exit node and a subnet router. linux only, refused by name elsewhere. Each
+# advertised prefix is announced only while its rule is installed and the
+# kernel forwards its family, so do not repeat one of them in originate.
+# egress:
+#   enable: true
+#   advertise: ["0.0.0.0/0", "::/0"] # a subnet router names its own prefixes
+#   source4: auto                    # or an address; auto lets the host's routes decide
+#   source6: auto
+#   return: true                     # also translate into the mesh, for a subnet router
+#   interval: 30s
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
@@ -383,14 +398,17 @@ Babel lived in BIRD: neighbor liveness and link cost, routes received per
 neighbor, routes selected and originated, established sessions per path, packets
 each peer refused to queue, and inbound ESP packet and drop counters.
 
-It also reports the two subsystems that have no exporter anywhere, because on a
-fleet node they were the kernel's: the route reconciler, which replaced BIRD's
+It also reports the three subsystems that have no exporter anywhere, because on
+a fleet node they were the kernel's: the route reconciler, which replaced BIRD's
 kernel protocols, as routes installed and skipped, when its last pass finished
-and whether that pass failed; and segment routing, which replaced `seg6local`,
-as what this node did for peers (forwarded, delivered, dropped, answered) and
-what it did with its own traffic (steered, and dropped with a reason). A node
-with the reconciler off writes none of its series rather than zeroes that read
-as a reconciler installing nothing.
+and whether that pass failed; segment routing, which replaced `seg6local`, as
+what this node did for peers (forwarded, delivered, dropped, answered) and what
+it did with its own traffic (steered, and dropped with a reason); and the
+`egress` capability, as rules installed, connections translated, other
+translation found at the same hook, and the two prefix counts whose difference
+says this node is withholding an advertisement it cannot stand behind. A node
+with the reconciler or the capability off writes none of its series rather than
+zeroes that read as a subsystem installing nothing.
 
 Everything is read from live state at scrape time, so a scrape reflects the
 instant it happened rather than a sampled snapshot. What a counter cannot carry,
@@ -456,6 +474,60 @@ out of it. The other direction, a header the kernel writes and this tree acts
 on, is held by the unit tests in `internal/srv6` against a reconstruction of
 what `__seg6_do_srh_encap` produces, and by no VM arm: no arm configures
 `segments.local`, so `End` and `End.DT46` have no end-to-end coverage.
+
+## Exit nodes and subnet routers
+
+The `egress` block makes this node carry other nodes' traffic out of the mesh.
+One action covers both features a customer asks for: an exit node advertises
+`0.0.0.0/0` and `::/0`, a subnet router advertises the prefixes behind it, and
+each ends at the same operation. A packet arrives on the TUN, its source is
+translated to an address the far side can answer, and the host forwards it by
+its ordinary routes. linux only for now; the capability is refused by name where
+there is no packet filter to write into, because a node that accepted the
+configuration and translated nothing would advertise itself and then drop every
+flow that took it.
+
+Both interfaces are matched, never one. A packet that arrives on the TUN and
+leaves by it again is mesh transit, and rewriting its source would put this
+node's address on a packet it is only relaying. A packet this host generated
+itself has no arrival interface at all, which nftables breaks out of a rule
+over, so neither direction ever reaches one.
+
+`source4` and `source6` say what the source becomes. Omitted, or written as
+`auto`, the host's own routes decide it per packet, which is the only answer
+available to a deployment that owns no address block: on the way out of the mesh
+that is the address of the link the packet leaves by, and on the way in it is
+this node's own mesh address, which is unique per node and routable within the
+mesh. An address written out is used unchanged in both directions, which is how
+a deployment with an address block of its own pins the address return traffic
+comes back to, and the only way to make a reply land on a chosen node rather
+than on whichever one it reaches first.
+
+`return: true` translates the other direction as well, which a subnet router
+needs where the mesh holds no route back to the network behind it. An exit node
+does not, since nothing sits behind it to start a flow. A node carrying more
+than one mesh address of a family is refused rather than picked from, because
+the choice decides the address every flow out of its LAN appears as and a guess
+would change under an unrelated edit.
+
+**An exit that cannot translate refuses to advertise.** Babel carries no
+capability signal: a node that advertises a prefix is promising to carry it, and
+the only thing a peer ever learns is the advertisement, so an exit whose rule
+will not install would attract traffic and drop it with nothing to tell the
+sender. The advertisement is therefore published by the capability rather than
+by the configuration, per family and on every pass: a prefix is announced only
+while its rule is installed and `net.ipv4.ip_forward` or
+`net.ipv6.conf.all.forwarding` is on for its family, and it is retracted the
+moment either stops being true. `status` prints what is being announced and what
+is being withheld, and the scrape carries both counts. It is the same fact the
+transit warning above is about, read from the same place and acted on here
+because this end is the only one that knows.
+
+The return path is conntrack's. A reply arriving for a translated flow has its
+destination put back before the forwarding lookup runs, so the route to the peer
+has to be in a table that lookup consults: with the mesh's routes in a table of
+the reconciler's own, that means a `kernel.rules` entry sending the mesh
+prefixes there. Without one the translation works and every reply is dropped.
 
 ## What each platform gives the reconciler
 
@@ -579,7 +651,8 @@ the process starts.
 
 ranet-lite is built to run next to Tailscale, NetBird, ZeroTier, an SD-WAN
 agent, or anything else that owns interfaces and routes on the same box, and the
-reconciler's ownership rules make that true rather than a hope.
+reconciler's ownership rules make that true rather than a hope. The `egress`
+capability follows the same rules in the host's packet filter, see below.
 
 On Linux it reads back only routes whose table, `rt_proto` and output interface
 all match its own, so a delete list can never contain another writer's route,
@@ -654,6 +727,32 @@ VRF only while it has no master at all, so systemd-networkd keeps whatever it
 already claimed. The device itself is created by asking for the next free unit,
 so it never takes a name another tunnel is using.
 
+The `egress` capability writes into the packet filter, where the same three
+rules hold. It creates an nftables table named after this tool, one per address
+family, holding one nat postrouting chain; that name is the whole of its
+ownership claim, as `rt_proto` is the reconciler's. It writes only inside those
+tables, reads back only rules it wrote, replaces the chain's contents in one
+transaction rather than editing it rule by rule, so no packet is ever evaluated
+against half a ruleset, and removes both tables at shutdown. A table left behind
+by an earlier instance carries the same name and is adopted, then brought to
+what the configuration now asks for, and one in a family the configuration no
+longer covers is removed at startup rather than left translating under rules
+nothing is maintaining.
+
+Nothing here writes iptables. The two are separate registries in the kernel, an
+`iptables-nft` rule is visible here as an ordinary nftables table, and the
+conflicts everybody remembers between firewall managers are an iptables problem
+this declines to join. A host still running legacy iptables is invisible to the
+conflict report below for the same reason.
+
+Other source translation at the same hook is reported rather than fought over.
+Several nat postrouting chains coexist at `srcnat` priority, docker's and
+Tailscale's among them, and the first one to translate a connection keeps it for
+that connection's lifetime. Deleting a neighbor's rule to win that race would
+break whatever installed it, so `status` and the scrape name the other chains
+instead and leave them alone. Their rules and this one are usually disjoint,
+since this one matches on the mesh device in both directions.
+
 ## Reloading
 
 `SIGHUP` re-reads the config file and the registry and reconciles rather than
@@ -686,12 +785,15 @@ it moved the path or rewrote the file in place, rather than reported as applied
 while the node keeps signing with the key it started on. The `babel` block is
 built into the speaker once, apart from the prefixes it originates, which a
 reload does apply. The `kernel` block, including the addresses
-`assign_originated` expands into, is read once at startup. The rekey and replay
-settings are captured by a session when it is created, so applying them to new
-sessions alone would leave the node running two policies at once. And
-`responder` decides whether the node answers at all, which is wired up before
-the reload path exists. A restart is the honest way to change any of them, and a
-reload that fails validation changes nothing.
+`assign_originated` expands into, is read once at startup, and so is the
+`egress` block: the capability owns the tables it created under the families the
+old block named, and a new one applied here would leave the host holding rules
+from a configuration nothing is running. The rekey and replay settings are
+captured by a session when it is created, so applying them to new sessions alone
+would leave the node running two policies at once. And `responder` decides
+whether the node answers at all, which is wired up before the reload path
+exists. A restart is the honest way to change any of them, and a reload that
+fails validation changes nothing.
 
 ## Repository layout
 
@@ -716,6 +818,9 @@ reload that fails validation changes nothing.
   client the subcommands read it with.
 - `internal/srv6` is segment routing: the header, the encapsulation, and the two
   behaviors this mesh uses, all in this process rather than in a kernel.
+- `internal/egress` is the exit node and subnet router capability: the source
+  translation, the nftables table it owns, and the advertisement it withholds
+  while that table does not hold the rules the configuration asks for.
 - `internal/kernel/rules_linux.go` is the policy rules and the VRF, which exist
   on linux alone and are therefore optional halves of the platform rather than
   methods every backend stubs out.
@@ -746,11 +851,22 @@ nix build .#checks.x86_64-linux.integration -L
 nix build .#checks.x86_64-linux.integration-multicore -L
 nix build .#checks.x86_64-linux.responder -L
 nix build .#checks.x86_64-linux.kernel -L
+nix build .#checks.x86_64-linux.segments -L
+nix build .#checks.x86_64-linux.egress -L
 ```
 
 `responder` inverts the exchange: strongSwan dials and ranet-lite answers, which
 upstream could not do at all, and the check asserts that ranet-lite never dials.
 `kernel` exercises the route reconciler against a real table.
+
+`egress` makes the client an exit node and boots a third machine behind it,
+holding prefixes the gateway can reach through the mesh and no other way. It
+asserts that the announcement reaches BIRD on the far side, that the machine
+behind the exit sees the exit's own address on both families and never the mesh
+address the packet started with, that the sweep recognizes its own rules rather
+than rewriting them, that turning `net.ipv4.ip_forward` off withdraws the IPv4
+advertisement and leaves the IPv6 one alone, and that a stop leaves no nftables
+table behind.
 
 These checks exercise one-core and four-core clients, IPv4 and IPv6 routes,
 locally scheduled and peer-initiated rekeys, BIRD withdrawal/recovery, and a

@@ -181,3 +181,42 @@ babel:
 #     - { fwmark: 0x726c, table: main, priority: 40, family: both }
 #     - { to: "3fff:1:69c::/48", table: 200, priority: 100 }
 #     - { from: "10.66.0.5/32", table: 200, priority: 150 }
+
+# Optional: carry other nodes' traffic out of the mesh, the one action behind
+# an exit node and a subnet router. linux only: the translation is an nftables
+# table named after this tool, and the capability is refused by name where
+# there is no packet filter to write into. Off unless enabled.
+#
+# The table, its one nat postrouting chain and its rules are this tool's alone.
+# Nothing outside them is read, replaced or deleted, they are withdrawn whole
+# at shutdown, and other source translation found at the same hook is reported
+# rather than fought over, since the first chain to claim a connection keeps it.
+#
+# advertise names the prefixes this node offers to carry, and decides which
+# families are translated as well as which are announced. A prefix here is announced
+# only while its rule is installed and the kernel forwards its family, so an
+# exit that cannot translate stops attracting traffic it would drop. Do not
+# repeat one of these in originate, which would announce it either way.
+# egress:
+#   enable: true
+#   advertise: ["0.0.0.0/0", "::/0"]      # a subnet router names its own prefixes here
+#
+#   # The address a translated packet leaves under, per family. Omitted, or
+#   # written as auto, the host's own routes decide it per packet, which is the
+#   # only answer a deployment that owns no address block has. An address
+#   # written out is used unchanged, which is how a deployment with its own
+#   # block pins the address return traffic comes back to.
+#   source4: auto
+#   source6: auto
+#
+#   # Translate the other direction too, so a packet from one of the advertised
+#   # prefixes enters the mesh under this node's own mesh address. A subnet
+#   # router needs it where the mesh has no route back to the LAN. An exit node
+#   # does not: nothing sits behind it to start a flow. A node carrying more
+#   # than one mesh address of a family is refused rather than picked from, so
+#   # name the one to use in source4 or source6.
+#   return: true
+#
+#   # The periodic sweep, which reinstalls a table somebody removed and re-reads
+#   # the forwarding sysctls. Omitted it is 30s.
+#   interval: 30s
