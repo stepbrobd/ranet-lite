@@ -3,6 +3,7 @@ module github.com/NickCao/ranet-lite
 go 1.26.3
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.57.0
 	golang.org/x/net v0.59.0
