@@ -167,6 +167,7 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		outboundBufferSize: tunOffset + max(mtu, outboundPacketBufferSize),
 		closed:             make(chan struct{}),
 	}
+	m.startSegmentReports()
 	m.startInboundWriters()
 	m.startOutboundPipeline()
 	return m, nil
@@ -266,19 +267,29 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 			// Steering happens before the route lookup, because a steered
 			// packet is routed by the segment it is going to rather than by
 			// the address it was addressed to.
-			if size, steered := m.steer(b.bufs[i], b.sizes[i], src, dst); steered {
-				b.sizes[i] = size
+			steered := false
+			if size, ok := m.steer(b.bufs[i], b.sizes[i], src, dst); ok {
+				b.sizes[i], steered = size, true
 				if src, dst, nh, ok = addrsOf(b.bufs[i][tunOffset : tunOffset+size]); !ok {
 					continue
 				}
 			}
-			if peer, ok := m.Routes.Lookup(src, dst); ok {
-				b.peers[i], b.headers[i] = peer, nh
-				if b.counts[peer] == 0 {
-					b.peerOrder = append(b.peerOrder, peer)
+			peer, ok := m.Routes.Lookup(src, dst)
+			if !ok {
+				// A steered packet whose first segment the mesh cannot reach
+				// is gone at this point, so it is counted here: without this
+				// the steered counter climbs while the traffic disappears.
+				if steered {
+					m.segmentsDropped.Add(1)
+					m.reportSegmentDrop("no route to the first segment of a steered packet", "segment", dst)
 				}
-				b.counts[peer]++
+				continue
 			}
+			b.peers[i], b.headers[i] = peer, nh
+			if b.counts[peer] == 0 {
+				b.peerOrder = append(b.peerOrder, peer)
+			}
+			b.counts[peer]++
 		}
 		if len(b.peerOrder) == 0 {
 			b.reset()
