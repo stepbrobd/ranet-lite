@@ -83,7 +83,7 @@ func kernelLine(k KernelStatus) string {
 	if k.PassAt.IsZero() {
 		line += ", no pass yet"
 	} else {
-		line += fmt.Sprintf(", last pass %s ago", shortDuration(time.Since(k.PassAt)))
+		line += fmt.Sprintf(", last pass %s ago", sinceText(time.Since(k.PassAt)))
 	}
 	if k.Err != "" {
 		line += ", " + k.Err
@@ -270,6 +270,23 @@ func optionalDuration(d *Duration) string {
 // shortDuration rounds to something a person reads at a glance. Go's own
 // String gives "1h3m0.5762s" for an uptime, where the seconds carry no
 // information and the digits make two rows harder to compare.
+// sinceText is a duration inside a sentence, where the unit is written out. A
+// column keeps the compact form instead, to be scanned down rather than read,
+// and to match what birdc prints.
+func sinceText(d time.Duration) string {
+	unit, count := "second", int(d.Round(time.Second).Seconds())
+	switch {
+	case d >= time.Hour:
+		unit, count = "hour", int(d.Round(time.Hour).Hours())
+	case d >= time.Minute:
+		unit, count = "minute", int(d.Round(time.Minute).Minutes())
+	}
+	if count == 1 {
+		return "1 " + unit
+	}
+	return fmt.Sprintf("%d %ss", count, unit)
+}
+
 func shortDuration(d time.Duration) string {
 	switch {
 	case d < 0:
