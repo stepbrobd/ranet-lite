@@ -17,10 +17,10 @@ import (
 // operator owns sends marked traffic to a table that is not the mesh's. darwin
 // has no marks, no rules and one forwarding table, and answers by binding the
 // socket to the interface the host's own default route leaves by, which scopes
-// its route lookups to that interface. On that platform the host also has to
-// carry a default of its own scoped to that interface, which is not something
-// this process writes; reportBoundReach in socket_darwin.go has the
-// measurement and says so out loud when it is missing.
+// its route lookups to that interface. On that platform the interface also has
+// to carry a default of its own scoped to it, which internal/kernel writes; see
+// UnderlayDefaults there for the measurement and for the ownership rules that
+// keep it off the host's own default.
 //
 // Either one makes a real default out of the tun safe, and an exit-node client
 // installs a real default. Without one the route has to go where no ordinary
@@ -44,15 +44,15 @@ type Underlay struct {
 	// has rather than only the mesh.
 	//
 	// It is not enough on its own: that interface also needs a default route
-	// scoped to it, which macOS writes for every interface but the primary one
-	// and which this process does not write at all.
+	// scoped to it, which macOS writes for every interface but the primary
+	// one. Runtime.Routes writes the missing one, and this socket is moved
+	// onto an interface only once that has happened.
 	Bind bool `yaml:"bind,omitempty" json:"bind,omitempty" toml:"bind,omitempty"`
 }
 
 // Runtime carries what the caller resolves at startup rather than writes in a
-// file.
-// It is separate from Underlay so the capability stays a value that a config
-// file, a control plane and a test can each produce whole.
+// file. It is separate from Underlay so the setting stays a value that a
+// config file, a control plane and a test can each produce whole.
 type Runtime struct {
 	// Links answers which interface the host's own traffic leaves by. Nil is
 	// allowed only where Underlay.Bind is unset.
