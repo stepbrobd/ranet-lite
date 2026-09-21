@@ -27,6 +27,15 @@ let
   # the mesh without a second announcement to keep in step with this one.
   gatewaySID = "fd00:99::6:1";
   gatewayBehind = "fd00:99::9";
+  # The mirror image, for the direction where the gateway's kernel builds the
+  # header and this tree acts on it. The SID is announced so the gateway can
+  # route to it, and clientBehind is not, so the only way a packet reaches it
+  # is the segment.
+  clientSID = "fd00:88::6:1";
+  # On loopback rather than on the tun: an address on the tun is one the kernel
+  # can pick as the source for the mesh traffic that leaves through it, and
+  # nothing announces this one, so the replies would have nowhere to go.
+  clientBehind = "fd00:88::9";
   publicKey = builtins.readFile ./org-pub.pem;
 
   common = {
@@ -280,6 +289,13 @@ in
               VNetHeader = true;
             };
           };
+          networks."05-lo" = pkgs.lib.mkIf segments {
+            matchConfig.Name = "lo";
+            networkConfig.ConfigureWithoutCarrier = true;
+            # What an End.DT46 on this node delivers to, reachable through the
+            # segment and nothing else, because nothing announces it.
+            addresses = [ { Address = "${clientBehind}/128"; } ];
+          };
           networks."40-ranet0" = {
             matchConfig.Name = "ranet0";
             linkConfig = {
@@ -344,6 +360,7 @@ in
             originate:
               - "${clientTunnel}/128"
               - "${clientTunnelV4}/32"
+            ${pkgs.lib.optionalString segments "  - \"${clientSID}/128\"\n"}
             tun: ranet0
             child_rekey_interval: ${if profile then "0" else "5s"}
             ike_rekey_interval: ${if profile then "0" else "15s"}
@@ -362,6 +379,8 @@ in
             ${pkgs.lib.optionalString segments ''
               segments:
                 source: "${clientTunnel}"
+                local:
+                  - { sid: "${clientSID}", behavior: "End.DT46" }
                 steer:
                   - from: "${clientTunnel}/128"
                     to: "${gatewayBehind}/128"
@@ -497,6 +516,30 @@ in
         print(refused)
         assert "${gatewaySID}" in refused, "the steered packet stopped arriving for another reason"
         assert not bare_inner(refused), f"something still decapsulated the header:\n{refused}"
+
+        # The other direction: the gateway's kernel builds the header and this
+        # tree acts on it. Nothing announces the address behind the client, so
+        # the gateway reaches it through the segment or not at all, and the
+        # client's own counter says which of the two carried the packet.
+        gateway.wait_until_succeeds("ip -6 route get ${clientSID}", timeout=timeout)
+        gateway.succeed(
+            "ip -6 route replace ${clientBehind}/128 encap seg6 mode encap segs ${clientSID} dev swan0"
+        )
+        print(gateway.succeed("ip -6 route show ${clientBehind}/128"))
+
+        before = json.loads(client.succeed("ranet-lite status -json"))["segment_counters"]
+        gateway.wait_until_succeeds(
+            "ping -c 1 -W 2 -I ${gatewayTunnel} ${clientBehind}", timeout=timeout
+        )
+        gateway.succeed("ping -c 3 -i 0.3 -W 2 -I ${gatewayTunnel} ${clientBehind}")
+        status = json.loads(client.succeed("ranet-lite status -json"))
+        after = status["segment_counters"]
+        print(json.dumps(after, indent=2))
+        assert after["delivered"] > before["delivered"], (
+            f"the ping arrived without this tree's exit delivering it: {before} then {after}"
+        )
+        assert after["dropped"] == before["dropped"], f"a segment was refused: {after}"
+        assert status["segments"], "the local segment is not reported"
       '';
 
       # strongSwan answers, ranet-lite dials: upstream's original exchange.
