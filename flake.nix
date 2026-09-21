@@ -47,6 +47,16 @@
                 # sandbox forbids by default
                 __darwinAllowLocalNetworking = true;
               });
+            # the internal/kernel test binary, to be run as root in a vm where
+            # the netlink round trips it holds are not skipped
+            netlinkTests = self'.packages.default.overrideAttrs (old: {
+              pname = "ranet-lite-netlink-tests";
+              buildPhase = ''
+                export HOME="$TMPDIR"
+                go test -c -o netlink-tests ./internal/kernel/
+              '';
+              installPhase = ''install -Dm755 netlink-tests "$out/bin/netlink-tests"'';
+            });
           in
           {
             _module.args.pkgs = import inputs.nixpkgs {
@@ -115,6 +125,9 @@
               responder = integration { responder = true; };
               kernel = integration { kernel = true; };
               segments = integration { segments = true; };
+              netlink = pkgs.testers.runNixOSTest (
+                import ./integration/netlink-test.nix { inherit pkgs netlinkTests; }
+              );
             };
           };
       }
