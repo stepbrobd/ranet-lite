@@ -76,7 +76,7 @@ const (
 
 // openPacketBind takes the one socket this node's IKE and ESP share. index
 // names an interface to bind it to, which this platform never asks for.
-func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []receiveFunc, uint16, error) {
+func openPacketBind(port uint16, underlay Underlay, index int, routed bool) (packetBind, []receiveFunc, uint16, error) {
 	// The port selected by the IPv4 bind may already be occupied on IPv6.
 	// Retry ephemeral allocation; an explicitly requested port still fails.
 	var err error

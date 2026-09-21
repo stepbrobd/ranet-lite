@@ -68,7 +68,7 @@ func (s *darwinSocket) boundInterfaceOption() (level, option int) {
 	return unix.IPPROTO_IP, unix.IP_BOUND_IF
 }
 
-func (s *darwinSocket) bindInterface(index int) error {
+func (s *darwinSocket) setBoundInterface(index int) error {
 	level, option := s.boundInterfaceOption()
 	var setErr error
 	if err := s.raw.Control(func(fd uintptr) {
@@ -108,7 +108,7 @@ func (b *darwinBind) Close() error {
 // bindInterface moves both families at once, where zero unbinds. A partial
 // move is reported rather than left: one family on the old interface and one
 // on the new is a node that reaches half its peers.
-func (b *darwinBind) bindInterface(index int) error {
+func (b *darwinBind) bindInterface(index int, routed bool) error {
 	b.rebind.Lock()
 	defer b.rebind.Unlock()
 	var errs []error
@@ -116,14 +116,14 @@ func (b *darwinBind) bindInterface(index int) error {
 		if socket == nil {
 			continue
 		}
-		if err := socket.bindInterface(index); err != nil {
+		if err := socket.setBoundInterface(index); err != nil {
 			errs = append(errs, fmt.Errorf("transport: bind the underlay socket to interface %d: %w", index, err))
 		}
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	reportBoundReach(index)
+	reportBoundReach(index, routed)
 	return nil
 }
 
@@ -136,9 +136,8 @@ var offLinkProbes = []netip.Addr{
 	netip.MustParseAddr("2001:db8::1"),
 }
 
-// reportBoundReach says out loud when a bound socket can no longer reach
-// anything off its own link, which is the failure this platform has and linux
-// does not.
+// reportBoundReach checks that the binding left the socket able to reach
+// anything at all, which on this platform does not follow from the binding.
 //
 // IP_BOUND_IF does not take a socket out of the forwarding table. Measured on
 // Darwin 27.2.0 by TestDarwinBoundSocketNeedsAScopedDefault: a scoped lookup
@@ -146,16 +145,13 @@ var offLinkProbes = []netip.Addr{
 // interface, the lookup falls back only to a route already on the bound one.
 // So an unscoped default out of the tun, the thing binding the socket is meant
 // to make safe, takes the underlay with it unless the underlay's own interface
-// carries a default of its own scoped to it:
+// carries a default of its own scoped to it. internal/kernel writes that route
+// when the mesh is about to capture; routed says it did.
 //
-//	route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>
-//
-// macOS writes exactly that for every interface but the primary one, which is
-// why this is reachable at all and why it goes unnoticed until the mesh takes
-// the default. It is a warning rather than a refusal because the remedy is on
-// the host and a node that cannot reach its peers stops holding the default
-// anyway: see the capture gate in internal/kernel.
-func reportBoundReach(index int) {
+// Either way an unreachable socket is reported rather than refused: the node
+// stops holding a capturing route once its sessions die, so the state is
+// recoverable and a refusal here would turn a bad route into a dead daemon.
+func reportBoundReach(index int, routed bool) {
 	if index == 0 {
 		return
 	}
@@ -170,9 +166,15 @@ func reportBoundReach(index int) {
 	if len(unreachable) < len(offLinkProbes) {
 		return
 	}
+	if routed {
+		slog.Warn("transport bound the underlay socket to an interface it still cannot reach off",
+			"interface_index", index, "probes", strings.Join(unreachable, " "),
+			"detail", "the default scoped to that interface was written and did not make it usable, so this node's own peers are unreachable while the mesh holds the address space")
+		return
+	}
 	slog.Warn("transport bound the underlay socket to an interface it cannot reach off",
 		"interface_index", index, "probes", strings.Join(unreachable, " "),
-		"detail", "give that interface a default route scoped to it, route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>, or the mesh's own default takes the underlay with it")
+		"detail", "nothing here writes that interface's routing, so give it a default scoped to it, route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>")
 }
 
 // reachesWhenBound resolves one route the way the bound socket would. It opens
@@ -248,8 +250,9 @@ const (
 
 // openPacketBind takes the one socket this node's IKE and ESP share. index
 // binds it to that interface, and zero leaves it following the forwarding
-// table as every other socket on the machine does.
-func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []receiveFunc, uint16, error) {
+// table as every other socket on the machine does. routed says the caller has
+// already written that interface's own routing; see reportBoundReach.
+func openPacketBind(port uint16, underlay Underlay, index int, routed bool) (packetBind, []receiveFunc, uint16, error) {
 	// The port selected by the IPv4 bind may already be occupied on IPv6.
 	// Retry ephemeral allocation; an explicitly requested port still fails.
 	var err error
@@ -264,7 +267,7 @@ func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []re
 				// bindInterface, and it is the one that matters most: a node
 				// starting next to the default a previous run installed has no
 				// working underlay from its first datagram.
-				reportBoundReach(index)
+				reportBoundReach(index, routed)
 			}
 			return bind, receivers, bound, err
 		}

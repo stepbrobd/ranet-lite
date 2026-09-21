@@ -206,9 +206,22 @@ func NewHub(localAddr string, underlay Underlay, rt Runtime) (*Hub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: %w", err)
 	}
-	bind, fns, port, err := openPacketBind(uint16(laddr.Port), underlay, index)
+	// Before the socket exists, for the same reason a move prepares before it
+	// rebinds: the first datagram this node sends goes out of a socket that is
+	// already bound, and nothing else will make that interface usable first.
+	if index != 0 && rt.Routes != nil {
+		if err := rt.Routes.Prepare(index); err != nil {
+			return nil, fmt.Errorf("transport: prepare interface %d: %w", index, err)
+		}
+	}
+	bind, fns, port, err := openPacketBind(uint16(laddr.Port), underlay, index, rt.Routes != nil)
 	if err != nil {
 		return nil, fmt.Errorf("transport: open bind: %w", err)
+	}
+	if index != 0 && rt.Routes != nil {
+		if err := rt.Routes.Settle(index); err != nil {
+			return nil, fmt.Errorf("transport: settle on interface %d: %w", index, err)
+		}
 	}
 	h := &Hub{bind: bind, port: port, underlay: underlay, boundTo: index,
 		ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux),
@@ -220,7 +233,7 @@ func NewHub(localAddr string, underlay Underlay, rt Runtime) (*Hub, error) {
 	// Started only where the binding has to follow something, so a hub that
 	// binds nothing carries no goroutine and no link source.
 	if underlay.Bind && rt.Links != nil {
-		go h.follow(rt.Links)
+		go h.follow(rt.Links, rt.Routes)
 	}
 	return h, nil
 }

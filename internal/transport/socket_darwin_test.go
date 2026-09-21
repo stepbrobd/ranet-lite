@@ -4,9 +4,12 @@ package transport
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -234,7 +237,8 @@ func TestBoundReachProbeAnswersForBothFamilies(t *testing.T) {
 		}
 	}
 	// Index zero is the unbound socket, which nothing should be warned about.
-	reportBoundReach(0)
+	reportBoundReach(0, false)
+	reportBoundReach(0, true)
 }
 
 // Binding needs something to say which interface to bind to. A caller that
@@ -262,3 +266,122 @@ func TestUnboundUnderlayReportsReady(t *testing.T) {
 		t.Error("a hub that was never asked to bind set IP_BOUND_IF anyway")
 	}
 }
+
+// recordingRoutes is the routing a bound socket depends on, which on darwin is
+// a default scoped to the interface it is bound to. It records the order of
+// every call against the interface the socket was on at the time, because the
+// order is the property under test.
+type recordingRoutes struct {
+	hub *Hub
+	mu  sync.Mutex
+	at  []string
+}
+
+func (r *recordingRoutes) note(what string, index int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	bound := 0
+	if r.hub != nil {
+		r.hub.mu.Lock()
+		bound = r.hub.boundTo
+		r.hub.mu.Unlock()
+	}
+	r.at = append(r.at, fmt.Sprintf("%s %d while bound to %d", what, index, bound))
+}
+
+func (r *recordingRoutes) Prepare(index int) error { r.note("prepare", index); return nil }
+func (r *recordingRoutes) Settle(index int) error  { r.note("settle", index); return nil }
+
+func (r *recordingRoutes) calls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.at)
+}
+
+// A move makes the interface the socket is going to usable before the socket
+// moves onto it, and clears the one it left only after. On this platform a
+// bound socket still reads the shared forwarding table, so a socket on an
+// interface whose scoped default has already gone reaches nothing at all.
+func TestUnderlayPreparesAnInterfaceBeforeBindingToIt(t *testing.T) {
+	first, second := twoInterfaces(t)
+	links := newFakeLinks(first)
+	routes := &recordingRoutes{}
+	hub, err := NewHub(":0", Underlay{Bind: true}, Runtime{Links: links, Routes: routes})
+	if err != nil {
+		t.Fatalf("open a bound hub: %v", err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+	routes.mu.Lock()
+	routes.hub = hub
+	routes.mu.Unlock()
+	bind := hub.bind.(*darwinBind)
+
+	links.move(second, nil)
+	waitFor(t, bind, second)
+	// The settle after the move is the last call, and a poll can read the
+	// list between the bind and it.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(routes.calls()) < 4 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	calls := routes.calls()
+	if len(calls) < 4 {
+		t.Fatalf("the move made %v, want a prepare and a settle for each interface", calls)
+	}
+	// The opening pair is on the interface the socket was born on, and the
+	// hub's own binding happened inside the listen hook, so the first prepare
+	// reads as bound to nothing.
+	if want := fmt.Sprintf("prepare %d while bound to 0", first); calls[0] != want {
+		t.Errorf("the first call was %q, want %q", calls[0], want)
+	}
+	// The move: prepared while still on the old interface, settled once on
+	// the new one. Either half in the other order is a window with no route.
+	if want := fmt.Sprintf("prepare %d while bound to %d", second, first); calls[2] != want {
+		t.Errorf("the move prepared as %q, want %q", calls[2], want)
+	}
+	if want := fmt.Sprintf("settle %d while bound to %d", second, second); calls[3] != want {
+		t.Errorf("the move settled as %q, want %q", calls[3], want)
+	}
+}
+
+// A prepare that fails stops the move. Binding onto an interface whose routing
+// could not be written is the outage the ordering exists to avoid, so the
+// socket stays where it is and the failure is reported.
+func TestUnderlayStaysPutWhenAnInterfaceCannotBePrepared(t *testing.T) {
+	first, second := twoInterfaces(t)
+	links := newFakeLinks(first)
+	refusing := &refusingRoutes{}
+	hub, err := NewHub(":0", Underlay{Bind: true}, Runtime{Links: links, Routes: refusing})
+	if err != nil {
+		t.Fatalf("open a bound hub: %v", err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+	bind := hub.bind.(*darwinBind)
+
+	refusing.refuse.Store(true)
+	links.move(second, nil)
+	// Nothing acknowledges a move that is meant not to happen, so this waits
+	// rather than polling: the failure it looks for is the socket moving.
+	time.Sleep(200 * time.Millisecond)
+	if got := boundInterface(t, bind.v4); got != first {
+		t.Errorf("the socket moved to %d although its routing could not be written", got)
+	}
+
+	// And it follows the next notification once the routing can be written.
+	refusing.refuse.Store(false)
+	links.move(second, nil)
+	waitFor(t, bind, second)
+}
+
+// refusingRoutes fails Prepare on demand.
+type refusingRoutes struct{ refuse atomic.Bool }
+
+func (r *refusingRoutes) Prepare(int) error {
+	if r.refuse.Load() {
+		return errors.New("the routing could not be written")
+	}
+	return nil
+}
+
+func (r *refusingRoutes) Settle(int) error { return nil }

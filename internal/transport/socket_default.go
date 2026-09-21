@@ -39,7 +39,7 @@ const (
 	bindsSockets = false
 )
 
-func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []receiveFunc, uint16, error) {
+func openPacketBind(port uint16, underlay Underlay, index int, routed bool) (packetBind, []receiveFunc, uint16, error) {
 	b := &portableBind{conn.NewStdNetBind()}
 	fns, port, err := b.Open(port)
 	if err != nil {

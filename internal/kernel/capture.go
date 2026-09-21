@@ -21,6 +21,20 @@ const DefaultCaptureGrace = 10 * time.Second
 // prefix length only at 32 and 128.
 func capturesTheMachine(r Route) bool { return r.Destination.Bits() <= 1 }
 
+// CaptureRoutes holds the rest of the routing the kernel needs before the mesh
+// may be handed this machine's own traffic, and takes it out again after. On
+// darwin that is the underlay default, see UnderlayDefaults there; nothing
+// implements it on linux, where a marked socket needs no route of its own.
+//
+// Hold runs before the first capturing route is installed and Release after
+// the last one is withdrawn, so the grace below withdraws both together and
+// there is no moment in which the machine's traffic is in the tun while the
+// underlay has nothing to fall back on.
+type CaptureRoutes interface {
+	Hold() error
+	Release() error
+}
+
 // captureGate decides when the mesh may be handed this machine's own traffic.
 //
 // An exit announces a default and the reconciler installs it, and from then on

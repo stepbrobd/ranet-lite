@@ -5,6 +5,7 @@ package kernel
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"sync/atomic"
@@ -26,10 +27,17 @@ import (
 // splitting the answer is the fix if one ever appears.
 type Links struct {
 	monitor *routeMonitor
+	// mesh is the tun this node carries the overlay on, which can never be
+	// the answer. Once the mesh holds routes covering the address space, an
+	// ordinary lookup for the unspecified address answers with the tun, and
+	// binding the underlay socket to that would put every datagram this node
+	// sends inside the tunnel it is supposed to be running under.
+	mesh int
 }
 
-// WatchLinks opens the notification half. The caller closes it.
-func WatchLinks() (*Links, error) {
+// WatchLinks opens the notification half. mesh is the index of this node's own
+// tun, which no answer may name. The caller closes it.
+func WatchLinks(mesh int) (*Links, error) {
 	// Index zero, so a change on any interface wakes it: the route being
 	// followed moves between wifi, ethernet, a dock and a VPN of the user's
 	// own, and it is never on the mesh tun the reconciler watches.
@@ -37,15 +45,56 @@ func WatchLinks() (*Links, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Links{monitor: monitor}, nil
+	return &Links{monitor: monitor, mesh: mesh}, nil
+}
+
+// WatchLinksOn is WatchLinks for an interface named rather than numbered.
+func WatchLinksOn(mesh string) (*Links, error) {
+	device, err := net.InterfaceByName(mesh)
+	if err != nil {
+		return nil, fmt.Errorf("kernel: look up interface %s: %w", mesh, err)
+	}
+	return WatchLinks(device.Index)
 }
 
 func (l *Links) Changed() <-chan struct{} { return l.monitor.signal }
 func (l *Links) Close() error             { return l.monitor.Close() }
 
+// Mesh is the interface index no answer may name.
+func (l *Links) Mesh() int { return l.mesh }
+
 // errNoDefaultRoute is a host with no way off itself, which is an ordinary
 // state on a laptop between two networks rather than a failure.
 var errNoDefaultRoute = errors.New("kernel: the host has no default route")
+
+// Default is the host's own default route of one family: the interface it
+// leaves by and the next hop it points at, invalid where it leaves through a
+// link instead.
+//
+// It is an exact lookup of the one entry keyed on the unspecified address
+// rather than a longest-prefix match, because the mesh installs routes that
+// cover the whole address space and a match answers with those. Measured on
+// Darwin 27.2.0: with 0.0.0.0/1 and 128.0.0.0/1 out of the tun, the match
+// answers utun and the exact lookup answers the physical interface. Where
+// there is no entry at all the exact lookup falls back to a match, which is
+// why the mesh interface is rejected here too and not only there.
+func (l *Links) Default(family netip.Addr) (index int, gateway netip.Addr, err error) {
+	answer, err := routeToDefault(family)
+	if err != nil {
+		return 0, netip.Addr{}, err
+	}
+	if answer.Index == l.mesh {
+		// The only entry covering the unspecified address of this family is
+		// one of ours, so the host has no default of its own to fall back to.
+		return 0, netip.Addr{}, errNoDefaultRoute
+	}
+	if len(answer.Addrs) > unix.RTAX_GATEWAY {
+		if next, ok := addressFromRouteAddr(answer.Addrs[unix.RTAX_GATEWAY]); ok {
+			gateway = next.WithZone("")
+		}
+	}
+	return answer.Index, gateway, nil
+}
 
 // DefaultInterface is the index of the interface the host's own default route
 // leaves by. IPv4 is asked first and IPv6 only if that has no answer, so a
@@ -53,14 +102,25 @@ var errNoDefaultRoute = errors.New("kernel: the host has no default route")
 // still binds to something.
 func (l *Links) DefaultInterface() (int, error) {
 	var errs []error
-	for _, unspecified := range []netip.Addr{netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
-		index, err := interfaceIndexFor(unspecified, true)
+	for _, family := range []netip.Addr{netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
+		index, _, err := l.Default(family)
 		if err == nil {
 			return index, nil
 		}
 		errs = append(errs, err)
 	}
 	return 0, errors.Join(append(errs, errNoDefaultRoute)...)
+}
+
+// routeToDefault asks for the one entry keyed on the unspecified address, by
+// sending the netmask with it: XNU turns an RTM_GET carrying a netmask from a
+// longest-prefix match into a lookup of that exact key.
+func routeToDefault(family netip.Addr) (*route.RouteMessage, error) {
+	mask := netip.AddrFrom4([4]byte{})
+	if family.Is6() {
+		mask = netip.AddrFrom16([16]byte{})
+	}
+	return routeRequest(family.Unmap(), mask)
 }
 
 // lookupSeq numbers the RTM_GET requests this process makes, so a reply can be
@@ -94,10 +154,16 @@ func interfaceIndexFor(destination netip.Addr, canRecurse bool) (int, error) {
 	return gatewayIndex(answer, canRecurse)
 }
 
-// routeTo is the request itself, separated from what is read off the answer so
-// that a test can look at the gateway the kernel named rather than guess which
-// address it was.
+// routeTo is a longest-prefix lookup, the question `route -n get` asks.
 func routeTo(destination netip.Addr) (*route.RouteMessage, error) {
+	return routeRequest(destination, netip.Addr{})
+}
+
+// routeRequest is the request itself, separated from what is read off the
+// answer so that a test can look at the gateway the kernel named rather than
+// guess which address it was. An invalid mask sends no RTAX_NETMASK, which is
+// the longest-prefix question; a valid one asks for that exact key.
+func routeRequest(destination, mask netip.Addr) (*route.RouteMessage, error) {
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: open a routing socket to ask for a route: %w", err)
@@ -112,13 +178,18 @@ func routeTo(destination netip.Addr) (*route.RouteMessage, error) {
 		return nil, fmt.Errorf("kernel: bound the route lookup: %w", err)
 	}
 	seq := int(lookupSeq.Add(1))
+	addrs := make([]route.Addr, unix.RTAX_MAX)
+	addrs[unix.RTAX_DST] = routeAddr(destination)
+	if mask.IsValid() {
+		addrs[unix.RTAX_NETMASK] = routeAddr(mask)
+	}
 	request := &route.RouteMessage{
 		Version: unix.RTM_VERSION,
 		Type:    unix.RTM_GET,
 		Flags:   unix.RTF_UP,
 		ID:      uintptr(os.Getpid()),
 		Seq:     seq,
-		Addrs:   []route.Addr{unix.RTAX_DST: routeAddr(destination)},
+		Addrs:   addrs,
 	}
 	raw, err := request.Marshal()
 	if err != nil {
