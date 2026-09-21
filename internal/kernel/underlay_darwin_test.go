@@ -54,9 +54,10 @@ func testUnderlay(t *testing.T, links defaultRoutes, rib func() []byte) (*Underl
 	sock := &fakeRouteSocket{t: t}
 	return &UnderlayDefaults{
 		sock: sock, links: links,
-		written: make(map[writtenDefault]bool),
-		warned:  make(map[netip.Prefix]bool),
-		dump:    func() ([]byte, error) { return rib(), nil },
+		written:      make(map[writtenDefault]bool),
+		warned:       make(map[netip.Prefix]bool),
+		dump:         func() ([]byte, error) { return rib(), nil },
+		lookupDevice: func(string) (int, error) { return uplinkIndex, nil },
 	}, sock
 }
 

@@ -45,9 +45,9 @@ type Client struct {
 	// about which interface the underlay is on.
 	capture  kernel.CaptureRoutes
 	sessions *sessionSet
-	workers    int
-	ctx        context.Context
-	cancel     context.CancelFunc
+	workers  int
+	ctx      context.Context
+	cancel   context.CancelFunc
 
 	// dialers is one cancel per running peer loop, keyed by the same path name
 	// sessions uses, so a reload can start and stop them individually.

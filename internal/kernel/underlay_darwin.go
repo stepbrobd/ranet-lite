@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"slices"
 	"sync"
@@ -48,13 +49,12 @@ import (
 //   - a delete message is refused outright unless it carries RTF_IFSCOPE, so
 //     no path through this file can name the host's own unscoped default;
 //   - an add that answers EEXIST is success and not ownership, so a route
-//     macOS wrote for a secondary interface, or one a crashed instance of this
-//     process left behind, is used and never withdrawn;
-//   - a scoped default an earlier crashed instance left behind therefore stays
-//     for good. Deleting it would mean adopting by shape, which is the thing
-//     this refuses to do, and the leftover is inert: it is consulted only by a
-//     socket that asked for that interface by name, and it answers with the
-//     same next hop the host's own default answers with.
+//     macOS wrote for a secondary interface is used and never withdrawn;
+//   - the record outlives the process. It is written to the runtime directory
+//     before the route is, so an instance killed while holding one is
+//     withdrawn by the next instance rather than leaking for good. That is the
+//     same ownership claim and not a weaker one: see reclaim, which still
+//     refuses to act on a record whose route no longer matches it.
 //
 // The failure that rule exists to prevent is tailscale's #21395, where
 // clearing an exit node deleted the physical default route.
@@ -83,8 +83,15 @@ type UnderlayDefaults struct {
 	// is ever deleted, and a move holds two of them for one destination until
 	// the socket has left the first.
 	written map[writtenDefault]bool
-	// dump reads the routing table back, replaced by a test.
-	dump func() ([]byte, error)
+	// statePath is where that set is written so it survives this process.
+	// Empty keeps it in memory alone, which a test uses and which leaks one
+	// route per kill.
+	statePath string
+	// dump reads the routing table back, and lookupDevice resolves an
+	// interface name. Both are fields so a test can drive reclaim against a
+	// table and a set of devices it decides.
+	dump         func() ([]byte, error)
+	lookupDevice func(string) (int, error)
 	// warned bounds a repeated report to one line per transition.
 	warned map[netip.Prefix]bool
 }
@@ -99,9 +106,14 @@ type defaultRoutes interface {
 // withdrawal can prove the kernel still holds that exact route. The kernel
 // keys a scoped route on its destination and its interface, so two of these
 // differing in the interface are two routes and can be held at once.
+//
+// device is the interface's name, which the kernel keys nothing on and which a
+// record that outlives a reboot needs: an index is reused, so a record holding
+// the index alone would name whichever device took it.
 type writtenDefault struct {
 	destination netip.Prefix
 	index       int
+	device      string
 	gateway     netip.Addr
 }
 
@@ -112,8 +124,13 @@ var defaultPrefixes = []netip.Prefix{
 }
 
 // NewUnderlayDefaults takes a route socket of its own, so its writes are never
-// interleaved with the reconciler's on one sequence number.
-func NewUnderlayDefaults(links defaultRoutes) (*UnderlayDefaults, error) {
+// interleaved with the reconciler's on one sequence number, and reclaims what
+// a previous instance recorded writing before anything else happens.
+//
+// statePath is where that record lives; empty keeps it in memory for this
+// process only. A state file that cannot be read is reported and treated as
+// empty, because a node that will not start is worse than a route left behind.
+func NewUnderlayDefaults(links defaultRoutes, statePath string) (*UnderlayDefaults, error) {
 	if links == nil {
 		return nil, errors.New("kernel: the underlay defaults need a link source")
 	}
@@ -121,12 +138,21 @@ func NewUnderlayDefaults(links defaultRoutes) (*UnderlayDefaults, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &UnderlayDefaults{
-		sock: sock, links: links,
-		written: make(map[writtenDefault]bool),
-		warned:  make(map[netip.Prefix]bool),
-		dump:    func() ([]byte, error) { return route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0) },
-	}, nil
+	u := &UnderlayDefaults{
+		sock: sock, links: links, statePath: statePath,
+		written:      make(map[writtenDefault]bool),
+		warned:       make(map[netip.Prefix]bool),
+		dump:         func() ([]byte, error) { return route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0) },
+		lookupDevice: deviceIndex,
+	}
+	records, err := loadUnderlayState(statePath)
+	if err != nil {
+		slog.Warn("kernel could not read which underlay routes an earlier run wrote",
+			"path", statePath, "err", err,
+			"detail", "any route it left is left where it is")
+	}
+	u.reclaim(records)
+	return u, nil
 }
 
 // Hold is called before the reconciler installs a route that would carry this
@@ -221,7 +247,12 @@ func (u *UnderlayDefaults) ensure() error {
 				"destination", destination, "host_uses", index, "socket_on", u.on)
 			continue
 		}
-		want := writtenDefault{destination: destination, index: index, gateway: gateway}
+		device, err := u.deviceName(index)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		want := writtenDefault{destination: destination, index: index, device: device, gateway: gateway}
 		if u.written[want] {
 			continue
 		}
@@ -236,13 +267,23 @@ func (u *UnderlayDefaults) ensure() error {
 			errs = append(errs, err)
 			continue
 		}
+		// Recorded before the route is written, never after. A process dying
+		// between the two then leaves a record for a route that does not
+		// exist, which reclaim discards on the readback; the other order
+		// leaves a route with no record, which nothing may ever remove.
+		u.written[want] = true
+		u.persist()
 		ours, err := u.write(want)
 		if err != nil {
+			delete(u.written, want)
+			u.persist()
 			errs = append(errs, err)
 			continue
 		}
 		delete(u.warned, destination)
 		if !ours {
+			delete(u.written, want)
+			u.persist()
 			// Somebody else already holds that exact key on that interface,
 			// which macOS itself does for every interface but the primary. It
 			// does the job and it is not ours, so it is not recorded and will
@@ -251,7 +292,6 @@ func (u *UnderlayDefaults) ensure() error {
 				"destination", destination, "interface_index", want.index, "next_hop", want.gateway)
 			continue
 		}
-		u.written[want] = true
 		slog.Info("kernel wrote a default scoped to the underlay interface",
 			"destination", destination, "interface_index", want.index, "next_hop", want.gateway,
 			"detail", "a socket bound to that interface has no route without it once the mesh holds the address space")
@@ -310,13 +350,16 @@ func (u *UnderlayDefaults) sorted() []writtenDefault {
 }
 
 // removeOne withdraws one recorded route, and only after the kernel says it is
-// still the route this process wrote. The record is dropped either way: a
-// route that is no longer ours is not ours to try again on.
+// still the route this process wrote.
+//
+// The record is dropped once the route is gone, whether this withdrew it or
+// found it already replaced, and kept on a failure the next pass or the next
+// start can retry. Keeping it costs nothing, because every path to a delete
+// reads the kernel back first.
 func (u *UnderlayDefaults) removeOne(held writtenDefault) error {
 	if !u.written[held] {
 		return nil
 	}
-	delete(u.written, held)
 	present, err := u.stillOurs(held)
 	if err != nil {
 		// Reported rather than deleted on a guess. A dump this process could
@@ -324,21 +367,31 @@ func (u *UnderlayDefaults) removeOne(held writtenDefault) error {
 		return fmt.Errorf("kernel: read back %s before withdrawing it: %w", held.destination, err)
 	}
 	if !present {
+		delete(u.written, held)
+		u.persist()
 		slog.Warn("kernel is leaving a scoped default it no longer recognizes",
 			"destination", held.destination, "interface_index", held.index, "next_hop", held.gateway,
 			"detail", "something replaced it, so withdrawing would take out a route this process did not write")
 		return nil
 	}
-	message, err := scopedDefaultMessage(unix.RTM_DELETE, held)
-	if err != nil {
-		return err
-	}
-	if err := u.sock.WriteRoute(message); err != nil && !gone(err) {
+	if err := u.withdraw(held); err != nil {
 		return fmt.Errorf("kernel: withdraw %s scoped to interface %d: %w", held.destination, held.index, err)
 	}
+	delete(u.written, held)
+	u.persist()
 	slog.Info("kernel withdrew the default scoped to the underlay interface",
 		"destination", held.destination, "interface_index", held.index, "next_hop", held.gateway)
 	return nil
+}
+
+// deviceName is the name of one interface index, which the record carries so
+// that a reused index cannot be mistaken for the device that was recorded.
+func (u *UnderlayDefaults) deviceName(index int) (string, error) {
+	device, err := net.InterfaceByIndex(index)
+	if err != nil {
+		return "", fmt.Errorf("kernel: name interface %d: %w", index, err)
+	}
+	return device.Name, nil
 }
 
 // stillOurs reports whether the kernel holds a default at this destination
@@ -355,6 +408,12 @@ func (u *UnderlayDefaults) stillOurs(held writtenDefault) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return heldByKernel(messages, held), nil
+}
+
+// heldByKernel is that test against a dump already parsed, which reclaim needs
+// once for every record rather than once each.
+func heldByKernel(messages []route.Message, held writtenDefault) bool {
 	for _, message := range messages {
 		rm, ok := message.(*route.RouteMessage)
 		if !ok || rm.Type != unix.RTM_GET || rm.Index != held.index {
@@ -373,9 +432,9 @@ func (u *UnderlayDefaults) stillOurs(held writtenDefault) (bool, error) {
 		if !ok || gateway.WithZone("") != held.gateway {
 			continue
 		}
-		return true, nil
+		return true
 	}
-	return false, nil
+	return false
 }
 
 // isDefaultKey reports whether one dumped route is the default of that family,
