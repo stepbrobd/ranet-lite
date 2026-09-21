@@ -237,22 +237,29 @@ func run() int {
 			mesh.Name, mesh.QueueCount())
 	}
 
-	// The control socket is bound rather than served here, so a path that
-	// cannot be bound refuses the startup instead of leaving a node an
-	// operator has no way to ask anything. -control "" is the opt-out.
+	// The control socket is bound rather than served here, so a path an
+	// operator named and this node cannot bind refuses the startup instead of
+	// leaving a node nobody has a way to ask anything. The default path is the
+	// one case that warns and carries on: it is on without being asked for, so
+	// a node whose unit cannot reach /var/run would otherwise stop starting on
+	// upgrade over a diagnostic it never requested. -control "" is the opt-out.
 	if opts.controlPath != "" {
 		listener, err := control.Listen(opts.controlPath)
-		if err != nil {
+		if err != nil && opts.controlPath == control.DefaultSocket {
+			slog.Warn("running without a control socket, so the subcommands have nothing to read", "err", err)
+		} else if err != nil {
 			return refuseToStart(err)
 		}
-		defer listener.Close()
-		go func() {
-			log.Printf("control socket listening on %s", opts.controlPath)
-			if err := control.Serve(listener, node); err != nil {
-				log.Printf("control: %v", err)
-				failed.Store(true)
-			}
-		}()
+		if listener != nil {
+			defer listener.Close()
+			go func() {
+				log.Printf("control socket listening on %s", opts.controlPath)
+				if err := control.Serve(listener, node); err != nil {
+					log.Printf("control: %v", err)
+					failed.Store(true)
+				}
+			}()
+		}
 	}
 
 	// The reconciler has to finish withdrawing while the TUN still exists,
