@@ -113,6 +113,22 @@ babel:
 #   ip addr add 10.66.0.5/32 dev ranet0
 #   ip route add ::/0 dev ranet0
 
+# Optional: the segments this node answers for, RFC 8986. This tree acts on a
+# segment routing header in the dataplane rather than asking a kernel to, so
+# these work the same on every platform: darwin has no segment routing and a
+# mobile tunnel provider has no forwarding table at all, and neither needs one
+# when the process carrying the packet is the one acting on the header.
+#
+# A packet arriving for one of these is acted on before it reaches the tun.
+# End sends it to its next segment, End.DT46 strips the outer header and hands
+# what was inside to the stack. The spelling is the one
+# `ip route ... encap seg6local action` takes, so a fleet's own SIDs move here
+# unchanged.
+# segments:
+#   local:
+#     - { sid: "2a0c:b641:69c:8c6::1", behavior: "End.DT46" }
+#     - { sid: "2a0c:b641:69c:8c6::2", behavior: "End" }
+
 # Optional: mirror the routes babel learns into a routing table of its own,
 # taking over from BIRD's kernel protocols. Off unless enabled. The reconciler
 # deletes only routes carrying its own protocol, in its own table, out of the
