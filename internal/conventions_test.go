@@ -39,7 +39,11 @@ func treeFiles(t *testing.T, least map[string]int) []string {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && (d.Name() == "vendor" || d.Name() == ".git") {
+		// .claude holds the worktrees an agent session checks out, which are
+		// whole second copies of this tree plus whatever that session is
+		// writing. Judging them would report another session's scratch files
+		// as this tree's violations.
+		if d.IsDir() && (d.Name() == "vendor" || d.Name() == ".git" || d.Name() == ".claude") {
 			return filepath.SkipDir
 		}
 		if d.IsDir() {

@@ -378,13 +378,16 @@ func TestSyncPeersStartsAndStopsDialers(t *testing.T) {
 			{Organization: "example", CommonName: "b"},
 		},
 	})
-	// Both nodes are in the registry, with an endpoint that never resolves, so
-	// each dialer stays in its retry loop rather than giving up and taking
-	// itself out of the map. What is under test is the bookkeeping, not the
-	// dialing.
+	// Both nodes are in the registry carrying an address, so each dialer stays
+	// in its retry loop against a port nothing answers on rather than giving
+	// up and taking itself out of the map. An endpoint with no address at all
+	// is one no dial can use, which a dialer now reports and stands down from,
+	// and the bookkeeping this tests would then race that goroutine. What is
+	// under test is the bookkeeping, not the dialing.
+	unreachable := "127.0.0.1"
 	reg := registry.Registry{{Organization: "example", Nodes: []registry.Node{
-		{CommonName: "a", Endpoints: []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Port: 13000}}},
-		{CommonName: "b", Endpoints: []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Port: 13000}}},
+		{CommonName: "a", Endpoints: []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Address: &unreachable, Port: 13000}}},
+		{CommonName: "b", Endpoints: []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Address: &unreachable, Port: 13000}}},
 	}}}
 	c.reg.Store(&reg)
 
