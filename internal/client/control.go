@@ -96,12 +96,13 @@ func (c *Client) Status() control.Status {
 		},
 		Originate:       announced,
 		Segments:        segmentText(c.Mesh.Segments()),
+		Steering:        c.Mesh.Steering().Entries(),
 		SegmentCounters: segmentCounters(c.Mesh.SegmentCounters()),
 	}
 }
 
 // segmentCounters carries the dataplane's counters onto the wire. The two
-// structs are written out rather than converted, so a field added to one
+// structs are written out rather than converted, so adding a field to one
 // without the other is a compile error rather than a number that silently
 // stops being reported.
 func segmentCounters(counters netstack.SegmentCounters) control.SegmentCounters {
@@ -109,6 +110,8 @@ func segmentCounters(counters netstack.SegmentCounters) control.SegmentCounters 
 		Forwarded: counters.Forwarded,
 		Delivered: counters.Delivered,
 		Dropped:   counters.Dropped,
+		Steered:   counters.Steered,
+		Unsteered: counters.Unsteered,
 	}
 }
 

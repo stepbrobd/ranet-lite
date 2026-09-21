@@ -105,11 +105,17 @@ type Status struct {
 	ESP          ESPCounters  `json:"esp"`
 	Originate    []Originated `json:"originate"`
 	// Segments lists the addresses this node answers for as a waypoint or an
-	// exit, each written as the address and the behavior, and SegmentCounters
-	// records how it has acted on them. Both are absent on a node that
-	// configures no segment routing, which is most of them.
-	Segments        []string        `json:"segments,omitempty"`
-	SegmentCounters SegmentCounters `json:"segment_counters,omitzero"`
+	// exit, each written as the address and the behavior. It is absent on a
+	// node that configures no segment routing, which is most of them.
+	Segments []string `json:"segments,omitempty"`
+	// Steering is the policies deciding which of this node's own packets go
+	// through a segment list, in the order they were written.
+	Steering []string `json:"steering,omitempty"`
+	// SegmentCounters is always present, zeroes included. Omitting it while
+	// nothing had happened yet would read the same as a node with no segment
+	// routing at all, and those are the two states a reader is trying to tell
+	// apart.
+	SegmentCounters SegmentCounters `json:"segment_counters"`
 }
 
 // SegmentCounters is this node's segment routing, counted since startup.
@@ -121,6 +127,11 @@ type SegmentCounters struct {
 	Forwarded uint64 `json:"forwarded"`
 	Delivered uint64 `json:"delivered"`
 	Dropped   uint64 `json:"dropped"`
+	// Steered counts this node's own packets a policy encapsulated, and
+	// Unsteered the ones a policy claimed and could not, which went out
+	// unencapsulated and took the route they would have taken anyway.
+	Steered   uint64 `json:"steered"`
+	Unsteered uint64 `json:"unsteered"`
 }
 
 // RegistryInfo is the trust root as this node last read it. A reload replaces

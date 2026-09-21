@@ -44,6 +44,7 @@ func RenderStatus(w io.Writer, s Status) {
 		{"routes", fmt.Sprintf("%d prefixes, %d selected, %d originated", s.Counts.Prefixes, s.Counts.Selected, s.Counts.Originated)},
 		{"originate", originateLine(s.Originate)},
 		{"segments", segmentLine(s)},
+		{"steering", steeringLine(s)},
 		{"esp", fmt.Sprintf("%d in, %d dropped, %d refused", s.ESP.InboundPackets, s.ESP.InboundDropped, s.ESP.ReceiveRefused)},
 	}
 	out := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -100,6 +101,20 @@ func segmentLine(s Status) string {
 	return fmt.Sprintf("%s (%d forwarded, %d delivered, %d dropped)",
 		strings.Join(s.Segments, ", "),
 		s.SegmentCounters.Forwarded, s.SegmentCounters.Delivered, s.SegmentCounters.Dropped)
+}
+
+// steeringLine says "off" on a node that steers nothing, which is most of
+// them, rather than two zeroes a reader has to interpret as an absence.
+func steeringLine(s Status) string {
+	if len(s.Steering) == 0 {
+		return "off"
+	}
+	line := strings.Join(s.Steering, "; ")
+	line += fmt.Sprintf(" (%d steered", s.SegmentCounters.Steered)
+	if s.SegmentCounters.Unsteered > 0 {
+		line += fmt.Sprintf(", %d could not be", s.SegmentCounters.Unsteered)
+	}
+	return line + ")"
 }
 
 func originateLine(routes []Originated) string {
