@@ -30,11 +30,13 @@
 package babel
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -868,13 +870,28 @@ func (s *Speaker) Originated() []OriginatedRoute {
 	for key := range s.originate {
 		out = append(out, OriginatedRoute{Destination: key.dest, Source: key.source})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Destination != out[j].Destination {
-			return out[i].Destination.String() < out[j].Destination.String()
-		}
-		return out[i].Source.String() < out[j].Source.String()
+	slices.SortFunc(out, func(a, b OriginatedRoute) int {
+		return compareKey(a.Destination, a.Source, b.Destination, b.Source)
 	})
 	return out
+}
+
+// compareKey orders two route keys by destination and then by source prefix,
+// on the addresses rather than on their text. Comparing the text puts
+// 10.0.0.0/8 before 9.0.0.0/8, and it allocates two strings per comparison,
+// which at the route table's own limit is where a whole dump's cost goes.
+func compareKey(aDest, aSource, bDest, bSource netip.Prefix) int {
+	if c := comparePrefix(aDest, bDest); c != 0 {
+		return c
+	}
+	return comparePrefix(aSource, bSource)
+}
+
+func comparePrefix(a, b netip.Prefix) int {
+	if c := a.Addr().Compare(b.Addr()); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Bits(), b.Bits())
 }
 
 // RouteStat is one prefix of the Babel route table as an operator reads it:
@@ -900,6 +917,18 @@ type RouteStat struct {
 // deliberately the route table rather than the forwarding table: a prefix with
 // no usable route still appears, which is the case an operator is looking for.
 func (s *Speaker) RouteDump() []RouteStat {
+	out := s.routeStats()
+	// Ordered outside the lock. The walk has to be one moment and an ordering
+	// of its result does not, and at maxRouteKeys the sort is an order of
+	// magnitude more work than the walk, so holding s.mu across it stops every
+	// neighbor's receive path for as long as a reader takes.
+	slices.SortFunc(out, func(a, b RouteStat) int {
+		return compareKey(a.Destination, a.Source, b.Destination, b.Source)
+	})
+	return out
+}
+
+func (s *Speaker) routeStats() []RouteStat {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Both maps, the way advertisableKeys reads both: adoptOriginatedLocked
@@ -943,11 +972,5 @@ func (s *Speaker) RouteDump() []RouteStat {
 	for key := range s.routes.entries {
 		add(key)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Destination != out[j].Destination {
-			return out[i].Destination.String() < out[j].Destination.String()
-		}
-		return out[i].Source.String() < out[j].Source.String()
-	})
 	return out
 }
