@@ -15,6 +15,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 	"github.com/NickCao/ranet-lite/internal/transport"
@@ -48,6 +49,15 @@ type Client struct {
 	stopped bool
 	peers   sync.WaitGroup
 
+	// regReadAt is when the registry now installed was read, in unix
+	// nanoseconds, so a diagnostic can tell a registry that reloaded from one
+	// that has been the same since startup.
+	regReadAt atomic.Int64
+	// kernelStatus is the route reconciler's own view, supplied by the command
+	// that built it. Nil until then, and nil forever on a node whose routes
+	// are configured externally.
+	kernelStatus atomic.Pointer[func() control.KernelStatus]
+
 	inboundPackets atomic.Uint64
 	inboundDropped atomic.Uint64
 	// dropReported is nanoseconds since started, read through time.Since so it
@@ -67,6 +77,7 @@ func (c *Client) storeRegistry(reg registry.Registry) {
 	addresses := underlayAddrs(reg)
 	c.reg.Store(&reg)
 	c.underlay.Store(&addresses)
+	c.regReadAt.Store(time.Now().UnixNano())
 }
 
 // Underlay is every endpoint address in the registry this node could have to

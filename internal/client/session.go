@@ -304,6 +304,28 @@ func closeSession(sess *ike.Session) {
 // one that would only be resolved away. A session that has stopped proving it
 // does not count, so a dialer takes over from a dead one instead of waiting
 // out dead peer detection behind it.
+// liveSessionView is one entry of the set, copied out so that a caller reads
+// it without holding the lock every handshake and every teardown needs.
+type liveSessionView struct {
+	path      string
+	session   *ike.Session
+	preferred bool
+	peer      ike.Identity
+}
+
+// snapshot copies the live set. The sessions themselves are pointers, so a
+// caller reads each one through its own accessors afterwards; what the lock
+// protects is the map, and it is released before any of that happens.
+func (s *sessionSet) snapshot() []liveSessionView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]liveSessionView, 0, len(s.live))
+	for path, live := range s.live {
+		out = append(out, liveSessionView{path: path, session: live.session, preferred: live.preferred, peer: live.peer})
+	}
+	return out
+}
+
 func (s *sessionSet) holds(path string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
