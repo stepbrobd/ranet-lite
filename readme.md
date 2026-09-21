@@ -501,12 +501,17 @@ name, and a path an operator named and this node cannot bind refuses the
 startup. The default path warns and carries on instead, because it is on without
 having been asked for.
 
+The version a node reports is `version.txt` and the commit the binary was built
+from, because `version.txt` moves once per release and a fleet is converted one
+node at a time in between. `ranet-lite -version` asks the binary the same
+question without a node running.
+
 The subcommands read it and print a table, or the wire form with `-json`:
 
 ```
 $ ranet-lite status
 node        ysun/framework
-version     2026.912.0
+version     2026.912.0+860393bf1c2e
 uptime      3h12m0s
 port        13000
 endpoints   0/ip6 1/ip4

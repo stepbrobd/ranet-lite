@@ -56,7 +56,7 @@ func (c *Client) Status() control.Status {
 		announced = append(announced, control.Originated{Prefix: route.Destination, From: route.Source})
 	}
 	return control.Status{
-		Version:      version.Value,
+		Version:      version.String(),
 		Organization: cfg.Organization,
 		CommonName:   cfg.CommonName,
 		Port:         cfg.Port,

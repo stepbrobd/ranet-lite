@@ -1,6 +1,10 @@
 {
   lib,
   buildGoApplication,
+  # the commit this build came from, which tells two nodes apart between
+  # releases: version.txt moves once per release and a fleet converts one node
+  # at a time in between
+  revision ? null,
 }:
 
 buildGoApplication (
@@ -49,7 +53,10 @@ buildGoApplication (
       "-s"
       "-w"
       "-X github.com/NickCao/ranet-lite/internal/version.Value=${finalAttrs.version}"
-    ];
+    ]
+    ++ lib.optional (
+      revision != null
+    ) "-X github.com/NickCao/ranet-lite/internal/version.Revision=${revision}";
 
     # the test suite runs as a flake check, never inside the package build
     doCheck = false;

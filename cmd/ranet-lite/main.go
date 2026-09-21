@@ -28,6 +28,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/kernel"
+	"github.com/NickCao/ranet-lite/internal/version"
 )
 
 func main() { os.Exit(run()) }
@@ -41,6 +42,7 @@ type options struct {
 	pprofAddr          string
 	metricsAddr        string
 	controlPath        string
+	version            bool
 	contentionProfiles bool
 	level              slog.Level
 }
@@ -61,6 +63,7 @@ func parseOptions(args []string, usage io.Writer) (options, error) {
 	fs.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
 	fs.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
 	fs.StringVar(&o.controlPath, "control", control.DefaultSocket, "unix socket serving the read-only control surface the subcommands read; empty disables it")
+	fs.BoolVar(&o.version, "version", false, "print the version this binary was built from and exit")
 	logLevel := fs.String("log-level", "info", "minimum log level: debug, info, warn, or error")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
@@ -113,6 +116,12 @@ func run() int {
 	if err != nil {
 		log.Print(err)
 		return 1
+	}
+	if opts.version {
+		// Asked of the binary rather than of a node, because the question
+		// comes up before a node is running and on a host where one will not.
+		fmt.Fprintln(os.Stdout, version.String())
+		return 0
 	}
 	configPath, pprofAddr := &opts.configPath, &opts.pprofAddr
 	metricsAddr, contentionProfiles := &opts.metricsAddr, &opts.contentionProfiles

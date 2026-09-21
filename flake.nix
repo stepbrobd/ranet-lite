@@ -55,7 +55,9 @@
             };
 
             packages = {
-              default = pkgs.callPackage ./default.nix { };
+              default = pkgs.callPackage ./default.nix {
+                revision = inputs.self.shortRev or inputs.self.dirtyShortRev or null;
+              };
               iperf3-benchmark = pkgs.callPackage ./integration/iperf3.nix { };
             }
             # profiling variants are built on demand, never as part of a check
