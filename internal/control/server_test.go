@@ -328,10 +328,10 @@ func (p *onePipe) Close() error   { return nil }
 func (p *onePipe) Addr() net.Addr { return p.daemon.LocalAddr() }
 
 // A client that accumulates connections costs the daemon a goroutine and a
-// descriptor apiece, and a node out of descriptors cannot be asked anything,
-// which is the one thing this socket exists to prevent. Past the bound a
-// connection is closed as it is accepted rather than queued, so a client
-// holding every place cannot hold up the accept loop or a shutdown either.
+// descriptor apiece, and a node out of descriptors cannot be asked anything at
+// all, the silence this socket was built to end. Past the bound a connection is
+// closed as it is accepted rather than queued, so a client holding every place
+// cannot hold up the accept loop or a shutdown either.
 func TestConnectionsPastTheBoundAreRefusedRatherThanQueued(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "control.sock")
 	listener, err := Listen(path)

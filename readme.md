@@ -424,12 +424,15 @@ comes up with the longest configured list taken off its MTU, and a list long
 enough to take it under the 1280 byte minimum IPv6 requires is refused rather
 than installed. Steering happens before the route lookup, because a steered
 packet is routed by the segment it is going to rather than by the address it was
-addressed to. A packet a policy claims and cannot encapsulate goes out
-unencapsulated and is counted as `unsteered`, which is the more conservative of
-the two failures. Every reason it can fail is refused when the configuration is
-read, so the only one left needs a packet larger than the device MTU the daemon
-itself set, and the counter stays at zero on a node whose MTU nothing else has
-raised.
+addressed to. The outer header takes its traffic class, flow label and hop limit
+from the packet it carries, as `__seg6_do_srh_encap` does, so a steered path
+costs the packet one hop per waypoint and a packet that arrives with nothing
+left to spend is answered with an ICMP Time Exceeded rather than dropped in
+silence. A packet a policy claims and cannot encapsulate goes out unencapsulated
+and is counted as `unsteered`, which is the more conservative of the two
+failures. Every reason it can fail is refused when the configuration is read, so
+the only one left needs a packet larger than the device MTU the daemon itself
+set, and the counter stays at zero on a node whose MTU nothing else has raised.
 
 A header this tree writes is one the kernel acts on, which the `segments` VM
 check holds: the client steers through a SID the gateway answers for with

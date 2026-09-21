@@ -709,8 +709,9 @@ func stopTimer(t *time.Timer) {
 // The pass is recorded here rather than inside applyRoutes, so that what a
 // diagnostic reports is the error Run logged rather than one fifth of it: a
 // node whose rules or VRF fail on every pass would otherwise answer `ranet-lite
-// status` with a clean route count and no error at all, which is the outage
-// that reads as a routing problem for a day.
+// status` with a clean route count and no error at all. See
+// refuseWhatThePlatformLacks for why that particular silence is the expensive
+// one.
 func (r *Reconciler) reconcile() error {
 	// The VRF first, because applyMaster enslaves the link to it and a master
 	// that does not exist yet is a master the link cannot join.
