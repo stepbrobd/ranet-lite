@@ -318,6 +318,88 @@ func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force fun
 	force()
 }
 
+// kernelRules turns the config file's rules into the reconciler's, resolving
+// each one's address family. A rule that names neither a destination nor a
+// source selects on a mark alone, which belongs to no family, so it says which
+// one it is for; "both" is written once and installed twice, because that is
+// what keeping an underlay out of a mesh table needs and writing it twice by
+// hand is how one of the two goes missing.
+//
+// Everything the reconciler itself judges is left to Rule.validate, so the one
+// place that decides what a rule may say is the one that installs it.
+func kernelRules(rules []config.Rule) ([]kernel.Rule, error) {
+	var out []kernel.Rule
+	for _, rule := range rules {
+		to, err := rulePrefix("to", rule.To)
+		if err != nil {
+			return nil, err
+		}
+		from, err := rulePrefix("from", rule.From)
+		if err != nil {
+			return nil, err
+		}
+		families, err := ruleFamilies(rule, to, from)
+		if err != nil {
+			return nil, err
+		}
+		for _, family := range families {
+			out = append(out, kernel.Rule{
+				Family:   family,
+				To:       to,
+				From:     from,
+				FWMark:   rule.FWMark,
+				FWMask:   rule.FWMask,
+				Table:    uint32(rule.Table),
+				Priority: rule.Priority,
+			})
+		}
+	}
+	return out, nil
+}
+
+// ruleFamilies is the families one configured rule installs for. An address
+// already says which family it belongs to, so naming one as well is refused
+// rather than silently resolved one way or the other.
+func ruleFamilies(rule config.Rule, to, from netip.Prefix) ([]uint8, error) {
+	addressed := to.IsValid() || from.IsValid()
+	named := strings.ToLower(rule.Family)
+	if addressed && named != "" {
+		return nil, fmt.Errorf("config: kernel rule at priority %d names family %q and an address, which already says which family it is", rule.Priority, rule.Family)
+	}
+	if addressed {
+		address := to.Addr()
+		if !to.IsValid() {
+			address = from.Addr()
+		}
+		if address.Is4() {
+			return []uint8{kernel.FamilyIPv4}, nil
+		}
+		return []uint8{kernel.FamilyIPv6}, nil
+	}
+	switch named {
+	case "ipv4":
+		return []uint8{kernel.FamilyIPv4}, nil
+	case "ipv6":
+		return []uint8{kernel.FamilyIPv6}, nil
+	case "both":
+		return []uint8{kernel.FamilyIPv4, kernel.FamilyIPv6}, nil
+	case "":
+		return nil, fmt.Errorf("config: kernel rule at priority %d selects on a mark alone, so it has to name family: ipv4, ipv6 or both", rule.Priority)
+	}
+	return nil, fmt.Errorf("config: kernel rule at priority %d: family %q is not ipv4, ipv6 or both", rule.Priority, rule.Family)
+}
+
+func rulePrefix(name, raw string) (netip.Prefix, error) {
+	if raw == "" {
+		return netip.Prefix{}, nil
+	}
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("config: kernel rule %s %q: %w", name, raw, err)
+	}
+	return prefix, nil
+}
+
 // kernelStatus is the reconciler as the control surface reports it: what it
 // was configured to own and what its last pass did. The configuration half
 // comes from the resolved kernel.Config rather than from the config file, so
@@ -345,6 +427,10 @@ func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
 // parsed here rather than in config.Load, so the reconciler's own validation
 // in kernel.New stays the single place that decides what it accepts.
 func kernelConfig(cfg *config.Config, device string, underlay func() []netip.Addr) (kernel.Config, error) {
+	rules, err := kernelRules(cfg.Kernel.Rules)
+	if err != nil {
+		return kernel.Config{}, err
+	}
 	out := kernel.Config{
 		Interface: device,
 		Underlay:  underlay,
@@ -352,6 +438,8 @@ func kernelConfig(cfg *config.Config, device string, underlay func() []netip.Add
 		Protocol:  cfg.Kernel.Protocol,
 		Metric:    cfg.Kernel.Metric,
 		VRF:       cfg.Kernel.VRF,
+		CreateVRF: cfg.Kernel.CreateVRF,
+		Rules:     rules,
 	}
 	if cfg.Kernel.ReconcileInterval != nil {
 		out.ReconcileInterval = time.Duration(*cfg.Kernel.ReconcileInterval)

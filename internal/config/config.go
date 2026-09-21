@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,9 +117,95 @@ type Kernel struct {
 	// VRF enslaves the TUN to that master device, but only while the link has
 	// no master, so networkd keeps whatever it already claimed.
 	VRF string `yaml:"vrf"`
+	// CreateVRF makes that device when nothing of the name exists, bound to
+	// Table, so a deployment does not need its host's network manager to make
+	// it first. One this process created is removed again at shutdown. linux
+	// only: there are no VRFs on the other platforms this builds for, and a
+	// configuration asking for one there is refused by name.
+	CreateVRF bool `yaml:"vrf_create"`
+	// Rules are the policy rules the reconciler owns, in the order written.
+	// linux only, for the same reason and with the same refusal: darwin has
+	// one forwarding table and no rules, and a mobile tunnel provider is
+	// handed a route list rather than a table. What a rule expresses carries
+	// across anyway, and each platform reaches it its own way; see the
+	// platform notes in readme.md.
+	Rules []Rule `yaml:"rules"`
 	// ReconcileInterval is the periodic sweep that corrects drift nothing
 	// announced. Omitted uses the package default.
 	ReconcileInterval *Duration `yaml:"reconcile_interval"`
+}
+
+// Rule is one policy rule as the file spells it. The strings are parsed where
+// the reconciler is configured rather than here, so the one place that decides
+// what a rule may say is the one that installs it.
+type Rule struct {
+	// To and From are the destination and source prefixes this rule selects
+	// on, each optional. A rule naming neither selects on a mark alone and has
+	// to name its Family, because a mark belongs to no address family.
+	To   string `yaml:"to"`
+	From string `yaml:"from"`
+	// FWMark and FWMask select on the packet's mark. A hex literal is
+	// ordinary YAML, so fwmark: 0x726c is written as it reads elsewhere.
+	FWMark uint32 `yaml:"fwmark"`
+	FWMask uint32 `yaml:"fwmask"`
+	// Table is the table this rule looks up, as a number or as one of the
+	// three names the kernel reserves.
+	Table TableID `yaml:"table"`
+	// Priority is the rule's position in the list. It is required: leaving it
+	// to the kernel puts the rule just above the last one, which is a
+	// different place on every node.
+	Priority uint32 `yaml:"priority"`
+	// Family is "ipv4", "ipv6" or "both", and is needed only when neither To
+	// nor From says which. "both" installs the rule once per family.
+	Family string `yaml:"family"`
+}
+
+// TableID accepts a routing table as a number or as one of the names the
+// kernel reserves, so a rule that sends the underlay to the main table reads
+// as "table: main" rather than as "table: 254".
+type TableID uint32
+
+// Reserved table numbers, from linux/rtnetlink.h. Named here rather than taken
+// from x/sys so that the config package still builds on every platform.
+const (
+	TableDefault TableID = 253
+	TableMain    TableID = 254
+	TableLocal   TableID = 255
+)
+
+func (t *TableID) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("line %d: a table is a number or a name such as main, not %s", value.Line, nodeKindName(value.Kind))
+	}
+	switch strings.ToLower(value.Value) {
+	case "main":
+		*t = TableMain
+		return nil
+	case "local":
+		*t = TableLocal
+		return nil
+	case "default":
+		*t = TableDefault
+		return nil
+	}
+	number, err := strconv.ParseUint(value.Value, 0, 32)
+	if err != nil {
+		return fmt.Errorf("line %d: table %q is neither a number nor one of main, local and default", value.Line, value.Value)
+	}
+	*t = TableID(number)
+	return nil
+}
+
+func (t TableID) String() string {
+	switch t {
+	case TableMain:
+		return "main"
+	case TableLocal:
+		return "local"
+	case TableDefault:
+		return "default"
+	}
+	return strconv.FormatUint(uint64(t), 10)
 }
 
 // KernelAddresses keeps startup and reload checking the same assigned-address

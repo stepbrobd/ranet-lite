@@ -220,6 +220,9 @@ func sameKernelSettings(old, next config.Kernel) bool {
 		if len(k.Addresses) == 0 {
 			k.Addresses = nil
 		}
+		if len(k.Rules) == 0 {
+			k.Rules = nil
+		}
 		interval := kernel.DefaultReconcileInterval
 		if k.ReconcileInterval != nil {
 			interval = time.Duration(*k.ReconcileInterval)
