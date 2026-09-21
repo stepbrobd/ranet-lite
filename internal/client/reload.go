@@ -9,7 +9,9 @@ import (
 	"reflect"
 	"slices"
 
+	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/registry"
 	"github.com/NickCao/ranet-lite/internal/schema"
@@ -131,7 +133,7 @@ func (c *Client) Reload(path string) error {
 	for _, path := range c.sessions.revoke(c.stillTrusted) {
 		log.Printf("reload: %s is no longer in the trust document, session closed", path)
 	}
-	c.speaker.SetRoutes(cfg.Routes())
+	c.republish(cfg)
 	c.syncPeers()
 	nodes := 0
 	for _, organization := range reg {
@@ -212,8 +214,35 @@ func reloadable(old, next *config.Config) error {
 		// applying them to newly dialed sessions alone would leave the node
 		// running two different policies at once.
 		return fmt.Errorf("config: cap.crypto changed, restart to apply")
+	case !sameEgress(old, next):
+		// The translator is built once in main and owns the tables it created
+		// under the families the old block named, so a new one applied here
+		// would leave the host holding rules from a configuration nothing is
+		// running any more.
+		return fmt.Errorf("config: cap.egress changed, restart to apply")
 	}
 	return nil
+}
+
+// sameEgress compares the capability by what it was given rather than by how
+// the file was written, as sameTable does: an omitted list and an empty one
+// ask for the same thing, and so do an omitted sweep and one written out as
+// its own default.
+func sameEgress(old, next *config.Config) bool {
+	normalize := func(e *egress.Egress) *egress.Egress {
+		if e == nil {
+			return nil
+		}
+		copied := *e
+		if len(copied.Advertise) == 0 {
+			copied.Advertise = nil
+		}
+		if copied.Sweep == 0 {
+			copied.Sweep = schema.Duration(egress.DefaultSweep)
+		}
+		return &copied
+	}
+	return reflect.DeepEqual(normalize(old.Egress()), normalize(next.Egress()))
 }
 
 // sameCrypto compares the timers and the window a session captures when it is
@@ -302,6 +331,43 @@ func normalize(segments srv6.Segments) srv6.Segments {
 		}
 	}
 	return segments
+}
+
+// announced is every prefix this node is putting into the mesh right now: the
+// ones cap.route asks for unconditionally, plus the ones cap.egress is
+// currently willing to stand behind. The second set is read from the
+// translator on every call rather than from the file, because an exit withholds
+// a prefix whose rule is not installed and that answer changes under a running
+// node.
+func (c *Client) announced(cfg *config.Config) []babel.OriginatedRoute {
+	routes := cfg.Routes().Originated()
+	for _, prefix := range c.egressAdvertised() {
+		routes = append(routes, babel.OriginatedRoute{Destination: prefix})
+	}
+	return routes
+}
+
+// SetEgressAnnounce hands the runtime cap.egress's own view of what it may
+// advertise. See announced.
+func (c *Client) SetEgressAnnounce(read func() []netip.Prefix) {
+	c.egressAnnounce.Store(&read)
+}
+
+func (c *Client) egressAdvertised() []netip.Prefix {
+	if read := c.egressAnnounce.Load(); read != nil {
+		return (*read)()
+	}
+	return nil
+}
+
+// Republish rebuilds the announcement set and hands it to the speaker.
+// cap.egress calls it whenever the prefixes it may advertise change, which is
+// how an exit whose rule stopped being installed retracts rather than going on
+// attracting traffic it would have to drop.
+func (c *Client) Republish() { c.republish(c.config()) }
+
+func (c *Client) republish(cfg *config.Config) {
+	c.speaker.SetOriginated(c.announced(cfg))
 }
 
 // forgetDialer drops a dialer that ended by itself, and only if the map still

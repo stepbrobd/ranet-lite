@@ -31,6 +31,20 @@ func (c *Client) SetKernelStatus(read func() control.KernelStatus) {
 	c.kernelStatus.Store(&read)
 }
 
+// SetEgressStatus does the same for the egress capability, which the command
+// builds for the same reason: it owns a table in the host's packet filter and
+// this owns the mesh. Without it the capability reports as off, which is the
+// honest answer for a node that carries nothing for anybody else.
+func (c *Client) SetEgressStatus(read func() control.EgressStatus) {
+	c.egressStatus.Store(&read)
+}
+
+// Forwarding reports whether this host forwards, per family. It is exported so
+// that the egress capability and the transit warning read one answer rather
+// than two: a node that advertises a prefix is promising to carry it, and both
+// the warning and the withheld advertisement come from this fact.
+func Forwarding() (v4, v6 bool) { return forwardingEnabled() }
+
 func (c *Client) Status() control.Status {
 	cfg := c.config()
 	reg := c.registry()
@@ -78,6 +92,7 @@ func (c *Client) Status() control.Status {
 			ReadAt:        c.registryReadAt(),
 		},
 		Kernel: c.kernel(),
+		Egress: c.egress(),
 		Counts: control.Counts{
 			Dialers:        c.dialerCount(),
 			Sessions:       len(c.sessions.paths()),
@@ -153,6 +168,19 @@ func (c *Client) kernel() control.KernelStatus {
 		status.L3mdevAccept = &accepts
 	}
 	return status
+}
+
+// egress reports the exit node capability, or that there is none. As with the
+// reconciler, the configured half comes from the command through
+// SetEgressStatus rather than from the config file, because a block that
+// failed validation never became a translator and reporting its fields would
+// describe rules nobody installed.
+func (c *Client) egress() control.EgressStatus {
+	read := c.egressStatus.Load()
+	if read == nil {
+		return control.EgressStatus{}
+	}
+	return (*read)()
 }
 
 func (c *Client) registryReadAt() time.Time {

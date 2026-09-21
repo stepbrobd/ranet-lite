@@ -8,8 +8,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/NickCao/ranet-lite/internal/control"
 )
 
 // Metrics replaces what prometheus-bird-exporter reported while Babel lived in
@@ -78,6 +76,41 @@ func (c *Client) Metrics(w io.Writer) {
 	c.renderReceiveCounters(w)
 	c.renderSegmentCounters(w)
 	c.renderKernel(w)
+	c.renderEgress(w)
+}
+
+// renderEgress writes the exit node and subnet router capability. A node that
+// carries nothing for anybody writes none of it, as with the reconciler.
+//
+// The advertised and announced counts are separate series rather than one
+// gauge and a label, because their difference is the alert: a prefix is
+// announced only while its rule is installed and the kernel forwards it, so
+// announced below advertised is this node declining to attract traffic it
+// would drop, and no peer can see that from its own end.
+func (c *Client) renderEgress(w io.Writer) {
+	egress := c.egress()
+	if !egress.Enabled {
+		return
+	}
+	fmt.Fprint(w, "# HELP ranet_lite_egress_rules_installed Source translation rules the host holds for this node as of its last pass.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_egress_rules_installed gauge\n")
+	fmt.Fprintf(w, "ranet_lite_egress_rules_installed %d\n", egress.Installed)
+	fmt.Fprint(w, "# HELP ranet_lite_egress_prefixes Prefixes this node offers to carry, and the ones it is announcing: announcing fewer is this node withholding a prefix whose rule is not installed or whose family the kernel will not forward.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_egress_prefixes gauge\n")
+	fmt.Fprintf(w, "ranet_lite_egress_prefixes{state=\"advertised\"} %d\n", len(egress.Advertise))
+	fmt.Fprintf(w, "ranet_lite_egress_prefixes{state=\"announced\"} %d\n", len(egress.Announced))
+	fmt.Fprint(w, "# HELP ranet_lite_egress_flows_total Connections the translation rules have rewritten. A nat chain is consulted once per connection, so this counts flows rather than packets.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_egress_flows_total counter\n")
+	fmt.Fprintf(w, "ranet_lite_egress_flows_total %d\n", egress.Flows)
+	fmt.Fprint(w, "# HELP ranet_lite_egress_conflicts Other source translation at the same hook, which the first chain to claim a connection keeps.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_egress_conflicts gauge\n")
+	fmt.Fprintf(w, "ranet_lite_egress_conflicts %d\n", len(egress.Conflicts))
+	fmt.Fprint(w, "# HELP ranet_lite_egress_pass_timestamp_seconds When the last pass finished, and zero before the first one has.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_egress_pass_timestamp_seconds gauge\n")
+	fmt.Fprintf(w, "ranet_lite_egress_pass_timestamp_seconds %d\n", unixOrZero(egress.PassAt))
+	fmt.Fprint(w, "# HELP ranet_lite_egress_pass_failed Whether the last pass reported an error.\n")
+	fmt.Fprint(w, "# TYPE ranet_lite_egress_pass_failed gauge\n")
+	fmt.Fprintf(w, "ranet_lite_egress_pass_failed %d\n", boolValue(egress.Err != ""))
 }
 
 // renderSegmentCounters writes the segment routing half. Nothing exported it
@@ -131,21 +164,21 @@ func (c *Client) renderKernel(w io.Writer) {
 	fmt.Fprintf(w, "ranet_lite_kernel_routes_skipped %d\n", kernel.Skipped)
 	fmt.Fprint(w, "# HELP ranet_lite_kernel_pass_timestamp_seconds When the last pass finished, and zero before the first one has.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_kernel_pass_timestamp_seconds gauge\n")
-	fmt.Fprintf(w, "ranet_lite_kernel_pass_timestamp_seconds %d\n", passSeconds(kernel))
+	fmt.Fprintf(w, "ranet_lite_kernel_pass_timestamp_seconds %d\n", unixOrZero(kernel.PassAt))
 	fmt.Fprint(w, "# HELP ranet_lite_kernel_pass_failed Whether the last pass reported an error.\n")
 	fmt.Fprint(w, "# TYPE ranet_lite_kernel_pass_failed gauge\n")
 	fmt.Fprintf(w, "ranet_lite_kernel_pass_failed %d\n", boolValue(kernel.Err != ""))
 }
 
-// passSeconds is the unix time of the last pass, and zero rather than a
-// negative number before the first one, since the zero time predates the
-// epoch by two millennia and an alert reading "older than five minutes" would
-// be true of it either way.
-func passSeconds(kernel control.KernelStatus) int64 {
-	if kernel.PassAt.IsZero() {
+// unixOrZero is the unix time of a pass, and zero rather than a negative
+// number before the first one, since the zero time predates the epoch by two
+// millennia and an alert reading "older than five minutes" would be true of it
+// either way.
+func unixOrZero(at time.Time) int64 {
+	if at.IsZero() {
 		return 0
 	}
-	return kernel.PassAt.Unix()
+	return at.Unix()
 }
 
 // renderReceiveCounters writes the three the hub keeps. They are separate

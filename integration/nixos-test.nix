@@ -14,6 +14,11 @@
   # against the implementation it has to interoperate with rather than against
   # its own decoder.
   segments ? false,
+  # egress makes the client an exit node for a network the gateway can reach no
+  # other way, so the translation, the forwarding and the advertisement are
+  # measured against a third machine rather than against this tree's own idea
+  # of what it installed.
+  egress ? false,
 }:
 
 let
@@ -36,6 +41,17 @@ let
   # can pick as the source for the mesh traffic that leaves through it, and
   # nothing announces this one, so the replies would have nowhere to go.
   clientBehind = "fd00:88::9";
+  # The network behind the exit node, on the same link as the underlay but in
+  # prefixes neither the gateway nor the test harness assigns, so the gateway
+  # reaches it through the mesh or not at all. behind answers there and has no
+  # route back to the tunnel prefixes, so a reply proves the source was
+  # translated as surely as the capture does.
+  exitNetV4 = "198.51.100.0/24";
+  exitNetV6 = "fd00:aa::/64";
+  behindV4 = "198.51.100.1";
+  behindV6 = "fd00:aa::1";
+  exitV4 = "198.51.100.2";
+  exitV6 = "fd00:aa::2";
   publicKey = builtins.readFile ./org-pub.pem;
 
   common = {
@@ -56,6 +72,8 @@ in
       "ranet-lite-kernel"
     else if segments then
       "ranet-lite-segments"
+    else if egress then
+      "ranet-lite-egress"
     else
       "ranet-lite-integration";
 
@@ -264,6 +282,34 @@ in
         imports = [ common ];
 
         boot.kernelModules = [ "tun" ];
+
+        # An exit node forwards for its peers, and a node that advertises a
+        # prefix it will not forward attracts traffic and drops it. The
+        # capability withholds the advertisement while these are off, which the
+        # script turns one of them off to measure.
+        boot.kernel.sysctl = pkgs.lib.mkIf egress {
+          "net.ipv4.ip_forward" = 1;
+          "net.ipv6.conf.all.forwarding" = 1;
+        };
+
+        # The far side of the exit is on the same link as the underlay, under
+        # prefixes the harness assigns to nobody, so the gateway has a route to
+        # it through the mesh alone.
+        networking.interfaces.eth1 = pkgs.lib.mkIf egress {
+          ipv4.addresses = [
+            {
+              address = exitV4;
+              prefixLength = 24;
+            }
+          ];
+          ipv6.addresses = [
+            {
+              address = exitV6;
+              prefixLength = 64;
+            }
+          ];
+        };
+
         environment.systemPackages =
           with pkgs;
           [
@@ -271,6 +317,12 @@ in
             iperf3
             iproute2
             ranetLite
+          ]
+          # nft reads back what this tree wrote through netlink, and jq asks
+          # the control socket a question the shell cannot.
+          ++ pkgs.lib.optionals egress [
+            jq
+            nftables
           ]
           ++ lib.optionals profile [
             pprof
@@ -378,7 +430,18 @@ in
                   margin: 0
                   jitter: 0
               ${pkgs.lib.optionalString segments ''segment: { source: "${clientTunnel}", local: [{ sid: "${clientSID}", behavior: "End.DT46" }], steer: [{ from: "${clientTunnel}/128", to: "${gatewayBehind}/128", via: ["${gatewaySID}"] }] }''}
-              ${pkgs.lib.optionalString kernel "table: { id: ${toString kernelTable}, proto: ${toString kernelProtocol}, metric: 32, prefsrc4: ${clientTunnelV4}, reconcile: 2s }"}
+              ${pkgs.lib.optionalString egress ''egress: { advertise: ["${exitNetV4}", "${exitNetV6}"], sweep: 2s }''}
+              ${pkgs.lib.optionalString (kernel || egress)
+                "table: { id: ${toString kernelTable}, proto: ${toString kernelProtocol}, metric: 32, prefsrc4: ${clientTunnelV4}, reconcile: 2s${
+                  # A reply to a translated flow has its destination put back
+                  # before the forwarding lookup runs, so the route to the peer
+                  # has to be in a table that lookup consults. The mesh's routes
+                  # are in a table of the reconciler's own, and a rule is how
+                  # anything else reaches them.
+                  pkgs.lib.optionalString egress
+                    ", rules: [{ to: \"10.99.0.0/24\", table: ${toString kernelTable}, priority: 100 }, { to: \"fd00:99::/64\", table: ${toString kernelTable}, priority: 100 }]"
+                } }"
+              }
           '';
         };
 
@@ -398,6 +461,30 @@ in
           };
         };
       };
+  }
+  // pkgs.lib.optionalAttrs egress {
+    # The network the exit node carries. It has no route to either tunnel
+    # prefix, so it can answer the exit's own address and nothing else: a reply
+    # that arrives at the gateway is a source that was translated, and the
+    # capture says which address it was translated to.
+    behind = {
+      imports = [ common ];
+      environment.systemPackages = [ pkgs.tcpdump ];
+      networking.interfaces.eth1 = {
+        ipv4.addresses = [
+          {
+            address = behindV4;
+            prefixLength = 24;
+          }
+        ];
+        ipv6.addresses = [
+          {
+            address = behindV6;
+            prefixLength = 64;
+          }
+        ];
+      };
+    };
   };
 
   testScript =
@@ -521,6 +608,134 @@ in
         )
         assert after["dropped"] == before["dropped"], f"a segment was refused: {after}"
         assert status["segments"], "the local segment is not reported"
+      '';
+
+      # The client is the exit node and the gateway is the peer using it. What
+      # is measured is a third machine's view: it answers in prefixes only the
+      # exit can reach, and it sees the exit's own address rather than the mesh
+      # address the packet started with. The rules go away at shutdown, which
+      # is the ownership claim and not a guess.
+      exitNode = ''
+        import json
+
+        try:
+            gateway.wait_for_unit("systemd-networkd-wait-online.service")
+            gateway.wait_for_unit("strongswan-swanctl.service")
+            gateway.wait_for_unit("bird.service")
+            # The addresses rather than the unit: networkd's wait-online is
+            # WantedBy network-online.target, a passive target nothing on this
+            # node pulls in, so it never becomes active here however configured
+            # the link is. This arm needs the far side answering instead, so it
+            # waits for the addresses themselves.
+            for address in ["${behindV4}", "${behindV6}"]:
+                behind.wait_until_succeeds(f"ip addr show dev eth1 | grep -qF {address}", timeout=timeout)
+            client.wait_for_unit("ranet-lite.service")
+
+            # The mesh first, so a failure below is the exit rather than the tunnel.
+            client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+
+            # Only this tree's own tables exist, and only in the families it was
+            # asked for. Anything else here would be a rule written outside what
+            # the ownership rules allow.
+            client.wait_until_succeeds("nft list table ip ranet-lite", timeout=timeout)
+            tables = sorted(t for t in client.succeed("nft list tables").splitlines() if t.strip())
+            assert tables == ["table ip ranet-lite", "table ip6 ranet-lite"], tables
+            ruleset = client.succeed("nft list ruleset")
+            print(ruleset)
+            for want in ["chain postrouting", "type nat hook postrouting", "masquerade",
+                         'iifname "ranet0"', 'oifname != "ranet0"']:
+                assert want in ruleset, f"the ruleset does not carry {want}:\n{ruleset}"
+
+            # The announcement reaches a peer that has never heard of this
+            # capability, through ordinary babel and the BIRD on the far side.
+            gateway.wait_until_succeeds("ip -4 route show ${exitNetV4} | grep -q swan0", timeout=timeout)
+            gateway.wait_until_succeeds("ip -6 route show ${exitNetV6} | grep -q swan0", timeout=timeout)
+
+            def carried(name, filter, source, destination):
+                """What the far side saw of three pings through the exit.
+
+                tcpdump counts the three it wants and exits on its own, rather
+                than being killed once the pings are done: a kill races the
+                write, and measured here it lost, reporting six packets past
+                the filter and none written. The filter is the echo request
+                alone, so neighbor discovery cannot make up the count.
+                """
+                behind.succeed(f"rm -f /tmp/{name}.pcap /tmp/{name}.log")
+                behind.execute(
+                    f"tcpdump -Uni eth1 -c 3 -w /tmp/{name}.pcap '{filter}' >/tmp/{name}.log 2>&1 &")
+                behind.wait_until_succeeds(f"grep -q 'listening on' /tmp/{name}.log", timeout=timeout)
+                print(gateway.succeed(f"ping -c 3 -i 0.3 -W 2 -I {source} {destination}"))
+                behind.wait_until_fails("pgrep -x tcpdump", timeout=timeout)
+                print(behind.succeed(f"cat /tmp/{name}.log"))
+                return behind.succeed(f"tcpdump -nr /tmp/{name}.pcap")
+
+            for name, filter, source, destination, translated in [
+                ("v4", "icmp[icmptype] = icmp-echo", "${gatewayTunnelV4}", "${behindV4}", "${exitV4}"),
+                ("v6", "icmp6 and ip6[40] = 128", "${gatewayTunnel}", "${behindV6}", "${exitV6}"),
+            ]:
+                # The round trip first: behind has no route to the tunnel
+                # prefixes, so a reply that comes back at all is one the exit
+                # translated and then put back.
+                gateway.wait_until_succeeds(
+                    f"ping -c 1 -W 2 -I {source} {destination}", timeout=timeout)
+                capture = carried(name, filter, source, destination)
+                print(capture)
+                assert f"{translated} > {destination}" in capture, (
+                    f"the far side did not see the exit's own address:\n{capture}")
+                assert source not in capture, (
+                    f"the mesh address reached the far side untranslated:\n{capture}")
+
+            status = json.loads(client.succeed("ranet-lite status --json"))["egress"]
+            print(json.dumps(status, indent=2))
+            assert status["enabled"], status
+            assert status["installed"] == 2, status
+            assert sorted(status["announced"]) == sorted(status["advertise"]), status
+            assert status["flows"] > 0, status
+            assert not status.get("err"), status
+            metrics = client.succeed("curl -sf http://127.0.0.1:9669/metrics")
+            for want in [
+                'ranet_lite_egress_prefixes{state="advertised"} 2',
+                'ranet_lite_egress_prefixes{state="announced"} 2',
+                "ranet_lite_egress_pass_failed 0",
+            ]:
+                assert want in metrics, f"the scrape does not carry {want}:\n{metrics}"
+
+            # A rule is recognized on every sweep rather than rewritten, which
+            # is the proof that the spelling the host hands back is the one this
+            # node wrote. Many sweeps have run by now.
+            installs = client.succeed(
+                "journalctl -u ranet-lite.service --no-pager | grep -c 'egress rules installed'").strip()
+            assert installs == "1", f"the ruleset was rewritten {installs} times, so a pass does not recognize its own rules"
+
+            # An exit that cannot forward must stop advertising rather than
+            # attract traffic it would drop, and babel gives a peer no other way
+            # to learn that. The IPv6 half keeps working, because a host can
+            # forward one family and not the other.
+            client.succeed("sysctl -w net.ipv4.ip_forward=0")
+            client.wait_until_succeeds(
+                "ranet-lite status --json | jq -e '.egress.announced == [\"${exitNetV6}\"]'", timeout=timeout)
+            gateway.wait_until_fails("ip -4 route show ${exitNetV4} | grep -q swan0", timeout=timeout)
+            client.succeed("sysctl -w net.ipv4.ip_forward=1")
+            client.wait_until_succeeds(
+                "ranet-lite status --json | jq -e '.egress.announced | length == 2'", timeout=timeout)
+            gateway.wait_until_succeeds("ip -4 route show ${exitNetV4} | grep -q swan0", timeout=timeout)
+
+            # Shutdown takes the tables with it. A rule left behind would go on
+            # translating for a process that is no longer running.
+            client.succeed("systemctl stop ranet-lite.service")
+            assert client.succeed("systemctl show -p Result --value ranet-lite.service").strip() == "success"
+            left = client.succeed("nft list tables").strip()
+            assert left == "", f"shutdown left tables behind: {left}"
+
+            # And a restart installs them again, so the withdrawal above was a
+            # shutdown rather than a failure to write.
+            client.succeed("systemctl start ranet-lite.service")
+            client.wait_until_succeeds("nft list table ip ranet-lite", timeout=timeout)
+        finally:
+            print(client.execute("nft list ruleset")[1])
+            print(client.execute("ip -4 rule show")[1])
+            print(client.execute(f"ip -4 route show table {kernel_table}")[1])
+            print(gateway.execute("birdc show route")[1])
       '';
 
       # strongSwan answers, ranet-lite dials: upstream's original exchange.
@@ -691,6 +906,8 @@ in
         responderScript
       else if segments then
         segmentRouted
+      else if egress then
+        exitNode
       else
         initiator
     );

@@ -13,6 +13,7 @@ exclude = [
   "checks.aarch64-linux.responder",
   "checks.aarch64-linux.kernel",
   "checks.aarch64-linux.segments",
+  "checks.aarch64-linux.egress",
   "checks.aarch64-linux.netlink",
   # both linux arches put the same files in front of these four, so the
   # x86_64-linux arm covers the aarch64 one exactly. go test stays on both,

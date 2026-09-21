@@ -92,3 +92,9 @@ cap:
   #     margin: 5m
   #     jitter: 1m
   #     retry: { first: 5s, max: 5m }
+  # egress:
+  #   advertise: ["198.51.100.0/24", "2001:db8:2::/48"]
+  #   source4: auto
+  #   source6: auto
+  #   return: true
+  #   sweep: 30s

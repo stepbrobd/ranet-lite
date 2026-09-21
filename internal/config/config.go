@@ -28,6 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/srv6"
@@ -128,6 +129,7 @@ type Caps struct {
 	Table   *kernel.Table  `yaml:"table,omitempty" json:"table,omitempty" toml:"table,omitempty"`
 	Segment *srv6.Segments `yaml:"segment,omitempty" json:"segment,omitempty" toml:"segment,omitempty"`
 	Crypto  *ike.Crypto    `yaml:"crypto,omitempty" json:"crypto,omitempty" toml:"crypto,omitempty"`
+	Egress  *egress.Egress `yaml:"egress,omitempty" json:"egress,omitempty" toml:"egress,omitempty"`
 }
 
 // Routes, Babel, Segments and Crypto are the capability in force, which for an
@@ -161,6 +163,11 @@ func (c *Config) Crypto() ike.Crypto {
 	}
 	return *c.Cap.Crypto
 }
+
+// Egress has no zero value worth returning: an absent block means this node
+// carries nobody else's traffic, and an empty capability is refused rather
+// than taken as that. A caller asks for the pointer instead.
+func (c *Config) Egress() *egress.Egress { return c.Cap.Egress }
 
 // Load reads a configuration, picking the decoder by file extension: .toml
 // goes to the TOML decoder and .yaml, .yml and .json to the YAML one, since
@@ -271,8 +278,17 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	// Table and Egress are asked only where the block was written, because
+	// neither has a zero value worth checking: an absent table writes no
+	// routes and an absent egress carries nobody else's traffic, while an
+	// empty block of either is a mistake each refuses by name.
 	if c.Cap.Table != nil {
 		if err := c.Cap.Table.Validate(); err != nil {
+			return err
+		}
+	}
+	if c.Cap.Egress != nil {
+		if err := c.Cap.Egress.Validate(); err != nil {
 			return err
 		}
 	}

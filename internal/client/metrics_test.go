@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -158,6 +159,50 @@ func TestMetricsExposesSegmentsAndTheReconciler(t *testing.T) {
 	c.renderKernel(&first)
 	if !strings.Contains(first.String(), "ranet_lite_kernel_pass_timestamp_seconds 0") {
 		t.Errorf("before the first pass the scrape reads:\n%s", first.String())
+	}
+}
+
+// The advertised and announced prefix counts are separate series, because
+// their difference is the alert: a prefix is announced only while its rule is
+// installed and the kernel forwards its family, so announcing fewer than are
+// advertised is this node declining to attract traffic it would drop, and no
+// peer can see that from its own end.
+func TestMetricsExposesWhatTheEgressCapabilityIsWithholding(t *testing.T) {
+	c := &Client{}
+	pass := time.Date(2026, 9, 21, 19, 3, 0, 0, time.UTC)
+	carried := netip.MustParsePrefix("198.51.100.0/24")
+	withheld := netip.MustParsePrefix("2001:db8:1::/48")
+	c.SetEgressStatus(func() control.EgressStatus {
+		return control.EgressStatus{
+			Enabled: true, Installed: 3, Flows: 91, PassAt: pass,
+			Advertise: []netip.Prefix{carried, withheld},
+			Announced: []netip.Prefix{carried},
+			Conflicts: []string{"ip table nat chain POSTROUTING at priority 100"},
+		}
+	})
+	var out strings.Builder
+	c.renderEgress(&out)
+	for _, want := range []string{
+		"ranet_lite_egress_rules_installed 3",
+		`ranet_lite_egress_prefixes{state="advertised"} 2`,
+		`ranet_lite_egress_prefixes{state="announced"} 1`,
+		"ranet_lite_egress_flows_total 91",
+		"ranet_lite_egress_conflicts 1",
+		fmt.Sprintf("ranet_lite_egress_pass_timestamp_seconds %d", pass.Unix()),
+		"ranet_lite_egress_pass_failed 0",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the scrape does not carry %q:\n%s", want, out.String())
+		}
+	}
+
+	// A node that carries nothing for anybody writes none of it, rather than
+	// zeroes that read as an exit node translating nothing.
+	c.SetEgressStatus(func() control.EgressStatus { return control.EgressStatus{} })
+	var off strings.Builder
+	c.renderEgress(&off)
+	if off.Len() != 0 {
+		t.Errorf("a node with no egress capability wrote %q", off.String())
 	}
 }
 

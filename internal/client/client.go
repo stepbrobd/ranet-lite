@@ -69,6 +69,13 @@ type Client struct {
 	// that built it. Nil until then, and nil forever on a node whose routes
 	// are configured externally.
 	kernelStatus atomic.Pointer[func() control.KernelStatus]
+	// egressStatus and egressAnnounce are the egress capability's, supplied
+	// the same way. The second is read on every republication rather than
+	// captured, because an exit withholds its advertisement whenever its rule
+	// is not installed and the set it may announce changes under a running
+	// node.
+	egressStatus   atomic.Pointer[func() control.EgressStatus]
+	egressAnnounce atomic.Pointer[func() []netip.Prefix]
 
 	inboundPackets atomic.Uint64
 	inboundDropped atomic.Uint64

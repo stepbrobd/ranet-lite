@@ -202,3 +202,32 @@ announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
 # [cap.crypto.rekey.retry]
 # first = "5s"
 # max = "5m"
+
+# Carry other nodes' traffic out of the mesh: an exit node advertises the
+# defaults, a subnet router the prefixes behind it, and both end at the same
+# source translation. linux only, refused by name elsewhere. A prefix here is
+# announced only while its rule is installed and the kernel forwards its
+# family, so an exit that cannot translate stops attracting traffic it would
+# drop. Do not name one of these under cap.route as well, which would announce
+# it either way.
+# [cap.egress]
+# advertise = ["198.51.100.0/24", "2001:db8:2::/48"]
+
+# The address a translated packet leaves under, per family. Omitted, or written
+# as auto, this node's own routes decide it per packet, which is the only
+# answer a deployment owning no address block has: leaving the mesh that is the
+# address of the link the packet goes out by, and entering it, this node's own
+# mesh address. An address written out is used unchanged in both directions.
+# source4 = "auto"
+# source6 = "auto"
+
+# Translate the other direction too, so a packet from one of the prefixes above
+# enters the mesh under this node's own mesh address. A subnet router needs it
+# where the mesh holds no route back to the LAN. An exit node does not: nothing
+# sits behind it to start a flow. A node carrying more than one mesh address of
+# a family is refused rather than picked from, so name the one to use above.
+# return = true
+
+# The periodic pass, which reinstalls a table somebody removed and re-reads the
+# forwarding sysctls. Omitted it is 30s.
+# sweep = "30s"

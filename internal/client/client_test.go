@@ -26,6 +26,7 @@ import (
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -387,6 +388,9 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 			c.Cap.Segment = &srv6.Segments{Local: []srv6.Segment{
 				{SID: schema.MustAddr("2001:db8::1"), Behavior: srv6.BehaviorEnd},
 			}}
+		},
+		"cap.egress": func(c *config.Config) {
+			c.Cap.Egress = &egress.Egress{Advertise: []schema.Prefix{schema.MustPrefix("0.0.0.0/0")}}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

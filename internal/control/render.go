@@ -3,6 +3,8 @@ package control
 import (
 	"fmt"
 	"io"
+	"net/netip"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -38,6 +40,7 @@ func RenderStatus(w io.Writer, s Status) {
 		{"forwarding", fmt.Sprintf("ipv4 %s ipv6 %s", onOff(s.ForwardsIPv4), onOff(s.ForwardsIPv6))},
 		{"registry", fmt.Sprintf("%s, %d nodes in %d organizations", s.Registry.Path, s.Registry.Nodes, s.Registry.Organizations)},
 		{"kernel", kernelLine(s.Kernel)},
+		{"egress", egressLine(s.Egress)},
 		{"dialers", fmt.Sprintf("%d running", s.Counts.Dialers)},
 		{"sessions", fmt.Sprint(s.Counts.Sessions)},
 		{"neighbors", fmt.Sprintf("%d, %d alive", s.Counts.Neighbors, s.Counts.NeighborsAlive)},
@@ -103,6 +106,57 @@ func kernelLine(k KernelStatus) string {
 		line += ", " + k.Err
 	}
 	return line
+}
+
+// egressLine says "off" on a node that is neither an exit node nor a subnet
+// router, which is most of them. On one that is, it leads with what is being
+// announced rather than with what was configured, because the two differ
+// exactly when the capability is not working and that difference is the whole
+// reason to read the line.
+func egressLine(e EgressStatus) string {
+	if !e.Enabled {
+		return "off, this node carries no traffic for others"
+	}
+	line := fmt.Sprintf("%s, %d rules, %d flows", e.Where, e.Installed, e.Flows)
+	withheld := make([]string, 0, len(e.Advertise))
+	for _, prefix := range e.Advertise {
+		if !slices.Contains(e.Announced, prefix) {
+			withheld = append(withheld, prefix.String())
+		}
+	}
+	if len(e.Announced) > 0 {
+		line += ", announcing " + prefixText(e.Announced)
+	}
+	if len(withheld) > 0 {
+		// Named rather than counted, and said as a refusal rather than as a
+		// failure: a prefix is withheld because announcing it would attract
+		// traffic this node would drop, and babel gives a peer no other way
+		// to learn that.
+		line += ", withholding " + strings.Join(withheld, " ") + " until its rule is installed and the kernel forwards it"
+	}
+	if len(e.Conflicts) > 0 {
+		line += fmt.Sprintf(", sharing the hook with %s", strings.Join(e.Conflicts, "; "))
+	}
+	switch since := time.Since(e.PassAt); {
+	case e.PassAt.IsZero():
+		line += ", no pass yet"
+	case since < 0:
+		line += ", last pass timestamped ahead of this clock"
+	default:
+		line += fmt.Sprintf(", last pass %s ago", sinceText(since))
+	}
+	if e.Err != "" {
+		line += ", " + e.Err
+	}
+	return line
+}
+
+func prefixText(prefixes []netip.Prefix) string {
+	text := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		text = append(text, prefix.String())
+	}
+	return strings.Join(text, " ")
 }
 
 // segmentLine says nothing but "off" on a node that configures no segment

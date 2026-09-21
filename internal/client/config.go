@@ -24,6 +24,9 @@ func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, re
 	if err != nil {
 		return err
 	}
+	if err := refuseEgressAdvertisedUnconditionally(cfg); err != nil {
+		return err
+	}
 	refuse, skip := validatePeers(cfg, reg, families)
 	for _, problem := range skip {
 		log.Printf("%v, so nothing will dial it", problem)
@@ -57,6 +60,30 @@ func validateLocalConfig(cfg *config.Config, privateKey ed25519.PrivateKey, reg 
 		localFamilies[endpoint.Family] = struct{}{}
 	}
 	return localFamilies, nil
+}
+
+// refuseEgressAdvertisedUnconditionally rejects a prefix cap.egress offers to
+// carry that cap.route announces as well. The capability withholds a prefix
+// whose translation rule is not installed, so that this node stops attracting
+// traffic it would have to drop; an unconditional announcement of the same
+// prefix takes that back and leaves the withholding reporting as working while
+// changing nothing on the wire.
+//
+// It is here rather than in either capability because each half is in a
+// different block, which is the one check neither can make for itself.
+func refuseEgressAdvertisedUnconditionally(cfg *config.Config) error {
+	if cfg.Egress() == nil {
+		return nil
+	}
+	for _, entry := range cfg.Egress().Advertise {
+		for _, announced := range cfg.Routes().Announced() {
+			if announced.Masked() != entry.Prefix {
+				continue
+			}
+			return fmt.Errorf("config: cap.egress advertise %s is announced by cap.route as well, which would advertise it whether or not its translation rule is installed", entry)
+		}
+	}
+	return nil
 }
 
 // effectivePeers is who this node dials: the configured list, or every node

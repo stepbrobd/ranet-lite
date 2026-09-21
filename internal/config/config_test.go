@@ -387,6 +387,22 @@ func TestBothDecodersRefuseTheSameConfigurations(t *testing.T) {
 			asYAML: "cap:\n  table:\n    addresses: [\"3fff:1:69c:8c6::1/128\"]\n  segment:\n    local: [{ sid: \"3fff:1:69c:8c6::1\", behavior: End }]\n",
 			asTOML: "[cap.table]\naddresses = [\"3fff:1:69c:8c6::1/128\"]\n[cap.segment]\nlocal = [{ sid = \"3fff:1:69c:8c6::1\", behavior = \"End\" }]\n",
 		},
+		"an exit that advertises nothing": {
+			asYAML: "cap:\n  egress:\n    source4: auto\n",
+			asTOML: "[cap.egress]\nsource4 = \"auto\"\n",
+		},
+		"an advertised prefix with host bits": {
+			asYAML: "cap:\n  egress:\n    advertise: [\"198.51.100.7/24\"]\n",
+			asTOML: "[cap.egress]\nadvertise = [\"198.51.100.7/24\"]\n",
+		},
+		"an egress source of the other family": {
+			asYAML: "cap:\n  egress:\n    advertise: [\"0.0.0.0/0\"]\n    source4: \"2001:db8::1\"\n",
+			asTOML: "[cap.egress]\nadvertise = [\"0.0.0.0/0\"]\nsource4 = \"2001:db8::1\"\n",
+		},
+		"an egress source nothing can reply to": {
+			asYAML: "cap:\n  egress:\n    advertise: [\"0.0.0.0/0\"]\n    source4: 127.0.0.1\n",
+			asTOML: "[cap.egress]\nadvertise = [\"0.0.0.0/0\"]\nsource4 = \"127.0.0.1\"\n",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := loadYAML(t, nodeYAML+pair.asYAML); err == nil {
