@@ -33,7 +33,15 @@ link:
   # required for a full mesh, where every node both dials and answers.
   # listen: true
   # tun: ranet0
-  # mark: 0x726c
+  # Keep the one socket carrying IKE and ESP out of the reach of the routes the
+  # mesh installs. mark is SO_MARK plus a rule under cap.table.rules, linux
+  # only; bind is IP_BOUND_IF on the interface the host's own default leaves by
+  # plus a default scoped to that interface, darwin only, and it also makes an
+  # announced default install plain rather than scoped. Each is refused by name
+  # on the platform that has no meaning for it.
+  # underlay:
+  #   mark: 0x726c
+  #   bind: true
 
 # Who this node dials. An entry's org defaults to node.org above.
 dial:
@@ -65,6 +73,7 @@ cap:
   #   addresses: ["10.66.0.5/32"]
   #   assign_announced: false
   #   reconcile: 30s
+  #   capture_grace: 10s
   #   vrf: { name: mesh, create: true }
   #   rules:
   #     - { fwmark: 0x726c, table: main, priority: 40, family: both }

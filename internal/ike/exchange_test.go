@@ -14,7 +14,7 @@ import (
 func TestInitiateCancellationLeavesSharedHubOpen(t *testing.T) {
 	peer := listenPeer(t)
 	address := peer.LocalAddr().(*net.UDPAddr)
-	hub, err := transport.NewHub(":0", 0)
+	hub, err := transport.NewHub(":0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}

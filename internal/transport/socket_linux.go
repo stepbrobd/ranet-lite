@@ -67,7 +67,16 @@ func (b *udpBind) Close() error {
 	return errors.Join(errs...)
 }
 
-func openPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint16, error) {
+// linux keeps the underlay out of the mesh's routing with a socket mark and a
+// policy rule, so it marks and does not bind. Underlay.refuse reads these.
+const (
+	marksSockets = true
+	bindsSockets = false
+)
+
+// openPacketBind takes the one socket this node's IKE and ESP share. index
+// names an interface to bind it to, which this platform never asks for.
+func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []receiveFunc, uint16, error) {
 	// The port selected by the IPv4 bind may already be occupied on IPv6.
 	// Retry ephemeral allocation; an explicitly requested port still fails.
 	var err error
@@ -75,7 +84,7 @@ func openPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint
 		var bind packetBind
 		var receivers []receiveFunc
 		var bound uint16
-		bind, receivers, bound, err = listenPacketBind(port, fwmark)
+		bind, receivers, bound, err = listenPacketBind(port, underlay.Mark)
 		if port != 0 || !errors.Is(err, unix.EADDRINUSE) {
 			return bind, receivers, bound, err
 		}
