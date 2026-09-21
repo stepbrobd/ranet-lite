@@ -381,8 +381,8 @@ func TestSourceSpecificOriginationAndSelection(t *testing.T) {
 		match  string
 		miss   string
 	}{
-		{"ipv6 default from an exit prefix", "::/0", "2602:f590::/36", "2001:4860::1", "2602:f590:1::7", "2001:db8::7"},
-		{"ipv4 default from an announced prefix", "0.0.0.0/0", "23.161.104.0/24", "192.0.2.1", "23.161.104.7", "198.51.100.7"},
+		{"ipv6 default from an exit prefix", "::/0", "3fff:a::/36", "2001:4860::1", "3fff:a:1::7", "2001:db8::7"},
+		{"ipv4 default from an announced prefix", "0.0.0.0/0", "198.18.104.0/24", "192.0.2.1", "198.18.104.7", "198.51.100.7"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fabric := newMeshFabric(t, Config{}, "a-b")
@@ -424,7 +424,7 @@ func TestSourceSpecificOriginationAndSelection(t *testing.T) {
 // for by name rather than answered with the ordinary route's state.
 func TestRequestsCarrySourcePrefix(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b")
-	dest, source := netip.MustParsePrefix("::/0"), netip.MustParsePrefix("2602:f590::/36")
+	dest, source := netip.MustParsePrefix("::/0"), netip.MustParsePrefix("3fff:a::/36")
 	fabric.speakers["a"].OriginateFrom(dest, source)
 	fabric.reset()
 

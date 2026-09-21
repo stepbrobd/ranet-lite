@@ -34,26 +34,26 @@ func TestNoSteeringTableClaimsNothing(t *testing.T) {
 }
 
 // The table is keyed the way the forwarding table is keyed, so the selector
-// `gv` uses, everything sourced from this node's announced address, reaches
+// such a tool uses, everything sourced from this node's announced address, reaches
 // exactly the packets it reaches there.
 func TestSourceSelectorClaimsOnlyItsOwnTraffic(t *testing.T) {
-	announced := policy("2a0c:b641:69c:8c0::1", "2a0c:b641:69c:98d6::1")
-	table, err := NewSteerTable([]Steer{{From: prefix("2602:f590::23:161:104:117/128"), Policy: announced}})
+	announced := policy("3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1")
+	table, err := NewSteerTable([]Steer{{From: prefix("3fff:a::198:18:104:117/128"), Policy: announced}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := table.Lookup(addr("2602:f590::23:161:104:117"), addr("2001:4860:4860::8888")); got == nil {
+	if got := table.Lookup(addr("3fff:a::198:18:104:117"), addr("2001:4860:4860::8888")); got == nil {
 		t.Fatal("the announced address was not claimed")
 	} else if !slices.Equal(got.Path, announced.Path) {
 		t.Errorf("the claimed policy is %v", got.Path)
 	}
-	if got := table.Lookup(addr("2602:f590::23:161:104:118"), addr("2001:4860:4860::8888")); got != nil {
+	if got := table.Lookup(addr("3fff:a::198:18:104:118"), addr("2001:4860:4860::8888")); got != nil {
 		t.Errorf("another node's address was claimed by %s", got)
 	}
 	if table.Overhead() != Overhead(1) || len(table.Entries()) != 1 {
 		t.Errorf("the table reports overhead %d over %d entries", table.Overhead(), len(table.Entries()))
 	}
-	if entries := table.Entries(); len(entries) != 1 || entries[0] != "from 2602:f590::23:161:104:117/128 via 2a0c:b641:69c:98d6::1" {
+	if entries := table.Entries(); len(entries) != 1 || entries[0] != "from 3fff:a::198:18:104:117/128 via 3fff:1:69c:98d6::1" {
 		t.Errorf("the table reads as %v", entries)
 	}
 }
@@ -61,12 +61,12 @@ func TestSourceSelectorClaimsOnlyItsOwnTraffic(t *testing.T) {
 // An entry that selects on nothing would claim the encapsulated packets this
 // node has just produced, which would then be encapsulated again.
 func TestSteeringRefusesWhatWouldClaimItsOwnEncapsulation(t *testing.T) {
-	via := policy("2a0c:b641:69c:8c0::1", "2a0c:b641:69c:98d6::1")
+	via := policy("3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1")
 	for name, entry := range map[string]Steer{
 		"no selector":    {Policy: via},
-		"no segments":    {From: prefix("2001:db8::/32"), Policy: Policy{Source: addr("2a0c:b641:69c:8c0::1")}},
-		"a v4 source":    {From: prefix("10.0.0.0/8"), Policy: policy("23.161.104.117", "2a0c:b641:69c:98d6::1")},
-		"a v4 segment":   {From: prefix("2001:db8::/32"), Policy: policy("2a0c:b641:69c:8c0::1", "23.161.104.117")},
+		"no segments":    {From: prefix("2001:db8::/32"), Policy: Policy{Source: addr("3fff:1:69c:8c0::1")}},
+		"a v4 source":    {From: prefix("10.0.0.0/8"), Policy: policy("198.18.104.117", "3fff:1:69c:98d6::1")},
+		"a v4 segment":   {From: prefix("2001:db8::/32"), Policy: policy("3fff:1:69c:8c0::1", "198.18.104.117")},
 		"mixed families": {From: prefix("2001:db8::/32"), To: prefix("10.0.0.0/8"), Policy: via},
 		// A v4-mapped prefix goes into the IPv6 half of the trie while a v4
 		// packet is looked up in the v4 half, so it would never match.
@@ -84,8 +84,8 @@ func TestSteeringRefusesWhatWouldClaimItsOwnEncapsulation(t *testing.T) {
 // disagree, and the trie keeps one of them while a diagnostic prints both. The
 // local segment table and the rule list both refuse the same shape.
 func TestSteeringRefusesTwoEntriesWithOneSelector(t *testing.T) {
-	first := policy("2a0c:b641:69c:8c0::1", "2a0c:b641:69c:98d6::1")
-	second := policy("2a0c:b641:69c:8c0::1", "2a0c:b641:69c:6c46::1")
+	first := policy("3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1")
+	second := policy("3fff:1:69c:8c0::1", "3fff:1:69c:6c46::1")
 	for name, entries := range map[string][]Steer{
 		"written the same way": {
 			{From: prefix("2001:db8::/32"), Policy: first},
@@ -117,8 +117,8 @@ func TestSteeringRefusesTwoEntriesWithOneSelector(t *testing.T) {
 // allocating encoder gets its zeros from make, and the in-place one is handed
 // the bytes of the very packet it is moving out of the way.
 func TestInPlaceEncapsulationMatchesTheAllocatingOne(t *testing.T) {
-	source := addr("2a0c:b641:69c:8c0::1")
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
+	source := addr("3fff:1:69c:8c0::1")
+	path := []netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:29a6::1")}
 	inner := innerV6("payload")
 	inner[0], inner[1], inner[2], inner[3] = 0x6a, 0xbc, 0xde, 0xf0
 
@@ -150,8 +150,8 @@ func TestInPlaceEncapsulationMatchesTheAllocatingOne(t *testing.T) {
 // deployment has the MTU wrong, which is worth reporting rather than
 // corrupting.
 func TestInPlaceEncapsulationRefusesABufferTooShort(t *testing.T) {
-	source := addr("2a0c:b641:69c:8c0::1")
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::1")}
+	source := addr("3fff:1:69c:8c0::1")
+	path := []netip.Addr{addr("3fff:1:69c:98d6::1")}
 	inner := innerV6("payload")
 	buf := make([]byte, 16+len(inner)+8)
 	copy(buf[16:], inner)

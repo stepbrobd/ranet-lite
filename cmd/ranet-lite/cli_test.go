@@ -15,23 +15,23 @@ import (
 type stubSource struct{}
 
 func (stubSource) Status() control.Status {
-	return control.Status{Organization: "ysun", CommonName: "framework", Port: 13000, FullMesh: true}
+	return control.Status{Organization: "example", CommonName: "laptop", Port: 13000, FullMesh: true}
 }
 
 func (stubSource) Neighbors() []control.Neighbor {
-	return []control.Neighbor{{Peer: "ysun/toompea@0", Alive: true, Cost: 116, Routes: 15}}
+	return []control.Neighbor{{Peer: "example/gateway@0", Alive: true, Cost: 116, Routes: 15}}
 }
 
 func (stubSource) Routes() []control.Route {
-	return []control.Route{{Destination: netip.MustParsePrefix("23.161.104.117/32"), Originated: true}}
+	return []control.Route{{Destination: netip.MustParsePrefix("198.18.104.117/32"), Originated: true}}
 }
 
 func (stubSource) Sessions() []control.Session {
-	return []control.Session{{Path: "ysun/toompea/0@0", Peer: "ysun/toompea", Active: true}}
+	return []control.Session{{Path: "example/gateway/0@0", Peer: "example/gateway", Active: true}}
 }
 
 func (stubSource) Peers() []control.Peer {
-	return []control.Peer{{Path: "ysun/toompea/@0", Organization: "ysun", CommonName: "toompea", Connected: true}}
+	return []control.Peer{{Path: "example/gateway/@0", Organization: "example", CommonName: "gateway", Connected: true}}
 }
 
 // serveStub starts a control socket for one test and returns its path.
@@ -79,11 +79,11 @@ func TestSubcommandIsAFirstArgumentWithoutADash(t *testing.T) {
 func TestCommandsReadTheirOwnSubsystem(t *testing.T) {
 	socket := serveStub(t)
 	for name, want := range map[string]string{
-		"status":    "ysun/framework",
-		"neighbors": "ysun/toompea@0",
-		"routes":    "23.161.104.117/32",
-		"sessions":  "ysun/toompea/0@0",
-		"peers":     "toompea",
+		"status":    "example/laptop",
+		"neighbors": "example/gateway@0",
+		"routes":    "198.18.104.117/32",
+		"sessions":  "example/gateway/0@0",
+		"peers":     "gateway",
 	} {
 		t.Run(name, func(t *testing.T) {
 			var out, usage strings.Builder
@@ -105,7 +105,7 @@ func TestJSONPrintsTheWireForm(t *testing.T) {
 	if code := runCommand("status", []string{"-control", socket, "-json"}, &out, &usage); code != 0 {
 		t.Fatalf("status -json exited %d: %s", code, usage.String())
 	}
-	for _, want := range []string{`"common_name": "framework"`, `"full_mesh": true`} {
+	for _, want := range []string{`"common_name": "laptop"`, `"full_mesh": true`} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("status -json printed %q, want it to carry %q", out.String(), want)
 		}

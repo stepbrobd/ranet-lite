@@ -71,7 +71,7 @@ func TestBatchWithoutSegmentsIsUntouched(t *testing.T) {
 // An exit takes the outer header off and what was inside goes to the tun in
 // place of it, so the batch that comes back carries the inner packet.
 func TestExitDeliversWhatWasInside(t *testing.T) {
-	exit := segAddr("2a0c:b641:69c:8c6::1")
+	exit := segAddr("3fff:1:69c:8c6::1")
 	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: exit, Behavior: srv6.BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
@@ -79,8 +79,8 @@ func TestExitDeliversWhatWasInside(t *testing.T) {
 	mesh := &Mesh{Routes: NewRouteTable()}
 	mesh.SetSegments(table)
 
-	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:98d0::1"), []netip.Addr{exit})
+	inner := plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "payload")
+	outer, err := srv6.Encapsulate(inner, segAddr("3fff:1:69c:98d0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +105,8 @@ func TestExitDeliversWhatWasInside(t *testing.T) {
 // leaves the batch: writing it to the tun would deliver a packet addressed to
 // somebody else's segment to this node's own stack.
 func TestWaypointForwardsInsteadOfDelivering(t *testing.T) {
-	waypoint := segAddr("2a0c:b641:69c:8c6::2")
-	exit := segAddr("2a0c:b641:69c:98d6::1")
+	waypoint := segAddr("3fff:1:69c:8c6::2")
+	exit := segAddr("3fff:1:69c:98d6::1")
 	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
@@ -114,10 +114,10 @@ func TestWaypointForwardsInsteadOfDelivering(t *testing.T) {
 	mesh := &Mesh{Routes: NewRouteTable()}
 	mesh.SetSegments(table)
 	recorder := &recordingPeer{}
-	mesh.Routes.Set(netip.Prefix{}, segPrefix("2a0c:b641:69c:98d6::/64"), recorder.peer("exit"))
+	mesh.Routes.Set(netip.Prefix{}, segPrefix("3fff:1:69c:98d6::/64"), recorder.peer("exit"))
 
-	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
+	inner := plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "payload")
+	outer, err := srv6.Encapsulate(inner, segAddr("3fff:1:69c:8c0::1"), []netip.Addr{waypoint, exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestWaypointForwardsInsteadOfDelivering(t *testing.T) {
 // routes to, are both counted and dropped rather than written to the tun,
 // where they would arrive as undeliverable packets addressed to us.
 func TestSegmentsThatCannotBeActedOnAreDropped(t *testing.T) {
-	waypoint := segAddr("2a0c:b641:69c:8c6::2")
+	waypoint := segAddr("3fff:1:69c:8c6::2")
 	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
@@ -162,9 +162,9 @@ func TestSegmentsThatCannotBeActedOnAreDropped(t *testing.T) {
 	unrouted := &Mesh{Routes: NewRouteTable()}
 	unrouted.SetSegments(table)
 	outer, err := srv6.Encapsulate(
-		plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload"),
-		segAddr("2a0c:b641:69c:8c0::1"),
-		[]netip.Addr{waypoint, segAddr("2a0c:b641:69c:98d6::1")})
+		plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "payload"),
+		segAddr("3fff:1:69c:8c0::1"),
+		[]netip.Addr{waypoint, segAddr("3fff:1:69c:98d6::1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestSegmentsThatCannotBeActedOnAreDropped(t *testing.T) {
 // ones before it have to survive in order. A batch that is all passers keeps
 // its own backing array.
 func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
-	exit := segAddr("2a0c:b641:69c:8c6::1")
+	exit := segAddr("3fff:1:69c:8c6::1")
 	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: exit, Behavior: srv6.BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
@@ -191,8 +191,8 @@ func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
 	first := plainV6(segAddr("2001:db8::1"), segAddr("2001:db8::a"), "first")
 	second := plainV6(segAddr("2001:db8::1"), segAddr("2001:db8::b"), "second")
 	last := plainV6(segAddr("2001:db8::1"), segAddr("2001:db8::c"), "last")
-	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "inner")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:98d0::1"), []netip.Addr{exit})
+	inner := plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "inner")
+	outer, err := srv6.Encapsulate(inner, segAddr("3fff:1:69c:98d0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,10 +212,10 @@ func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
 // segment rather than by the address it was addressed to, which is the whole
 // point of steering it and the thing a route lookup done first would undo.
 func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
-	exit := segAddr("2a0c:b641:69c:98d6::1")
+	exit := segAddr("3fff:1:69c:98d6::1")
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("2602:f590::17/128"),
-		Policy: srv6.Policy{Source: segAddr("2a0c:b641:69c:8c0::1"), Path: []netip.Addr{exit}},
+		From:   segPrefix("3fff:a::17/128"),
+		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{exit}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -224,10 +224,10 @@ func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 	mesh.SetSteering(table)
 
 	buf := make([]byte, tunOffset+2048)
-	inner := plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
+	inner := plainV6(segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"), "payload")
 	copy(buf[tunOffset:], inner)
 
-	size, action := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
+	size, action := mesh.steer(buf, len(inner), segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"))
 	if action != steerSent {
 		t.Fatal("a packet the policy names was not steered")
 	}
@@ -243,7 +243,7 @@ func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 
 	// A packet from another address is left exactly as it was.
 	other := len(inner)
-	if size, action := mesh.steer(buf, other, segAddr("2602:f590::18"), segAddr("2001:4860:4860::8888")); action != steerPass || size != other {
+	if size, action := mesh.steer(buf, other, segAddr("3fff:a::18"), segAddr("2001:4860:4860::8888")); action != steerPass || size != other {
 		t.Errorf("a packet no policy names was steered, size %d", size)
 	}
 }
@@ -253,8 +253,8 @@ func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 // the counter says it happened.
 func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("2602:f590::17/128"),
-		Policy: srv6.Policy{Source: segAddr("2a0c:b641:69c:8c0::1"), Path: []netip.Addr{segAddr("2a0c:b641:69c:98d6::1")}},
+		From:   segPrefix("3fff:a::17/128"),
+		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{segAddr("3fff:1:69c:98d6::1")}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -262,11 +262,11 @@ func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 	mesh := &Mesh{Routes: NewRouteTable()}
 	mesh.SetSteering(table)
 
-	inner := plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
+	inner := plainV6(segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"), "payload")
 	// A buffer with no room for the header at all.
 	buf := make([]byte, tunOffset+len(inner))
 	copy(buf[tunOffset:], inner)
-	size, action := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
+	size, action := mesh.steer(buf, len(inner), segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"))
 	// Dropped rather than sent as it was: the policy selects an exit, so the
 	// route this packet would otherwise take puts it out of a different node
 	// under a source that node does not announce.
@@ -286,12 +286,12 @@ func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 // 128th of the batch size, so most of a forwarded burst is dropped on an idle
 // machine and a peer can spend this node's whole allowance to a third peer.
 func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
-	waypoint := segAddr("2a0c:b641:69c:8c6::2")
+	waypoint := segAddr("3fff:1:69c:8c6::2")
 	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	exit := segAddr("2a0c:b641:69c:98d6::1")
+	exit := segAddr("3fff:1:69c:98d6::1")
 
 	// The peer is asked to reserve for a number of packets, and seals once per
 	// reserved batch, so the two together say how the batch was split.
@@ -309,14 +309,14 @@ func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
 	m := &Mesh{Routes: NewRouteTable()}
 	m.startSegmentReports()
 	m.SetSegments(table)
-	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("2a0c:b641:69c:98d6::1/128"), peer)
+	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("3fff:1:69c:98d6::1/128"), peer)
 
 	const count = 64
 	batch := make([][]byte, 0, count)
 	for range count {
 		outer, err := srv6.Encapsulate(
-			plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload"),
-			segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
+			plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "payload"),
+			segAddr("3fff:1:69c:8c0::1"), []netip.Addr{waypoint, exit})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -348,7 +348,7 @@ func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
 // loop gets the refill rate and no more, while the counters keep the whole
 // record.
 func TestRefusedPacketsAreAnsweredAtABoundedRate(t *testing.T) {
-	waypoint := segAddr("2a0c:b641:69c:8c6::2")
+	waypoint := segAddr("3fff:1:69c:8c6::2")
 	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
@@ -359,7 +359,7 @@ func TestRefusedPacketsAreAnsweredAtABoundedRate(t *testing.T) {
 	m.SetSegments(table)
 	// The error goes back to the node that encapsulated the packet, so the
 	// route that has to exist is the one to its tunnel source.
-	m.Routes.Set(netip.Prefix{}, segPrefix("2a0c:b641:69c::/48"), recorder.peer("sender"))
+	m.Routes.Set(netip.Prefix{}, segPrefix("3fff:1:69c::/48"), recorder.peer("sender"))
 
 	// A segment list this node will not act on, which is the refusal RFC 8986
 	// section 4.1 S10 answers with a Parameter Problem.
@@ -367,8 +367,8 @@ func TestRefusedPacketsAreAnsweredAtABoundedRate(t *testing.T) {
 	batch := make([][]byte, 0, flood)
 	for range flood {
 		outer, err := srv6.Encapsulate(
-			plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload"),
-			segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, segAddr("2a0c:b641:69c:98d6::1")})
+			plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "payload"),
+			segAddr("3fff:1:69c:8c0::1"), []netip.Addr{waypoint, segAddr("3fff:1:69c:98d6::1")})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -403,7 +403,7 @@ const ipv6HeaderOffsetSegmentsLeft = 40 + 3
 // and acts on the second, and a node that only consulted its mesh routes would
 // drop the packet one hop short, because a node has no route to itself.
 func TestTwoSegmentsOfThisNodeInOneListAreBothActedOn(t *testing.T) {
-	waypoint, exit := segAddr("2a0c:b641:69c:8c6::2"), segAddr("2a0c:b641:69c:8c6::1")
+	waypoint, exit := segAddr("3fff:1:69c:8c6::2"), segAddr("3fff:1:69c:8c6::1")
 	table, err := srv6.NewLocalTable([]srv6.Segment{
 		{SID: waypoint, Behavior: srv6.BehaviorEnd},
 		{SID: exit, Behavior: srv6.BehaviorEndDT46},
@@ -415,8 +415,8 @@ func TestTwoSegmentsOfThisNodeInOneListAreBothActedOn(t *testing.T) {
 	mesh.startSegmentReports()
 	mesh.SetSegments(table)
 
-	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
+	inner := plainV6(segAddr("3fff:a::1"), segAddr("3fff:a::2"), "payload")
+	outer, err := srv6.Encapsulate(inner, segAddr("3fff:1:69c:8c0::1"), []netip.Addr{waypoint, exit})
 	if err != nil {
 		t.Fatal(err)
 	}

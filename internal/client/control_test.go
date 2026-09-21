@@ -24,13 +24,13 @@ func TestSegmentCountersDoNotDrift(t *testing.T) {
 // delivered. On linux the two coexist, because there the SID is a route.
 func TestLocalSegmentOnOneOfThisNodesAddressesIsRefused(t *testing.T) {
 	cfg := &config.Config{
-		Kernel:   config.Kernel{Addresses: []string{"2a0c:b641:69c:8c6::1/128"}},
-		Segments: config.Segments{Local: []config.LocalSegment{{SID: "2a0c:b641:69c:8c6::1", Behavior: "End.DT46"}}},
+		Kernel:   config.Kernel{Addresses: []string{"3fff:1:69c:8c6::1/128"}},
+		Segments: config.Segments{Local: []config.LocalSegment{{SID: "3fff:1:69c:8c6::1", Behavior: "End.DT46"}}},
 	}
 	if _, err := localSegments(cfg); err == nil {
 		t.Error("a segment on one of this node's own addresses was accepted")
 	}
-	cfg.Kernel.Addresses = []string{"2a0c:b641:69c:8c6::9/128"}
+	cfg.Kernel.Addresses = []string{"3fff:1:69c:8c6::9/128"}
 	if _, err := localSegments(cfg); err != nil {
 		t.Errorf("a segment beside an unrelated address was refused: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestLocalSegmentOnOneOfThisNodesAddressesIsRefused(t *testing.T) {
 	// check covers everything the reconciler assigns rather than the addresses
 	// list alone.
 	cfg.Kernel.AssignOriginated = true
-	cfg.Originate = []string{"2a0c:b641:69c:8c6::1/128"}
+	cfg.Originate = []string{"3fff:1:69c:8c6::1/128"}
 	if _, err := localSegments(cfg); err == nil {
 		t.Error("a segment on a prefix this node assigns from originate was accepted")
 	}
@@ -50,13 +50,13 @@ func TestLocalSegmentOnOneOfThisNodesAddressesIsRefused(t *testing.T) {
 // one address was meant and says nothing about it.
 func TestSteerSelectorWithHostBitsIsRefused(t *testing.T) {
 	cfg := &config.Config{Segments: config.Segments{
-		Source: "2a0c:b641:69c:8c0::1",
-		Steer:  []config.SteerEntry{{From: "2602:f590::23:161:104:117/64", Via: []string{"2a0c:b641:69c:98d6::1"}}},
+		Source: "3fff:1:69c:8c0::1",
+		Steer:  []config.SteerEntry{{From: "3fff:a::198:18:104:117/64", Via: []string{"3fff:1:69c:98d6::1"}}},
 	}}
 	if _, err := steerTable(cfg); err == nil {
 		t.Error("a selector with bits below its prefix length was accepted")
 	}
-	cfg.Segments.Steer[0].From = "2602:f590::23:161:104:117/128"
+	cfg.Segments.Steer[0].From = "3fff:a::198:18:104:117/128"
 	if _, err := steerTable(cfg); err != nil {
 		t.Errorf("a host selector was refused: %v", err)
 	}

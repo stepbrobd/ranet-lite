@@ -963,7 +963,7 @@ func unroutable(destination netip.Prefix) string {
 // last. A lookup is longest prefix first and only then by metric, so a hold
 // still outranks the covering route it exists to keep a packet away from,
 // while anything else holding that exact prefix wins. On a converted fleet
-// node that anything else is the gravity VRF's connected route for the /60 the
+// node that anything else is the mesh VRF's connected route for the /60 the
 // node itself originates, in the same table.
 const holdMetric = ^uint32(0)
 

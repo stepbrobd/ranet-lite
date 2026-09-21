@@ -11,7 +11,7 @@ import (
 // does, over the same pseudo-header: a correct message sums to zero, which is
 // the check RFC 4443 section 2.3 has the receiver make.
 func TestTimeExceededChecksumsAsAReceiverVerifiesIt(t *testing.T) {
-	sid := addr("2a0c:b641:69c:8c6::2")
+	sid := addr("3fff:1:69c:8c6::2")
 	offending := segmentRouted(t)
 	answer, ok := TimeExceeded(offending, sid)
 	if !ok {
@@ -43,7 +43,7 @@ func TestTimeExceededChecksumsAsAReceiverVerifiesIt(t *testing.T) {
 // A packet quoted at the minimum MTU is truncated rather than dropped, and the
 // message still verifies, which is the odd-length path through the checksum.
 func TestLargeOffendingPacketIsQuotedUpToTheMinimumMTU(t *testing.T) {
-	sid := addr("2a0c:b641:69c:8c6::2")
+	sid := addr("3fff:1:69c:8c6::2")
 	offending := append(segmentRouted(t), make([]byte, 2000)...)
 	binary.BigEndian.PutUint16(offending[4:], uint16(len(offending)-ipv6HeaderLen))
 	answer, ok := ParameterProblem(offending, sid)
@@ -65,7 +65,7 @@ func TestLargeOffendingPacketIsQuotedUpToTheMinimumMTU(t *testing.T) {
 // these turns one refused packet into many, which is the reason the rule
 // exists and the reason a segment routing node is a good place to break it.
 func TestNoErrorAnswersWhatWouldMultiply(t *testing.T) {
-	sid := addr("2a0c:b641:69c:8c6::2")
+	sid := addr("3fff:1:69c:8c6::2")
 	for name, damage := range map[string]func([]byte) []byte{
 		"a source that is no single node": func(raw []byte) []byte {
 			copy(raw[8:], addr16(addr("::")))

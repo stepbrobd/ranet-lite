@@ -16,10 +16,10 @@ import (
 // the packet correctly encapsulated and handed to the wrong peer, which
 // arrives at a node holding no such segment.
 func TestOutboundSeamRoutesBySegmentRatherThanByDestination(t *testing.T) {
-	exit := segAddr("2a0c:b641:69c:98d6::1")
+	exit := segAddr("3fff:1:69c:98d6::1")
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("2602:f590::17/128"),
-		Policy: srv6.Policy{Source: segAddr("2a0c:b641:69c:8c0::1"), Path: []netip.Addr{exit}},
+		From:   segPrefix("3fff:a::17/128"),
+		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{exit}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestOutboundSeamRoutesBySegmentRatherThanByDestination(t *testing.T) {
 	m.SetSteering(table)
 	// The two halves of the mesh: the segment goes one way, the address the
 	// packet was written to goes the other.
-	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("2a0c:b641:69c:98d6::1/128"), segmentPeer)
+	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("3fff:1:69c:98d6::1/128"), segmentPeer)
 	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("2001:4860:4860::8888/128"), destinationPeer)
 	m.outboundFree <- m.newOutboundBatch(1)
 	m.startOutboundPipeline()
@@ -56,7 +56,7 @@ func TestOutboundSeamRoutesBySegmentRatherThanByDestination(t *testing.T) {
 		m.outboundWorkerWG.Wait()
 	}()
 
-	dev.reads <- plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
+	dev.reads <- plainV6(segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"), "payload")
 	select {
 	case sent := <-viaSegment:
 		if got := netip.AddrFrom16([16]byte(sent[24:40])); got != exit {
@@ -74,8 +74,8 @@ func TestOutboundSeamRoutesBySegmentRatherThanByDestination(t *testing.T) {
 // traffic disappears and nothing anywhere says so.
 func TestSteeredPacketWithNoRouteIsCounted(t *testing.T) {
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("2602:f590::17/128"),
-		Policy: srv6.Policy{Source: segAddr("2a0c:b641:69c:8c0::1"), Path: []netip.Addr{segAddr("2a0c:b641:69c:98d6::1")}},
+		From:   segPrefix("3fff:a::17/128"),
+		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{segAddr("3fff:1:69c:98d6::1")}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestSteeredPacketWithNoRouteIsCounted(t *testing.T) {
 		m.outboundWorkerWG.Wait()
 	}()
 
-	dev.reads <- plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
+	dev.reads <- plainV6(segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"), "payload")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if counters := m.SegmentCounters(); counters.Dropped > 0 {

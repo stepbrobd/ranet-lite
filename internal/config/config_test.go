@@ -104,7 +104,7 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 		// node that configured the reconciler and forgot the one line would
 		// otherwise come up with no rules and no message.
 		"rules while the reconciler is off": "kernel:\n  enabled: false\n  rules:\n    - { fwmark: 0x726c, table: main, priority: 40, family: both }\n",
-		"a vrf while the reconciler is off": "kernel:\n  enabled: false\n  vrf: gravity\n",
+		"a vrf while the reconciler is off": "kernel:\n  enabled: false\n  vrf: mesh\n",
 		// Nothing reads segments.source until a steer entry needs it, so a
 		// typo in it survives a start on a node that steers nothing yet.
 		"an unparseable segment source": "segments:\n  source: \"not an address\"\n",
@@ -350,7 +350,7 @@ babel:
 		// originatedKey masks, so this announces "::/0" and claims the exit.
 		// The mapping spelling is the one an exit actually uses, so refusing
 		// it only in the top-level list refuses it where nobody writes it.
-		"masked default":        `{ prefix: "2001:db8::1/0", from: "2602:f590::/36" }`,
+		"masked default":        `{ prefix: "2001:db8::1/0", from: "3fff:a::/36" }`,
 		"masked default, bare":  `2001:db8::1/0`,
 		"masked default, v4":    `198.51.100.1/0`,
 		"masked source default": `{ prefix: "2001:db8::/48", from: "2001:db8::1/0" }`,
@@ -475,12 +475,12 @@ func TestOriginateRefusalNamesTheSameFieldEveryTime(t *testing.T) {
 // registry and the key on its command line instead of in the file.
 func TestRanetsOwnConfigIsAccepted(t *testing.T) {
 	const ranet = `{
-  "common_name": "framework",
+  "common_name": "laptop",
   "endpoints": [
     {"address_family": "ip6", "port": 13000, "serial_number": "0", "updown": "/nix/store/deadbeef-updown"},
-    {"address_family": "ip4", "port": 13000, "serial_number": "1", "updown": "/nix/store/deadbeef-updown", "address": "framework.if.example.co", "fwmark": "0x726c"}
+    {"address_family": "ip4", "port": 13000, "serial_number": "1", "updown": "/nix/store/deadbeef-updown", "address": "laptop.example.invalid", "fwmark": "0x726c"}
   ],
-  "organization": "ysun",
+  "organization": "example",
   "experimental": {"iptfs": false}
 }`
 	write := func(t *testing.T, body string) string {

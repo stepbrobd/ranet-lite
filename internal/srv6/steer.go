@@ -14,7 +14,7 @@ import (
 //
 // It is keyed the way the forwarding table is keyed, by source and destination
 // prefix together, because that is the selector the fleet's own steering uses:
-// `gv` sends the traffic sourced from this node's announced address through a
+// A steering tool sends the traffic sourced from this node's announced address through a
 // list and leaves everything else alone. Reusing the same trie means the two
 // tables answer the same question the same way rather than nearly the same
 // way.

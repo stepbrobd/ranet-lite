@@ -10,7 +10,7 @@ import (
 // A packet not addressed to one of this node's segments costs a map lookup and
 // goes where it was going, which is almost every packet on the mesh.
 func TestPacketsForSomebodyElsePassThrough(t *testing.T) {
-	table, err := NewLocalTable([]Segment{{SID: addr("2a0c:b641:69c:8c6::1"), Behavior: BehaviorEndDT46}})
+	table, err := NewLocalTable([]Segment{{SID: addr("3fff:1:69c:8c6::1"), Behavior: BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +41,8 @@ func TestPacketsForSomebodyElsePassThrough(t *testing.T) {
 // An exit hands back what was inside. Both are reached only by a packet whose
 // current segment is this node's.
 func TestWaypointAndExitActOnTheirOwnSegments(t *testing.T) {
-	waypoint := addr("2a0c:b641:69c:8c6::2")
-	exit := addr("2a0c:b641:69c:98d6::1")
+	waypoint := addr("3fff:1:69c:8c6::2")
+	exit := addr("3fff:1:69c:98d6::1")
 	table, err := NewLocalTable([]Segment{
 		{SID: waypoint, Behavior: BehaviorEnd},
 		{SID: exit, Behavior: BehaviorEndDT46},
@@ -51,7 +51,7 @@ func TestWaypointAndExitActOnTheirOwnSegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := innerV6("payload")
-	raw, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
+	raw, err := Encapsulate(inner, addr("3fff:1:69c:8c0::1"), []netip.Addr{waypoint, exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestWaypointAndExitActOnTheirOwnSegments(t *testing.T) {
 // dropped with a reason rather than written to the tun, where it would arrive
 // as an undeliverable IPv6 packet addressed to an address of ours.
 func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
-	sid := addr("2a0c:b641:69c:8c6::2")
+	sid := addr("3fff:1:69c:8c6::2")
 	waypoint, err := NewLocalTable([]Segment{{SID: sid, Behavior: BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
@@ -103,13 +103,13 @@ func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
 	}
 
 	// An exit reached with segments still to go.
-	exitSID := addr("2a0c:b641:69c:98d6::1")
+	exitSID := addr("3fff:1:69c:98d6::1")
 	exit, err := NewLocalTable([]Segment{{SID: exitSID, Behavior: BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	midPath, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"),
-		[]netip.Addr{exitSID, addr("2a0c:b641:69c:29a6::1")})
+	midPath, err := Encapsulate(innerV6("payload"), addr("3fff:1:69c:8c0::1"),
+		[]netip.Addr{exitSID, addr("3fff:1:69c:29a6::1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
 // names something not implemented, is refused at startup rather than skipped.
 func TestLocalTableRefusesWhatItCannotAnswerFor(t *testing.T) {
 	for name, segments := range map[string][]Segment{
-		"a v4 segment":     {{SID: addr("23.161.104.117"), Behavior: BehaviorEnd}},
+		"a v4 segment":     {{SID: addr("198.18.104.117"), Behavior: BehaviorEnd}},
 		"a duplicate":      {{SID: addr("2001:db8::1"), Behavior: BehaviorEnd}, {SID: addr("2001:db8::1"), Behavior: BehaviorEndDT46}},
 		"a behavior of no": {{SID: addr("2001:db8::1"), Behavior: 0}},
 		"one not written":  {{SID: addr("2001:db8::1"), Behavior: Behavior(99)}},
@@ -171,8 +171,8 @@ func TestBehaviorSpellsItselfTheWayTheFleetWritesIt(t *testing.T) {
 // between two reads is one an operator cannot diff.
 func TestSegmentsReportInAStableOrder(t *testing.T) {
 	table, err := NewLocalTable([]Segment{
-		{SID: addr("2a0c:b641:69c:8c6::2"), Behavior: BehaviorEnd},
-		{SID: addr("2a0c:b641:69c:8c6::1"), Behavior: BehaviorEndDT46},
+		{SID: addr("3fff:1:69c:8c6::2"), Behavior: BehaviorEnd},
+		{SID: addr("3fff:1:69c:8c6::1"), Behavior: BehaviorEndDT46},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestSegmentsReportInAStableOrder(t *testing.T) {
 	}
 	for range 4 {
 		got := table.Segments()
-		if len(got) != 2 || got[0].SID.String() != "2a0c:b641:69c:8c6::1" || got[1].Behavior != BehaviorEnd {
+		if len(got) != 2 || got[0].SID.String() != "3fff:1:69c:8c6::1" || got[1].Behavior != BehaviorEnd {
 			t.Fatalf("the table reported %v", got)
 		}
 	}

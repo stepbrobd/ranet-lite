@@ -208,11 +208,11 @@ func TestFullMeshDialsEveryNodeTheRegistryNames(t *testing.T) {
 // SIGHUP with "local endpoints changed", which is the reload that exists so a
 // node joining the mesh does not restart every other node's dataplane.
 func TestReloadSurvivesRanetsEndpointFields(t *testing.T) {
-	const body = `{"organization":"ysun","common_name":"framework","full_mesh":true,
+	const body = `{"organization":"example","common_name":"laptop","full_mesh":true,
 		"registry":"r","private_key":"k",
 		"endpoints":[
 			{"serial_number":"0","address_family":"ip6","port":13000,
-			 "address":"framework.if.example.co","updown":"/nix/store/x-updown","fwmark":"0x726c"},
+			 "address":"laptop.example.invalid","updown":"/nix/store/x-updown","fwmark":"0x726c"},
 			{"serial_number":"1","address_family":"ip4","port":13000,"address":null}]}`
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
@@ -275,10 +275,10 @@ func TestReloadKeepsThePathsTheCommandLineSupplied(t *testing.T) {
 	}
 	publicPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
 	reg := registry.Registry{{
-		Organization: "ysun", PublicKey: publicPEM,
+		Organization: "example", PublicKey: publicPEM,
 		Nodes: []registry.Node{
-			{CommonName: "framework", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
-			{CommonName: "butte", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
+			{CommonName: "laptop", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
+			{CommonName: "exit", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
 		},
 	}}
 	registryPath := filepath.Join(dir, "registry.json")
@@ -288,7 +288,7 @@ func TestReloadKeepsThePathsTheCommandLineSupplied(t *testing.T) {
 
 	// ranet's own shape: no registry, no private_key, the port on the endpoint.
 	configPath := filepath.Join(dir, "config.json")
-	body := `{"organization":"ysun","common_name":"framework","full_mesh":true,
+	body := `{"organization":"example","common_name":"laptop","full_mesh":true,
 		"endpoints":[{"serial_number":"1","address_family":"ip4","port":13000}]}`
 	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
 		t.Fatal(err)
@@ -508,9 +508,9 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := registry.Registry{{
-		Organization: "ysun",
+		Organization: "example",
 		PublicKey:    string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})),
-		Nodes: []registry.Node{{CommonName: "framework",
+		Nodes: []registry.Node{{CommonName: "laptop",
 			Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}}},
 	}}
 	registryPath := filepath.Join(dir, "registry.json")
@@ -518,7 +518,7 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 	keyPath := filepath.Join(dir, "key.pem")
 	writeKey(t, keyPath, privateKey)
 	configPath := filepath.Join(dir, "config.json")
-	body := `{"organization":"ysun","common_name":"framework","full_mesh":true,
+	body := `{"organization":"example","common_name":"laptop","full_mesh":true,
 		"endpoints":[{"serial_number":"1","address_family":"ip4","port":13000}]}`
 	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
 		t.Fatal(err)

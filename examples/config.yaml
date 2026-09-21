@@ -126,15 +126,15 @@ babel:
 # unchanged.
 # segments:
 #   local:
-#     - { sid: "2a0c:b641:69c:8c6::1", behavior: "End.DT46" }
-#     - { sid: "2a0c:b641:69c:8c6::2", behavior: "End" }
+#     - { sid: "3fff:1:69c:8c6::1", behavior: "End.DT46" }
+#     - { sid: "3fff:1:69c:8c6::2", behavior: "End" }
 #
 #   # The outer source an encapsulation is sent from, which the fleet sets once
 #   # per node with `ip sr tunsrc`. A steer entry below inherits it.
-#   source: "2a0c:b641:69c:8c0::1"
+#   source: "3fff:1:69c:8c0::1"
 #
 #   # Which of this node's own packets go through a segment list, and which
-#   # list, which `gv` installs by hand today: the traffic sourced from this
+#   # list, which an operator installs by hand today: the traffic sourced from this
 #   # node's announced address, through the waypoints and out at a chosen exit.
 #   # from and to select the packets, the same pair the forwarding table is
 #   # keyed by, and an entry naming neither is refused because it would steer
@@ -146,7 +146,7 @@ babel:
 #   # take it under the 1280 byte minimum IPv6 requires is refused rather than
 #   # installed.
 #   steer:
-#     - { from: "2602:f590::23:161:104:117/128", via: ["2a0c:b641:69c:98d6::1"] }
+#     - { from: "3fff:a::198:18:104:117/128", via: ["3fff:1:69c:98d6::1"] }
 
 # Optional: mirror the routes babel learns into a routing table of its own,
 # taking over from BIRD's kernel protocols. Off unless enabled. The reconciler
@@ -162,7 +162,7 @@ babel:
 #   prefsrc4: 10.66.0.5            # linux only, refused on darwin, which has no preferred source
 #   addresses: ["10.66.0.5/32"]
 #   assign_originated: false
-#   vrf: gravity
+#   vrf: mesh
 #   vrf_create: true               # linux only: make the vrf rather than expect networkd to have
 #   reconcile_interval: 30s
 #
@@ -179,5 +179,5 @@ babel:
 #   # table takes a number or one of main, local and default.
 #   rules:
 #     - { fwmark: 0x726c, table: main, priority: 40, family: both }
-#     - { to: "2a0c:b641:69c::/48", table: 200, priority: 100 }
+#     - { to: "3fff:1:69c::/48", table: 200, priority: 100 }
 #     - { from: "10.66.0.5/32", table: 200, priority: 150 }

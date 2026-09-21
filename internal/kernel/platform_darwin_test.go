@@ -557,7 +557,7 @@ func TestDarwinPlatformRejectsLinuxConfig(t *testing.T) {
 	}{
 		{"table", func(c *Config) { c.Table = 220 }, "routing tables"},
 		{"protocol", func(c *Config) { c.Protocol = 12 }, "route protocol"},
-		{"vrf", func(c *Config) { c.VRF = "gravity" }, "VRF"},
+		{"vrf", func(c *Config) { c.VRF = "mesh" }, "VRF"},
 		{"name", func(c *Config) { c.Interface = strings.Repeat("u", unix.IFNAMSIZ) }, "ifreq"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -580,7 +580,7 @@ func TestDarwinHasNoVRF(t *testing.T) {
 	if master, err := plat.Master(); master != "" || err != nil {
 		t.Fatalf("Master reported %q, %v, want the empty string and no error", master, err)
 	}
-	err := plat.Enslave("gravity")
+	err := plat.Enslave("mesh")
 	if err == nil || !strings.Contains(err.Error(), "darwin") {
 		t.Fatalf("Enslave reported %v, want an error naming the platform", err)
 	}
@@ -1354,11 +1354,11 @@ func TestDarwinKeepsTheRefusalRecordThroughAnUnparseableDump(t *testing.T) {
 // rather than whichever exit sorts lower by address.
 func TestDarwinKeepsTheMoreSpecificSourceAtOneDestination(t *testing.T) {
 	plat, _ := testPlatform(t, Config{})
-	held := prefix("2602:f590::23:161:104:117/128")
+	held := prefix("3fff:a::198:18:104:117/128")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
 
-	wide := Route{Destination: prefix("::/0"), Source: prefix("2602:f590::/36")}
-	narrow := Route{Destination: prefix("::/0"), Source: prefix("2602:f590::/48")}
+	wide := Route{Destination: prefix("::/0"), Source: prefix("3fff:a::/36")}
+	narrow := Route{Destination: prefix("::/0"), Source: prefix("3fff:a::/48")}
 	for _, r := range []*Route{&wide, &narrow} {
 		r.Metric = routeMetric(plat.cfg.Metric, r.Destination, false)
 	}
@@ -1399,10 +1399,10 @@ func TestDarwinKeepsTheMoreSpecificSourceAtOneDestination(t *testing.T) {
 // first case, which on a real mesh is most of them.
 func TestDarwinNamesTheTwoSourceRefusalsApart(t *testing.T) {
 	plat, _ := testPlatform(t, Config{})
-	held := prefix("2602:f590::23:161:104:117/128")
+	held := prefix("3fff:a::198:18:104:117/128")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
 
-	foreign := Route{Destination: prefix("::/0"), Source: prefix("2602:f590:a::/48")}
+	foreign := Route{Destination: prefix("::/0"), Source: prefix("3fff:a:a::/48")}
 	foreign.Metric = routeMetric(plat.cfg.Metric, foreign.Destination, foreign.Unreachable)
 	if err := plat.AddRoute(foreign); !errors.Is(err, errRouteSkipped) {
 		t.Fatalf("a source holding none of our addresses reported %v", err)
@@ -1422,8 +1422,8 @@ func TestDarwinRefusesSettingsItCannotHonor(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"table":    func(c *Config) { c.Table = DefaultTable + 1 },
 		"protocol": func(c *Config) { c.Protocol = DefaultProtocol + 1 },
-		"vrf":      func(c *Config) { c.VRF = "gravity" },
-		"prefsrc4": func(c *Config) { c.PrefSrc4 = netip.MustParseAddr("23.161.104.117") },
+		"vrf":      func(c *Config) { c.VRF = "mesh" },
+		"prefsrc4": func(c *Config) { c.PrefSrc4 = netip.MustParseAddr("198.18.104.117") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			// Deliberately a device that does not exist: each refusal has to

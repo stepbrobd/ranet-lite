@@ -23,8 +23,8 @@ func innerV6Hops(payload string, hops uint8) []byte {
 	binary.BigEndian.PutUint16(raw[4:], uint16(len(payload)))
 	raw[6] = 59 // no next header
 	raw[7] = hops
-	copy(raw[8:], addr16(addr("2602:f590::1")))
-	copy(raw[24:], addr16(addr("2602:f590::2")))
+	copy(raw[8:], addr16(addr("3fff:a::1")))
+	copy(raw[24:], addr16(addr("3fff:a::2")))
 	copy(raw[40:], payload)
 	return raw
 }
@@ -34,8 +34,8 @@ func innerV4(payload string) []byte {
 	raw[0] = 0x45
 	binary.BigEndian.PutUint16(raw[2:], uint16(len(raw)))
 	raw[8] = 64
-	copy(raw[12:], addr("23.161.104.117").AsSlice())
-	copy(raw[16:], addr("23.161.104.118").AsSlice())
+	copy(raw[12:], addr("198.18.104.117").AsSlice())
+	copy(raw[16:], addr("198.18.104.118").AsSlice())
 	copy(raw[20:], payload)
 	return raw
 }
@@ -45,8 +45,8 @@ func innerV4(payload string) []byte {
 // to the exit first and the waypoints afterwards, which still forwards and
 // still arrives, so nothing but this test would report it.
 func TestEncapsulationPutsTheFirstSegmentOnTheOuterHeader(t *testing.T) {
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:6c46::2"), addr("2a0c:b641:69c:29a6::1")}
-	source := addr("2a0c:b641:69c:8c0::1")
+	path := []netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:6c46::2"), addr("3fff:1:69c:29a6::1")}
+	source := addr("3fff:1:69c:8c0::1")
 	inner := innerV6("payload")
 
 	out, err := Encapsulate(inner, source, path)
@@ -91,8 +91,8 @@ func TestEncapsulationPutsTheFirstSegmentOnTheOuterHeader(t *testing.T) {
 // and nothing else produces, and the one length a reversal bug cannot show up
 // in.
 func TestEncapsulationHandlesASingleSegment(t *testing.T) {
-	exit := addr("2a0c:b641:69c:98d6::1")
-	out, err := Encapsulate(innerV4("payload"), addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit})
+	exit := addr("3fff:1:69c:98d6::1")
+	out, err := Encapsulate(innerV4("payload"), addr("3fff:1:69c:8c0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,9 +121,9 @@ func TestEncapsulationHandlesASingleSegment(t *testing.T) {
 // Every waypoint moves the packet along by one and leaves the rest alone, so a
 // three-segment path arrives at its exit with the inner packet untouched.
 func TestWaypointsWalkThePathInOrder(t *testing.T) {
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:6c46::2"), addr("2a0c:b641:69c:29a6::1")}
+	path := []netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:6c46::2"), addr("3fff:1:69c:29a6::1")}
 	inner := innerV6Hops("payload", 10)
-	out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), path)
+	out, err := Encapsulate(inner, addr("3fff:1:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,8 +210,8 @@ func TestMalformedHeadersAreRefusedByName(t *testing.T) {
 // its own path, and one carrying something that is not an IP packet is not
 // something an exit can hand to a stack.
 func TestExitRefusesWhatItCannotDeliver(t *testing.T) {
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
-	midPath, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path)
+	path := []netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:29a6::1")}
+	midPath, err := Encapsulate(innerV6("payload"), addr("3fff:1:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestExitRefusesWhatItCannotDeliver(t *testing.T) {
 // this node will carry, because every segment is sixteen bytes in front of
 // every packet and the length is a cost somebody else would otherwise choose.
 func TestEncapsulationRefusesWhatItWillNotCarry(t *testing.T) {
-	source, exit := addr("2a0c:b641:69c:8c0::1"), addr("2a0c:b641:69c:98d6::1")
+	source, exit := addr("3fff:1:69c:8c0::1"), addr("3fff:1:69c:98d6::1")
 	long := make([]netip.Addr, MaxSegments+1)
 	for i := range long {
 		long[i] = exit
@@ -242,8 +242,8 @@ func TestEncapsulationRefusesWhatItWillNotCarry(t *testing.T) {
 	}{
 		"no segments":       {source: source, path: nil, inner: innerV6("x")},
 		"too many segments": {source: source, path: long, inner: innerV6("x")},
-		"a v4 source":       {source: addr("23.161.104.117"), path: []netip.Addr{exit}, inner: innerV6("x")},
-		"a v4 segment":      {source: source, path: []netip.Addr{addr("23.161.104.117")}, inner: innerV6("x")},
+		"a v4 source":       {source: addr("198.18.104.117"), path: []netip.Addr{exit}, inner: innerV6("x")},
+		"a v4 segment":      {source: source, path: []netip.Addr{addr("198.18.104.117")}, inner: innerV6("x")},
 		"nothing inside":    {source: source, path: []netip.Addr{exit}, inner: nil},
 		"not an ip packet":  {source: source, path: []netip.Addr{exit}, inner: []byte{0x10, 0, 0, 0}},
 		// A zone never reaches the wire, and neither the unspecified address
@@ -270,8 +270,8 @@ func TestEncapsulationRefusesWhatItWillNotCarry(t *testing.T) {
 // node it has already visited dies at the same count anything else does rather
 // than running until something else notices.
 func TestWaypointRefusesToForwardAtTheLastHop(t *testing.T) {
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
-	out, err := Encapsulate(innerV6Hops("payload", 1), addr("2a0c:b641:69c:8c0::1"), path)
+	path := []netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:29a6::1")}
+	out, err := Encapsulate(innerV6Hops("payload", 1), addr("3fff:1:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,8 +282,8 @@ func TestWaypointRefusesToForwardAtTheLastHop(t *testing.T) {
 
 func segmentRouted(t *testing.T) []byte {
 	t.Helper()
-	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
-	out, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path)
+	path := []netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:29a6::1")}
+	out, err := Encapsulate(innerV6("payload"), addr("3fff:1:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,8 +301,8 @@ func segmentRouted(t *testing.T) []byte {
 // rather than rejecting a malformed packet.
 func TestReducedHeaderIsForwarded(t *testing.T) {
 	// Policy S1,S2,S3 with S1 in the destination, so the list is S3,S2.
-	s2, s3 := addr("2a0c:b641:69c:6c46::2"), addr("2a0c:b641:69c:29a6::1")
-	raw := reducedHeader(t, addr("2a0c:b641:69c:98d6::2"), []netip.Addr{s3, s2})
+	s2, s3 := addr("3fff:1:69c:6c46::2"), addr("3fff:1:69c:29a6::1")
+	raw := reducedHeader(t, addr("3fff:1:69c:98d6::2"), []netip.Addr{s3, s2})
 
 	header, err := Parse(raw)
 	if err != nil {
@@ -324,9 +324,9 @@ func TestReducedHeaderIsForwarded(t *testing.T) {
 // this node does not recognize to be ignored. An 8-octet padding TLV makes Hdr
 // Ext Len odd, which is legal, and moves where the payload starts.
 func TestTLVAfterTheSegmentsIsIgnored(t *testing.T) {
-	exit := addr("2a0c:b641:69c:98d6::1")
+	exit := addr("3fff:1:69c:98d6::1")
 	inner := innerV6("payload")
-	raw, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit})
+	raw, err := Encapsulate(inner, addr("3fff:1:69c:8c0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,8 +361,8 @@ func TestExitDeliversAnEncapsulationWithNoRoutingHeader(t *testing.T) {
 	binary.BigEndian.PutUint16(raw[4:], uint16(len(inner)))
 	raw[6] = NextHeaderIPv6
 	raw[7] = 64
-	copy(raw[8:], addr16(addr("2a0c:b641:69c:8c0::1")))
-	copy(raw[24:], addr16(addr("2a0c:b641:69c:98d6::1")))
+	copy(raw[8:], addr16(addr("3fff:1:69c:8c0::1")))
+	copy(raw[24:], addr16(addr("3fff:1:69c:98d6::1")))
 	copy(raw[ipv6HeaderLen:], inner)
 
 	delivered, family, err := Decap(raw)
@@ -381,13 +381,13 @@ func TestExitDeliversAnEncapsulationWithNoRoutingHeader(t *testing.T) {
 // outer hop limit would launder a packet past the budget its own header had
 // already spent.
 func TestEncapsulationCopiesTheInnerTrafficClassAndHopLimit(t *testing.T) {
-	exit := []netip.Addr{addr("2a0c:b641:69c:98d6::1")}
+	exit := []netip.Addr{addr("3fff:1:69c:98d6::1")}
 	for class := range 256 {
 		inner := innerV6Hops("payload", 7)
 		inner[0] = 0x60 | byte(class)>>4
 		inner[1] = byte(class)<<4 | 0x0c
 		inner[2], inner[3] = 0xde, 0xf0 // the rest of the flow label
-		out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), exit)
+		out, err := Encapsulate(inner, addr("3fff:1:69c:8c0::1"), exit)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -399,7 +399,7 @@ func TestEncapsulationCopiesTheInnerTrafficClassAndHopLimit(t *testing.T) {
 		}
 	}
 	// An IPv4 inner has no class or label to copy, so the outer gets neither.
-	out, err := Encapsulate(innerV4("payload"), addr("2a0c:b641:69c:8c0::1"), exit)
+	out, err := Encapsulate(innerV4("payload"), addr("3fff:1:69c:8c0::1"), exit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,9 +427,9 @@ func TestRoutingHeaderLongerThanItsPacketIsRefused(t *testing.T) {
 func TestSegmentListPastTheCapIsRefused(t *testing.T) {
 	segments := make([]netip.Addr, MaxSegments+1)
 	for i := range segments {
-		segments[i] = addr("2a0c:b641:69c:29a6::1")
+		segments[i] = addr("3fff:1:69c:29a6::1")
 	}
-	raw := reducedHeader(t, addr("2a0c:b641:69c:98d6::2"), segments)
+	raw := reducedHeader(t, addr("3fff:1:69c:98d6::2"), segments)
 	if _, err := Parse(raw); err == nil {
 		t.Fatalf("a %d segment header was accepted", len(segments))
 	}
@@ -447,7 +447,7 @@ func reducedHeader(t *testing.T, destination netip.Addr, segments []netip.Addr) 
 	binary.BigEndian.PutUint16(raw[4:], uint16(srhLen+len(inner)))
 	raw[6] = nextHeaderRouting
 	raw[7] = 64
-	copy(raw[8:], addr16(addr("2a0c:b641:69c:8c0::1")))
+	copy(raw[8:], addr16(addr("3fff:1:69c:8c0::1")))
 	copy(raw[24:], addr16(destination))
 	srh := raw[ipv6HeaderLen:]
 	srh[0] = NextHeaderIPv6
@@ -475,9 +475,9 @@ func oversizedV6() []byte {
 // in a packet a kernel acts on, and refuses it as addressed to one of this
 // node's own segments with nothing in it.
 func TestRoutingHeaderIsFoundBehindAnotherExtensionHeader(t *testing.T) {
-	exit := addr("2a0c:b641:69c:98d6::1")
+	exit := addr("3fff:1:69c:98d6::1")
 	inner := innerV6("payload")
-	plain, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit})
+	plain, err := Encapsulate(inner, addr("3fff:1:69c:8c0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,13 +556,13 @@ func TestExtensionHeaderWalkRefusesWhatAPeerCanChoose(t *testing.T) {
 func FuzzParseNeverPanics(f *testing.F) {
 	f.Add(innerV6("payload"))
 	f.Add(innerV4("payload"))
-	raw, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"),
-		[]netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")})
+	raw, err := Encapsulate(innerV6("payload"), addr("3fff:1:69c:8c0::1"),
+		[]netip.Addr{addr("3fff:1:69c:98d6::2"), addr("3fff:1:69c:29a6::1")})
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Add(raw)
-	f.Add(reducedHeader(&testing.T{}, addr("2a0c:b641:69c:98d6::2"), []netip.Addr{addr("2a0c:b641:69c:29a6::1")}))
+	f.Add(reducedHeader(&testing.T{}, addr("3fff:1:69c:98d6::2"), []netip.Addr{addr("3fff:1:69c:29a6::1")}))
 
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		header, err := Parse(raw)
@@ -571,7 +571,7 @@ func FuzzParseNeverPanics(f *testing.F) {
 		}
 		End(bytes.Clone(raw))
 		Decap(bytes.Clone(raw))
-		TimeExceeded(raw, addr("2a0c:b641:69c:8c6::2"))
-		ParameterProblem(raw, addr("2a0c:b641:69c:8c6::2"))
+		TimeExceeded(raw, addr("3fff:1:69c:8c6::2"))
+		ParameterProblem(raw, addr("3fff:1:69c:8c6::2"))
 	})
 }

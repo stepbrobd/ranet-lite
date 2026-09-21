@@ -72,7 +72,7 @@ func (p CostParams) Cost(rtt time.Duration, haveRTT bool) uint16 {
 // link, added to the rxcost the neighbor reports, rather than on the rxcost
 // this node advertises.
 //
-// Measured against the fleet before this was so: every one of sixteen ysun
+// Measured against the fleet before this was so: every one of sixteen
 // nodes reported cost 96 whether its real round trip was 10 ms or 307 ms,
 // because BIRD applies the penalty locally and advertises the nominal cost.
 // Selection could not tell Paris from Sydney and took a 202 ms exit from a

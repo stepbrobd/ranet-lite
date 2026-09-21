@@ -230,10 +230,10 @@ func harness(t *testing.T, cfg Config) (*Reconciler, *netstack.RouteTable, *fake
 }
 
 func TestReconcileInstallsSnapshotRoutes(t *testing.T) {
-	reconciler, table, fake := harness(t, Config{PrefSrc4: addr("23.161.104.5")})
+	reconciler, table, fake := harness(t, Config{PrefSrc4: addr("198.18.104.5")})
 	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
-	table.Set(netip.Prefix{}, prefix("2602:f590::/36"), nil)
-	table.Set(prefix("2602:f590:1::/48"), prefix("::/0"), nil)
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
+	table.Set(prefix("3fff:a:1::/48"), prefix("::/0"), nil)
 
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -241,9 +241,9 @@ func TestReconcileInstallsSnapshotRoutes(t *testing.T) {
 	// an unset metric is the kernel's own default, which is 0 for IPv4 and
 	// IP6_RT_PRIO_USER for IPv6.
 	want := []Route{
-		{Destination: prefix("10.0.0.0/8"), PrefSrc: addr("23.161.104.5")},
-		{Destination: prefix("::/0"), Source: prefix("2602:f590:1::/48"), Metric: defaultIPv6Metric},
-		{Destination: prefix("2602:f590::/36"), Metric: defaultIPv6Metric},
+		{Destination: prefix("10.0.0.0/8"), PrefSrc: addr("198.18.104.5")},
+		{Destination: prefix("::/0"), Source: prefix("3fff:a:1::/48"), Metric: defaultIPv6Metric},
+		{Destination: prefix("3fff:a::/36"), Metric: defaultIPv6Metric},
 	}
 	slices.SortFunc(want, compareRoutes)
 	if got := fake.snapshot(); !slices.Equal(got, want) {
@@ -274,7 +274,7 @@ func TestReconcileRemovesWithdrawnRoutes(t *testing.T) {
 func TestReconcileLeavesUnchangedRoutesAlone(t *testing.T) {
 	reconciler, table, fake := harness(t, Config{})
 	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
-	table.Set(prefix("2602:f590:1::/48"), prefix("::/0"), nil)
+	table.Set(prefix("3fff:a:1::/48"), prefix("::/0"), nil)
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -297,8 +297,8 @@ func TestReconcileLeavesUnchangedRoutesAlone(t *testing.T) {
 // two kernel routes, not one, which is the distinction RTA_SRC carries.
 func TestReconcileKeepsSourceSpecificAndOrdinaryApart(t *testing.T) {
 	reconciler, table, fake := harness(t, Config{})
-	table.Set(netip.Prefix{}, prefix("2602:f590::/36"), nil)
-	table.Set(prefix("2602:f590:1::/48"), prefix("2602:f590::/36"), nil)
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
+	table.Set(prefix("3fff:a:1::/48"), prefix("3fff:a::/36"), nil)
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -307,11 +307,11 @@ func TestReconcileKeepsSourceSpecificAndOrdinaryApart(t *testing.T) {
 	}
 
 	// retracting only the source-specific entry must leave the ordinary one.
-	table.Remove(prefix("2602:f590:1::/48"), prefix("2602:f590::/36"))
+	table.Remove(prefix("3fff:a:1::/48"), prefix("3fff:a::/36"))
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	want := []Route{{Destination: prefix("2602:f590::/36"), Metric: defaultIPv6Metric}}
+	want := []Route{{Destination: prefix("3fff:a::/36"), Metric: defaultIPv6Metric}}
 	if got := fake.snapshot(); !slices.Equal(got, want) {
 		t.Fatalf("installed %v, want %v", got, want)
 	}
@@ -504,7 +504,7 @@ func TestReconcileReportsFailedDump(t *testing.T) {
 
 func TestApplyAddressesOnlyRemovesWhatItAdded(t *testing.T) {
 	operator := prefix("192.0.2.1/32")
-	ours := prefix("23.161.104.5/32")
+	ours := prefix("198.18.104.5/32")
 	reconciler, _, fake := harness(t, Config{Addresses: []netip.Prefix{operator, ours}})
 	fake.addrs[operator] = true
 
@@ -533,12 +533,12 @@ func TestApplyAddressesOnlyRemovesWhatItAdded(t *testing.T) {
 }
 
 func TestApplyMasterEnslavesOnlyUnclaimedLink(t *testing.T) {
-	reconciler, _, fake := harness(t, Config{VRF: "gravity"})
+	reconciler, _, fake := harness(t, Config{VRF: "mesh"})
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if fake.master != "gravity" {
-		t.Fatalf("master is %q, want gravity", fake.master)
+	if fake.master != "mesh" {
+		t.Fatalf("master is %q, want mesh", fake.master)
 	}
 	// idempotent: a second pass must not touch a link already in place.
 	if err := reconciler.reconcile(); err != nil {
@@ -553,7 +553,7 @@ func TestApplyMasterEnslavesOnlyUnclaimedLink(t *testing.T) {
 }
 
 func TestApplyMasterLeavesAnotherManagersLinkAlone(t *testing.T) {
-	reconciler, _, fake := harness(t, Config{VRF: "gravity"})
+	reconciler, _, fake := harness(t, Config{VRF: "mesh"})
 	fake.master = "somebody-else"
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -571,7 +571,7 @@ func TestApplyMasterLeavesAnotherManagersLinkAlone(t *testing.T) {
 
 func TestRunWithdrawsOnCancel(t *testing.T) {
 	reconciler, table, fake := harness(t, Config{
-		Addresses:         []netip.Prefix{prefix("23.161.104.5/32")},
+		Addresses:         []netip.Prefix{prefix("198.18.104.5/32")},
 		ReconcileInterval: 10 * time.Millisecond,
 	})
 	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
@@ -771,7 +771,7 @@ func TestRetractedPrefixIsHeldInKernelTable(t *testing.T) {
 	}
 	// A lookup is longest prefix first and only then by metric, so the hold
 	// keeps its job while losing to anything else holding that exact prefix.
-	// A converted fleet node has one: its gravity /60 is a connected route in
+	// A converted fleet node has one: its mesh /60 is a connected route in
 	// the table this reconciler owns, and the node has to originate that same
 	// /60, so a hold that wins there rejects every packet for the node's own
 	// prefix.
@@ -968,7 +968,7 @@ func TestStatsReportWhatThePassDidAndDidNotInstall(t *testing.T) {
 	}
 
 	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
-	table.Set(netip.Prefix{}, prefix("2602:f590::/36"), nil)
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatal(err)
 	}
@@ -1091,12 +1091,12 @@ func TestPlatformWithoutRulesRefusesThemByName(t *testing.T) {
 	if !strings.Contains(err.Error(), "scoped") {
 		t.Errorf("the refusal reads %q, want it to say what the platform does instead", err)
 	}
-	if err := refuseWhatThePlatformLacks(Config{CreateVRF: true, VRF: "gravity"}, plat); err == nil {
+	if err := refuseWhatThePlatformLacks(Config{CreateVRF: true, VRF: "mesh"}, plat); err == nil {
 		t.Fatal("vrf creation was accepted on a platform with no VRFs")
 	}
 	// Naming a VRF without asking for one to be created still needs the link
 	// enslaved to it, which the same platforms cannot do.
-	if err := refuseWhatThePlatformLacks(Config{VRF: "gravity"}, plat); err == nil {
+	if err := refuseWhatThePlatformLacks(Config{VRF: "mesh"}, plat); err == nil {
 		t.Fatal("a vrf was accepted on a platform with no VRFs")
 	}
 	// Asking for a device with no name to create is a configuration that
@@ -1105,7 +1105,7 @@ func TestPlatformWithoutRulesRefusesThemByName(t *testing.T) {
 		t.Fatal("vrf_create with no vrf was accepted")
 	}
 	// The same configuration on a platform that has both is accepted.
-	if err := refuseWhatThePlatformLacks(Config{Rules: []Rule{rule}, CreateVRF: true, VRF: "gravity"}, newFakeKernel(t)); err != nil {
+	if err := refuseWhatThePlatformLacks(Config{Rules: []Rule{rule}, CreateVRF: true, VRF: "mesh"}, newFakeKernel(t)); err != nil {
 		t.Errorf("a platform with rules and VRFs refused them: %v", err)
 	}
 }
@@ -1149,7 +1149,7 @@ func TestRuleValidationRefusesWhatReadsWrong(t *testing.T) {
 func TestRulePassInstallsOnceAndWithdrawsWhatIsGone(t *testing.T) {
 	underlay := Rule{Family: FamilyIPv4, FWMark: 0x726c, Table: 254, Priority: 40}
 	mesh := Rule{Family: FamilyIPv6, From: prefix("2001:db8::/32"), Table: 200, Priority: 150}
-	reconciler, _, fake := harness(t, Config{Rules: []Rule{underlay, mesh}, VRF: "gravity", CreateVRF: true})
+	reconciler, _, fake := harness(t, Config{Rules: []Rule{underlay, mesh}, VRF: "mesh", CreateVRF: true})
 
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatal(err)
@@ -1157,7 +1157,7 @@ func TestRulePassInstallsOnceAndWithdrawsWhatIsGone(t *testing.T) {
 	if got, err := fake.Rules(); err != nil || len(got) != 2 {
 		t.Fatalf("the first pass installed %v (%v), want both rules", got, err)
 	}
-	if table, ok := fake.vrfs["gravity"]; !ok || table != DefaultTable {
+	if table, ok := fake.vrfs["mesh"]; !ok || table != DefaultTable {
 		t.Fatalf("the vrf is %v bound to %d, want the reconciler's table", ok, table)
 	}
 
@@ -1187,7 +1187,7 @@ func TestRulePassInstallsOnceAndWithdrawsWhatIsGone(t *testing.T) {
 	if got, _ := fake.Rules(); len(got) != 0 {
 		t.Errorf("shutdown left %v behind", got)
 	}
-	if _, ok := fake.vrfs["gravity"]; ok {
+	if _, ok := fake.vrfs["mesh"]; ok {
 		t.Error("shutdown left behind the vrf it created")
 	}
 }
@@ -1195,19 +1195,19 @@ func TestRulePassInstallsOnceAndWithdrawsWhatIsGone(t *testing.T) {
 // A VRF that was already there belongs to whoever made it: rebinding it moves
 // every route in its table, and removing it at shutdown takes them with it.
 func TestVRFThatWasAlreadyThereIsLeftAlone(t *testing.T) {
-	reconciler, _, fake := harness(t, Config{VRF: "gravity", CreateVRF: true})
-	fake.vrfs["gravity"] = 42
+	reconciler, _, fake := harness(t, Config{VRF: "mesh", CreateVRF: true})
+	fake.vrfs["mesh"] = 42
 
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if table := fake.vrfs["gravity"]; table != 42 {
+	if table := fake.vrfs["mesh"]; table != 42 {
 		t.Fatalf("the existing vrf was rebound to %d", table)
 	}
 	if err := reconciler.withdraw(); err != nil {
 		t.Fatal(err)
 	}
-	if table, ok := fake.vrfs["gravity"]; !ok || table != 42 {
+	if table, ok := fake.vrfs["mesh"]; !ok || table != 42 {
 		t.Errorf("shutdown removed a vrf it did not create: %v %d", ok, table)
 	}
 }
@@ -1263,7 +1263,7 @@ func TestRulesAreCanonicalizedToWhatTheKernelReportsBack(t *testing.T) {
 // applyRoutes counts, so a node whose rules or VRF fail on every pass would
 // otherwise report a clean route count and no error at all.
 func TestStatsCarryTheWholePassError(t *testing.T) {
-	reconciler, _, fake := harness(t, Config{VRF: "gravity", CreateVRF: true})
+	reconciler, _, fake := harness(t, Config{VRF: "mesh", CreateVRF: true})
 	fake.vrfErr = errors.New("no permission to create a vrf")
 
 	if err := reconciler.reconcile(); err == nil {

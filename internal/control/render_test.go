@@ -89,8 +89,8 @@ func TestRoutesNameOriginatedAndUnreachable(t *testing.T) {
 // said as words rather than as booleans a reader reassembles.
 func TestStatusSaysTheRoleInWords(t *testing.T) {
 	var out strings.Builder
-	RenderStatus(&out, Status{Organization: "ysun", CommonName: "framework", Responder: false, FullMesh: true, NoTransit: true})
-	for _, want := range []string{"ysun/framework", "initiator", "full mesh", "no transit", "off, routes configured externally"} {
+	RenderStatus(&out, Status{Organization: "example", CommonName: "laptop", Responder: false, FullMesh: true, NoTransit: true})
+	for _, want := range []string{"example/laptop", "initiator", "full mesh", "no transit", "off, routes configured externally"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("status printed as %q, want it to carry %q", out.String(), want)
 		}

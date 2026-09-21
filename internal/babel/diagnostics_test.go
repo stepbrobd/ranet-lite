@@ -17,9 +17,9 @@ func TestRouteDumpCarriesOriginatedPrefixes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	own := netip.MustParsePrefix("23.161.104.117/32")
+	own := netip.MustParsePrefix("198.18.104.117/32")
 	exit := netip.MustParsePrefix("::/0")
-	from := netip.MustParsePrefix("2602:f590::/36")
+	from := netip.MustParsePrefix("3fff:a::/36")
 	speaker.OriginateFrom(own, netip.Prefix{})
 	speaker.OriginateFrom(exit, from)
 
@@ -59,12 +59,12 @@ func TestRouteDumpReportsSelectionAndHolds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer := netstack.NewPeer("ysun/toompea@0", nil, nil)
+	peer := netstack.NewPeer("example/gateway@0", nil, nil)
 	handle := speaker.AddPeer(peer)
 	defer handle.Close()
 	neighbor := speaker.neighbors[peer.ID]
 	makeNeighborReachable(neighbor)
-	dest := netip.MustParsePrefix("2a0c:b641:69c:98d0::/60")
+	dest := netip.MustParsePrefix("3fff:1:69c:98d0::/60")
 	key := routeKey{dest: dest}
 	speaker.routes.update(neighbor, key, advertisement{routerID: [8]byte{1, 2}, seqno: 7, metric: 100}, time.Minute, time.Now())
 
@@ -92,7 +92,7 @@ func TestNeighborStatsCarryBothDirections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer := netstack.NewPeer("ysun/toompea@0", nil, nil)
+	peer := netstack.NewPeer("example/gateway@0", nil, nil)
 	handle := speaker.AddPeer(peer)
 	defer handle.Close()
 

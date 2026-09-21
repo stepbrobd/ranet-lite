@@ -27,7 +27,7 @@ func TestCostFormula(t *testing.T) {
 // and that procedure is the one a node runs on its own routes. Feeding the
 // penalty to the advertised rxcost instead leaves selection blind, because the
 // other end advertises its nominal cost: measured against the fleet, all
-// sixteen ysun nodes reported 96 whether the real round trip was 10 ms or
+// sixteen nodes reported 96 whether the real round trip was 10 ms or
 // 307 ms, and a node 10 ms from Paris took a 202 ms exit.
 func TestRoundTripPenaltyLandsOnTheCostThisNodeComputes(t *testing.T) {
 	params := DefaultCostParams()

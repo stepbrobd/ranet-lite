@@ -56,7 +56,7 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 
 	// RTA_PREFSRC is only accepted for an address the box actually has, so
 	// the address assignment has to land first.
-	local4, local6 := prefix("10.99.0.1/32"), prefix("2602:f590:1::1/128")
+	local4, local6 := prefix("10.99.0.1/32"), prefix("3fff:a:1::1/128")
 	for _, address := range []netip.Prefix{local4, local6} {
 		if err := plat.AddAddr(address); err != nil {
 			t.Fatalf("assign %s: %v", address, err)
@@ -76,8 +76,8 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 	// reports back exactly the route that was installed.
 	want := []Route{
 		{Destination: prefix("10.0.0.0/8"), PrefSrc: local4.Addr()},
-		{Destination: prefix("::/0"), Source: prefix("2602:f590:1::/48"), Metric: defaultIPv6Metric},
-		{Destination: prefix("2602:f590::/36"), Metric: defaultIPv6Metric},
+		{Destination: prefix("::/0"), Source: prefix("3fff:a:1::/48"), Metric: defaultIPv6Metric},
+		{Destination: prefix("3fff:a::/36"), Metric: defaultIPv6Metric},
 	}
 	slices.SortFunc(want, compareRoutes)
 	for _, route := range want {
@@ -143,7 +143,7 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 
 	// A delete removes exactly one route and is idempotent, so a reconcile
 	// that races the kernel does not fail on the second attempt.
-	victim := Route{Destination: prefix("2602:f590::/36"), Metric: defaultIPv6Metric}
+	victim := Route{Destination: prefix("3fff:a::/36"), Metric: defaultIPv6Metric}
 	for range 2 {
 		if err := plat.DelRoute(victim); err != nil {
 			t.Fatalf("remove %s: %v", victim, err)
@@ -441,8 +441,8 @@ func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
 	}
 
 	want := []Rule{
-		{Family: FamilyIPv4, To: prefix("23.161.104.0/24"), Table: DefaultTable, Priority: 100},
-		{Family: FamilyIPv6, From: prefix("2a0c:b641:69c::/48"), Table: DefaultTable, Priority: 150},
+		{Family: FamilyIPv4, To: prefix("198.18.104.0/24"), Table: DefaultTable, Priority: 100},
+		{Family: FamilyIPv6, From: prefix("3fff:1:69c::/48"), Table: DefaultTable, Priority: 150},
 		{Family: FamilyIPv4, FWMark: 0x726c, Table: 254, Priority: 40},
 		{Family: FamilyIPv6, FWMark: 0x726c, Table: 254, Priority: 40},
 	}

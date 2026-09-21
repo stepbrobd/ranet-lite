@@ -156,7 +156,7 @@ func TestDarwinScopesARouteThatCoversTheUnderlay(t *testing.T) {
 	peer := netip.MustParseAddr("2001:db8:beef::1")
 	plat, _ := testPlatform(t, Config{Underlay: func() []netip.Addr { return []netip.Addr{peer} }})
 	capturing := Route{Destination: prefix("2000::/3")}
-	elsewhere := Route{Destination: prefix("2a0c:b641::/32")}
+	elsewhere := Route{Destination: prefix("3fff:1::/32")}
 	if plat.scopeRoute(capturing) {
 		t.Fatal("the underlay was consulted before Routes took it, so a pass would decide scope two ways")
 	}

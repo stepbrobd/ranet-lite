@@ -32,6 +32,6 @@
     # kernel here rather than against a fake, so a rule or a VRF left behind is
     # a leak this check is the only thing positioned to see.
     assert "proto 155" not in machine.succeed("ip rule show; ip -6 rule show")
-    machine.fail("ip link show gravity")
+    machine.fail("ip link show mesh")
   '';
 }

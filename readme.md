@@ -330,12 +330,12 @@ babel:
 #   prefsrc4: 10.66.0.5            # linux only: RTA_PREFSRC on v4 routes, as krt_prefsrc
 #   addresses: ["10.66.0.5/32"]    # assigned to the TUN, removed again at exit
 #   assign_originated: false       # also assign every prefix in originate
-#   vrf: gravity                   # joined only while the link has no master
+#   vrf: mesh                   # joined only while the link has no master
 #   vrf_create: true               # linux only: make it rather than expect networkd to have
 #   reconcile_interval: 30s
 #   rules:                         # linux only, see the platform notes below
 #     - { fwmark: 0x726c, table: main, priority: 40, family: both }
-#     - { to: "2a0c:b641:69c::/48", table: 200, priority: 100 }
+#     - { to: "3fff:1:69c::/48", table: 200, priority: 100 }
 #     - { from: "10.66.0.5/32", table: 200, priority: 150 }
 
 # Optional: segment routing, performed here rather than by a kernel, so it is
@@ -344,12 +344,12 @@ babel:
 # steered packet carries its list inside the tunnel, so the device's MTU comes
 # down by the longest list configured.
 # segments:
-#   source: "2a0c:b641:69c:8c0::1" # the outer source, as `ip sr tunsrc` sets it
+#   source: "3fff:1:69c:8c0::1" # the outer source, as `ip sr tunsrc` sets it
 #   local:
-#     - { sid: "2a0c:b641:69c:8c6::1", behavior: "End.DT46" }
-#     - { sid: "2a0c:b641:69c:8c6::2", behavior: "End" }
+#     - { sid: "3fff:1:69c:8c6::1", behavior: "End.DT46" }
+#     - { sid: "3fff:1:69c:8c6::2", behavior: "End" }
 #   steer:
-#     - { from: "2602:f590::23:161:104:117/128", via: ["2a0c:b641:69c:98d6::1"] }
+#     - { from: "3fff:a::198:18:104:117/128", via: ["3fff:1:69c:98d6::1"] }
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
@@ -413,11 +413,11 @@ unchanged.
 
 `segments.steer` is which of this node's own packets go through a segment list.
 It is keyed by source and destination prefix together, the pair the forwarding
-table is keyed by, because that is the selector the fleet's `gv` uses: the
-traffic sourced from this node's announced address, through the waypoints and
-out at a chosen exit. An entry naming neither a source nor a destination is
-refused, since it would claim the encapsulated packets this node has just
-produced.
+table is keyed by, because that is the selector a steering tool on such a fleet
+uses: the traffic sourced from this node's announced address, through the
+waypoints and out at a chosen exit. An entry naming neither a source nor a
+destination is refused, since it would claim the encapsulated packets this node
+has just produced.
 
 Every steered packet carries its segment list inside the tunnel, so the device
 comes up with the longest configured list taken off its MTU, and a list long
@@ -516,7 +516,7 @@ The subcommands read it and print a table, or the wire form with `-json`:
 
 ```
 $ ranet-lite status
-node        ysun/framework
+node        example/laptop
 version     2026.912.0+860393bf1c2e
 uptime      3h12m0s
 port        13000
@@ -530,19 +530,19 @@ dialers     117 running
 sessions    83
 neighbors   83, 81 alive
 routes      611 prefixes, 604 selected, 3 originated
-originate   23.161.104.117/32 2602:f590::23:161:104:117/128 2a0c:b641:69c:8c0::/60
-segments    2a0c:b641:69c:8c6::1 End.DT46 (0 forwarded, 5 delivered, 0 dropped)
-steering    from 2602:f590::23:161:104:117/128 via 2a0c:b641:69c:98d6::1 (12 steered)
+originate   198.18.104.117/32 3fff:a::198:18:104:117/128 3fff:1:69c:8c0::/60
+segments    3fff:1:69c:8c6::1 End.DT46 (0 forwarded, 5 delivered, 0 dropped)
+steering    from 3fff:a::198:18:104:117/128 via 3fff:1:69c:98d6::1 (12 steered)
 esp         41822931 in, 0 dropped, 14 refused
 
 $ ranet-lite neighbors
 peer            state  cost  rxcost  rtt      routes  expires  dropped  failed
-ysun/toompea@0  up     116   96      27.2ms   15      11.3s    0        0
-ysun/isere@1    up     194   96      176.7ms  130     9.8s     0        0
+example/gateway@0  up     116   96      27.2ms   15      11.3s    0        0
+example/relay@1    up     194   96      176.7ms  130     9.8s     0        0
 
 $ ranet-lite routes
 destination  from            via             metric  router-id         seqno  paths
-::/0         2602:f590::/36  ysun/toompea@0  212     0a1b2c3d4e5f6071  42     7
+::/0         3fff:a::/36  example/gateway@0  212     0a1b2c3d4e5f6071  42     7
 ```
 
 `neighbors` answers `birdc show babel neighbors`, with the neighbor's own
@@ -575,7 +575,7 @@ never touches another table, another device, or any policy rule.
 Installing is where a router daemon usually takes over from its neighbors, and
 this one does not. It asks for the route exclusively, and a key something else
 already holds is left alone and reported once. That matters most in a VRF table,
-which a gravity node hands it: a replace compares neither the protocol nor the
+which a mesh node hands it: a replace compares neither the protocol nor the
 route type, so it would have displaced the kernel's own local and connected
 entries for an address on an enslaved link, at the same priority an IPv4 route
 with no configured metric uses. The reconciler also names any other routing

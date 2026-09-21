@@ -195,7 +195,7 @@ type Segments struct {
 	// `<base>6::2` for End, and the same two addresses go here unchanged.
 	Local []LocalSegment `yaml:"local"`
 	// Steer decides which of this node's own packets go through a segment
-	// list, which `gv` installs by hand today: the traffic sourced from this
+	// list, which an operator installs by hand today: the traffic sourced from this
 	// node's announced address, through the waypoints and out at a chosen
 	// exit.
 	Steer []SteerEntry `yaml:"steer"`
@@ -540,7 +540,7 @@ func maskedDefault(prefix netip.Prefix) error {
 //	  originate:
 //	    - 2001:db8::/48
 //	    - prefix: ::/0
-//	      from: 2602:f590::/36
+//	      from: 3fff:a::/36
 type OriginatePrefix struct {
 	Prefix netip.Prefix
 	From   netip.Prefix

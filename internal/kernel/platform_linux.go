@@ -244,7 +244,7 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 	// EXCL rather than REPLACE. A replace takes over whatever sits first at the
 	// same prefix, tos and priority no matter who wrote it: fib_table_insert
 	// compares neither rtm_protocol nor the route type. In a VRF table, which
-	// is the kind a gravity node gives this reconciler, that first entry is the
+	// is the kind a mesh node gives this reconciler, that first entry is the
 	// kernel's own RTPROT_KERNEL local and connected route for an address on an
 	// enslaved link, sitting at priority 0 where an IPv4 route with no
 	// configured metric also sits. Replacing it would stop the node reaching
