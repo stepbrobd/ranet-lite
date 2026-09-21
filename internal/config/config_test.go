@@ -187,7 +187,7 @@ func TestRenderedCapabilitiesParseBackToThemselves(t *testing.T) {
 				Port:      13000,
 				Listen:    true,
 				TUN:       "ranet0",
-				Underlay:  transport.Underlay{Mark: 0x726c},
+				Underlay:  transport.Underlay{Mark: 0x726c, Bind: true},
 				Endpoints: []Endpoint{{Serial: "0", Family: "ip4"}},
 			},
 			Dial: Dial{All: true, To: []Peer{{Org: "example", Name: "gateway", Serial: "1"}}},
@@ -230,6 +230,7 @@ func TestRenderedCapabilitiesParseBackToThemselves(t *testing.T) {
 				AssignAnnounced: true,
 				VRF:             &kernel.VRF{Name: "mesh", Create: true},
 				Reconcile:       schema.Duration(30 * time.Second),
+				CaptureGrace:    schema.Duration(10 * time.Second),
 				Rules: []kernel.Rule{
 					{FWMark: 0x726c, Table: schema.TableMain, Priority: 40, Family: kernel.FamilyBoth},
 					{To: schema.MustPrefix("3fff:1:69c::/48"), Table: 200, Priority: 100},
