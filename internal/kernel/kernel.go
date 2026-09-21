@@ -332,19 +332,12 @@ func (r Rule) String() string {
 //
 // A mark with no mask matches every bit, which the kernel stores and reports
 // as a mask of all ones: `ip rule add fwmark X` and `ip rule add fwmark
-// X/0xffffffff` answer EEXIST to each other. A prefix of length zero selects
-// every address, so the kernel emits no FRA_DST or FRA_SRC for it and a rule
-// carrying nothing else is one that matches everything, which validate then
-// refuses by name rather than installing.
+// X/0xffffffff` answer EEXIST to each other. The other spelling that does not
+// survive a dump, a zero-length selector, is refused by validate instead, so
+// that the refusal can name the field the operator wrote.
 func (r Rule) canonical() Rule {
 	if r.FWMask == ^uint32(0) {
 		r.FWMask = 0
-	}
-	if r.To.Bits() == 0 {
-		r.To = netip.Prefix{}
-	}
-	if r.From.Bits() == 0 {
-		r.From = netip.Prefix{}
 	}
 	return r
 }
@@ -368,6 +361,13 @@ func (r Rule) validate() error {
 		}
 		if named.prefix.Masked() != named.prefix {
 			return fmt.Errorf("kernel: rule %s: %s %s has bits set below its prefix length", r, named.name, named.prefix)
+		}
+		if named.prefix.Bits() == 0 {
+			// The kernel emits no FRA_DST or FRA_SRC for a zero-length
+			// selector, so a rule carrying one never matches its own readback
+			// and the pass reinstalls it forever. Whatever else the rule
+			// selects on is the honest way to write it.
+			return fmt.Errorf("kernel: rule %s: %s %s selects every address, which the kernel reports back as no selector at all", r, named.name, named.prefix)
 		}
 	}
 	if !r.To.IsValid() && !r.From.IsValid() && r.FWMark == 0 {
@@ -523,11 +523,16 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = DefaultReconcileInterval
 	}
-	cfg.Rules = canonicalRules(cfg.Rules)
-	for i, rule := range cfg.Rules {
+	// Validated as written and canonicalized afterwards, so a refusal names
+	// the field an operator can find in their own file rather than the one
+	// canonicalization left behind.
+	for _, rule := range cfg.Rules {
 		if err := rule.validate(); err != nil {
 			return nil, err
 		}
+	}
+	cfg.Rules = canonicalRules(cfg.Rules)
+	for i, rule := range cfg.Rules {
 		if slices.Contains(cfg.Rules[:i], rule) {
 			return nil, fmt.Errorf("kernel: rule %s is configured twice", rule)
 		}
@@ -797,6 +802,9 @@ func (r *Reconciler) applyRules() error {
 // applyRoutes removes before it installs, so a changed non-key attribute does
 // not collide with the old route under the exclusive-install policy.
 func (r *Reconciler) applyRoutes() error {
+	// Cleared first, so a pass that fails before it can count anything reports
+	// nothing rather than the counts of the last pass that succeeded.
+	r.routePass = Stats{}
 	actual, err := r.plat.Routes()
 	if err != nil {
 		return fmt.Errorf("list routes: %w", err)

@@ -1223,9 +1223,16 @@ func TestRulesAreCanonicalizedToWhatTheKernelReportsBack(t *testing.T) {
 	if got := masked.canonical(); got.FWMask != 0 {
 		t.Errorf("an all-ones mask survived canonicalization as %#x", got.FWMask)
 	}
+	// The other spelling a dump does not return is refused rather than folded,
+	// so that the message names the field as the operator wrote it instead of
+	// the empty rule canonicalization would have left.
 	wide := Rule{Family: FamilyIPv6, To: prefix("::/0"), FWMark: 1, Table: 200, Priority: 100}
-	if got := wide.canonical(); got.To.IsValid() {
-		t.Errorf("a zero-length prefix survived canonicalization as %s", got.To)
+	err := wide.validate()
+	if err == nil {
+		t.Fatal("a zero-length selector was accepted")
+	}
+	if !strings.Contains(err.Error(), "::/0") {
+		t.Errorf("the refusal reads %q, want it to name the prefix that was written", err)
 	}
 
 	// The reconciler holds the canonical form, so the diff compares the dump
@@ -1245,10 +1252,9 @@ func TestRulesAreCanonicalizedToWhatTheKernelReportsBack(t *testing.T) {
 		t.Errorf("a second pass moved %d adds and %d deletes", fake.ruleAdds-adds, fake.ruleDels-dels)
 	}
 
-	// Dropping a zero-length prefix leaves a rule selecting nothing, which is
-	// refused by name rather than installed as a rule matching everything.
-	everything := Rule{Family: FamilyIPv6, To: prefix("::/0"), Table: 200, Priority: 100}
-	if err := everything.canonical().validate(); err == nil {
+	// And New refuses it too, rather than installing a rule that matches
+	// everything and never matches its own readback.
+	if _, err := New(Config{Interface: "ranet0", Rules: []Rule{wide}}, netstack.NewRouteTable()); err == nil {
 		t.Error("a rule selecting every address was accepted")
 	}
 }
@@ -1269,5 +1275,30 @@ func TestStatsCarryTheWholePassError(t *testing.T) {
 	}
 	if stats.At.IsZero() {
 		t.Error("a failing pass left no timestamp, so a stale one reads as current")
+	}
+}
+
+// A pass that fails before it can count anything reports nothing rather than
+// the counts of the last pass that worked. Reporting "2 added" on a pass that
+// listed no routes at all is a number an operator acts on.
+func TestFailingPassDoesNotRepublishTheLastGoodCounts(t *testing.T) {
+	reconciler, table, fake := harness(t, Config{})
+	table.Set(netip.Prefix{}, prefix("2001:db8::/32"), nil)
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if got := reconciler.Stats(); got.Added == 0 {
+		t.Fatalf("the first pass installed nothing: %+v", got)
+	}
+
+	fake.failList = errors.New("the dump is broken")
+	if err := reconciler.reconcile(); err == nil {
+		t.Fatal("a failing dump did not fail the pass")
+	}
+	switch got := reconciler.Stats(); {
+	case got.Err == "":
+		t.Error("the failing pass reported no error")
+	case got.Added != 0 || got.Installed != 0 || got.Desired != 0:
+		t.Errorf("the failing pass republished the last good counts: %+v", got)
 	}
 }
