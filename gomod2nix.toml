@@ -10,16 +10,16 @@ version = 'v1.14.1'
 hash = 'sha256-6NzhXCCD1Qhj05WHbCDxH5hwfNM6psoAk7uIxm7N55E='
 
 [mod.'golang.org/x/crypto']
-version = 'v0.55.0'
-hash = 'sha256-99uV/ESeqhaDEwqbXxDpePuwzO0JoEHGhqZXZVHq/H4='
+version = 'v0.57.0'
+hash = 'sha256-3/hkB+mZVBKnoxUaJv7DOzvxaL+8uQ7V6ofW4JiHhz4='
 
 [mod.'golang.org/x/net']
-version = 'v0.57.0'
-hash = 'sha256-gKo8UMw4hfETBHm8N5GOfuNadse9TWEQXJo2YWq5bY4='
+version = 'v0.59.0'
+hash = 'sha256-EGnbU9mIAvXqx4vEIWJDt+lZgs/YsUngAFJwmFSc5Tc='
 
 [mod.'golang.org/x/sys']
-version = 'v0.47.0'
-hash = 'sha256-TpbRyWWqHjddP6QzUgAbaLd2EE0S+GYNRUIDJd18r98='
+version = 'v0.48.0'
+hash = 'sha256-u+LwI76YIeg1asQKZItD2mnL4Yvx8veLhBuL8wv60Ls='
 
 [mod.'golang.zx2c4.com/wintun']
 version = 'v0.0.0-20230126152724-0fa3db229ce2'
