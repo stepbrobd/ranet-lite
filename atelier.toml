@@ -12,6 +12,24 @@ exclude = [
   "checks.aarch64-linux.integration-multicore",
   "checks.aarch64-linux.responder",
   "checks.aarch64-linux.kernel",
-  "packages.*.integration-profile",             # built on demand, not checked
+  "checks.aarch64-linux.segments",
+  "checks.aarch64-linux.netlink",
+  # both linux arches put the same files in front of these four, so the
+  # x86_64-linux arm covers the aarch64 one exactly. go test stays on both,
+  # since the race detector is the one check whose answer depends on the
+  # memory model underneath it.
+  "checks.aarch64-linux.gofmt",
+  "checks.aarch64-linux.format",
+  "checks.aarch64-linux.staticcheck",
+  "checks.aarch64-linux.vet",
+  "checks.aarch64-linux.cross",
+  # gofmt and the prose, nix and toml formatter read one text on every
+  # platform, and the freebsd cross build is the same build from either host.
+  # vet and staticcheck stay on darwin: the build tags put 1200 lines in front
+  # of them there that no linux run ever compiles.
+  "checks.aarch64-darwin.gofmt",
+  "checks.aarch64-darwin.format",
+  "checks.aarch64-darwin.cross",
+  "packages.*.integration-profile", # built on demand, not checked
   "packages.*.namespace-profile",
 ]
