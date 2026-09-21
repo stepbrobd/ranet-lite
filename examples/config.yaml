@@ -128,4 +128,21 @@ babel:
 #   addresses: ["10.66.0.5/32"]
 #   assign_originated: false
 #   vrf: gravity
+#   vrf_create: true               # linux only: make the vrf rather than expect networkd to have
 #   reconcile_interval: 30s
+#
+#   # Policy rules the reconciler owns, linux only. Each carries the protocol
+#   # above, so a dump reads back only these and a delete can never reach
+#   # another writer's rule, and they are withdrawn at shutdown with the
+#   # routes. darwin has one forwarding table and no rules, and refuses these
+#   # by name; it scopes an announced default and a source-specific route to
+#   # the tun instead, which reaches the same two ends.
+#   #
+#   # A rule naming an address takes that address's family. One selecting on a
+#   # mark alone says which family it is for, and "both" installs it once per
+#   # family, which keeping the underlay out of the mesh table needs.
+#   # table takes a number or one of main, local and default.
+#   rules:
+#     - { fwmark: 0x726c, table: main, priority: 40, family: both }
+#     - { to: "2a0c:b641:69c::/48", table: 200, priority: 100 }
+#     - { from: "10.66.0.5/32", table: 200, priority: 150 }

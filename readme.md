@@ -325,13 +325,18 @@ babel:
 # kernel:
 #   enabled: true
 #   table: 200                     # the table the policy rules look up
-#   protocol: 155                  # rt_proto marking this reconciler's routes
+#   protocol: 155                  # rt_proto marking this reconciler's routes and rules
 #   metric: 64                     # BIRD's kbabel uses 32, so not 32 while it shares this table
 #   prefsrc4: 10.66.0.5            # linux only: RTA_PREFSRC on v4 routes, as krt_prefsrc
 #   addresses: ["10.66.0.5/32"]    # assigned to the TUN, removed again at exit
 #   assign_originated: false       # also assign every prefix in originate
 #   vrf: gravity                   # joined only while the link has no master
+#   vrf_create: true               # linux only: make it rather than expect networkd to have
 #   reconcile_interval: 30s
+#   rules:                         # linux only, see the platform notes above
+#     - { fwmark: 0x726c, table: main, priority: 40, family: both }
+#     - { to: "2a0c:b641:69c::/48", table: 200, priority: 100 }
+#     - { from: "10.66.0.5/32", table: 200, priority: 150 }
 ```
 
 Required fields: `organization`, `common_name`, `port`, at least one local
@@ -368,6 +373,46 @@ is read from live state at scrape time, so a scrape reflects the instant it
 happened rather than a sampled snapshot. What a counter cannot carry, the
 per-neighbor route lists, the route table and the reconciler's last pass, is on
 [the control socket](#control-socket) instead.
+
+## What each platform gives the reconciler
+
+The reconciler's job is the same everywhere and the facilities under it are not,
+so the configuration names what it wants and each backend reaches it the way its
+kernel allows. A backend that cannot reach something refuses the configuration
+by name at startup rather than coming up with a working mesh and no steering,
+which is the failure that reads as a routing problem for a day.
+
+**linux** has policy rules and 2^32 tables. `kernel.rules` are installed with
+`FRA_PROTOCOL` set to `kernel.protocol`, the same ownership marker the routes
+carry, so a dump reads back only this reconciler's and a delete can never reach
+another writer's. systemd-networkd stamps `RTPROT_STATIC` on the rules it
+writes, so a node mid-migration keeps the two sets apart on its own.
+`kernel.vrf_create` makes the master device the mesh table is bound to, and one
+this process created is removed again at shutdown, while one it found is left
+alone with everything in its table.
+
+**darwin** has one forwarding table, no rules and no VRFs, and refuses
+`kernel.rules`, `kernel.vrf_create` and `prefsrc4` by name. It reaches the two
+ends the rules exist for with interface scope instead: an announced default and
+a source-specific route are installed scoped to the tun, so no unbound socket
+can select either, which keeps the machine from being captured and the ESP
+underlay out of the tunnel carrying it. `fwmark` is refused there for the same
+reason, since there is nothing for a mark to select and nothing to select it
+with.
+
+**iOS and Android**, planned rather than present, have less again: the tunnel is
+a `NEPacketTunnelProvider` or a `VpnService`, the process is handed a list of
+routes to include and exclude, and there is no table, no rule and no netlink at
+all. The underlay stays out of the tunnel because the platform keeps it out,
+`VpnService.protect` on one side and the provider's own socket handling on the
+other, so a mark is unnecessary there as well. What the reconciler computes, the
+set of prefixes the mesh reaches and the source prefix each one is for, maps
+onto those lists directly; what it will not have is a table to put them in.
+
+The control surface is platform-neutral by construction. `internal/control`
+holds the types and the handler and speaks no transport of its own, so the unix
+socket is how linux and darwin reach it and a mobile app reads the same JSON
+over the extension's own channel.
 
 ## Control socket
 
@@ -565,6 +610,9 @@ reload that fails validation changes nothing.
 - `internal/config` is ranet-lite's own config format.
 - `internal/control` is the read-only control socket, its wire types, and the
   client the subcommands read it with.
+- `internal/kernel/rules_linux.go` is the policy rules and the VRF, which exist
+  on linux alone and are therefore optional halves of the platform rather than
+  methods every backend stubs out.
 - `cmd/ranet-lite` is the production binary.
 - `cmd/*test` are standalone interop and smoke-test binaries used during
   development (IKE, ESP, babel tests).
