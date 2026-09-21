@@ -39,23 +39,33 @@ type fakeKernel struct {
 	adds    int
 	dels    int
 
-	failAdd   map[Route]error
-	failDel   map[Route]error
-	failList  error
-	failAddrs error
+	rules    map[Rule]bool
+	vrfs     map[string]uint32
+	ruleAdds int
+	ruleDels int
+
+	failAdd     map[Route]error
+	failDel     map[Route]error
+	failList    error
+	failAddrs   error
+	failRules   error
+	failAddRule map[Rule]error
 
 	signal chan struct{}
 }
 
 func newFakeKernel(t *testing.T) *fakeKernel {
 	return &fakeKernel{
-		t:       t,
-		routes:  make(map[Route]bool),
-		foreign: make(map[Route]bool),
-		addrs:   make(map[netip.Prefix]bool),
-		failAdd: make(map[Route]error),
-		failDel: make(map[Route]error),
-		signal:  make(chan struct{}, 1),
+		t:           t,
+		routes:      make(map[Route]bool),
+		foreign:     make(map[Route]bool),
+		addrs:       make(map[netip.Prefix]bool),
+		rules:       make(map[Rule]bool),
+		vrfs:        make(map[string]uint32),
+		failAdd:     make(map[Route]error),
+		failDel:     make(map[Route]error),
+		failAddRule: make(map[Rule]error),
+		signal:      make(chan struct{}, 1),
 	}
 }
 
@@ -985,5 +995,200 @@ func TestStatsReportWhatThePassDidAndDidNotInstall(t *testing.T) {
 	}
 	if second.Err != "" {
 		t.Errorf("a skipped route was reported as a failure: %s", second.Err)
+	}
+}
+
+// The fake's policy engine. It models what the linux backend guarantees rather
+// than the wire format: Rules returns only what this reconciler installed, so
+// a test that saw another writer's rule in the list would be testing a promise
+// the backend does not make.
+func (f *fakeKernel) Rules() ([]Rule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failRules != nil {
+		return nil, f.failRules
+	}
+	out := make([]Rule, 0, len(f.rules))
+	for rule := range f.rules {
+		out = append(out, rule)
+	}
+	slices.SortFunc(out, func(a, b Rule) int { return strings.Compare(a.String(), b.String()) })
+	return out, nil
+}
+
+func (f *fakeKernel) AddRule(rule Rule) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.failAddRule[rule]; err != nil {
+		return err
+	}
+	f.ruleAdds++
+	f.rules[rule] = true
+	return nil
+}
+
+func (f *fakeKernel) DelRule(rule Rule) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ruleDels++
+	delete(f.rules, rule)
+	return nil
+}
+
+func (f *fakeKernel) EnsureVRF(name string, table uint32) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.vrfs[name]; exists {
+		return false, nil
+	}
+	f.vrfs[name] = table
+	return true, nil
+}
+
+func (f *fakeKernel) RemoveVRF(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.vrfs, name)
+	return nil
+}
+
+// routesOnly is a platform with no policy engine and no VRFs, which is every
+// platform but linux. It delegates rather than embedding, because embedding
+// promotes the rule methods and the point of this type is not having them.
+type routesOnly struct{ inner *fakeKernel }
+
+func (p routesOnly) Routes() ([]Route, error)          { return p.inner.Routes() }
+func (p routesOnly) where(cfg Config) string           { return p.inner.where(cfg) }
+func (p routesOnly) AddRoute(r Route) error            { return p.inner.AddRoute(r) }
+func (p routesOnly) DelRoute(r Route) error            { return p.inner.DelRoute(r) }
+func (p routesOnly) Addrs() ([]netip.Prefix, error)    { return p.inner.Addrs() }
+func (p routesOnly) AddAddr(prefix netip.Prefix) error { return p.inner.AddAddr(prefix) }
+func (p routesOnly) DelAddr(prefix netip.Prefix) error { return p.inner.DelAddr(prefix) }
+func (p routesOnly) Master() (string, error)           { return p.inner.Master() }
+func (p routesOnly) Enslave(master string) error       { return p.inner.Enslave(master) }
+func (p routesOnly) Release() error                    { return p.inner.Release() }
+func (p routesOnly) Notify() <-chan struct{}           { return p.inner.Notify() }
+func (p routesOnly) Close() error                      { return p.inner.Close() }
+
+// A platform with no policy engine refuses a configuration that asks for one,
+// rather than coming up with a working mesh and no steering at all.
+func TestPlatformWithoutRulesRefusesThemByName(t *testing.T) {
+	plat := routesOnly{inner: newFakeKernel(t)}
+	rule := Rule{Family: FamilyIPv6, From: prefix("2001:db8::/32"), Table: 200, Priority: 150}
+	err := refuseWhatThePlatformLacks(Config{Rules: []Rule{rule}}, plat)
+	if err == nil {
+		t.Fatal("a rule was accepted on a platform that cannot install one")
+	}
+	if !strings.Contains(err.Error(), "scoped") {
+		t.Errorf("the refusal reads %q, want it to say what the platform does instead", err)
+	}
+	if err := refuseWhatThePlatformLacks(Config{CreateVRF: true, VRF: "gravity"}, plat); err == nil {
+		t.Fatal("vrf creation was accepted on a platform with no VRFs")
+	}
+	// The same configuration on a platform that has both is accepted.
+	if err := refuseWhatThePlatformLacks(Config{Rules: []Rule{rule}, CreateVRF: true, VRF: "gravity"}, newFakeKernel(t)); err != nil {
+		t.Errorf("a platform with rules and VRFs refused them: %v", err)
+	}
+}
+
+// A rule the kernel would take and an operator would not recognize afterwards
+// is refused at startup, because the alternative is finding it in a rule list
+// on a live node.
+func TestRuleValidationRefusesWhatReadsWrong(t *testing.T) {
+	for name, rule := range map[string]Rule{
+		"no family":           {To: prefix("10.0.0.0/8"), Table: 200, Priority: 100},
+		"the wrong family":    {Family: FamilyIPv6, To: prefix("10.0.0.0/8"), Table: 200, Priority: 100},
+		"host bits":           {Family: FamilyIPv4, To: netip.MustParsePrefix("10.1.2.3/8"), Table: 200, Priority: 100},
+		"no selector":         {Family: FamilyIPv4, Table: 200, Priority: 100},
+		"a mask with no mark": {Family: FamilyIPv4, FWMask: 0xffff, Table: 200, Priority: 100},
+		"the local priority":  {Family: FamilyIPv4, To: prefix("10.0.0.0/8"), Table: 200},
+		"no table":            {Family: FamilyIPv4, To: prefix("10.0.0.0/8"), Priority: 100},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := rule.validate(); err == nil {
+				t.Errorf("%s was accepted: %s", name, rule)
+			}
+		})
+	}
+	for name, rule := range map[string]Rule{
+		"an address rule": {Family: FamilyIPv6, From: prefix("2001:db8::/32"), Table: 200, Priority: 150},
+		"a mark rule":     {Family: FamilyIPv4, FWMark: 0x726c, Table: 254, Priority: 40},
+		"a masked mark":   {Family: FamilyIPv6, FWMark: 0x726c, FWMask: 0xffff, Table: 254, Priority: 40},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := rule.validate(); err != nil {
+				t.Errorf("%s was refused: %v", name, err)
+			}
+		})
+	}
+}
+
+// The rule pass installs what is configured, removes what is not, and does
+// neither twice. The second half is the one that matters: a rule read back in
+// a different spelling than it was written in would be deleted and reinstalled
+// on every pass, at four passes a second on a busy node.
+func TestRulePassInstallsOnceAndWithdrawsWhatIsGone(t *testing.T) {
+	underlay := Rule{Family: FamilyIPv4, FWMark: 0x726c, Table: 254, Priority: 40}
+	mesh := Rule{Family: FamilyIPv6, From: prefix("2001:db8::/32"), Table: 200, Priority: 150}
+	reconciler, _, fake := harness(t, Config{Rules: []Rule{underlay, mesh}, VRF: "gravity", CreateVRF: true})
+
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fake.Rules(); err != nil || len(got) != 2 {
+		t.Fatalf("the first pass installed %v (%v), want both rules", got, err)
+	}
+	if table, ok := fake.vrfs["gravity"]; !ok || table != DefaultTable {
+		t.Fatalf("the vrf is %v bound to %d, want the reconciler's table", ok, table)
+	}
+
+	adds, dels := fake.ruleAdds, fake.ruleDels
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.ruleAdds != adds || fake.ruleDels != dels {
+		t.Fatalf("a second pass over an unchanged configuration moved %d adds and %d dels",
+			fake.ruleAdds-adds, fake.ruleDels-dels)
+	}
+
+	// A rule an earlier instance left behind is adopted by the readback and
+	// withdrawn, rather than left for somebody to find later.
+	stale := Rule{Family: FamilyIPv4, To: prefix("10.0.0.0/8"), Table: 200, Priority: 100}
+	fake.rules[stale] = true
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := fake.Rules(); len(got) != 2 || slices.Contains(got, stale) {
+		t.Fatalf("a stale rule survived the pass: %v", got)
+	}
+
+	if err := reconciler.withdraw(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := fake.Rules(); len(got) != 0 {
+		t.Errorf("shutdown left %v behind", got)
+	}
+	if _, ok := fake.vrfs["gravity"]; ok {
+		t.Error("shutdown left behind the vrf it created")
+	}
+}
+
+// A VRF that was already there belongs to whoever made it: rebinding it moves
+// every route in its table, and removing it at shutdown takes them with it.
+func TestVRFThatWasAlreadyThereIsLeftAlone(t *testing.T) {
+	reconciler, _, fake := harness(t, Config{VRF: "gravity", CreateVRF: true})
+	fake.vrfs["gravity"] = 42
+
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if table := fake.vrfs["gravity"]; table != 42 {
+		t.Fatalf("the existing vrf was rebound to %d", table)
+	}
+	if err := reconciler.withdraw(); err != nil {
+		t.Fatal(err)
+	}
+	if table, ok := fake.vrfs["gravity"]; !ok || table != 42 {
+		t.Errorf("shutdown removed a vrf it did not create: %v %d", ok, table)
 	}
 }

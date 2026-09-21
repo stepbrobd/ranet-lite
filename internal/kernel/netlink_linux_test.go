@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -404,5 +405,114 @@ func TestNetlinkHoldsRetractedPrefix(t *testing.T) {
 	}
 	if got, err := plat.Routes(); err != nil || len(got) != 0 {
 		t.Fatalf("the hold outlived its withdrawal: %v, error %v", got, err)
+	}
+}
+
+// The policy engine and the VRF against a real kernel. Everything else about
+// rules is checked against an encoder, which proves the bytes and not that the
+// kernel takes them: FRA_PROTOCOL is the whole ownership story and a kernel
+// that ignored it would leave this reconciler deleting other people's rules.
+func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Getuid() != 0 {
+		t.Skip("the real netlink path needs root on linux")
+	}
+	enterThrowawayNamespace(t)
+
+	conn, err := dialNetlink()
+	if err != nil {
+		t.Fatalf("dial rtnetlink: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	const device = "ranettest0"
+	createTUN(t, device)
+	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
+	opened, err := newPlatform(cfg)
+	if err != nil {
+		t.Fatalf("open the netlink platform: %v", err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	plat := opened.(*netlinkPlatform)
+
+	// The kernel's own three rules carry no FRA_PROTOCOL of ours, so a fresh
+	// namespace reads back empty however many rules it holds.
+	if rules, err := plat.Rules(); err != nil || len(rules) != 0 {
+		t.Fatalf("a fresh namespace reads back %v (err %v), want none of ours", rules, err)
+	}
+
+	want := []Rule{
+		{Family: FamilyIPv4, To: prefix("23.161.104.0/24"), Table: DefaultTable, Priority: 100},
+		{Family: FamilyIPv6, From: prefix("2a0c:b641:69c::/48"), Table: DefaultTable, Priority: 150},
+		{Family: FamilyIPv4, FWMark: 0x726c, Table: 254, Priority: 40},
+		{Family: FamilyIPv6, FWMark: 0x726c, Table: 254, Priority: 40},
+	}
+	for _, rule := range want {
+		if err := plat.AddRule(rule); err != nil {
+			t.Fatalf("install %s: %v", rule, err)
+		}
+	}
+	got, err := plat.Rules()
+	if err != nil {
+		t.Fatalf("list rules: %v", err)
+	}
+	slices.SortFunc(got, func(a, b Rule) int { return strings.Compare(a.String(), b.String()) })
+	sorted := slices.Clone(want)
+	slices.SortFunc(sorted, func(a, b Rule) int { return strings.Compare(a.String(), b.String()) })
+	if !slices.Equal(got, sorted) {
+		t.Fatalf("the kernel holds %v, want %v", got, sorted)
+	}
+
+	// A rule written by somebody else is invisible here, which is the property
+	// the whole delete path rests on.
+	foreign := plat.ruleMessage(Rule{Family: FamilyIPv4, To: prefix("192.0.2.0/24"), Table: DefaultTable, Priority: 101})
+	foreign = replaceProtocol(t, foreign, unix.RTPROT_STATIC)
+	if _, err := conn.execute(unix.RTM_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, foreign); err != nil {
+		t.Fatalf("install another writer's rule: %v", err)
+	}
+	after, err := plat.Rules()
+	if err != nil {
+		t.Fatalf("list rules: %v", err)
+	}
+	if len(after) != len(want) {
+		t.Fatalf("another writer's rule reads back as ours: %v", after)
+	}
+
+	for _, rule := range want {
+		if err := plat.DelRule(rule); err != nil {
+			t.Fatalf("delete %s: %v", rule, err)
+		}
+		// A second delete is success, as it has to be for a pass racing its
+		// own notification.
+		if err := plat.DelRule(rule); err != nil {
+			t.Fatalf("deleting %s twice: %v", rule, err)
+		}
+	}
+	if rules, err := plat.Rules(); err != nil || len(rules) != 0 {
+		t.Fatalf("after withdrawal the kernel holds %v (err %v)", rules, err)
+	}
+
+	created, err := plat.EnsureVRF("gravitytest", DefaultTable)
+	if err != nil {
+		t.Fatalf("create the vrf: %v", err)
+	}
+	if !created {
+		t.Fatal("creating a vrf that did not exist reported that it was already there")
+	}
+	if _, _, err := conn.link("gravitytest"); err != nil {
+		t.Fatalf("the vrf is not there after being created: %v", err)
+	}
+	// A second call finds it and says so, which is the answer that keeps
+	// shutdown from removing a device this process did not make.
+	if created, err := plat.EnsureVRF("gravitytest", DefaultTable); err != nil || created {
+		t.Fatalf("a second EnsureVRF reported created=%v (err %v)", created, err)
+	}
+	if err := plat.RemoveVRF("gravitytest"); err != nil {
+		t.Fatalf("remove the vrf: %v", err)
+	}
+	if err := plat.RemoveVRF("gravitytest"); err != nil {
+		t.Fatalf("removing a vrf that is already gone: %v", err)
+	}
+	if _, _, err := conn.link("gravitytest"); err == nil {
+		t.Fatal("the vrf survived its removal")
 	}
 }

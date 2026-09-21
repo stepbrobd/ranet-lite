@@ -130,6 +130,18 @@ type Config struct {
 	// VRF enslaves Interface to that master device, but only while the link
 	// has no master yet. Empty leaves the link's master alone.
 	VRF string
+	// CreateVRF makes the device VRF names when no device of that name
+	// exists, bound to Table, rather than expecting the host's network
+	// manager to have made it. One this reconciler created is removed again
+	// at shutdown; one it found is left alone, the same rule addresses follow.
+	CreateVRF bool
+	// Rules are the policy rules this reconciler owns. Each carries Protocol
+	// in FRA_PROTOCOL, the same ownership marker routes carry, so a dump
+	// reads back only these and a delete can never reach another writer's.
+	// They are withdrawn at shutdown as the routes are: a rule pointing into
+	// an empty table costs only a lookup, and one left behind sends traffic
+	// to a table nothing is writing any more.
+	Rules []Rule
 	// ReconcileInterval is the periodic sweep. Zero uses
 	// DefaultReconcileInterval.
 	ReconcileInterval time.Duration
@@ -202,6 +214,38 @@ type auditor interface {
 	foreignWriters() ([]string, error)
 }
 
+// ruler is implemented by a platform that has a policy routing engine. linux
+// has FIB rules and 2^32 tables; darwin has one FIB and neither; a mobile
+// tunnel provider is handed a list of routes to include and exclude and never
+// sees a table at all. A platform without one does not implement this, and New
+// refuses a configuration that asks for rules there by name rather than
+// accepting it and quietly doing nothing.
+//
+// What the rules express is portable even where the mechanism is not: keeping
+// the underlay out of the mesh, and sending traffic from an address into it.
+// Each backend reaches those its own way, and the ones that cannot take a rule
+// list say so. See the platform notes in readme.md.
+type ruler interface {
+	// Rules returns only the rules carrying this reconciler's protocol.
+	Rules() ([]Rule, error)
+	AddRule(Rule) error
+	// DelRule treats a rule that is already gone as success.
+	DelRule(Rule) error
+}
+
+// vrfMaker is implemented by a platform that can create the master device a
+// mesh table is bound to. Same rule as ruler: absent rather than stubbed, so a
+// configuration asking for one where there are no VRFs is refused by name.
+type vrfMaker interface {
+	// EnsureVRF creates the device when no device of that name exists and
+	// reports whether it created it. A device that is already there is left
+	// alone, whatever it is bound to, because it belongs to whoever made it.
+	EnsureVRF(name string, table uint32) (bool, error)
+	// RemoveVRF deletes a device this reconciler created. A device that is
+	// already gone is success.
+	RemoveVRF(name string) error
+}
+
 // platform is the kernel surface the reconciler drives. Everything above it is
 // portable and syscall-free, so the diff is testable against a
 // fake kernel.
@@ -229,6 +273,104 @@ type platform interface {
 	Close() error
 }
 
+// Rule is one policy rule. It is compared with ==, so every field is part of
+// the key: the kernel matches a delete against the selectors it is given, and
+// two rules differing in any of them are two entries.
+//
+// A rule selects a lookup table and nothing else. This reconciler installs no
+// action but FR_ACT_TO_TBL, so a rule it owns sends traffic to another table
+// and can never make an address unreachable, which keeps the worst outcome of
+// a mistaken rule a lookup in the wrong table rather than a black hole.
+type Rule struct {
+	// Family is AF_INET or AF_INET6. A rule selecting on an address takes its
+	// family from that address; one selecting only on a mark has to name it,
+	// because a mark says nothing about which family it belongs to.
+	Family uint8
+	// To is FRA_DST and From is FRA_SRC, each invalid when unset.
+	To   netip.Prefix
+	From netip.Prefix
+	// FWMark and FWMask are FRA_FWMARK and FRA_FWMASK. A zero mark means the
+	// rule does not select on one, and a zero mask with a nonzero mark is an
+	// exact match, which is how the kernel reads an absent FRA_FWMASK.
+	FWMark uint32
+	FWMask uint32
+	// Table is the table to look up, the reserved ones included: a rule
+	// pointing at main is ordinary, and keeps an underlay out of a mesh table.
+	Table uint32
+	// Priority is FRA_PRIORITY, the position in the rule list. Zero belongs
+	// to the local table's own rule and is refused.
+	Priority uint32
+}
+
+func (r Rule) String() string {
+	parts := []string{fmt.Sprintf("priority %d", r.Priority)}
+	if r.From.IsValid() {
+		parts = append(parts, "from "+r.From.String())
+	}
+	if r.To.IsValid() {
+		parts = append(parts, "to "+r.To.String())
+	}
+	if r.FWMark != 0 {
+		mark := fmt.Sprintf("fwmark %#x", r.FWMark)
+		if r.FWMask != 0 {
+			mark += fmt.Sprintf("/%#x", r.FWMask)
+		}
+		parts = append(parts, mark)
+	}
+	return strings.Join(append(parts, fmt.Sprintf("lookup %d", r.Table)), " ")
+}
+
+// validate refuses a rule the kernel would accept and an operator would not
+// recognize afterwards. It runs at startup, so a mistake costs a refusal to
+// start rather than a rule installed against a live fleet.
+func (r Rule) validate() error {
+	if r.Family != FamilyIPv4 && r.Family != FamilyIPv6 {
+		return fmt.Errorf("kernel: rule %s: family must be ipv4 or ipv6", r)
+	}
+	for _, named := range []struct {
+		name   string
+		prefix netip.Prefix
+	}{{"to", r.To}, {"from", r.From}} {
+		if !named.prefix.IsValid() {
+			continue
+		}
+		if ruleFamily(named.prefix.Addr()) != r.Family {
+			return fmt.Errorf("kernel: rule %s: %s %s is not of the rule's family", r, named.name, named.prefix)
+		}
+		if named.prefix.Masked() != named.prefix {
+			return fmt.Errorf("kernel: rule %s: %s %s has bits set below its prefix length", r, named.name, named.prefix)
+		}
+	}
+	if !r.To.IsValid() && !r.From.IsValid() && r.FWMark == 0 {
+		return fmt.Errorf("kernel: rule %s selects nothing, so it would match every packet", r)
+	}
+	if r.FWMark == 0 && r.FWMask != 0 {
+		return fmt.Errorf("kernel: rule %s carries a mark mask and no mark", r)
+	}
+	if r.Priority == 0 {
+		return fmt.Errorf("kernel: rule %s: priority 0 belongs to the local table", r)
+	}
+	if r.Table == 0 {
+		return fmt.Errorf("kernel: rule %s: table is required", r)
+	}
+	return nil
+}
+
+// FamilyIPv4 and FamilyIPv6 are AF_INET and AF_INET6, spelled here rather than
+// taken from x/sys so that this file still builds on every platform, including
+// the ones where a rule is refused rather than absent from the type.
+const (
+	FamilyIPv4 uint8 = 2
+	FamilyIPv6 uint8 = 10
+)
+
+func ruleFamily(address netip.Addr) uint8 {
+	if address.Is4() {
+		return FamilyIPv4
+	}
+	return FamilyIPv6
+}
+
 type Reconciler struct {
 	cfg  Config
 	src  RouteSource
@@ -251,6 +393,16 @@ type Reconciler struct {
 	// warned holds the routes already reported as unrepresentable. It is
 	// rebuilt from each pass, so it stays bounded by the snapshot.
 	warned map[Route]bool
+
+	// rules and vrfs are the optional halves of the platform, nil where it has
+	// no policy engine or no VRFs. New refuses a configuration that needs one
+	// of them on such a platform, so nil here means the configuration asked
+	// for nothing.
+	rules ruler
+	vrfs  vrfMaker
+	// madeVRF records that this reconciler created the VRF device itself, the
+	// only condition under which it removes one again.
+	madeVRF bool
 
 	// stats is the last route pass as an operator reads it. The single
 	// reconcile goroutine publishes a whole value and a reader takes one, so
@@ -335,20 +487,62 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = DefaultReconcileInterval
 	}
+	for i, rule := range cfg.Rules {
+		if err := rule.validate(); err != nil {
+			return nil, err
+		}
+		for _, earlier := range cfg.Rules[:i] {
+			if earlier == rule {
+				return nil, fmt.Errorf("kernel: rule %s is configured twice", rule)
+			}
+		}
+	}
 	plat, err := newPlatform(cfg)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseWhatThePlatformLacks(cfg, plat); err != nil {
+		plat.Close()
 		return nil, err
 	}
 	return newReconciler(cfg, src, plat), nil
 }
 
+// refuseWhatThePlatformLacks stops a startup that asked for a facility this
+// platform does not have. It is one place rather than one per backend, so a
+// refusal says what the platform does instead as well as what it will not do.
+//
+// Refusing matters more than it looks. Policy rules and a VRF are the two
+// halves of the steering a fleet node needs, and a platform that accepted the
+// configuration and reconciled only the routes would come up with a working
+// mesh and no steering at all, which is the shape of outage that reads as a
+// routing problem for a day.
+func refuseWhatThePlatformLacks(cfg Config, plat platform) error {
+	if _, ok := plat.(ruler); !ok && len(cfg.Rules) > 0 {
+		return fmt.Errorf("kernel: %d policy rules are configured and this platform has no policy routing: %s", len(cfg.Rules), rulesUnavailable)
+	}
+	if _, ok := plat.(vrfMaker); !ok && cfg.CreateVRF {
+		return errors.New("kernel: vrf_create is set and this platform has no VRFs: there is one forwarding table here and the reconciler already writes it")
+	}
+	return nil
+}
+
+// rulesUnavailable says what a platform without rules does instead, so the
+// refusal answers the next question as well as the current one.
+const rulesUnavailable = "an announced default and a source-specific route are installed scoped to the tun instead, which keeps both off every unbound socket, and the underlay stays out of the mesh without needing a mark"
+
 func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
-	return &Reconciler{
+	r := &Reconciler{
 		cfg: cfg, src: src, plat: plat,
 		owned:       make(map[netip.Prefix]bool),
 		warnedAddrs: make(map[netip.Prefix]bool),
 		warned:      make(map[Route]bool),
 	}
+	// Nil on a platform without them, which New has already refused to
+	// configure, so every use below is reached only where the backend answers.
+	r.rules, _ = plat.(ruler)
+	r.vrfs, _ = plat.(vrfMaker)
+	return r
 }
 
 // Where names the space this reconciler owns, for an operator reading a log
@@ -456,7 +650,76 @@ func stopTimer(t *time.Timer) {
 // independent and every error is collected, so a VRF that cannot be joined
 // does not stop routes from being installed.
 func (r *Reconciler) reconcile() error {
-	return errors.Join(r.applyMaster(), r.applyAddresses(), r.applyRoutes())
+	// The VRF first, because applyMaster enslaves the link to it and a master
+	// that does not exist yet is a master the link cannot join.
+	return errors.Join(r.applyVRF(), r.applyMaster(), r.applyAddresses(), r.applyRoutes(), r.applyRules())
+}
+
+// applyVRF creates the master device when the configuration asked for one and
+// nothing of that name exists. A device that is already there is left as it
+// is, whatever table it is bound to: it belongs to whoever created it, and
+// rebinding somebody else's VRF would move every route in it.
+func (r *Reconciler) applyVRF() error {
+	if r.vrfs == nil || !r.cfg.CreateVRF || r.cfg.VRF == "" {
+		return nil
+	}
+	created, err := r.vrfs.EnsureVRF(r.cfg.VRF, r.cfg.Table)
+	if err != nil {
+		return fmt.Errorf("create vrf %s: %w", r.cfg.VRF, err)
+	}
+	if created {
+		r.madeVRF = true
+		slog.Info("kernel created the mesh vrf", "vrf", r.cfg.VRF, "table", r.cfg.Table)
+	}
+	return nil
+}
+
+// applyRules brings the policy rules to the configured set. It removes before
+// it installs for the same reason applyRoutes does, and it reads the kernel
+// back rather than trusting a record, so rules an earlier instance left behind
+// are adopted and then withdrawn rather than duplicated.
+func (r *Reconciler) applyRules() error {
+	if r.rules == nil {
+		return nil
+	}
+	actual, err := r.rules.Rules()
+	if err != nil {
+		return fmt.Errorf("list rules: %w", err)
+	}
+	var errs []error
+	added, removed := 0, 0
+	wanted := make(map[Rule]bool, len(r.cfg.Rules))
+	for _, rule := range r.cfg.Rules {
+		wanted[rule] = true
+	}
+	for _, rule := range actual {
+		if wanted[rule] {
+			continue
+		}
+		if err := r.rules.DelRule(rule); err != nil {
+			errs = append(errs, fmt.Errorf("delete rule %s: %w", rule, err))
+		} else {
+			removed++
+		}
+	}
+	held := make(map[Rule]bool, len(actual))
+	for _, rule := range actual {
+		held[rule] = true
+	}
+	for _, rule := range r.cfg.Rules {
+		if held[rule] {
+			continue
+		}
+		if err := r.rules.AddRule(rule); err != nil {
+			errs = append(errs, fmt.Errorf("add rule %s: %w", rule, err))
+		} else {
+			added++
+		}
+	}
+	if added > 0 || removed > 0 {
+		slog.Info("kernel rules reconciled", "added", added, "removed", removed)
+	}
+	return errors.Join(errs...)
 }
 
 // applyRoutes removes before it installs, so a changed non-key attribute does
@@ -863,9 +1126,36 @@ func (r *Reconciler) withdraw() error {
 			r.enslaved = false
 		}
 	}
-	// Both counts are of things that left, so a line reporting nothing removed
-	// is a shutdown that removed nothing.
-	slog.Info("kernel reconciler withdrawn", "routes", withdrawn, "addresses", removed)
+	// Rules go the same way routes do, read back under this reconciler's own
+	// protocol rather than remembered, so one an earlier instance left behind
+	// leaves with them.
+	rules := 0
+	if r.rules != nil {
+		held, err := r.rules.Rules()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("list rules: %w", err))
+		}
+		for _, rule := range held {
+			if err := r.rules.DelRule(rule); err != nil {
+				errs = append(errs, fmt.Errorf("delete rule %s: %w", rule, err))
+			} else {
+				rules++
+			}
+		}
+	}
+	// Only a VRF this process created. One that was already there when it
+	// started belongs to whoever made it, and removing it would take every
+	// route in its table with it.
+	if r.madeVRF {
+		if err := r.vrfs.RemoveVRF(r.cfg.VRF); err != nil {
+			errs = append(errs, fmt.Errorf("remove vrf %s: %w", r.cfg.VRF, err))
+		} else {
+			r.madeVRF = false
+		}
+	}
+	// Every count is of something that left, so a line reporting nothing
+	// removed is a shutdown that removed nothing.
+	slog.Info("kernel reconciler withdrawn", "routes", withdrawn, "addresses", removed, "rules", rules)
 	return errors.Join(errs...)
 }
 
