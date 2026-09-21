@@ -48,6 +48,9 @@ buildGoApplication (
     ldflags = [
       "-s"
       "-w"
+      # so `ranet-lite status` answers what a node is running without an
+      # operator reading a nix store path off it
+      "-X github.com/NickCao/ranet-lite/internal/version.Value=${finalAttrs.version}"
     ];
 
     # the test suite runs as a flake check, never inside the package build
