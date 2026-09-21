@@ -48,31 +48,50 @@ func (m *Mesh) SetSteering(table *srv6.SteerTable) { m.steerTable.Store(table) }
 // Steering is the table currently installed, for a diagnostic to report.
 func (m *Mesh) Steering() *srv6.SteerTable { return m.steerTable.Load() }
 
+// steerAction tells the caller how to treat a packet steer has looked at.
+type steerAction uint8
+
+const (
+	// steerPass is a packet no policy claims, which is almost all of them on a
+	// node that steers at all, and every packet on one that does not.
+	steerPass steerAction = iota
+	// steerSent is a packet encapsulated in place, to be routed by the segment
+	// it now carries rather than by the address it was written to.
+	steerSent
+	// steerDrop is a packet a policy claimed and this node could not
+	// encapsulate.
+	steerDrop
+)
+
 // steer encapsulates one outbound packet when a policy claims it, in the
-// buffer the tun reader already owns, and reports whether it did.
+// buffer the tun reader already owns.
 //
 // A packet no policy claims costs one trie lookup, which is the same lookup
-// the forwarding table is about to do anyway. One that cannot be encapsulated
-// is left alone rather than dropped: it then takes the route it would have
-// taken unsteered, which is the more conservative of the two failures, and the
-// counter says it happened.
-func (m *Mesh) steer(buf []byte, size int, source, destination netip.Addr) (int, bool) {
+// the forwarding table is about to do anyway. One a policy claims and this
+// node cannot encapsulate is dropped rather than sent as it was: a steering
+// policy here selects an exit, so sending the packet by the metric instead
+// puts it out of a different node under a source address that node does not
+// announce, which is a wrong path rather than a degraded one. Every reason
+// the encapsulation can fail is refused when the configuration is read, so
+// what is left needs a packet larger than the device MTU this node set, and
+// that is a deployment to fix rather than to carry.
+func (m *Mesh) steer(buf []byte, size int, source, destination netip.Addr) (int, steerAction) {
 	table := m.steerTable.Load()
 	if table == nil {
-		return size, false
+		return size, steerPass
 	}
 	policy := table.Lookup(source, destination)
 	if policy == nil {
-		return size, false
+		return size, steerPass
 	}
 	encapsulated, err := srv6.EncapsulateInPlace(buf, tunOffset, size, policy.Source, policy.Path)
 	if err != nil {
 		m.segmentsUnsteered.Add(1)
-		m.reportSegmentDrop("a packet could not be steered and went unencapsulated", "policy", policy, "err", err)
-		return size, false
+		m.reportSegmentDrop("a packet a policy claimed could not be encapsulated", "policy", policy, "err", err)
+		return size, steerDrop
 	}
 	m.segmentsSteered.Add(1)
-	return encapsulated, true
+	return encapsulated, steerSent
 }
 
 // SetSegments installs the segments this node answers for, or nil for none.
@@ -90,8 +109,8 @@ type SegmentCounters struct {
 	Delivered uint64
 	Dropped   uint64
 	// Steered counts this node's own packets that a policy encapsulated, and
-	// Unsteered the ones a policy claimed and could not, which went out as
-	// they were.
+	// Unsteered the ones a policy claimed and this node could not, which are
+	// dropped rather than sent by a route the policy exists to override.
 	Steered   uint64
 	Unsteered uint64
 	// Answered counts the ICMP errors sent for refused packets, which is the
@@ -133,7 +152,7 @@ func (m *Mesh) applySegments(raw [][]byte) [][]byte {
 	}
 	var forward []forwardedSegment
 	for i, packet := range raw {
-		result := table.Handle(packet)
+		result := actLocally(table, packet)
 		switch result.Action {
 		case srv6.ActionPass:
 			if deliver != nil {
@@ -157,6 +176,30 @@ func (m *Mesh) applySegments(raw [][]byte) [][]byte {
 		return raw
 	}
 	return deliver
+}
+
+// actLocally runs this node's own segments until the packet is going somewhere
+// else. A kernel repeats its FIB lookup after a waypoint rewrites the
+// destination, so a list naming two segments of one node is acted on twice
+// there, and consulting the table again does the same here. Without it the
+// second segment has no mesh route, because a node does not route to itself,
+// and the packet is dropped one hop short.
+//
+// The number of times is bounded by the longest list this node acts on rather
+// than by the hop limit, which the peer chooses.
+func actLocally(table *srv6.LocalTable, packet []byte) srv6.Result {
+	result := table.Handle(packet)
+	for range srv6.MaxSegments {
+		if result.Action != srv6.ActionForward {
+			return result
+		}
+		again := table.Handle(packet)
+		if again.Action == srv6.ActionPass {
+			return result
+		}
+		result = again
+	}
+	return result
 }
 
 // forwardedSegment is one waypointed packet between the decision and the send,

@@ -267,9 +267,13 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 			// Steering happens before the route lookup, because a steered
 			// packet is routed by the segment it is going to rather than by
 			// the address it was addressed to.
-			steered := false
-			if size, ok := m.steer(b.bufs[i], b.sizes[i], src, dst); ok {
-				b.sizes[i], steered = size, true
+			size, action := m.steer(b.bufs[i], b.sizes[i], src, dst)
+			if action == steerDrop {
+				continue
+			}
+			steered := action == steerSent
+			if steered {
+				b.sizes[i] = size
 				if src, dst, nh, ok = addrsOf(b.bufs[i][tunOffset : tunOffset+size]); !ok {
 					continue
 				}

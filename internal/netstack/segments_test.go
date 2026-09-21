@@ -225,8 +225,8 @@ func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 	inner := plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
 	copy(buf[tunOffset:], inner)
 
-	size, steered := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
-	if !steered {
+	size, action := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
+	if action != steerSent {
 		t.Fatal("a packet the policy names was not steered")
 	}
 	if size != len(inner)+srv6.Overhead(1) {
@@ -241,7 +241,7 @@ func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 
 	// A packet from another address is left exactly as it was.
 	other := len(inner)
-	if size, steered := mesh.steer(buf, other, segAddr("2602:f590::18"), segAddr("2001:4860:4860::8888")); steered || size != other {
+	if size, action := mesh.steer(buf, other, segAddr("2602:f590::18"), segAddr("2001:4860:4860::8888")); action != steerPass || size != other {
 		t.Errorf("a packet no policy names was steered, size %d", size)
 	}
 }
@@ -264,9 +264,12 @@ func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 	// A buffer with no room for the header at all.
 	buf := make([]byte, tunOffset+len(inner))
 	copy(buf[tunOffset:], inner)
-	size, steered := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
-	if steered || size != len(inner) {
-		t.Fatalf("a packet that could not be encapsulated reported steered=%v size=%d", steered, size)
+	size, action := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
+	// Dropped rather than sent as it was: the policy selects an exit, so the
+	// route this packet would otherwise take puts it out of a different node
+	// under a source that node does not announce.
+	if action != steerDrop || size != len(inner) {
+		t.Fatalf("a packet that could not be encapsulated reported action=%d size=%d", action, size)
 	}
 	if !bytes.Equal(buf[tunOffset:], inner) {
 		t.Error("a packet that could not be steered was changed anyway")
@@ -391,3 +394,35 @@ func TestRefusedPacketsAreAnsweredAtABoundedRate(t *testing.T) {
 // ipv6HeaderOffsetSegmentsLeft is where Segments Left sits in a packet whose
 // routing header follows the fixed header.
 const ipv6HeaderOffsetSegmentsLeft = 40 + 3
+
+// A segment list may name two segments of one node, which the fleet's own
+// addressing makes spellable: an End and an End.DT46 sit on the same node.
+// A kernel repeats its FIB lookup after a waypoint rewrites the destination
+// and acts on the second, and a node that only consulted its mesh routes would
+// drop the packet one hop short, because a node has no route to itself.
+func TestTwoSegmentsOfThisNodeInOneListAreBothActedOn(t *testing.T) {
+	waypoint, exit := segAddr("2a0c:b641:69c:8c6::2"), segAddr("2a0c:b641:69c:8c6::1")
+	table, err := srv6.NewLocalTable([]srv6.Segment{
+		{SID: waypoint, Behavior: srv6.BehaviorEnd},
+		{SID: exit, Behavior: srv6.BehaviorEndDT46},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mesh := &Mesh{Routes: NewRouteTable()}
+	mesh.startSegmentReports()
+	mesh.SetSegments(table)
+
+	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload")
+	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mesh.applySegments([][]byte{outer})
+	if len(got) != 1 || !bytes.Equal(got[0], inner) {
+		t.Fatalf("the exit on this node did not deliver the inner packet: %v", got)
+	}
+	if counters := mesh.SegmentCounters(); counters.Delivered != 1 || counters.Dropped != 0 {
+		t.Errorf("a list naming two of this node's segments counted %+v", counters)
+	}
+}
