@@ -77,23 +77,31 @@ func NewSteerTable(entries []Steer) (*SteerTable, error) {
 		return nil, nil
 	}
 	out := &SteerTable{entries: slices.Clone(entries)}
+	seen := make(map[[2]netip.Prefix]bool, len(out.entries))
 	for i := range out.entries {
 		entry := &out.entries[i]
-		if len(entry.Path) == 0 {
-			return nil, fmt.Errorf("srv6: a steering entry with no segments steers nothing")
-		}
-		if _, err := checkEncapsulation([]byte{0x60}, entry.Source, entry.Path); err != nil {
+		if err := CheckPath(entry.Source, entry.Path); err != nil {
 			return nil, err
 		}
 		if !entry.From.IsValid() && !entry.To.IsValid() {
-			// Such an entry matches the encapsulated packets this node sends
-			// as well as the ones it is steering, so the second encapsulation
-			// would be steered too, and so on until the buffer refused.
-			return nil, fmt.Errorf("srv6: a steering entry selecting neither a source nor a destination would steer its own encapsulation")
+			// Every packet this node sends is matched, the babel traffic that
+			// carries the mesh's own routing included, so the steering would
+			// take out the adjacency that makes its own segments reachable.
+			return nil, fmt.Errorf("srv6: a steering entry selecting neither a source nor a destination would steer every packet this node sends")
 		}
 		if entry.From.IsValid() && entry.To.IsValid() && entry.From.Addr().Is4() != entry.To.Addr().Is4() {
 			return nil, fmt.Errorf("srv6: steering entry from %s to %s names two address families", entry.From, entry.To)
 		}
+		for _, prefix := range [2]netip.Prefix{entry.From, entry.To} {
+			if prefix.IsValid() && prefix.Addr().Is4In6() {
+				return nil, fmt.Errorf("srv6: steering entry selector %s is a v4-mapped prefix, which no packet is looked up under", prefix)
+			}
+		}
+		selector := [2]netip.Prefix{entry.From, entry.To}
+		if seen[selector] {
+			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(*entry))
+		}
+		seen[selector] = true
 		entry.name = steerName(*entry)
 		out.overhead = max(out.overhead, entry.Policy.Overhead())
 		// The trie is keyed by destination first and has no entry for "any
@@ -170,11 +178,4 @@ func (t *SteerTable) Entries() []string {
 		out = append(out, entry.name)
 	}
 	return out
-}
-
-func (t *SteerTable) Len() int {
-	if t == nil {
-		return 0
-	}
-	return len(t.entries)
 }

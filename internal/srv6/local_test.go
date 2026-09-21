@@ -32,7 +32,7 @@ func TestPacketsForSomebodyElsePassThrough(t *testing.T) {
 	if result := absent.Handle(segmentRouted(t)); result.Action != ActionPass {
 		t.Errorf("a nil table returned %v", result.Action)
 	}
-	if absent.Len() != 0 || absent.Segments() != nil {
+	if absent.Segments() != nil {
 		t.Error("a nil table reported segments")
 	}
 }
@@ -51,7 +51,7 @@ func TestWaypointAndExitActOnTheirOwnSegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := innerV6("payload")
-	raw, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit}, 0)
+	raw, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	midPath, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"),
-		[]netip.Addr{exitSID, addr("2a0c:b641:69c:29a6::1")}, 0)
+		[]netip.Addr{exitSID, addr("2a0c:b641:69c:29a6::1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +177,8 @@ func TestSegmentsReportInAStableOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if table.Len() != 2 {
-		t.Fatalf("the table holds %d segments", table.Len())
+	if len(table.Segments()) != 2 {
+		t.Fatalf("the table holds %d segments", len(table.Segments()))
 	}
 	for range 4 {
 		got := table.Segments()

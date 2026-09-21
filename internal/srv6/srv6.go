@@ -28,7 +28,16 @@
 // H.Encaps of RFC 8986 section 5.1.
 //
 // Nothing here touches a socket or a route table. It takes bytes and returns
-// bytes, so it is testable without a kernel and identical on every platform.
+// bytes, which makes it testable without a kernel and identical on every
+// platform.
+//
+// # What it does not read
+//
+// A routing header is found only where it is the first extension header, which
+// is where H.Encaps puts it and where every encapsulation on this mesh has it.
+// A packet that reached a segment of this node's behind a hop-by-hop or
+// destination options header is refused rather than acted on, where
+// ipv6_find_hdr would have walked to it.
 //
 // [RFC 8754]: https://www.rfc-editor.org/rfc/rfc8754
 // [RFC 8986]: https://www.rfc-editor.org/rfc/rfc8986
@@ -42,8 +51,10 @@ import (
 )
 
 const (
-	// ipv6HeaderLen is the fixed IPv6 header, RFC 8200 section 3.
+	// ipv6HeaderLen is the fixed IPv6 header, RFC 8200 section 3, and
+	// ipv4HeaderLen the shortest IPv4 one, RFC 791 section 3.1.
 	ipv6HeaderLen = 40
+	ipv4HeaderLen = 20
 	// srhFixedLen is the routing header before its first segment.
 	srhFixedLen = 8
 	// addrLen is one segment.
@@ -64,7 +75,8 @@ const (
 	// fleet's longest path is a handful of waypoints, and the cap exists so
 	// the number is ours rather than a peer's: every segment is 16 bytes in
 	// front of every packet, and a list long enough to matter is a list
-	// somebody else chose the cost of.
+	// somebody else chose the cost of. A list this node builds is bounded
+	// tighter than this by the MTU, which refuses a fifth segment.
 	MaxSegments = 16
 )
 
@@ -73,8 +85,10 @@ var (
 	// ordinary case on a mesh where most traffic is not steered.
 	ErrNotSegmentRouted = errors.New("srv6: packet carries no segment routing header")
 	// ErrExhausted is an End reached with no segment left to move to. RFC 8986
-	// section 4.1 has the node drop it; there is nowhere else to send it.
-	ErrExhausted = errors.New("srv6: End reached the last segment, so there is nowhere to forward to")
+	// section 4.1 S03 hands the packet to whatever the next header names; this
+	// drops it, as get_and_validate_srh does, because a waypoint SID is not
+	// an address this node terminates traffic on.
+	ErrExhausted = errors.New("srv6: End reached the last segment and there is nowhere to forward to")
 )
 
 // Header is one segment routing header as this package reads and writes it.
@@ -87,7 +101,10 @@ var (
 type Header struct {
 	// SegmentsLeft indexes Segments for the destination the packet is
 	// currently heading to, so Segments[SegmentsLeft] and the outer
-	// destination address agree while the packet is in flight.
+	// destination address agree while the packet is in flight. A reduced
+	// header of RFC 8754 section 4.1.1 leaves the segment it is heading to
+	// out of the list, since the destination already carries it, and there
+	// SegmentsLeft is len(Segments).
 	SegmentsLeft uint8
 	Segments     []netip.Addr
 	Flags        uint8
@@ -98,7 +115,8 @@ type Header struct {
 }
 
 // Path is the segment list in the order a packet visits it, which is how an
-// operator writes one and the reverse of how it goes on the wire.
+// operator writes one and the reverse of how it goes on the wire. A reduced
+// header carries every segment but the first, so its path starts one hop in.
 func (h Header) Path() []netip.Addr {
 	path := make([]netip.Addr, 0, len(h.Segments))
 	for i := len(h.Segments) - 1; i >= 0; i-- {
@@ -108,7 +126,8 @@ func (h Header) Path() []netip.Addr {
 }
 
 // Active is the segment this packet is on its way to, which is also the outer
-// destination address of a well-formed packet in flight.
+// destination address of a well-formed packet in flight. A reduced header does
+// not carry it, so this reports false and the caller reads the destination.
 func (h Header) Active() (netip.Addr, bool) {
 	if int(h.SegmentsLeft) >= len(h.Segments) {
 		return netip.Addr{}, false
@@ -125,17 +144,19 @@ func (h Header) Active() (netip.Addr, bool) {
 // the outer header is sent from, which the fleet sets with `ip sr tunsrc` and
 // which here is an argument because nothing global decides it.
 //
-// The inner packet is not modified and its hop limit is not touched: an
-// encapsulated packet is carried, not forwarded, so the hop count it is
-// spending is the outer one.
-func Encapsulate(inner []byte, source netip.Addr, path []netip.Addr, hopLimit uint8) ([]byte, error) {
+// The inner packet is not modified. RFC 8986 section 5.1 S05 decrements its
+// hop limit and this does not, matching __seg6_do_srh_encap: a
+// packet read off the tun was either originated here, where a host must not
+// decrement, or already forwarded into the tun by the kernel, where it
+// already was. Decrementing again would charge it twice for one hop.
+func Encapsulate(inner []byte, source netip.Addr, path []netip.Addr) ([]byte, error) {
 	overhead, err := checkEncapsulation(inner, source, path)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]byte, overhead+len(inner))
 	copy(out[overhead:], inner)
-	writeOuter(out[:overhead], inner, source, path, hopLimit)
+	writeOuter(out[:overhead], inner, source, path)
 	return out, nil
 }
 
@@ -155,7 +176,7 @@ func Overhead(segments int) int {
 // before. A buffer too short to hold the result is refused rather than
 // truncated. The tun's MTU keeps that from happening, so a packet reaching
 // here anyway belongs to a deployment that has the MTU wrong.
-func EncapsulateInPlace(buf []byte, offset, size int, source netip.Addr, path []netip.Addr, hopLimit uint8) (int, error) {
+func EncapsulateInPlace(buf []byte, offset, size int, source netip.Addr, path []netip.Addr) (int, error) {
 	if offset < 0 || size < 0 || offset+size > len(buf) {
 		return 0, fmt.Errorf("srv6: a packet at %d+%d is not inside a %d byte buffer", offset, size, len(buf))
 	}
@@ -169,46 +190,86 @@ func EncapsulateInPlace(buf []byte, offset, size int, source netip.Addr, path []
 			size, overhead, len(buf)-offset-size)
 	}
 	copy(buf[offset+overhead:], inner)
-	writeOuter(buf[offset:offset+overhead], buf[offset+overhead:offset+overhead+size], source, path, hopLimit)
+	writeOuter(buf[offset:offset+overhead], buf[offset+overhead:offset+overhead+size], source, path)
 	return overhead + size, nil
+}
+
+// CheckPath refuses a segment list and a tunnel source this node will not
+// encapsulate with, so a configuration is rejected when it is read rather than
+// when the first packet matches it.
+func CheckPath(source netip.Addr, path []netip.Addr) error {
+	if len(path) == 0 {
+		return errors.New("srv6: a segment list needs at least one segment")
+	}
+	if len(path) > MaxSegments {
+		return fmt.Errorf("srv6: %d segments is more than the %d this node will build", len(path), MaxSegments)
+	}
+	if !Usable(source) {
+		return fmt.Errorf("srv6: tunnel source %s cannot address a segment routed packet", source)
+	}
+	for _, segment := range path {
+		if !Usable(segment) {
+			return fmt.Errorf("srv6: segment %s cannot address a segment routed packet", segment)
+		}
+	}
+	return nil
 }
 
 // checkEncapsulation refuses what this node will not encapsulate and returns
 // the bytes the header will take. Both entry points run it, so the two cannot
 // come to disagree about what is acceptable.
 func checkEncapsulation(inner []byte, source netip.Addr, path []netip.Addr) (int, error) {
-	if len(path) == 0 {
-		return 0, errors.New("srv6: a segment list needs at least one segment")
-	}
-	if len(path) > MaxSegments {
-		return 0, fmt.Errorf("srv6: %d segments is more than the %d this node will build", len(path), MaxSegments)
-	}
-	if !source.Is6() || source.Is4In6() {
-		return 0, fmt.Errorf("srv6: tunnel source %s is not an IPv6 address", source)
-	}
-	for _, segment := range path {
-		if !segment.Is6() || segment.Is4In6() {
-			return 0, fmt.Errorf("srv6: segment %s is not an IPv6 address", segment)
-		}
+	if err := CheckPath(source, path); err != nil {
+		return 0, err
 	}
 	if _, err := innerNextHeader(inner); err != nil {
 		return 0, err
 	}
+	// The outer payload length is 16 bits and counts the routing header as
+	// well, so a packet that would overflow it is refused rather than sent
+	// with a length that has wrapped.
+	payload := srhFixedLen + addrLen*len(path) + len(inner)
+	if payload > 0xffff {
+		return 0, fmt.Errorf("srv6: %d bytes behind %d segments is more than an IPv6 payload length can carry", len(inner), len(path))
+	}
 	return Overhead(len(path)), nil
+}
+
+// Usable reports whether an address can be a segment or a tunnel source. A
+// zone is local to one host and never reaches the wire, a v4-mapped address
+// cannot appear in an IPv6 destination, and neither the unspecified address
+// nor a multicast group is somewhere a packet can be forwarded to.
+func Usable(address netip.Addr) bool {
+	return address.Is6() && !address.Is4In6() && address.Zone() == "" &&
+		!address.IsUnspecified() && !address.IsMulticast()
 }
 
 // writeOuter fills a header of exactly Overhead(len(path)) bytes. Its caller
 // has already checked everything, so it cannot fail and never reports.
-func writeOuter(out, inner []byte, source netip.Addr, path []netip.Addr, hopLimit uint8) {
-	if hopLimit == 0 {
-		hopLimit = DefaultHopLimit
-	}
+//
+// Every byte of the header is assigned rather than left as it was found:
+// EncapsulateInPlace hands this the bytes the packet it is encapsulating used
+// to occupy, so anything skipped here would go on the wire as a fragment of
+// the inner header.
+func writeOuter(out, inner []byte, source netip.Addr, path []netip.Addr) {
 	innerNext, _ := innerNextHeader(inner)
+	// __seg6_do_srh_encap copies the traffic class and the hop limit out of an
+	// IPv6 inner packet and leaves the flow label at zero, the default the
+	// seg6_flowlabel sysctl asks for. Matching it keeps a packet
+	// this node steers and one a kernel headend steers the same bytes, and
+	// stops an encapsulation handing a packet a hop budget its own header had
+	// already spent.
+	traffic, hopLimit := uint8(0), uint8(DefaultHopLimit)
+	if innerNext == NextHeaderIPv6 {
+		traffic, hopLimit = inner[0]<<4|inner[1]>>4, inner[7]
+	}
 	segments := reversed(path)
 	last := uint8(len(segments) - 1)
 	srhLen := srhFixedLen + addrLen*len(segments)
 
-	out[0] = 0x60 // version 6, traffic class and flow label left at zero
+	out[0] = 0x60 | traffic>>4
+	out[1] = traffic << 4
+	binary.BigEndian.PutUint16(out[2:], 0) // flow label, see above
 	binary.BigEndian.PutUint16(out[4:], uint16(srhLen+len(inner)))
 	out[6] = nextHeaderRouting
 	out[7] = hopLimit
@@ -231,9 +292,10 @@ func writeOuter(out, inner []byte, source netip.Addr, path []netip.Addr, hopLimi
 	}
 }
 
-// DefaultHopLimit applies when a caller names none. It takes the RFC 8200
-// recommended default rather than a mesh-sized number, so a segment list that
-// loops dies at the same count anything else does.
+// DefaultHopLimit is the outer budget an IPv4 inner packet gets, since its TTL
+// is not an IPv6 hop limit to copy. It takes the RFC 8200 recommended default
+// rather than a mesh-sized number, so a segment list that loops dies at the
+// same count anything else does.
 const DefaultHopLimit = 64
 
 // Parse reads the routing header of an IPv6 packet, and reports
@@ -260,26 +322,23 @@ func Parse(raw []byte) (Header, error) {
 		return Header{}, ErrNotSegmentRouted
 	}
 	// Hdr Ext Len is in 8-octet units after the first eight, so the header is
-	// 8*(1+len) bytes and an odd value would not be a whole number of
-	// segments.
+	// 8*(1+len) bytes.
 	extLen := int(srh[1])
-	if extLen == 0 || extLen%2 != 0 {
-		return Header{}, fmt.Errorf("srv6: header length %d is not a whole number of segments", extLen)
-	}
 	total := srhFixedLen + 8*extLen
 	if len(srh) < total {
 		return Header{}, fmt.Errorf("srv6: the routing header claims %d bytes and %d are present", total, len(srh))
 	}
-	count := extLen / 2
+	// Last Entry gives the segment count, and RFC 8754 section 2.1 puts any
+	// TLVs after the list: they are present exactly when Hdr Ext Len is
+	// greater than (Last Entry+1)*2, and the same section requires a type this
+	// node does not recognize to be ignored rather than refused. So the
+	// segments have to fit and everything past them is somebody else's.
+	count := int(srh[4]) + 1
+	if 2*count > extLen {
+		return Header{}, fmt.Errorf("srv6: last entry %d needs %d bytes of segments and the header carries %d", srh[4], addrLen*count, 8*extLen)
+	}
 	if count > MaxSegments {
 		return Header{}, fmt.Errorf("srv6: %d segments is more than the %d this node will act on", count, MaxSegments)
-	}
-	// Last Entry indexes the list, so it has to name an element of it. A
-	// header with TLVs after the segments is well-formed and its Last Entry is
-	// smaller than the count; one larger than the count describes segments
-	// that are not there.
-	if int(srh[4]) >= count {
-		return Header{}, fmt.Errorf("srv6: last entry %d is past the %d segments present", srh[4], count)
 	}
 	header := Header{
 		NextHeader:   srh[0],
@@ -287,15 +346,19 @@ func Parse(raw []byte) (Header, error) {
 		Flags:        srh[5],
 		Tag:          binary.BigEndian.Uint16(srh[6:]),
 	}
-	last := int(srh[4])
-	header.Segments = make([]netip.Addr, 0, last+1)
-	for i := 0; i <= last; i++ {
+	header.Segments = make([]netip.Addr, 0, count)
+	for i := range count {
 		var segment [16]byte
 		copy(segment[:], srh[srhFixedLen+addrLen*i:])
 		header.Segments = append(header.Segments, netip.AddrFrom16(segment))
 	}
-	if int(header.SegmentsLeft) > last {
-		return Header{}, fmt.Errorf("srv6: segments left %d is past the last entry %d", header.SegmentsLeft, last)
+	// RFC 8986 section 4.1 S09 makes only a Segments Left past Last Entry+1 an
+	// error, because RFC 8754 section 4.1.1 lets a source leave out the
+	// segment the destination address already carries. That reduced header is
+	// what a kernel writes for `encap.red`, so refusing it black-holes a path
+	// rather than rejecting a malformed packet.
+	if int(header.SegmentsLeft) > count {
+		return Header{}, fmt.Errorf("srv6: segments left %d is past the last entry %d", header.SegmentsLeft, count-1)
 	}
 	return header, nil
 }
@@ -305,10 +368,8 @@ func Parse(raw []byte) (Header, error) {
 // the packet now goes to, having rewritten the destination and the counter in
 // place.
 //
-// The hop limit is decremented here, which forwarding does and which the RFC's
-// pseudocode leaves to the "Send" step it shares with ordinary forwarding. A
-// waypoint that did not would let a segment list that points back at an
-// earlier node run until something else noticed.
+// The hop limit is decremented, RFC 8986 section 4.1 S12, which bounds a
+// segment list that points back at an earlier node.
 func End(raw []byte) (netip.Addr, error) {
 	header, err := Parse(raw)
 	if err != nil {
@@ -328,51 +389,73 @@ func End(raw []byte) (netip.Addr, error) {
 	return next, nil
 }
 
-// Decap is the exit behavior of RFC 8986 section 4.10, End.DT46: the outer
-// IPv6 header and the routing header are removed and what was inside is
-// returned, with the next-header value that says which family it is.
+// Decap is the exit behavior of RFC 8986 section 4.8, End.DT46: the outer IPv6
+// header and the routing header are removed and what was inside is returned,
+// with the next-header value that says which family it is.
+//
+// An exit is keyed on the upper-layer header rather than on a routing header,
+// which is why a packet carrying none is delivered rather than refused: a
+// reduced encapsulation of a one-segment policy puts that segment in the
+// destination address and writes no SRH at all, and the kernel's own
+// decap_and_validate accepts it the same way.
 //
 // It returns a slice of raw rather than a copy, because the caller is the
 // dataplane and the buffer is already its own. The two-table half of the RFC's
 // End.DT46, choosing a lookup table per family, is the caller's: this package
 // takes bytes and returns bytes.
 func Decap(raw []byte) (inner []byte, family uint8, err error) {
-	header, err := Parse(raw)
-	if err != nil {
-		return nil, 0, err
+	if len(raw) < ipv6HeaderLen || raw[0]>>4 != 6 {
+		return nil, 0, ErrNotSegmentRouted
 	}
-	if header.SegmentsLeft != 0 {
-		// RFC 8986 section 4.10 runs End.DT46 on the last segment. Reaching it
-		// with segments still to go means the packet was addressed to an exit
-		// in the middle of its own path, which is a segment list that does not
-		// describe what it wants.
-		return nil, 0, fmt.Errorf("srv6: an exit was reached with %d segments still to go", header.SegmentsLeft)
+	offset, upper := ipv6HeaderLen, raw[6]
+	if upper == nextHeaderRouting {
+		header, err := Parse(raw)
+		if err != nil {
+			return nil, 0, err
+		}
+		if header.SegmentsLeft != 0 {
+			// RFC 8986 section 4.8 runs End.DT46 on the last segment. Reaching
+			// it with segments still to go means the packet was addressed to
+			// an exit in the middle of its own path, which is a segment list
+			// that does not describe what it wants.
+			return nil, 0, fmt.Errorf("srv6: an exit was reached with %d segments still to go", header.SegmentsLeft)
+		}
+		offset, upper = ipv6HeaderLen+srhFixedLen+8*int(raw[ipv6HeaderLen+1]), header.NextHeader
 	}
-	if header.NextHeader != NextHeaderIPv4 && header.NextHeader != NextHeaderIPv6 {
-		return nil, 0, fmt.Errorf("srv6: an exit cannot deliver next header %d, only an encapsulated IPv4 or IPv6 packet", header.NextHeader)
+	if upper != NextHeaderIPv4 && upper != NextHeaderIPv6 {
+		return nil, 0, fmt.Errorf("srv6: an exit cannot deliver next header %d, only an encapsulated IPv4 or IPv6 packet", upper)
 	}
-	offset := ipv6HeaderLen + srhFixedLen + 8*int(raw[ipv6HeaderLen+1])
 	if len(raw) <= offset {
 		return nil, 0, errors.New("srv6: the packet ends where its payload should start")
 	}
-	return raw[offset:], header.NextHeader, nil
+	return raw[offset:], upper, nil
 }
 
 // innerNextHeader is the protocol number announcing what an encapsulation is
 // carrying, read from the packet itself rather than taken on trust from the
 // caller: the two disagreeing is a packet an exit refuses to deliver, found
 // one hop too late to say anything useful about it.
+//
+// A packet too short to hold the header its version claims is refused here,
+// which lets writeOuter read the fields it copies.
 func innerNextHeader(inner []byte) (uint8, error) {
 	if len(inner) == 0 {
 		return 0, errors.New("srv6: nothing to encapsulate")
 	}
-	switch inner[0] >> 4 {
+	switch version := inner[0] >> 4; version {
 	case 4:
+		if len(inner) < ipv4HeaderLen {
+			return 0, fmt.Errorf("srv6: %d bytes is shorter than the IPv4 header it claims to be", len(inner))
+		}
 		return NextHeaderIPv4, nil
 	case 6:
+		if len(inner) < ipv6HeaderLen {
+			return 0, fmt.Errorf("srv6: %d bytes is shorter than the IPv6 header it claims to be", len(inner))
+		}
 		return NextHeaderIPv6, nil
+	default:
+		return 0, fmt.Errorf("srv6: the packet to encapsulate is IP version %d", version)
 	}
-	return 0, fmt.Errorf("srv6: the packet to encapsulate is IP version %d", inner[0]>>4)
 }
 
 func reversed(path []netip.Addr) []netip.Addr {

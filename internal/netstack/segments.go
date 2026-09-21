@@ -55,7 +55,7 @@ func (m *Mesh) steer(buf []byte, size int, source, destination netip.Addr) (int,
 	if policy == nil {
 		return size, false
 	}
-	encapsulated, err := srv6.EncapsulateInPlace(buf, tunOffset, size, policy.Source, policy.Path, 0)
+	encapsulated, err := srv6.EncapsulateInPlace(buf, tunOffset, size, policy.Source, policy.Path)
 	if err != nil {
 		m.segmentsUnsteered.Add(1)
 		m.reportSegmentDrop("a packet could not be steered and went unencapsulated", "policy", policy, "err", err)
@@ -117,6 +117,7 @@ func (m *Mesh) applySegments(raw [][]byte) [][]byte {
 			deliver = append(make([][]byte, 0, len(raw)), raw[:i]...)
 		}
 	}
+	var forward []forwardedSegment
 	for i, packet := range raw {
 		result := table.Handle(packet)
 		switch result.Action {
@@ -130,52 +131,96 @@ func (m *Mesh) applySegments(raw [][]byte) [][]byte {
 			deliver = append(deliver, result.Inner)
 		case srv6.ActionForward:
 			take(i)
-			m.forwardSegment(packet, result.Next)
+			forward = append(forward, forwardedSegment{raw: packet, next: result.Next})
 		case srv6.ActionDrop:
 			take(i)
 			m.noteSegmentDrop(result.Err)
 		}
 	}
+	m.forwardSegments(forward)
 	if deliver == nil {
 		return raw
 	}
 	return deliver
 }
 
-// forwardSegment sends one packet a waypoint has already rewritten on to the
-// peer its new destination selects.
+// forwardedSegment is one waypointed packet between the decision and the send,
+// held so that a whole batch can be reserved for at once.
+type forwardedSegment struct {
+	raw        []byte
+	next       netip.Addr
+	peer       *Peer
+	nextHeader byte
+}
+
+// forwardSegments sends the packets a waypoint has rewritten on to the peers
+// their new destinations select.
 //
-// It takes a single place on the peer's ordinary budget rather than the
-// control budget babel uses, because this is somebody else's traffic: a
-// segment list pointed at this node must not be able to spend the allowance
-// this node's own routing protocol runs on. A peer with no place free drops
-// the packet and counts it, the way a full egress queue drops.
-func (m *Mesh) forwardSegment(raw []byte, next netip.Addr) {
-	src, dst, nextHeader, ok := addrsOf(raw)
-	if !ok {
-		m.noteSegmentDrop(errNotIP)
+// It takes one place on each peer's budget for that peer's whole share of the
+// batch, as dispatchOutbound does for a tun read. Taking one per packet
+// instead would be the same accounting at a 128th of the batch size, since an
+// ESP receive batch is 128 packets against a budget of twice the core count:
+// most of a forwarded burst would be dropped on an idle machine, and a peer
+// could spend this node's whole allowance to a third peer.
+//
+// The budget is the peer's ordinary one rather than the control budget babel
+// runs on, because this is somebody else's traffic: a segment list pointed at
+// this node must not be able to spend the allowance this node's own routing
+// protocol needs. A peer with no place free drops its share and counts it, the
+// way a full egress queue drops.
+func (m *Mesh) forwardSegments(segments []forwardedSegment) {
+	if len(segments) == 0 {
 		return
 	}
-	peer, ok := m.Routes.Lookup(src, dst)
-	if !ok || peer == nil {
-		m.segmentsDropped.Add(1)
-		m.reportSegmentDrop("no route to the next segment", "segment", next)
-		return
+	counts := make(map[*Peer]int, len(segments))
+	order := make([]*Peer, 0, len(segments))
+	for i := range segments {
+		segment := &segments[i]
+		src, dst, nextHeader, ok := addrsOf(segment.raw)
+		if !ok {
+			m.noteSegmentDrop(errNotIP)
+			continue
+		}
+		peer, ok := m.Routes.Lookup(src, dst)
+		if !ok || peer == nil {
+			m.segmentsDropped.Add(1)
+			m.reportSegmentDrop("no route to the next segment", "segment", segment.next)
+			continue
+		}
+		if counts[peer] == 0 {
+			order = append(order, peer)
+		}
+		counts[peer]++
+		segment.peer, segment.nextHeader = peer, nextHeader
 	}
-	batch := peer.reserveBatchNow(1)
-	if batch == nil {
-		// The peer counts this one: it is the same drop an ordinary packet
-		// takes when the peer has no transmission slot free.
-		m.segmentsDropped.Add(1)
-		return
+	batches := make(map[*Peer]*peerBatch, len(order))
+	for _, peer := range order {
+		batch := peer.reserveBatchNow(counts[peer])
+		if batch == nil {
+			// The peer counts its own share of this; the segment counter says
+			// how much of it was somebody else's traffic.
+			m.segmentsDropped.Add(uint64(counts[peer]))
+			continue
+		}
+		batches[peer] = batch
 	}
-	batch.append(raw, nextHeader)
-	if err := batch.enqueue(); err != nil {
-		m.segmentsDropped.Add(1)
-		m.reportSegmentDrop("the transport lost a forwarded segment", "err", err)
-		return
+	for _, segment := range segments {
+		if batch := batches[segment.peer]; batch != nil {
+			batch.append(segment.raw, segment.nextHeader)
+		}
 	}
-	m.segmentsForwarded.Add(1)
+	for _, peer := range order {
+		batch := batches[peer]
+		if batch == nil {
+			continue
+		}
+		if err := batch.enqueue(); err != nil {
+			m.segmentsDropped.Add(uint64(counts[peer]))
+			m.reportSegmentDrop("the transport lost a forwarded segment", "err", err)
+			continue
+		}
+		m.segmentsForwarded.Add(uint64(counts[peer]))
+	}
 }
 
 func (m *Mesh) noteSegmentDrop(err error) {
@@ -187,12 +232,9 @@ func (m *Mesh) noteSegmentDrop(err error) {
 // so a peer sending a stream of refused headers costs a counter rather than a
 // log. The counter is the record; the line is there to say what kind.
 func (m *Mesh) reportSegmentDrop(message string, args ...any) {
-	now := time.Now()
-	last := m.segmentReported.Load()
-	if last != 0 && now.Sub(time.Unix(0, last)) < segmentDropInterval {
-		return
-	}
-	if !m.segmentReported.CompareAndSwap(last, now.UnixNano()) {
+	now := int64(time.Since(m.segmentsStarted))
+	previous := m.segmentReported.Load()
+	if now-previous < int64(segmentDropInterval) || !m.segmentReported.CompareAndSwap(previous, now) {
 		return
 	}
 	slog.Warn(message, append([]any{"interface", m.Name}, args...)...)
@@ -207,6 +249,16 @@ type segmentCounters struct {
 	steerTable        atomic.Pointer[srv6.SteerTable]
 	segmentsSteered   atomic.Uint64
 	segmentsUnsteered atomic.Uint64
-	// segmentReported is the last report in unix nanoseconds, zero for never.
+	// segmentsStarted and segmentReported space the drop reports on the
+	// monotonic clock, as Peer.sendErrReported does, so a backward step of the
+	// wall clock cannot suppress every report until it catches up.
+	segmentsStarted time.Time
 	segmentReported atomic.Int64
+}
+
+// startSegmentReports lets the first refused packet report immediately and
+// spaces the rest.
+func (c *segmentCounters) startSegmentReports() {
+	c.segmentsStarted = time.Now()
+	c.segmentReported.Store(-int64(segmentDropInterval))
 }

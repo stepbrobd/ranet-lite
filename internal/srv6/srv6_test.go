@@ -13,12 +13,16 @@ func addr(s string) netip.Addr { return netip.MustParseAddr(s) }
 
 // innerV6 and innerV4 are minimal well-formed packets, enough for the header
 // reading this package does and no more.
-func innerV6(payload string) []byte {
+func innerV6(payload string) []byte { return innerV6Hops(payload, 64) }
+
+// innerV6Hops names the hop limit, because H.Encaps copies it onto the outer
+// header, so a test about the outer budget sets it on the inner packet.
+func innerV6Hops(payload string, hops uint8) []byte {
 	raw := make([]byte, 40+len(payload))
 	raw[0] = 0x60
 	binary.BigEndian.PutUint16(raw[4:], uint16(len(payload)))
 	raw[6] = 59 // no next header
-	raw[7] = 64
+	raw[7] = hops
 	copy(raw[8:], addr16(addr("2602:f590::1")))
 	copy(raw[24:], addr16(addr("2602:f590::2")))
 	copy(raw[40:], payload)
@@ -45,7 +49,7 @@ func TestEncapsulationPutsTheFirstSegmentOnTheOuterHeader(t *testing.T) {
 	source := addr("2a0c:b641:69c:8c0::1")
 	inner := innerV6("payload")
 
-	out, err := Encapsulate(inner, source, path, 0)
+	out, err := Encapsulate(inner, source, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +92,7 @@ func TestEncapsulationPutsTheFirstSegmentOnTheOuterHeader(t *testing.T) {
 // in.
 func TestEncapsulationHandlesASingleSegment(t *testing.T) {
 	exit := addr("2a0c:b641:69c:98d6::1")
-	out, err := Encapsulate(innerV4("payload"), addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit}, 0)
+	out, err := Encapsulate(innerV4("payload"), addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,8 +122,8 @@ func TestEncapsulationHandlesASingleSegment(t *testing.T) {
 // three-segment path arrives at its exit with the inner packet untouched.
 func TestWaypointsWalkThePathInOrder(t *testing.T) {
 	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:6c46::2"), addr("2a0c:b641:69c:29a6::1")}
-	inner := innerV6("payload")
-	out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), path, 10)
+	inner := innerV6Hops("payload", 10)
+	out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +185,7 @@ func TestPlainPacketsAreNotSegmentRouted(t *testing.T) {
 // guess is how a forwarding loop starts.
 func TestMalformedHeadersAreRefusedByName(t *testing.T) {
 	for name, damage := range map[string]func([]byte){
-		"a length that is not whole segments": func(raw []byte) { raw[ipv6HeaderLen+1] = 3 },
+		"a length too short for its segments": func(raw []byte) { raw[ipv6HeaderLen+1] = 2 },
 		"a length past the buffer":            func(raw []byte) { raw[ipv6HeaderLen+1] = 40 },
 		"a last entry past the segments":      func(raw []byte) { raw[ipv6HeaderLen+4] = 9 },
 		"segments left past the last entry":   func(raw []byte) { raw[ipv6HeaderLen+3] = 9 },
@@ -207,7 +211,7 @@ func TestMalformedHeadersAreRefusedByName(t *testing.T) {
 // something an exit can hand to a stack.
 func TestExitRefusesWhatItCannotDeliver(t *testing.T) {
 	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
-	midPath, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path, 0)
+	midPath, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,9 +246,20 @@ func TestEncapsulationRefusesWhatItWillNotCarry(t *testing.T) {
 		"a v4 segment":      {source: source, path: []netip.Addr{addr("23.161.104.117")}, inner: innerV6("x")},
 		"nothing inside":    {source: source, path: []netip.Addr{exit}, inner: nil},
 		"not an ip packet":  {source: source, path: []netip.Addr{exit}, inner: []byte{0x10, 0, 0, 0}},
+		// A zone never reaches the wire, and neither the unspecified address
+		// nor a multicast group is somewhere a packet can be forwarded to.
+		"a zoned source":       {source: addr("fe80::1%eth0"), path: []netip.Addr{exit}, inner: innerV6("x")},
+		"a zoned segment":      {source: source, path: []netip.Addr{addr("fe80::1%eth0")}, inner: innerV6("x")},
+		"the unspecified exit": {source: source, path: []netip.Addr{addr("::")}, inner: innerV6("x")},
+		"a multicast exit":     {source: source, path: []netip.Addr{addr("ff02::1")}, inner: innerV6("x")},
+		// writeOuter reads the inner header's traffic class and hop limit, so
+		// a packet shorter than the header it claims is refused before it can.
+		"shorter than its own header": {source: source, path: []netip.Addr{exit}, inner: []byte{0x60, 0}},
+		// The outer payload length is 16 bits and counts the routing header.
+		"more than a payload length holds": {source: source, path: []netip.Addr{exit}, inner: oversizedV6()},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := Encapsulate(test.inner, test.source, test.path, 0); err == nil {
+			if _, err := Encapsulate(test.inner, test.source, test.path); err == nil {
 				t.Errorf("%s was accepted", name)
 			}
 		})
@@ -256,7 +271,7 @@ func TestEncapsulationRefusesWhatItWillNotCarry(t *testing.T) {
 // than running until something else notices.
 func TestWaypointRefusesToForwardAtTheLastHop(t *testing.T) {
 	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
-	out, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path, 1)
+	out, err := Encapsulate(innerV6Hops("payload", 1), addr("2a0c:b641:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +283,7 @@ func TestWaypointRefusesToForwardAtTheLastHop(t *testing.T) {
 func segmentRouted(t *testing.T) []byte {
 	t.Helper()
 	path := []netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")}
-	out, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path, 0)
+	out, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,4 +292,167 @@ func segmentRouted(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// A reduced header of RFC 8754 section 4.1.1 leaves out the segment the
+// destination address already carries, so its Segments Left is one past its
+// Last Entry. RFC 8986 section 4.1 S09 permits exactly that, and `ip route ...
+// encap seg6 mode encap.red` writes it, so refusing one black-holes a path
+// rather than rejecting a malformed packet.
+func TestReducedHeaderIsForwarded(t *testing.T) {
+	// Policy S1,S2,S3 with S1 in the destination, so the list is S3,S2.
+	s2, s3 := addr("2a0c:b641:69c:6c46::2"), addr("2a0c:b641:69c:29a6::1")
+	raw := reducedHeader(t, addr("2a0c:b641:69c:98d6::2"), []netip.Addr{s3, s2})
+
+	header, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("a reduced header was refused: %v", err)
+	}
+	if int(header.SegmentsLeft) != len(header.Segments) {
+		t.Fatalf("segments left is %d against %d segments", header.SegmentsLeft, len(header.Segments))
+	}
+	next, err := End(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != s2 {
+		t.Errorf("a reduced header moved to %s, want %s", next, s2)
+	}
+}
+
+// RFC 8754 section 2.1 puts TLVs after the segment list and requires a type
+// this node does not recognize to be ignored. An 8-octet padding TLV makes Hdr
+// Ext Len odd, which is legal, and moves where the payload starts.
+func TestTLVAfterTheSegmentsIsIgnored(t *testing.T) {
+	exit := addr("2a0c:b641:69c:98d6::1")
+	inner := innerV6("payload")
+	raw, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := ipv6HeaderLen + srhFixedLen + addrLen
+	withTLV := slices.Concat(raw[:cut], []byte{4, 6, 0, 0, 0, 0, 0, 0}, raw[cut:])
+	withTLV[ipv6HeaderLen+1]++
+	binary.BigEndian.PutUint16(withTLV[4:], uint16(len(withTLV)-ipv6HeaderLen))
+
+	header, err := Parse(withTLV)
+	if err != nil {
+		t.Fatalf("a header carrying a padding TLV was refused: %v", err)
+	}
+	if len(header.Segments) != 1 || header.Segments[0] != exit {
+		t.Fatalf("the segment list read back as %v", header.Segments)
+	}
+	delivered, family, err := Decap(withTLV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if family != NextHeaderIPv6 || !bytes.Equal(delivered, inner) {
+		t.Error("an exit did not skip the TLV to reach the inner packet")
+	}
+}
+
+// An exit is keyed on the upper-layer header, RFC 8986 section 4.8, so a
+// reduced encapsulation of a one-segment policy, which carries no routing
+// header at all, is delivered rather than refused.
+func TestExitDeliversAnEncapsulationWithNoRoutingHeader(t *testing.T) {
+	inner := innerV6("payload")
+	raw := make([]byte, ipv6HeaderLen+len(inner))
+	raw[0] = 0x60
+	binary.BigEndian.PutUint16(raw[4:], uint16(len(inner)))
+	raw[6] = NextHeaderIPv6
+	raw[7] = 64
+	copy(raw[8:], addr16(addr("2a0c:b641:69c:8c0::1")))
+	copy(raw[24:], addr16(addr("2a0c:b641:69c:98d6::1")))
+	copy(raw[ipv6HeaderLen:], inner)
+
+	delivered, family, err := Decap(raw)
+	if err != nil {
+		t.Fatalf("an exit refused a reduced encapsulation: %v", err)
+	}
+	if family != NextHeaderIPv6 || !bytes.Equal(delivered, inner) {
+		t.Error("the inner packet did not come back")
+	}
+}
+
+// H.Encaps copies the traffic class and the hop limit off an IPv6 inner packet
+// the way __seg6_do_srh_encap does, and leaves the flow label at zero, which
+// the default seg6_flowlabel asks for. A fixed outer hop limit would
+// launder a packet past the budget its own header had already spent.
+func TestEncapsulationCopiesTheInnerTrafficClassAndHopLimit(t *testing.T) {
+	inner := innerV6Hops("payload", 7)
+	inner[0], inner[1] = 0x6a, 0xbc // traffic class 0xab, flow label 0xc0000
+	out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{addr("2a0c:b641:69c:98d6::1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out[0]<<4 | out[1]>>4; got != 0xab {
+		t.Errorf("the outer traffic class is %#x, want the inner 0xab", got)
+	}
+	if out[7] != 7 {
+		t.Errorf("the outer hop limit is %d, want the inner 7", out[7])
+	}
+	if out[1]&0x0f != 0 || out[2] != 0 || out[3] != 0 {
+		t.Errorf("the outer flow label is %#x %#x %#x", out[1]&0x0f, out[2], out[3])
+	}
+}
+
+// A routing header longer than the packet holding it is refused. Without the
+// length check the segment loop reads past the buffer, which is a panic a peer
+// chooses, so this names the shape rather than relying on another check
+// happening to fire first.
+func TestRoutingHeaderLongerThanItsPacketIsRefused(t *testing.T) {
+	raw := segmentRouted(t)
+	raw[ipv6HeaderLen+1] = 40 // 328 bytes of header in a packet that has far less
+	raw[ipv6HeaderLen+4] = 15 // a last entry the header would have room for
+	raw[ipv6HeaderLen+3] = 15
+	if _, err := Parse(raw); err == nil {
+		t.Fatal("a routing header running past its packet was accepted")
+	}
+}
+
+// A segment list longer than this node will act on is refused, so the work a
+// peer can ask for stays bounded by a number this node chose.
+func TestSegmentListPastTheCapIsRefused(t *testing.T) {
+	segments := make([]netip.Addr, MaxSegments+1)
+	for i := range segments {
+		segments[i] = addr("2a0c:b641:69c:29a6::1")
+	}
+	raw := reducedHeader(t, addr("2a0c:b641:69c:98d6::2"), segments)
+	if _, err := Parse(raw); err == nil {
+		t.Fatalf("a %d segment header was accepted", len(segments))
+	}
+}
+
+// reducedHeader writes what a `mode encap.red` sender produces: the segment in
+// the destination address is left out of the list, so Segments Left is one
+// past Last Entry. Segments are in wire order.
+func reducedHeader(t *testing.T, destination netip.Addr, segments []netip.Addr) []byte {
+	t.Helper()
+	inner := innerV6("payload")
+	srhLen := srhFixedLen + addrLen*len(segments)
+	raw := make([]byte, ipv6HeaderLen+srhLen+len(inner))
+	raw[0] = 0x60
+	binary.BigEndian.PutUint16(raw[4:], uint16(srhLen+len(inner)))
+	raw[6] = nextHeaderRouting
+	raw[7] = 64
+	copy(raw[8:], addr16(addr("2a0c:b641:69c:8c0::1")))
+	copy(raw[24:], addr16(destination))
+	srh := raw[ipv6HeaderLen:]
+	srh[0] = NextHeaderIPv6
+	srh[1] = uint8(2 * len(segments))
+	srh[2] = routingTypeSegment
+	srh[3] = uint8(len(segments))
+	srh[4] = uint8(len(segments) - 1)
+	for i, segment := range segments {
+		copy(srh[srhFixedLen+addrLen*i:], addr16(segment))
+	}
+	copy(raw[ipv6HeaderLen+srhLen:], inner)
+	return raw
+}
+
+// oversizedV6 is a well-formed IPv6 packet too long for an outer payload
+// length to describe once a routing header is in front of it.
+func oversizedV6() []byte {
+	raw := innerV6("payload")
+	return append(raw, make([]byte, 0xffff-len(raw))...)
 }

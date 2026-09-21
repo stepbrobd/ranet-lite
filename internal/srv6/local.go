@@ -28,7 +28,7 @@ const (
 	// BehaviorEnd is the waypoint of RFC 8986 section 4.1: move the packet to
 	// the next segment and send it on, changing nothing else.
 	BehaviorEnd Behavior = iota + 1
-	// BehaviorEndDT46 is the exit of section 4.10: strip the outer header and
+	// BehaviorEndDT46 is the exit of section 4.8: strip the outer header and
 	// deliver what was inside, whichever family it is.
 	BehaviorEndDT46
 )
@@ -81,11 +81,8 @@ func NewLocalTable(segments []Segment) (*LocalTable, error) {
 	}
 	entries := make(map[netip.Addr]Behavior, len(segments))
 	for _, segment := range segments {
-		if !segment.SID.Is6() || segment.SID.Is4In6() {
-			return nil, fmt.Errorf("srv6: local segment %s is not an IPv6 address", segment.SID)
-		}
-		if segment.SID.Zone() != "" {
-			return nil, fmt.Errorf("srv6: local segment %s carries a zone", segment.SID)
+		if !Usable(segment.SID) {
+			return nil, fmt.Errorf("srv6: local segment %s cannot address a segment routed packet", segment.SID)
 		}
 		if segment.Behavior != BehaviorEnd && segment.Behavior != BehaviorEndDT46 {
 			return nil, fmt.Errorf("srv6: local segment %s: %s is not implemented", segment.SID, segment.Behavior)
@@ -109,13 +106,6 @@ func (t *LocalTable) Segments() []Segment {
 	}
 	slices.SortFunc(out, func(a, b Segment) int { return a.SID.Compare(b.SID) })
 	return out
-}
-
-func (t *LocalTable) Len() int {
-	if t == nil {
-		return 0
-	}
-	return len(t.entries)
 }
 
 // Action tells the caller how to treat a packet Handle has looked at.

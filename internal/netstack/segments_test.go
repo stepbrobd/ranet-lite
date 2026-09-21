@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/internal/srv6"
@@ -77,7 +78,7 @@ func TestExitDeliversWhatWasInside(t *testing.T) {
 	mesh.SetSegments(table)
 
 	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:98d0::1"), []netip.Addr{exit}, 0)
+	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:98d0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +115,7 @@ func TestWaypointForwardsInsteadOfDelivering(t *testing.T) {
 	mesh.Routes.Set(netip.Prefix{}, segPrefix("2a0c:b641:69c:98d6::/64"), recorder.peer("exit"))
 
 	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit}, 0)
+	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +162,7 @@ func TestSegmentsThatCannotBeActedOnAreDropped(t *testing.T) {
 	outer, err := srv6.Encapsulate(
 		plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload"),
 		segAddr("2a0c:b641:69c:8c0::1"),
-		[]netip.Addr{waypoint, segAddr("2a0c:b641:69c:98d6::1")}, 0)
+		[]netip.Addr{waypoint, segAddr("2a0c:b641:69c:98d6::1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +190,7 @@ func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
 	second := plainV6(segAddr("2001:db8::1"), segAddr("2001:db8::b"), "second")
 	last := plainV6(segAddr("2001:db8::1"), segAddr("2001:db8::c"), "last")
 	inner := plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "inner")
-	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:98d0::1"), []netip.Addr{exit}, 0)
+	outer, err := srv6.Encapsulate(inner, segAddr("2a0c:b641:69c:98d0::1"), []netip.Addr{exit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,5 +273,66 @@ func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 	}
 	if counters := mesh.SegmentCounters(); counters.Unsteered != 1 || counters.Steered != 0 {
 		t.Errorf("a refused encapsulation counted %+v", counters)
+	}
+}
+
+// A whole inbound batch of waypointed packets takes one place on the peer's
+// budget, as a tun read does. One per packet is the same accounting at a
+// 128th of the batch size, so most of a forwarded burst is dropped on an idle
+// machine and a peer can spend this node's whole allowance to a third peer.
+func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
+	waypoint := segAddr("2a0c:b641:69c:8c6::2")
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit := segAddr("2a0c:b641:69c:98d6::1")
+
+	// The peer is asked to reserve for a number of packets, and seals once per
+	// reserved batch, so the two together say how the batch was split.
+	var batches, reserved, forwarded atomic.Int64
+	peer := NewPeerReserved("next", func(n int) (BatchSealer, error) {
+		reserved.Add(int64(n))
+		return func(raw [][]byte, _ []byte, out [][]byte) ([][]byte, error) {
+			batches.Add(1)
+			forwarded.Add(int64(len(raw)))
+			return out[:0], nil
+		}, nil
+	}, func([][]byte) error { return nil })
+	defer peer.Close()
+
+	m := &Mesh{Routes: NewRouteTable()}
+	m.startSegmentReports()
+	m.SetSegments(table)
+	m.Routes.Set(netip.Prefix{}, netip.MustParsePrefix("2a0c:b641:69c:98d6::1/128"), peer)
+
+	const count = 64
+	batch := make([][]byte, 0, count)
+	for range count {
+		outer, err := srv6.Encapsulate(
+			plainV6(segAddr("2602:f590::1"), segAddr("2602:f590::2"), "payload"),
+			segAddr("2a0c:b641:69c:8c0::1"), []netip.Addr{waypoint, exit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch = append(batch, outer)
+	}
+	if left := m.applySegments(batch); len(left) != 0 {
+		t.Fatalf("%d waypointed packets reached the tun", len(left))
+	}
+	if got := batches.Load(); got != 1 {
+		t.Errorf("a batch of %d waypointed packets was split into %d, want one for the peer", count, got)
+	}
+	// Reserving for fewer than are appended is the same accounting at a 128th
+	// of the batch size, which drops most of a forwarded burst and lets a peer
+	// spend this node's whole allowance to a third peer.
+	if got := reserved.Load(); got != count {
+		t.Errorf("the peer reserved for %d packets and was handed %d", got, count)
+	}
+	if got := forwarded.Load(); got != count {
+		t.Errorf("the peer was handed %d of %d packets", got, count)
+	}
+	if got := m.SegmentCounters(); got.Forwarded != count || got.Dropped != 0 {
+		t.Errorf("the batch forwarded %d and dropped %d of %d", got.Forwarded, got.Dropped, count)
 	}
 }
