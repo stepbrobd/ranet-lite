@@ -16,8 +16,11 @@ import (
 // linux answers with a mark: the datagrams carry Mark, and a policy rule the
 // operator owns sends marked traffic to a table that is not the mesh's. darwin
 // has no marks, no rules and one forwarding table, and answers by binding the
-// socket to the interface the host's own default route leaves by, which takes
-// it out of the forwarding table altogether.
+// socket to the interface the host's own default route leaves by, which scopes
+// its route lookups to that interface. On that platform the host also has to
+// carry a default of its own scoped to that interface, which is not something
+// this process writes; reportBoundReach in socket_darwin.go has the
+// measurement and says so out loud when it is missing.
 //
 // Either one makes a real default out of the tun safe, and an exit-node client
 // installs a real default. Without one the route has to go where no ordinary
@@ -39,6 +42,10 @@ type Underlay struct {
 	// moves between wifi, ethernet, a dock and a VPN of its own, and a binding
 	// left on the interface that is gone costs the machine every network it
 	// has rather than only the mesh.
+	//
+	// It is not enough on its own: that interface also needs a default route
+	// scoped to it, which macOS writes for every interface but the primary one
+	// and which this process does not write at all.
 	Bind bool `yaml:"bind,omitempty" json:"bind,omitempty" toml:"bind,omitempty"`
 }
 

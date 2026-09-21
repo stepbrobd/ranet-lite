@@ -582,14 +582,16 @@ func (p *routePlatform) scopeRoute(r Route) bool {
 	if standsInForASource(r) || holdsAgainstTheFIB(r) {
 		return true
 	}
-	// A socket bound with IP_BOUND_IF does not consult this FIB at all, so
-	// once the transport has bound its own to the interface the host's default
-	// route leaves by, a default out of the tun can no longer take the
-	// underlay carrying it. Keeping the underlay out is the only reason those
-	// two were scoped, and a scoped default is reached by nothing that did not
-	// name this interface, so leaving the scope on is a Mac that holds a mesh
-	// address and cannot use a mesh exit. See Config.BoundUnderlay, which is
-	// set from the same configuration that binds the socket.
+	// A socket bound with IP_BOUND_IF looks up its routes scoped to the
+	// interface the host's own default leaves by, so once the transport has
+	// bound its own, a default out of the tun no longer takes the underlay
+	// carrying it. Keeping the underlay out is the only reason those two were
+	// scoped, and a scoped default is reached by nothing that did not name
+	// this interface, so leaving the scope on is a Mac that holds a mesh
+	// address and cannot use a mesh exit. See Config.BoundUnderlay, set from
+	// the same configuration that binds the socket, and
+	// TestDarwinBoundSocketNeedsAScopedDefault for the one thing the binding
+	// does not do by itself.
 	if p.rt.BoundUnderlay {
 		return false
 	}

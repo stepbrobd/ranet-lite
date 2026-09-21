@@ -217,6 +217,26 @@ func TestSocketMarkIsRefusedOnDarwin(t *testing.T) {
 	}
 }
 
+// The reachability probe runs on every binding, so it has to answer for both
+// families without reaching for the wrong one: netip.Addr.As4 panics on an
+// IPv6 address, and this runs on the goroutine that follows link changes.
+func TestBoundReachProbeAnswersForBothFamilies(t *testing.T) {
+	index, _ := twoInterfaces(t)
+	for _, probe := range offLinkProbes {
+		// Whether the host can reach them is the host's business; what is
+		// asserted is that asking does not panic and does not come back with
+		// something that is not a routing answer.
+		err := reachesWhenBound(index, probe)
+		t.Logf("interface %d to %s: %v", index, probe, err)
+		if err != nil && !errors.Is(err, unix.ENETUNREACH) && !errors.Is(err, unix.EHOSTUNREACH) &&
+			!errors.Is(err, unix.EADDRNOTAVAIL) && !errors.Is(err, unix.ENETDOWN) {
+			t.Errorf("probing %s answered %v, which is not a routing answer", probe, err)
+		}
+	}
+	// Index zero is the unbound socket, which nothing should be warned about.
+	reportBoundReach(0)
+}
+
 // Binding needs something to say which interface to bind to. A caller that
 // asks for it and supplies nothing gets an error rather than a socket that
 // silently follows the forwarding table.
