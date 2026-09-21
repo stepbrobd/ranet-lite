@@ -28,6 +28,7 @@ writeShellScriptBin "formatter" ''
   # before taplo, because gomod2nix rewrites gomod2nix.toml in its own layout
   # and formatting it first would leave the tree unformatted again
   ${lib.getExe' gomod2nix "gomod2nix"}
+  ${lib.getExe go} run ./internal/cmd/notices
   ${lib.getExe taplo} format **/*.toml
 
   popd

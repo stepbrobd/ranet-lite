@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/internal/notices"
 	"github.com/NickCao/ranet-lite/internal/version"
 )
 
@@ -85,6 +86,7 @@ func newRoot() *cobra.Command {
 				return emit(w, asJSON, peers, func() { control.RenderPeers(w, peers) })
 			}),
 		versionCommand(r),
+		licensesCommand(),
 		completionCommand(root),
 	)
 	return root
@@ -168,4 +170,20 @@ func emit(w io.Writer, asJSON bool, value any, render func()) error {
 	}
 	_, err = fmt.Fprintf(w, "%s\n", body)
 	return err
+}
+
+// licensesCommand prints the notice every module linked into this binary
+// requires a distribution to carry. It is a subcommand rather than a file
+// beside the binary, because a binary gets distributed on its own and the
+// obligation has to travel with it.
+func licensesCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "licenses",
+		Short: "print the license of every module linked into this binary",
+		Args:  noArguments,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := io.WriteString(cmd.OutOrStdout(), notices.ThirdParty)
+			return err
+		},
+	}
 }
