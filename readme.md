@@ -374,6 +374,51 @@ happened rather than a sampled snapshot. What a counter cannot carry, the
 per-neighbor route lists, the route table and the reconciler's last pass, is on
 [the control socket](#control-socket) instead.
 
+## Segment routing, in this process
+
+The fleet's SRv6 is `ip route ... encap seg6local`, which is a linux facility
+and only a linux facility: darwin has no segment routing, and a
+`NEPacketTunnelProvider` or a `VpnService` is handed a tun and a list of routes
+and never sees a forwarding table. Waiting for each platform's kernel would mean
+segment routing on one of the four.
+
+It does not have to be the kernel's, because this process is already the
+dataplane. A packet leaving a node is read off the tun here, routed here and
+sealed into ESP here, so pushing an outer IPv6 header and a routing header in
+front of it is one more step on a path that already copies. A packet arriving is
+decrypted here before anything else sees it, so a segment addressed to this node
+is acted on before it reaches the tun. `internal/srv6` implements
+[RFC 8754](https://www.rfc-editor.org/rfc/rfc8754)'s header and
+[RFC 8986](https://www.rfc-editor.org/rfc/rfc8986)'s H.Encaps, End and End.DT46,
+and the same code runs on every platform.
+
+`segments.local` names the addresses this node answers for. `End` moves a packet
+to its next segment and sends it on; `End.DT46` strips the outer header and
+hands what was inside to the stack. The spelling is the one
+`ip route ... encap seg6local action` takes, so a fleet's own SIDs move across
+unchanged.
+
+`segments.steer` is which of this node's own packets go through a segment list.
+It is keyed by source and destination prefix together, the pair the forwarding
+table is keyed by, because that is the selector the fleet's `gv` uses: the
+traffic sourced from this node's announced address, through the waypoints and
+out at a chosen exit. An entry naming neither a source nor a destination is
+refused, since it would claim the encapsulated packets this node has just
+produced.
+
+Every steered packet carries its segment list inside the tunnel, so the device
+comes up with the longest configured list taken off its MTU, and a list long
+enough to take it under the 1280 IPv6 requires is refused rather than installed.
+Steering happens before the route lookup, because a steered packet is routed by
+the segment it is going to rather than by the address it was addressed to. A
+packet a policy claims and cannot encapsulate goes out unencapsulated and is
+counted, which is the more conservative of the two failures.
+
+It interoperates with the kernel's own implementation in both directions, which
+the `segments` VM check holds: the client steers through a SID the gateway
+answers for with `seg6local`, and removing that route breaks exactly the steered
+destination and leaves the unsteered one alone.
+
 ## What each platform gives the reconciler
 
 The reconciler's job is the same everywhere and the facilities under it are not,
@@ -610,6 +655,8 @@ reload that fails validation changes nothing.
 - `internal/config` is ranet-lite's own config format.
 - `internal/control` is the read-only control socket, its wire types, and the
   client the subcommands read it with.
+- `internal/srv6` is segment routing: the header, the encapsulation, and the two
+  behaviors this mesh uses, all in this process rather than in a kernel.
 - `internal/kernel/rules_linux.go` is the policy rules and the VRF, which exist
   on linux alone and are therefore optional halves of the platform rather than
   methods every backend stubs out.
