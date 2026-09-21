@@ -57,14 +57,16 @@ func TestRuleEncodesTheExpressionsItsCommentDescribes(t *testing.T) {
 			"into the mesh from one prefix",
 			Rule{Family: FamilyIPv4, Direction: In, Interface: "ranet0",
 				From: netip.MustParsePrefix("198.51.100.0/24"), Source: netip.MustParseAddr("10.88.0.2")},
-			[]string{"meta", "cmp", "meta", "cmp", "payload", "bitwise", "cmp", "counter", "immediate", "nat"},
+			// The leading pair is the local-origin test an inbound rule
+			// carries; see TestInboundRuleExcludesThisNodesOwnTraffic.
+			[]string{"meta", "cmp", "meta", "cmp", "meta", "cmp", "payload", "bitwise", "cmp", "counter", "immediate", "nat"},
 		},
 		{
 			"into the mesh from one host",
 			Rule{Family: FamilyIPv4, Direction: In, Interface: "ranet0",
 				From: netip.MustParsePrefix("198.51.100.7/32"), Source: netip.MustParseAddr("10.88.0.2")},
 			// No bitwise: a prefix as long as the address masks nothing.
-			[]string{"meta", "cmp", "meta", "cmp", "payload", "cmp", "counter", "immediate", "nat"},
+			[]string{"meta", "cmp", "meta", "cmp", "meta", "cmp", "payload", "cmp", "counter", "immediate", "nat"},
 		},
 	} {
 		t.Run(one.name, func(t *testing.T) {
@@ -146,7 +148,9 @@ func TestDirectionInvertsBothInterfaceTests(t *testing.T) {
 		want      []uint32
 	}{
 		{Out, []uint32{unix.NFT_CMP_EQ, unix.NFT_CMP_NEQ}},
-		{In, []uint32{unix.NFT_CMP_NEQ, unix.NFT_CMP_EQ}},
+		// The leading NEQ is the local-origin test, which both directions of
+		// the interface pair follow.
+		{In, []uint32{unix.NFT_CMP_NEQ, unix.NFT_CMP_NEQ, unix.NFT_CMP_EQ}},
 	} {
 		t.Run(one.direction.String(), func(t *testing.T) {
 			request, err := newRule(Rule{Family: FamilyIPv4, Direction: one.direction, Interface: "ranet0"})
@@ -313,5 +317,80 @@ func TestFlushNamesOnlyThisToolsOwnChain(t *testing.T) {
 	}
 	if handles != 0 {
 		t.Errorf("named %d handles, which would delete one rule rather than the chain", handles)
+	}
+}
+
+// A packet this host generated itself has no arrival interface, which
+// nf_tables reports as the empty name rather than as a failure to read, so
+// "iifname is not the mesh device" is true of it. An inbound rule left at that
+// would translate this node's own mesh traffic to the return source, which on
+// an exit is an address belonging to somebody else. The rule rules it out by
+// interface index, which reads as zero for a locally generated packet on every
+// kernel that answers the question at all.
+func TestInboundRuleExcludesThisNodesOwnTraffic(t *testing.T) {
+	inbound, err := newRule(Rule{Family: FamilyIPv4, Direction: In, Interface: "ranet0",
+		Source: netip.MustParseAddr("10.88.0.2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := metaKeys(t, inbound.body)
+	if len(keys) == 0 || keys[0] != unix.NFT_META_IIF {
+		t.Fatalf("an inbound rule loads %v, want the interface index first", keys)
+	}
+
+	// An outbound rule needs none of it: a locally generated packet fails
+	// "iifname is the mesh device" whichever way the kernel answers.
+	outbound, err := newRule(Rule{Family: FamilyIPv4, Direction: Out, Interface: "ranet0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := metaKeys(t, outbound.body); slices.Contains(got, uint32(unix.NFT_META_IIF)) {
+		t.Errorf("an outbound rule loads %v, which it has no test to make of the index", got)
+	}
+}
+
+// metaKeys is the metadatum each meta expression loads, in order.
+func metaKeys(t *testing.T, body []byte) []uint32 {
+	t.Helper()
+	var out []uint32
+	for kind, value := range (nftMessage{Data: body}).attributes(sizeofNfgenmsg) {
+		if kind != unix.NFTA_RULE_EXPRESSIONS {
+			continue
+		}
+		for _, element := range nested(value) {
+			var name string
+			var data []byte
+			for _, field := range nested(element.value) {
+				switch field.kind {
+				case unix.NFTA_EXPR_NAME:
+					name = unix.ByteSliceToString(field.value)
+				case unix.NFTA_EXPR_DATA:
+					data = field.value
+				}
+			}
+			if name != "meta" {
+				continue
+			}
+			for _, field := range nested(data) {
+				if field.kind == unix.NFTA_META_KEY && len(field.value) == 4 {
+					out = append(out, binary.BigEndian.Uint32(field.value))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// A name too long to be a device's is refused rather than truncated. The
+// kernel pads an interface register to IFNAMSIZ with a terminator, so a
+// sixteen byte comparison without one can never equal it: the rule would
+// install and then match nothing, or in the inbound direction everything.
+func TestOversizedInterfaceNameIsRefused(t *testing.T) {
+	_, err := newRule(Rule{Family: FamilyIPv4, Direction: Out, Interface: strings.Repeat("r", ifNameSize)})
+	if err == nil || !strings.Contains(err.Error(), "device name is at most") {
+		t.Fatalf("refused with %v, want a message naming the limit", err)
+	}
+	if _, err := newRule(Rule{Family: FamilyIPv4, Direction: Out, Interface: strings.Repeat("r", ifNameSize-1)}); err != nil {
+		t.Errorf("the longest name a device can have was refused: %v", err)
 	}
 }

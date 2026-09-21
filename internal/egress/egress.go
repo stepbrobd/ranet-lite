@@ -162,6 +162,14 @@ func (c Config) Validate() error {
 		if prefix.Addr().Zone() != "" {
 			return fmt.Errorf("config: egress.advertise %s carries a zone, which no prefix the mesh announces can", prefix)
 		}
+		if prefix.Addr().Is4In6() {
+			// Refused rather than unmapped, because the two spellings send the
+			// prefix to different tables here: the 4-in-6 form would be
+			// translated by an IPv6 rule matching an address family no packet
+			// on the wire carries, and the node would advertise a prefix it
+			// silently never acts on.
+			return fmt.Errorf("config: egress.advertise %s is an IPv4 prefix written as IPv6, so write it as %s", prefix, netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96))
+		}
 	}
 	for i, prefix := range c.Advertise {
 		if slices.Contains(c.Advertise[:i], prefix) {

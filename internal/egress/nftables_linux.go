@@ -115,9 +115,9 @@ func nftFamily(family uint8) uint8 {
 }
 
 // Rules reads back the chain this tool owns, in order, with the flow counter
-// each rule has carried. Only the table named after this tool is read, so a
-// dump can never return somebody else's rule and a diff built on it can never
-// remove one.
+// each rule has carried. The kernel dumps every rule in the family and the
+// table and chain names are matched here, so what a diff is built from holds
+// nothing but this tool's own rules and can never remove another writer's.
 func (n *nftables) Rules() ([]Installed, error) {
 	var out []Installed
 	for _, family := range n.families {
@@ -258,7 +258,9 @@ func (n *nftables) removeUnusedTables() error {
 // removeTables deletes this tool's table in each family the predicate takes.
 // The tables are listed first rather than deleted blind, because a delete of a
 // table that is not there fails the whole transaction and would turn every
-// shutdown on a node that never installed anything into an error.
+// shutdown on a node that never installed anything into an error. A table that
+// goes away between the listing and the delete fails the same way, which only
+// something else writing under this tool's own name can cause.
 func (n *nftables) removeTables(match func(uint8) bool) error {
 	held, err := n.ownTables()
 	if err != nil {
@@ -428,6 +430,14 @@ func newRule(rule Rule) (nftRequest, error) {
 	if len(spec) >= udataCommentMax {
 		return nftRequest{}, fmt.Errorf("egress: rule %s does not fit in a %d byte comment, which is its identity on the host", spec, udataCommentMax)
 	}
+	if len(rule.Interface) >= ifNameSize {
+		// A name this long cannot be a device's, since the kernel caps one at
+		// IFNAMSIZ-1, and the comparison below would be against 16 bytes with
+		// no terminator, which no interface register can ever equal. The rule
+		// would install and then match nothing, or in the inbound direction
+		// everything.
+		return nftRequest{}, fmt.Errorf("egress: interface %q is %d bytes, and a device name is at most %d", rule.Interface, len(rule.Interface), ifNameSize-1)
+	}
 	inbound, outbound := unix.NFT_CMP_EQ, unix.NFT_CMP_NEQ
 	if rule.Direction == In {
 		inbound, outbound = unix.NFT_CMP_NEQ, unix.NFT_CMP_EQ
@@ -436,11 +446,19 @@ func newRule(rule Rule) (nftRequest, error) {
 	// only the arrival interface would also translate mesh transit, which
 	// arrives on the mesh device and leaves by it again, and would rewrite a
 	// relayed packet's source to this node.
-	//
-	// A packet this host generated itself has no arrival interface at all, and
-	// nf_tables breaks out of a rule whose meta iifname cannot be read, so
-	// neither spelling of the interface test ever reaches one.
-	expressions := metaCompare(unix.NFT_META_IIFNAME, inbound, rule.Interface)
+	var expressions [][]byte
+	if rule.Direction == In {
+		// A packet this host generated itself has no arrival interface, which
+		// nf_tables reports as the empty name rather than as a failure to
+		// read, so "iifname != the mesh device" is true of it. Left at that,
+		// an inbound rule would translate this node's own mesh traffic to the
+		// return source, which for an exit is an address belonging to somebody
+		// else. Ruling it out by index says so in one test that means the same
+		// thing on a kernel that breaks the rule instead: a locally generated
+		// packet reads as interface zero either way.
+		expressions = append(expressions, metaCompareValue(unix.NFT_META_IIF, unix.NFT_CMP_NEQ, make([]byte, 4))...)
+	}
+	expressions = append(expressions, metaCompare(unix.NFT_META_IIFNAME, inbound, rule.Interface)...)
 	expressions = append(expressions, metaCompare(unix.NFT_META_OIFNAME, outbound, rule.Interface)...)
 	if rule.From.IsValid() {
 		expressions = append(expressions, sourcePrefix(rule.From)...)
@@ -476,11 +494,17 @@ func translate(rule Rule) [][]byte {
 // IFNAMSIZ the kernel pads it to. A shorter comparison would match every
 // device whose name starts the same way.
 func metaCompare(key uint32, op int, name string) [][]byte {
-	meta := putAttrBE32(nil, unix.NFTA_META_KEY, key)
-	meta = putAttrBE32(meta, unix.NFTA_META_DREG, unix.NFT_REG_1)
 	padded := make([]byte, ifNameSize)
 	copy(padded, name)
-	return [][]byte{expression("meta", meta), expression("cmp", compare(op, padded))}
+	return metaCompareValue(key, op, padded)
+}
+
+// metaCompareValue loads one packet metadatum and compares it against a
+// literal, which is the shape every direction test here takes.
+func metaCompareValue(key uint32, op int, value []byte) [][]byte {
+	meta := putAttrBE32(nil, unix.NFTA_META_KEY, key)
+	meta = putAttrBE32(meta, unix.NFTA_META_DREG, unix.NFT_REG_1)
+	return [][]byte{expression("meta", meta), expression("cmp", compare(op, value))}
 }
 
 // sourcePrefix narrows a rule to packets sourced from one prefix: load the
@@ -583,6 +607,10 @@ type nftConn struct {
 // stop the reconcile loop with no error to report.
 const replyTimeout = 10
 
+// receiveBuffer is asked for so that a whole transaction's acknowledgements
+// fit while the sender is still sending. See dialNetfilter.
+const receiveBuffer = 1 << 20
+
 func dialNetfilter() (*nftConn, error) {
 	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_NETFILTER)
 	if err != nil {
@@ -606,6 +634,17 @@ func dialNetfilter() (*nftConn, error) {
 	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("egress: set netfilter netlink receive timeout: %w", err)
+	}
+	// Every message in a transaction is acknowledged, and the kernel queues
+	// all of those acks while this process is still inside its one send, with
+	// nothing draining them. The default receive buffer holds a few hundred,
+	// which a node advertising a few hundred prefixes would exceed, and the
+	// overflow arrives as an ENOBUFS that explains nothing. Best effort: the
+	// forced form needs the capability this process already holds to write a
+	// rule at all, and a kernel that refuses both leaves the smaller buffer
+	// rather than a failure to start.
+	if unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, receiveBuffer) != nil {
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, receiveBuffer)
 	}
 	return &nftConn{fd: fd, pid: local.Pid, buf: make([]byte, 64*1024)}, nil
 }
@@ -670,7 +709,10 @@ func (c *nftConn) batch(requests []nftRequest) error {
 			return err
 		}
 		for _, message := range messages {
-			if message.Pid != c.pid || message.Seq < first || message.Seq > last {
+			// Subtracted rather than compared, so a sequence number that
+			// wraps inside one transaction narrows the window rather than
+			// inverting it.
+			if message.Pid != c.pid || message.Seq-first > last-first {
 				continue
 			}
 			if message.Kind != unix.NLMSG_ERROR {

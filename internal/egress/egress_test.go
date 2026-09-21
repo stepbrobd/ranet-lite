@@ -424,6 +424,14 @@ func TestValidateRefusesWhatCannotBeTranslated(t *testing.T) {
 			"written twice",
 		},
 		{
+			// The two spellings reach different tables here, so the mapped one
+			// would be translated by an IPv6 rule matching an address family
+			// no packet on the wire carries.
+			"an IPv4 prefix written as IPv6",
+			Config{Enable: true, Advertise: prefixes(t, "::ffff:198.51.100.0/120")},
+			"written as IPv6, so write it as 198.51.100.0/24",
+		},
+		{
 			"a source of the other family",
 			Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0"), Source4: Source{Addr: netip.MustParseAddr("2001:db8::1")}},
 			"is not of that family",
