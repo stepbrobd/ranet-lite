@@ -162,6 +162,13 @@ type Table struct {
 	// Reconcile is the periodic sweep correcting drift nothing announced.
 	// Zero uses DefaultReconcileInterval.
 	Reconcile schema.Duration `yaml:"reconcile,omitempty" json:"reconcile,omitempty" toml:"reconcile,omitempty"`
+	// CaptureGrace is how long a route that would carry this machine's own
+	// traffic, an announced default above all, stays installed after the last
+	// live session went away. Such a route is never installed before one has
+	// been live and comes back on the next one, so this only sets how long a
+	// node waits before falling back to its own uplink. Zero uses
+	// DefaultCaptureGrace.
+	CaptureGrace schema.Duration `yaml:"capture_grace,omitempty" json:"capture_grace,omitempty" toml:"capture_grace,omitempty"`
 }
 
 // VRF is the master device the mesh table is bound to.
@@ -195,6 +202,15 @@ type Runtime struct {
 	// Table.AssignAnnounced puts on the device beside the addresses written
 	// here.
 	Announced []netip.Prefix
+	// Sessions reports how many of this node's mesh sessions have recently
+	// proved their peer is there. Until one has, and once none has for
+	// Table.CaptureGrace, no route that would carry this machine's own
+	// traffic is installed: see captureGate, which is the whole of why. Nil
+	// installs every route the mesh announces as soon as it announces it,
+	// which is right for a reconciler driven by something that has no
+	// sessions. It is here rather than in the capability because no operator
+	// writes it down.
+	Sessions func() int
 }
 
 // Name is the master device, empty for a table bound to none.
@@ -289,6 +305,9 @@ func (t Table) Validate() error {
 	}
 	if t.Reconcile < 0 {
 		return fmt.Errorf("kernel: cap.table reconcile %s is not an interval", t.Reconcile)
+	}
+	if t.CaptureGrace < 0 {
+		return fmt.Errorf("kernel: cap.table capture_grace %s is not an interval", t.CaptureGrace)
 	}
 	expanded, err := expandRules(t.Rules)
 	if err != nil {
@@ -669,6 +688,16 @@ type Reconciler struct {
 	// only condition under which it removes one again.
 	madeVRF bool
 
+	// gate holds back the routes that would carry this machine's own traffic
+	// until the mesh has proved it can carry them. Only the reconcile
+	// goroutine touches it, and capture is its answer for the pass now
+	// running, sampled once so every route of a pass is judged the same way.
+	gate    captureGate
+	capture bool
+	// now is the clock the gate reads, replaced by a test that drives the
+	// grace without sleeping through it.
+	now func() time.Time
+
 	// stats is the last route pass as an operator reads it. The single
 	// reconcile goroutine publishes a whole value and a reader takes one, so
 	// this needs no lock and a reader can never see half a pass.
@@ -733,6 +762,9 @@ func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
 	if t.Reconcile <= 0 {
 		t.Reconcile = schema.Duration(DefaultReconcileInterval)
 	}
+	if t.CaptureGrace <= 0 {
+		t.CaptureGrace = schema.Duration(DefaultCaptureGrace)
+	}
 	addresses := make([]netip.Prefix, 0, len(t.Addresses))
 	for _, prefix := range t.Assigned(rt.Announced) {
 		if _, ok := canonicalPrefix(prefix); !ok {
@@ -792,12 +824,19 @@ func canonicalRules(rules []Rule) []Rule {
 }
 
 func newReconciler(t Table, rt Runtime, rules []Rule, addresses []netip.Prefix, src RouteSource, plat platform) *Reconciler {
+	if t.CaptureGrace <= 0 {
+		// Filled here rather than only in New, because the tests reach this
+		// directly and a gate with no grace withdraws on the first idle pass.
+		t.CaptureGrace = schema.Duration(DefaultCaptureGrace)
+	}
 	r := &Reconciler{
 		table: t, rt: rt, ruleSet: rules, addresses: addresses,
 		src: src, plat: plat,
 		owned:       make(map[netip.Prefix]bool),
 		warnedAddrs: make(map[netip.Prefix]bool),
 		warned:      make(map[Route]bool),
+		gate:        captureGate{grace: t.CaptureGrace.Duration()},
+		now:         time.Now,
 	}
 	// Nil on a platform without them, which New has already refused to
 	// configure, so every use below is reached only where the backend answers.
@@ -833,6 +872,13 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	retry := time.NewTimer(r.table.Reconcile.Duration())
 	stopTimer(retry)
 	defer retry.Stop()
+	// Nothing else wakes at the moment the capture grace expires: the mesh has
+	// stopped changing, which is why the grace is running at all. Without this
+	// the machine's own traffic stays in a dead tun until the periodic sweep,
+	// which is three times the grace by default.
+	grace := time.NewTimer(r.table.Reconcile.Duration())
+	stopTimer(grace)
+	defer grace.Stop()
 
 	// The space this reconciler owns comes from the platform: darwin has one
 	// FIB and no rt_proto, so naming a table and a protocol there prints two
@@ -866,10 +912,16 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			stopTimer(retry)
 		}
 
+		stopTimer(grace)
+		if at, ok := r.captureDeadline(); ok {
+			grace.Reset(max(at.Sub(r.now()), 0))
+		}
+
 		select {
 		case <-ctx.Done():
 		case <-ticker.C:
 		case <-retry.C:
+		case <-grace.C:
 		case <-changed:
 			r.settle(ctx, changed, notify)
 		case <-notify:
@@ -918,12 +970,43 @@ func stopTimer(t *time.Timer) {
 // refuseWhatThePlatformLacks for why that particular silence is the expensive
 // one.
 func (r *Reconciler) reconcile() error {
+	// Sampled once for the whole pass, before any of the steps: a route
+	// installed under one answer and withdrawn under another would leave the
+	// kernel holding a key the diff never names again.
+	r.sampleCapture()
 	// The VRF first, because applyMaster enslaves the link to it and a master
 	// that does not exist yet is a master the link cannot join.
 	err := errors.Join(r.applyVRF(), r.applyMaster(), r.applyAddresses(), r.applyRoutes(), r.applyRules())
 	r.recordPass(err)
 	return err
 }
+
+// sampleCapture asks how much of the mesh is carrying traffic and records what
+// this pass may therefore install. A reconciler with no session source keeps
+// the behavior it had before the gate existed, because nothing it could ask
+// would answer.
+func (r *Reconciler) sampleCapture() {
+	if r.rt.Sessions == nil {
+		r.capture = true
+		return
+	}
+	open, changed := r.gate.sample(r.now(), r.rt.Sessions())
+	r.capture = open
+	if !changed {
+		return
+	}
+	if open {
+		slog.Info("kernel is carrying this machine's own traffic over the mesh again",
+			"detail", "a session is live, so an announced default is installed")
+		return
+	}
+	slog.Warn("kernel is withdrawing the routes that would carry this machine's own traffic",
+		"grace", r.table.CaptureGrace,
+		"detail", "no session has been live for that long, so this node falls back to its own uplink")
+}
+
+// captureDeadline is when a pass has to run for the grace to expire on time.
+func (r *Reconciler) captureDeadline() (time.Time, bool) { return r.gate.deadline() }
 
 // recordPass publishes the pass applyRoutes counted, with the whole pass's
 // error rather than the route half's. A pass that failed before applyRoutes
@@ -1089,6 +1172,14 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 			Destination: destination,
 			Metric:      routeMetric(r.table.Metric, destination, unreachable),
 			Unreachable: unreachable,
+		}
+		// Left out of the pass rather than reported as skipped: skipped counts
+		// what the mesh wanted and the kernel would not take, and this is the
+		// reconciler declining to ask. A hold is declined too, because a hold
+		// at a default answers with an error for every destination and is the
+		// same outage in a different shape.
+		if capturesTheMachine(route) && !r.capture {
+			continue
 		}
 		// A source covering every address is not a source-specific route, and
 		// installing it as one is beyond what the linux encoder can express: it

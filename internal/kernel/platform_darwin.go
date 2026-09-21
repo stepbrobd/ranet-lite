@@ -587,20 +587,6 @@ func (p *routePlatform) scopeRoute(r Route) bool {
 // distinction a source prefix draws.
 func standsInForASource(r Route) bool { return r.Source.IsValid() }
 
-// a default unscoped takes the peers' own endpoints with it, and there is one
-// FIB and no equivalent of the fleet's table plus "ipproto udp sport <port>
-// lookup main" to keep them out. On IPv4 it survives only by colliding with
-// the box's own, which AddRoute retries past the first moment the Mac has
-// none; on IPv6 there is no collision to rely on, since every default row on a
-// Mac is already scoped.
-//
-// Half the address space counts, because that is how a default that does not
-// replace the host's is written: 0.0.0.0/1 with 128.0.0.0/1, or ::/1 with
-// 8000::/1, the spelling wg-quick and the tunnels on this platform use. The
-// pair wins the lookup outright rather than colliding, and a neighbor can
-// announce one: the Update decoder bounds a prefix length only at 32 and 128.
-func capturesTheMachine(r Route) bool { return r.Destination.Bits() <= 1 }
-
 // a hold answers with an error rather than carrying the packet, and this FIB
 // is the only one the machine has, so unscoped it shadows whatever else could
 // still reach the prefix, for the life of the process if this node originates
