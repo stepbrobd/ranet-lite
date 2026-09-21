@@ -616,6 +616,15 @@ func (m *Mux) AdoptEndpoint(endpoint Endpoint) {
 	m.endpointMu.Unlock()
 }
 
+// Endpoint is the destination this mux currently sends to, which a NAT may
+// have moved since the session opened. It takes the same lock AdoptEndpoint
+// writes under, so a diagnostic reads one endpoint rather than a torn one.
+func (m *Mux) Endpoint() Endpoint {
+	m.endpointMu.Lock()
+	defer m.endpointMu.Unlock()
+	return m.endpoint
+}
+
 func (m *Mux) SendIKETo(b []byte, endpoint Endpoint) error {
 	out := make([]byte, nonESPMarkerLen+len(b))
 	copy(out[nonESPMarkerLen:], b)

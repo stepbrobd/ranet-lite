@@ -1055,6 +1055,32 @@ func (s *Session) Active() bool {
 // noteActive records that the peer has just proved it is still there.
 func (s *Session) noteActive() { s.lastActive.Store(int64(time.Since(s.started)) + 1) }
 
+// StartedAt is when this SA was established. It is written once, before the
+// session is handed to anyone, so it needs no lock.
+func (s *Session) StartedAt() time.Time { return s.started }
+
+// Idle is how long since the peer last proved it is still there, which is the
+// quantity dead peer detection acts on. It reports the session's whole age
+// when nothing has arrived yet, so a session that never carried anything does
+// not read as one that was busy a moment ago.
+func (s *Session) Idle() time.Duration {
+	age := time.Since(s.started)
+	last := s.lastActive.Load()
+	if last == 0 {
+		return age
+	}
+	return age - time.Duration(last-1)
+}
+
+// ChildSPIs is the live Child SA's pair, local then remote, under the lock a
+// rekey replaces it beneath. A diagnostic reading the field directly would
+// race with the install that swaps it.
+func (s *Session) ChildSPIs() (local, remote uint32) {
+	s.childMu.RLock()
+	defer s.childMu.RUnlock()
+	return s.Child.LocalSPI, s.Child.RemoteSPI
+}
+
 // minPeerChildRekeyInterval is the shortest gap between accepted
 // peer-initiated Child SA rekeys. Each one retains the SA it replaces for the
 // retirement delay, and installing a replacement copies the retained set, so a

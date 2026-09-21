@@ -170,6 +170,21 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 // QueueCount reports the number of independent TUN I/O lanes.
 func (m *Mesh) QueueCount() int { return len(m.devs) }
 
+// MTU is the device's own, asked of the kernel rather than reported from the
+// value New was given: attaching to a device somebody else created takes
+// whatever MTU that device already has. Zero means the device could not
+// answer, which is a device on its way out.
+func (m *Mesh) MTU() int {
+	if len(m.devs) == 0 {
+		return 0
+	}
+	mtu, err := m.devs[0].MTU()
+	if err != nil {
+		return 0
+	}
+	return mtu
+}
+
 func (m *Mesh) startOutboundPipeline() {
 	workers := max(1, runtime.GOMAXPROCS(0))
 	m.outboundJobs = make(chan *outboundBatch, 2*workers)
