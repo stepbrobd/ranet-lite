@@ -515,7 +515,7 @@ func expandRules(rules []Rule) ([]Rule, error) {
 	for _, rule := range rules {
 		addressed := rule.To.IsValid() || rule.From.IsValid()
 		if addressed && rule.Family != FamilyUnset {
-			return nil, fmt.Errorf("kernel: rule at priority %d names family %q and an address, which already says which family it is", rule.Priority, rule.Family)
+			return nil, fmt.Errorf("kernel: cap.table rules at priority %d names family %q and an address, which already says which family it is", rule.Priority, rule.Family)
 		}
 		if addressed {
 			address := rule.To.Addr()
@@ -538,7 +538,7 @@ func expandRules(rules []Rule) ([]Rule, error) {
 			rule.Family = FamilyIPv6
 			out = append(out, rule)
 		default:
-			return nil, fmt.Errorf("kernel: rule at priority %d selects on a mark alone, so it has to name family: ipv4, ipv6 or both", rule.Priority)
+			return nil, fmt.Errorf("kernel: cap.table rules at priority %d selects on a mark alone, so it has to name family: ipv4, ipv6 or both", rule.Priority)
 		}
 	}
 	return out, nil

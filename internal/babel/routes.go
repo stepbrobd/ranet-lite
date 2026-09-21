@@ -65,7 +65,7 @@ func (r Routes) Validate() error {
 				continue
 			}
 			if err := maskedDefault(field.prefix); err != nil {
-				return fmt.Errorf("cap.route announce %s %s %w", field.name, field.prefix, err)
+				return fmt.Errorf("babel: cap.route announce %s %s %w", field.name, field.prefix, err)
 			}
 		}
 		switch source := entry.From.Prefix; {
@@ -74,11 +74,11 @@ func (r Routes) Validate() error {
 			// originatedKey keeps a source only while it is shorter than the
 			// whole address space, so this one is dropped and the entry
 			// silently becomes an ordinary announcement of its destination.
-			return fmt.Errorf("cap.route announce %s: a source covering every address is not a source-specific route, drop the from", entry)
+			return fmt.Errorf("babel: cap.route announce %s: a source covering every address is not a source-specific route, drop the from", entry)
 		case source.Addr().Is4() != entry.Prefix.Addr().Is4():
 			// The source prefix is encoded under the destination's address
 			// encoding, so the pair has no representation on the wire.
-			return fmt.Errorf("cap.route announce %s: mismatched address families", entry)
+			return fmt.Errorf("babel: cap.route announce %s: mismatched address families", entry)
 		case entry.Prefix.Addr().Is4():
 			// Nothing consumes an IPv4 source-specific route. BIRD's
 			// babel_read_source_prefix drops the whole Update unless the
@@ -86,7 +86,7 @@ func (r Routes) Validate() error {
 			// Linux IPv4 FIB has no source-address-dependent lookup either, so
 			// internal/kernel refuses to install one. Announcing it would be a
 			// prefix that reaches nobody.
-			return fmt.Errorf("cap.route announce %s: source-specific routes are IPv6 only", entry)
+			return fmt.Errorf("babel: cap.route announce %s: source-specific routes are IPv6 only", entry)
 		}
 	}
 	return nil

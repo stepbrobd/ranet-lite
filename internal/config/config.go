@@ -256,16 +256,19 @@ func (c *Config) Validate() error {
 	if err := c.validateNode(); err != nil {
 		return err
 	}
+	// Returned as the capability wrote it. Each message already names the
+	// package that refused and the block an operator can find in their own
+	// file, and wrapping it in a second "config:" would say neither twice.
 	for _, capability := range []interface{ Validate() error }{
 		c.Routes(), c.Babel(), c.Segments(), c.Crypto(),
 	} {
 		if err := capability.Validate(); err != nil {
-			return fmt.Errorf("config: %w", err)
+			return err
 		}
 	}
 	if c.Cap.Table != nil {
 		if err := c.Cap.Table.Validate(); err != nil {
-			return fmt.Errorf("config: %w", err)
+			return err
 		}
 	}
 	return c.validateAcrossCapabilities()
