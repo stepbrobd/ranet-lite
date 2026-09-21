@@ -693,7 +693,7 @@ in
                 assert source not in capture, (
                     f"the mesh address reached the far side untranslated:\n{capture}")
 
-            status = json.loads(client.succeed("ranet-lite status -json"))["egress"]
+            status = json.loads(client.succeed("ranet-lite status --json"))["egress"]
             print(json.dumps(status, indent=2))
             assert status["enabled"], status
             assert status["installed"] == 2, status
@@ -721,11 +721,11 @@ in
             # forward one family and not the other.
             client.succeed("sysctl -w net.ipv4.ip_forward=0")
             client.wait_until_succeeds(
-                "ranet-lite status -json | jq -e '.egress.announced == [\"${exitNetV6}\"]'", timeout=timeout)
+                "ranet-lite status --json | jq -e '.egress.announced == [\"${exitNetV6}\"]'", timeout=timeout)
             gateway.wait_until_fails("ip -4 route show ${exitNetV4} | grep -q swan0", timeout=timeout)
             client.succeed("sysctl -w net.ipv4.ip_forward=1")
             client.wait_until_succeeds(
-                "ranet-lite status -json | jq -e '.egress.announced | length == 2'", timeout=timeout)
+                "ranet-lite status --json | jq -e '.egress.announced | length == 2'", timeout=timeout)
             gateway.wait_until_succeeds("ip -4 route show ${exitNetV4} | grep -q swan0", timeout=timeout)
 
             # Shutdown takes the tables with it. A rule left behind would go on
