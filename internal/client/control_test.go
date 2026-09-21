@@ -34,6 +34,15 @@ func TestLocalSegmentOnOneOfThisNodesAddressesIsRefused(t *testing.T) {
 	if _, err := localSegments(cfg); err != nil {
 		t.Errorf("a segment beside an unrelated address was refused: %v", err)
 	}
+
+	// assign_originated puts every originated prefix on the device too, so the
+	// check covers everything the reconciler assigns rather than the addresses
+	// list alone.
+	cfg.Kernel.AssignOriginated = true
+	cfg.Originate = []string{"2a0c:b641:69c:8c6::1/128"}
+	if _, err := localSegments(cfg); err == nil {
+		t.Error("a segment on a prefix this node assigns from originate was accepted")
+	}
 }
 
 // A host address written with a prefix length is refused rather than masked,

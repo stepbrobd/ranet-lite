@@ -2,7 +2,9 @@ package netstack
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"log/slog"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -429,22 +431,49 @@ func TestTwoSegmentsOfThisNodeInOneListAreBothActedOn(t *testing.T) {
 
 // The report interval is measured on the monotonic clock, which needs a start.
 // time.Since of a zero time saturates, so a counter set that was never started
-// would report once and suppress everything after it for 292 years, which is
-// the failure a rate limit is supposed to prevent rather than cause.
+// would report once and then suppress everything for 292 years, which is the
+// failure a rate limit exists to prevent rather than to cause.
 func TestDropReportsSurviveACounterSetThatWasNeverStarted(t *testing.T) {
-	primed := &Mesh{Routes: NewRouteTable()}
-	primed.startSegmentReports()
-	primed.reportSegmentDrop("first")
-	if got := primed.segmentReported.Load(); got < 0 {
-		t.Error("a started set did not record its first report")
+	lines := countRecords(t)
+
+	started := &Mesh{Routes: NewRouteTable()}
+	started.startSegmentReports()
+	for range 3 {
+		started.reportSegmentDrop("spaced")
+	}
+	if got := *lines; got != 1 {
+		t.Errorf("a started set wrote %d lines for three drops, want one", got)
 	}
 
-	// A Mesh nothing started still reports rather than going quiet.
+	*lines = 0
 	var unstarted Mesh
+	if !unstarted.segmentsStarted.IsZero() {
+		t.Fatal("the unstarted case is no longer reachable, so this is not testing it")
+	}
 	for range 3 {
 		unstarted.reportSegmentDrop("still speaking")
 	}
-	if !unstarted.segmentsStarted.IsZero() {
-		t.Fatal("the unstarted case is no longer reachable, so this test is not testing it")
+	if got := *lines; got != 3 {
+		t.Errorf("an unstarted set wrote %d lines for three drops, want every one", got)
 	}
 }
+
+// countRecords points the default logger at a counter for the test's duration.
+func countRecords(t *testing.T) *int {
+	t.Helper()
+	previous := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	counter := new(int)
+	slog.SetDefault(slog.New(countingHandler{n: counter}))
+	return counter
+}
+
+type countingHandler struct{ n *int }
+
+func (h countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h countingHandler) Handle(context.Context, slog.Record) error {
+	*h.n++
+	return nil
+}
+func (h countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h countingHandler) WithGroup(string) slog.Handler      { return h }

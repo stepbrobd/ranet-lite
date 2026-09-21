@@ -108,6 +108,10 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 		// Nothing reads segments.source until a steer entry needs it, so a
 		// typo in it survives a start on a node that steers nothing yet.
 		"an unparseable segment source": "segments:\n  source: \"not an address\"\n",
+		// A source an encapsulation will not send from is refused when it is
+		// read rather than when the first steer entry needs it.
+		"a v4 segment source":        "segments:\n  source: \"10.0.0.1\"\n",
+		"a multicast segment source": "segments:\n  source: \"ff02::1\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yaml")
