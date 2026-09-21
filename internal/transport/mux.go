@@ -67,6 +67,12 @@ type Hub struct {
 	bind packetBind
 	port uint16
 
+	// underlay is the configuration the socket was opened under, and boundTo
+	// the interface index it currently carries, zero for none. Both are read
+	// under mu, which the follower goroutine and a status reader share.
+	underlay Underlay
+	boundTo  int
+
 	mu        sync.Mutex
 	ike       map[uint64]*Mux
 	esp       map[uint32]*Mux
@@ -183,17 +189,12 @@ type espDatagramBatch struct {
 	bytes int
 }
 
-// NewHub binds localAddr's port on all local IPv4 and IPv6 interfaces.
-// NewHub binds the one UDP socket every session shares. fwmark, linux only and
-// zero for none, is set with SO_MARK on that socket so a policy rule can keep
-// its datagrams in a table of the operator's choosing. A leaf needs it: where
-// the mesh address is the only global address of its family, the kernel picks
-// that address as the source for this socket, a "from <mesh address>" rule
-// sends it to the mesh table, and an exit-announced default there carries the
-// underlay into the tun it is supposed to be running under. The rule matching
-// the mark is installed by the route reconciler, under cap.table.rules, since
-// this package writes none itself.
-func NewHub(localAddr string, fwmark uint32) (*Hub, error) {
+// NewHub binds the one UDP socket every session shares, on localAddr's port
+// and on all local IPv4 and IPv6 interfaces. underlay says how that socket is
+// kept out of the reach of the routes the mesh installs, and rt carries what
+// the caller had to resolve to answer it; see Underlay for why both platforms
+// need one and why they need different things.
+func NewHub(localAddr string, underlay Underlay, rt Runtime) (*Hub, error) {
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: resolve local addr: %w", err)
@@ -201,15 +202,38 @@ func NewHub(localAddr string, fwmark uint32) (*Hub, error) {
 	if laddr.IP != nil && !laddr.IP.IsUnspecified() {
 		log.Printf("transport: binding to a specific local address (%s) is not supported, binding all interfaces on port %d instead", laddr.IP, laddr.Port)
 	}
-	bind, fns, port, err := openPacketBind(uint16(laddr.Port), fwmark)
+	index, err := bindUnderlay(underlay, rt)
+	if err != nil {
+		return nil, fmt.Errorf("transport: %w", err)
+	}
+	// Before the socket exists, for the same reason a move prepares before it
+	// rebinds: the first datagram this node sends goes out of a socket that is
+	// already bound, and nothing else will make that interface usable first.
+	if index != 0 && rt.Routes != nil {
+		if err := rt.Routes.Prepare(index); err != nil {
+			return nil, fmt.Errorf("transport: prepare interface %d: %w", index, err)
+		}
+	}
+	bind, fns, port, err := openPacketBind(uint16(laddr.Port), underlay, index, rt.Routes != nil)
 	if err != nil {
 		return nil, fmt.Errorf("transport: open bind: %w", err)
 	}
-	h := &Hub{bind: bind, port: port, ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux),
+	if index != 0 && rt.Routes != nil {
+		if err := rt.Routes.Settle(index); err != nil {
+			return nil, fmt.Errorf("transport: settle on interface %d: %w", index, err)
+		}
+	}
+	h := &Hub{bind: bind, port: port, underlay: underlay, boundTo: index,
+		ike: make(map[uint64]*Mux), esp: make(map[uint32]*Mux),
 		muxes: make(map[*Mux]struct{}), done: make(chan struct{}), started: time.Now()}
 	h.reported.Store(-int64(dropReportInterval))
 	for _, fn := range fns {
 		go h.receiveLoop(fn)
+	}
+	// Started only where the binding has to follow something, so a hub that
+	// binds nothing carries no goroutine and no link source.
+	if underlay.Bind && rt.Links != nil {
+		go h.follow(rt.Links, rt.Routes)
 	}
 	return h, nil
 }
@@ -524,7 +548,7 @@ func (m *Mux) takeESP(batch espDatagramBatch) [][]byte {
 // Dial preserves the one-peer convenience path. The returned mux owns its
 // newly-created hub and closes it when closed.
 func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
-	h, err := NewHub(localAddr, 0)
+	h, err := NewHub(localAddr, Underlay{}, Runtime{})
 	if err != nil {
 		return nil, err
 	}

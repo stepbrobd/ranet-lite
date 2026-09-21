@@ -63,19 +63,93 @@ it, because that Babel channel exports only its own directly connected routes: a
 node learns a prefix from the node that originates it or not at all, so dialing
 a few exits reaches those exits and nothing behind them.
 
-A node whose mesh address is the only global address of its family should also
-set `link.mark`, on linux. The transport binds the wildcard and lets the kernel
-pick the source by route, and where the mesh address is the only candidate the
-kernel picks it, a `from <mesh address>` policy rule sends the datagram to the
-mesh table, and an exit-announced default there routes the ESP underlay into the
-tun that is carrying it. `SO_MARK` plus a rule matching it keeps it out, and the
-reconciler installs that rule itself: write it under `cap.table.rules`, as
-`{ fwmark = 0x726c, table = "main", priority = 40, family = "both" }`. darwin
-needs none: the reconciler installs a route interface-scoped when it is a
-default or when it covers one of the registry's endpoint addresses, and an
-unbound socket never sees a scoped route. A hostname endpoint is not covered,
-because resolving one is a network call and the scope decision is made once per
-reconcile pass.
+A node that takes an exit-announced default should set `link.underlay`. It is
+one block covering both platforms because it is one idea: keep the one UDP
+socket carrying IKE and ESP out of the reach of the routes the mesh installs.
+The transport binds the wildcard and lets the kernel pick the source by route,
+so on a node whose mesh address is the only global address of its family the
+kernel picks that address, a `from <mesh address>` policy rule sends the
+datagram to the mesh table, and an exit-announced default there routes the ESP
+underlay into the tun carrying it.
+
+`link.underlay.mark` is `SO_MARK`, linux only, and the reconciler installs the
+rule matching it: write it under `cap.table.rules`, as
+`{ fwmark = 0x726c, table = "main", priority = 40, family = "both" }`.
+
+`link.underlay.bind` is `IP_BOUND_IF` and `IPV6_BOUND_IF`, darwin only, set to
+the interface the host's own default route leaves by and moved with `setsockopt`
+on the live descriptor when that changes, so a laptop crossing from wifi to a
+dock keeps every SA. It scopes that socket's route lookups to that interface,
+which is the only thing on that platform that can make a real default out of the
+tun safe, so the same setting tells the reconciler to install an announced
+default plain rather than interface-scoped. Leaving it off keeps the scoping
+described under the platform notes below: reachable, and reachable by nothing
+that did not name the tun, so the node can hold an exit-announced address and
+cannot send its traffic through the exit.
+
+Binding is necessary and, on macOS 26, not sufficient on its own, which
+`TestDarwinBoundSocketNeedsAScopedDefault` measures. `IP_BOUND_IF` does not take
+a socket out of the forwarding table: the scoped lookup still finds the most
+specific route, and where that route leaves another interface it falls back only
+to a route already on the bound one. So while the mesh holds `0.0.0.0/1` and
+`128.0.0.0/1` out of the tun, a bound socket answers `ENETUNREACH` unless the
+underlay's own interface carries a default scoped to it, the route
+`route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>` writes. macOS
+writes exactly that for every interface but the primary one, which is why
+binding looks sufficient right up until the mesh takes the default away from the
+primary.
+
+ranet-lite writes it, and it is the only route this tree puts out of an
+interface it does not own, so the rules around it are narrower than the tun's.
+It goes in before the first capturing route and comes out after the last one, so
+`cap.table.capture_grace` withdraws the pair together. It follows the host's own
+default: the interface it is going to is written before the socket moves onto it
+and the one it left is cleared after that, which leaves no moment with no usable
+route. Only a route this tool recorded writing is ever withdrawn, only after a
+readback finds it still carrying `RTF_IFSCOPE`, the recorded interface and the
+recorded next hop, and a delete that is not interface-scoped cannot be encoded
+at all. An add that answers `EEXIST` is success and not ownership, so a route
+macOS wrote for a secondary interface is used and never removed.
+
+The record outlives the process. It is written to
+`/var/run/ranet-lite/underlay.json`, beside the control socket's lock, before
+the route is written and after it is withdrawn, so a daemon killed with
+`SIGKILL` is cleaned up by the next one rather than leaking. That is the same
+ownership claim made durable, not a weaker one: a restart withdraws a recorded
+route only when the kernel still holds one matching its destination, interface
+index, next hop and `RTF_IFSCOPE`, only when the recorded interface name still
+resolves to the recorded index, and only when that interface also carries the
+host's own unscoped default. The last clause separates our route from the
+system's, because macOS writes a scoped default for every interface except the
+one holding the unscoped default;
+`TestNoOtherProgramScopesADefaultToThePrimaryInterface` asserts that on whatever
+machine the suite runs on rather than taking it on trust. Any record failing any
+clause is kept and reported rather than acted on, and a state file that is
+missing, truncated or not JSON is reported and treated as empty: a node that
+will not start is worse than a route left behind.
+
+The edge that leaves is worth knowing. The last clause is a snapshot, so a host
+that makes another interface primary while our route is in place, and later
+makes it primary again, could have a restart withdraw a scoped default macOS
+wanted there. That is one route on one interface until the next link event,
+which macOS answers by rewriting it.
+
+Either way, a route that would carry this machine's own traffic is held back
+until at least one session is live, withdrawn once none has been live for
+`cap.table.capture_grace` (10s by default) and restored on the next live
+session. A session counts as live only while it is still proving its peer is
+there and only while the underlay socket is where `link.underlay` says it should
+be. Without that rule a laptop whose mesh has gone loses every network it has
+rather than only the mesh, and it cannot recover on its own, because reaching
+the peers needs the network the default just took.
+
+The capture itself has to be the pair of halves rather than a real default.
+darwin has no route replace, so `0.0.0.0/0` out of the tun collides with the
+host's own and is refused, while `0.0.0.0/1` with `128.0.0.0/1` wins the lookup
+outright. `::/1` with `8000::/1` is the same arrangement for IPv6 and is handled
+the same way throughout: the gate, the scoping decision and the scoped default
+all read a prefix of length zero or one as carrying this machine's own traffic,
+whichever family it is. What announces that pair is the exit, not this node.
 
 A leaf should write `transit = false` under `cap.route`, which advertises only
 the prefixes this node announces and never relays one it learned. Redistribution
@@ -288,7 +362,9 @@ port = 13000
 endpoints = [{ serial = "0", family = "ip4" }]
 # listen = true                     # answer peers that dial this node
 # tun = "ranet0"                    # attach to this device rather than a new one
-# mark = 0x726c                     # SO_MARK on the underlay socket, linux only
+# [link.underlay]                   # keep the underlay out of the mesh's own routing
+# mark = 0x726c                     # SO_MARK plus a rule under cap.table.rules, linux only
+# bind = true                       # IP_BOUND_IF plus a scoped default, darwin only
 
 [dial]
 # all = true                        # dial every node the trust document names
@@ -505,9 +581,15 @@ stands, so the tun's lookups go there rather than to `cap.table.id`.
 the two ends the rules exist for with interface scope instead: an announced
 default and a source-specific route are installed scoped to the tun, so no
 unbound socket can select either, which keeps the machine from being captured
-and the ESP underlay out of the tunnel carrying it. `link.mark` is refused there
-for the same reason, since there is nothing for a mark to select and nothing to
-select it with.
+and the ESP underlay out of the tunnel carrying it. `link.underlay.mark` is
+refused there for the same reason, since there is nothing for a mark to select
+and nothing to select it with; `link.underlay.bind` is the local spelling, and
+with it set the socket's lookups are scoped to the underlay interface, that
+interface is given a default of its own, and an announced default is installed
+plain, without which a node cannot use a mesh exit. A source-specific route and
+a retracted one stay scoped either way: interface scope is the only thing on
+this platform that expresses a source at all, and an unscoped hold at a default
+answers the whole machine's traffic with an error.
 
 **iOS and Android**, planned rather than present, have less again: the tunnel is
 a `NEPacketTunnelProvider` or a `VpnService`, the process is handed a list of

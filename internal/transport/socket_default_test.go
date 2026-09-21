@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package transport
 
@@ -7,24 +7,32 @@ import (
 	"testing"
 )
 
-// SO_MARK is a linux facility. A platform without it must refuse a mark rather
-// than ignore one, because the configuration that asked for it was written to
-// keep the underlay out of a table, and a rule that never matches is worse
-// than an error at startup. darwin needs no mark: an announced default is
-// installed interface-scoped there, so an unbound socket never sees it.
-func TestFWMarkIsRefusedWhereItCannotBeSet(t *testing.T) {
-	_, err := NewHub(":0", 0x5115)
-	if err == nil {
-		t.Fatal("a mark this platform cannot set was accepted")
+// Both spellings of keeping the underlay out are platform facilities: SO_MARK
+// is linux, IP_BOUND_IF is darwin. A platform with neither must refuse the
+// configuration rather than ignore it, because what asked for it was written
+// to keep the underlay out of a table, and a setting that never takes effect
+// is worse than an error at startup.
+func TestUnderlayIsolationIsRefusedWhereItCannotBeSet(t *testing.T) {
+	for name, underlay := range map[string]Underlay{
+		"a socket mark":                {Mark: 0x5115},
+		"an interface binding":         {Bind: true},
+		"a mark and a binding at once": {Mark: 0x5115, Bind: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewHub(":0", underlay, Runtime{})
+			if err == nil {
+				t.Fatal("a setting this platform cannot apply was accepted")
+			}
+			// Wrapped once by NewHub, so the reason has to survive without
+			// repeating the package name an operator already sees.
+			if got := err.Error(); strings.Count(got, "transport:") != 1 {
+				t.Errorf("the refusal reads %q", got)
+			}
+		})
 	}
-	// Wrapped once by NewHub, so the reason has to survive without repeating
-	// the package name an operator already sees.
-	if got := err.Error(); !strings.Contains(got, "fwmark") || strings.Count(got, "transport:") != 1 {
-		t.Errorf("the refusal reads %q", got)
-	}
-	hub, err := NewHub(":0", 0)
+	hub, err := NewHub(":0", Underlay{}, Runtime{})
 	if err != nil {
-		t.Fatalf("an unmarked hub was refused: %v", err)
+		t.Fatalf("a hub asking for neither was refused: %v", err)
 	}
 	_ = hub.Close()
 }

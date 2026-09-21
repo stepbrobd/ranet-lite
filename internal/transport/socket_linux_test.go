@@ -166,7 +166,7 @@ func TestUDPReceiveSkipsTruncatedMessagesAndPreservesGROTail(t *testing.T) {
 func TestUDPKernelGSORoundTrip(t *testing.T) {
 	for _, address := range []string{"127.0.0.1", "::1"} {
 		t.Run(address, func(t *testing.T) {
-			receiver, receivers, port, err := openPacketBind(0, 0)
+			receiver, receivers, port, err := openPacketBind(0, Underlay{}, 0, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -184,7 +184,7 @@ func TestUDPKernelGSORoundTrip(t *testing.T) {
 			if err := socket.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
-			sender, _, _, err := openPacketBind(0, 0)
+			sender, _, _, err := openPacketBind(0, Underlay{}, 0, false)
 			if err != nil {
 				t.Fatal(err)
 			}

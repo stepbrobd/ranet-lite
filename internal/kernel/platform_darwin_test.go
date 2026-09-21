@@ -1439,3 +1439,68 @@ func TestDarwinRefusesSettingsItCannotHonor(t *testing.T) {
 		})
 	}
 }
+
+// With the transport's socket bound off the forwarding table, the reason an
+// announced default was scoped is gone, and scope is the one thing keeping a
+// Mac from using a mesh exit: a scoped default is reached by nothing that did
+// not name the tun. The route has to install plain, read back plain, and
+// converge, or every pass would tear it down and put it back.
+func TestDarwinInstallsAPlainDefaultOnceTheUnderlayIsBound(t *testing.T) {
+	for _, destination := range []string{"0.0.0.0/0", "::/0", "::/1"} {
+		t.Run(destination, func(t *testing.T) {
+			peer := addr("2001:db8:beef::1")
+			plat, sock := testPlatform(t, Table{}, Runtime{
+				BoundUnderlay: true,
+				Underlay:      func() []netip.Addr { return []netip.Addr{peer} },
+			})
+			announced := Route{Destination: prefix(destination)}
+			announced.Metric = routeMetric(plat.table.Metric, announced.Destination, false)
+			if err := plat.AddRoute(announced); err != nil {
+				t.Fatal(err)
+			}
+			written := sock.messages(t)
+			if len(written) != 1 {
+				t.Fatalf("install wrote %d messages, want 1", len(written))
+			}
+			if written[0].Flags&unix.RTF_IFSCOPE != 0 {
+				t.Fatalf("default %s was scoped although the underlay socket is bound, so no ordinary socket can use the exit", destination)
+			}
+			rib := dumpRIB(t, dumpEntry{
+				index: testIndex, flags: written[0].Flags,
+				dst: announced.Destination, gateway: ourGateway(),
+			})
+			actual, err := plat.ownedRoutes(rib)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if add, del := diffRoutes([]Route{announced}, actual, plat.scopes); len(add) != 0 || len(del) != 0 {
+				t.Fatalf("the plain default did not converge: add %v, delete %v", add, del)
+			}
+		})
+	}
+}
+
+// The two remaining reasons to scope outlive the binding. A source prefix has
+// no other spelling on this platform at all, and a hold answers with an error
+// for every destination it covers, which unscoped is the whole machine.
+func TestDarwinKeepsScopingWhatABoundUnderlayDoesNotExplain(t *testing.T) {
+	plat, _ := testPlatform(t, Table{}, Runtime{BoundUnderlay: true})
+	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8:1::5/128")}, nil }
+	sourced := Route{Destination: prefix("::/0"), Source: prefix("2001:db8:1::/48")}
+	if !plat.scopeRoute(sourced) {
+		t.Error("a source-specific route lost its scope, which is the only way this FIB expresses a source")
+	}
+	held := Route{Destination: prefix("::/0"), Unreachable: true}
+	if !plat.scopeRoute(held) {
+		t.Error("a retracted default lost its scope, so the machine answers its own traffic with an error")
+	}
+}
+
+// Leaving the binding off keeps the behavior this backend has always had,
+// which is the fallback for a node that cannot bind its socket.
+func TestDarwinScopesADefaultWhileTheUnderlayIsUnbound(t *testing.T) {
+	plat, _ := testPlatform(t, Table{}, Runtime{})
+	if !plat.scopeRoute(Route{Destination: prefix("::/0")}) {
+		t.Error("an announced default installed plain with the underlay still on the forwarding table")
+	}
+}

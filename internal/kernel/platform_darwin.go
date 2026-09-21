@@ -579,27 +579,28 @@ func (p *routePlatform) AddRoute(r Route) error {
 // on the same machine: its exit-node default is scoped to its utun, its
 // 100.64/10 is not.
 func (p *routePlatform) scopeRoute(r Route) bool {
-	return standsInForASource(r) || capturesTheMachine(r) || holdsAgainstTheFIB(r) ||
-		coversAny(r.Destination, p.underlay)
+	if standsInForASource(r) || holdsAgainstTheFIB(r) {
+		return true
+	}
+	// A socket bound with IP_BOUND_IF looks up its routes scoped to the
+	// interface the host's own default leaves by, so once the transport has
+	// bound its own, a default out of the tun no longer takes the underlay
+	// carrying it. Keeping the underlay out is the only reason those two were
+	// scoped, and a scoped default is reached by nothing that did not name
+	// this interface, so leaving the scope on is a Mac that holds a mesh
+	// address and cannot use a mesh exit. See Config.BoundUnderlay, set from
+	// the same configuration that binds the socket, and
+	// TestDarwinBoundSocketNeedsAScopedDefault for the one thing the binding
+	// does not do by itself.
+	if p.rt.BoundUnderlay {
+		return false
+	}
+	return capturesTheMachine(r) || coversAny(r.Destination, p.underlay)
 }
 
 // interface scope is the only thing on this platform that draws the
 // distinction a source prefix draws.
 func standsInForASource(r Route) bool { return r.Source.IsValid() }
-
-// a default unscoped takes the peers' own endpoints with it, and there is one
-// FIB and no equivalent of the fleet's table plus "ipproto udp sport <port>
-// lookup main" to keep them out. On IPv4 it survives only by colliding with
-// the box's own, which AddRoute retries past the first moment the Mac has
-// none; on IPv6 there is no collision to rely on, since every default row on a
-// Mac is already scoped.
-//
-// Half the address space counts, because that is how a default that does not
-// replace the host's is written: 0.0.0.0/1 with 128.0.0.0/1, or ::/1 with
-// 8000::/1, the spelling wg-quick and the tunnels on this platform use. The
-// pair wins the lookup outright rather than colliding, and a neighbor can
-// announce one: the Update decoder bounds a prefix length only at 32 and 128.
-func capturesTheMachine(r Route) bool { return r.Destination.Bits() <= 1 }
 
 // a hold answers with an error rather than carrying the packet, and this FIB
 // is the only one the machine has, so unscoped it shadows whatever else could

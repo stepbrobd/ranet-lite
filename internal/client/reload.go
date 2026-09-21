@@ -168,10 +168,12 @@ func reloadable(old, next *config.Config) error {
 	switch {
 	case old.Node != next.Node:
 		return fmt.Errorf("config: node changed, restart to apply")
-	case old.Link.Mark != next.Link.Mark:
-		// The mark is set on the one socket when it is opened, so a change
-		// here would be read back from the file and reach nothing.
-		return fmt.Errorf("config: link.mark changed, restart to apply")
+	case old.Link.Underlay != next.Link.Underlay:
+		// Both spellings are applied to the one socket when it is opened, so a
+		// change here would be read back from the file and reach nothing. The
+		// interface a bound socket sits on does follow the host's own routing,
+		// but which interface that is was never written in this file.
+		return fmt.Errorf("config: link.underlay changed, restart to apply")
 	case old.Link.Port != next.Link.Port:
 		return fmt.Errorf("config: link.port changed, restart to apply")
 	case old.Link.TUN != next.Link.TUN:
