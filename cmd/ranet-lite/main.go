@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/internal/client"
 	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 )
 
@@ -38,6 +40,7 @@ type options struct {
 	fullMesh           bool
 	pprofAddr          string
 	metricsAddr        string
+	controlPath        string
 	contentionProfiles bool
 	level              slog.Level
 }
@@ -57,14 +60,18 @@ func parseOptions(args []string, usage io.Writer) (options, error) {
 	fs.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
 	fs.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
 	fs.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
+	fs.StringVar(&o.controlPath, "control", control.DefaultSocket, "unix socket serving the read-only control surface the subcommands read; empty disables it")
 	logLevel := fs.String("log-level", "info", "minimum log level: debug, info, warn, or error")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
 	if fs.NArg() != 0 {
 		// A missing dash is the way this happens: `ranet-lite config.yaml`
-		// otherwise starts silently against the default path.
-		return options{}, fmt.Errorf("unexpected argument %q: the config path is given with -config", fs.Arg(0))
+		// otherwise starts silently against the default path. A first
+		// argument is dispatched as a subcommand before this, so anything
+		// reaching here followed a flag and names neither.
+		return options{}, fmt.Errorf("unexpected argument %q: the config path is given with -config, and a subcommand comes first (%s)",
+			fs.Arg(0), strings.Join(commandNames(), ", "))
 	}
 	if err := o.level.UnmarshalText([]byte(*logLevel)); err != nil {
 		return options{}, fmt.Errorf("invalid -log-level %q: %w", *logLevel, err)
@@ -86,6 +93,13 @@ func refuseToStart(err error) int {
 // tells a supervisor the node stopped cleanly when it did not, and the route
 // withdrawal at shutdown is one of the things that reports this way.
 func run() int {
+	// A first argument that is not a flag asks for the client half rather than
+	// the daemon, so `ranet-lite -config ...` still starts a node and a
+	// deployment needs no change. See cli.go.
+	if name, rest, ok := subcommand(os.Args[1:]); ok {
+		return runCommand(name, rest, os.Stdout, os.Stderr)
+	}
+
 	// Before slog.SetDefault below, so this one refusal reaches stderr through
 	// the standard logger's own writer rather than through a handler that has
 	// not been installed. Every later one goes through refuseToStart.
@@ -217,9 +231,28 @@ func run() int {
 		// a platform that has no tables at all.
 		log.Printf("tun device %s ready with %d queues, reconciling its routes into %s",
 			mesh.Name, mesh.QueueCount(), routes.Where())
+		node.SetKernelStatus(func() control.KernelStatus { return kernelStatus(routes) })
 	} else {
 		log.Printf("tun device %s ready with %d queues, configure its addresses and kernel routes externally",
 			mesh.Name, mesh.QueueCount())
+	}
+
+	// The control socket is bound rather than served here, so a path that
+	// cannot be bound refuses the startup instead of leaving a node an
+	// operator has no way to ask anything. -control "" is the opt-out.
+	if opts.controlPath != "" {
+		listener, err := control.Listen(opts.controlPath)
+		if err != nil {
+			return refuseToStart(err)
+		}
+		defer listener.Close()
+		go func() {
+			log.Printf("control socket listening on %s", opts.controlPath)
+			if err := control.Serve(listener, node); err != nil {
+				log.Printf("control: %v", err)
+				failed.Store(true)
+			}
+		}()
 	}
 
 	// The reconciler has to finish withdrawing while the TUN still exists,
@@ -283,6 +316,28 @@ func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force fun
 	<-signals
 	log.Print("second signal, exiting without finishing shutdown")
 	force()
+}
+
+// kernelStatus is the reconciler as the control surface reports it: what it
+// was configured to own and what its last pass did. The configuration half
+// comes from the resolved kernel.Config rather than from the config file, so
+// the defaults the reconciler filled in are the ones reported.
+func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
+	cfg, stats := routes.Config(), routes.Stats()
+	return control.KernelStatus{
+		Enabled:   true,
+		Where:     routes.Where(),
+		Table:     cfg.Table,
+		Protocol:  cfg.Protocol,
+		Metric:    cfg.Metric,
+		VRF:       cfg.VRF,
+		PassAt:    stats.At,
+		Installed: stats.Installed,
+		Skipped:   stats.Skipped,
+		Added:     stats.Added,
+		Removed:   stats.Removed,
+		Err:       stats.Err,
+	}
 }
 
 // kernelConfig resolves the config file's kernel block against the device the
