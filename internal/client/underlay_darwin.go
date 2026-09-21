@@ -3,6 +3,9 @@
 package client
 
 import (
+	"path/filepath"
+
+	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
@@ -29,7 +32,11 @@ func underlayRuntime(underlay transport.Underlay, mesh string) (transport.Runtim
 	if err != nil {
 		return transport.Runtime{}, nil, func() {}, err
 	}
-	routes, err := kernel.NewUnderlayDefaults(links)
+	// Beside the control socket's lock, which is the other file in that
+	// directory saying what this process owns, and which a RuntimeDirectory=
+	// unit clears on a clean boot.
+	state := filepath.Join(filepath.Dir(control.DefaultSocket), "underlay.json")
+	routes, err := kernel.NewUnderlayDefaults(links, state)
 	if err != nil {
 		_ = links.Close()
 		return transport.Runtime{}, nil, func() {}, err

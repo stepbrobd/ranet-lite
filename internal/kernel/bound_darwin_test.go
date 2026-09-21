@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/net/route"
@@ -107,7 +108,8 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 		t.Logf("without a scoped default a bound socket reports: %v", err)
 	}
 
-	underlay, err := NewUnderlayDefaults(links)
+	state := filepath.Join(t.TempDir(), "underlay.json")
+	underlay, err := NewUnderlayDefaults(links, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +126,9 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	if got := underlay.Written(); len(got) != 1 || got[0].index != host {
 		t.Fatalf("the hold wrote %+v, want one route on interface %d", got, host)
 	}
+	if got := underlay.Written(); got[0].device != device.Name {
+		t.Errorf("the record names interface %q, want %q", got[0].device, device.Name)
+	}
 
 	// The remedy, measured: the bound socket reaches again, and the mesh is
 	// still carrying everything unbound.
@@ -134,9 +139,10 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 		t.Error("the scoped default took the mesh's own capture away from an unbound socket")
 	}
 
-	// A process that crashed and came back records nothing, so it withdraws
-	// nothing: the route it finds is left where it is.
-	restarted, err := NewUnderlayDefaults(links)
+	// A process that came back with no record of its own withdraws nothing,
+	// whatever it finds in the table.
+	empty := filepath.Join(t.TempDir(), "underlay.json")
+	restarted, err := NewUnderlayDefaults(links, empty)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,11 +156,34 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 		t.Errorf("a restarted process withdrew a route it never wrote: %v", err)
 	}
 
-	if err := underlay.Release(); err != nil {
-		t.Fatalf("withdraw the underlay's own default: %v", err)
+	// The kill: a process that wrote the route, recorded it, and never lived
+	// to withdraw it. Closing the socket without releasing leaves the table in
+	// the state a SIGKILL leaves it, minus the tun, which this test needs.
+	if err := underlay.sock.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if got := underlay.Written(); len(got) != 0 {
-		t.Errorf("the release left %+v recorded", got)
+	underlay.sock = nil
+	if err := boundReach(host, target); err != nil {
+		t.Fatalf("the killed process's route is not in the table: %v", err)
+	}
+	if recorded, err := loadUnderlayState(state); err != nil || len(recorded) != 1 {
+		t.Fatalf("the killed process recorded %v (%v), want one route", recorded, err)
+	}
+
+	// The restart reclaims it, because it wrote the record down.
+	reclaimed, err := NewUnderlayDefaults(links, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reclaimed.Close() })
+	if got := reclaimed.Written(); len(got) != 0 {
+		t.Errorf("the reclaim kept %+v rather than withdrawing it", got)
+	}
+	if err := boundReach(host, target); err == nil {
+		t.Error("the route the killed process left is still in the table after a restart")
+	}
+	if recorded, err := loadUnderlayState(state); err != nil || len(recorded) != 0 {
+		t.Errorf("the reclaim left %v recorded (%v)", recorded, err)
 	}
 	// The rule that matters: the host's own defaults are exactly as they were.
 	if after := defaultRoutesOnHost(t); !sameDefaults(before, after) {
