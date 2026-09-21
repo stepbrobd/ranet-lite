@@ -257,6 +257,9 @@ type routeMonitor struct {
 	done   chan struct{}
 }
 
+// newRouteMonitor watches one interface, or every interface when index is
+// zero, as a watcher for the host's own default route needs: the
+// route it follows moves between interfaces and is never on the mesh tun.
 func newRouteMonitor(index int) (*routeMonitor, error) {
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
 	if err != nil {
@@ -358,7 +361,7 @@ func (m *routeMonitor) wakesOn(message []byte) bool {
 	default:
 		return false
 	}
-	if int(binary.NativeEndian.Uint16(message[rtmIndexOffset:])) != m.index {
+	if m.index != 0 && int(binary.NativeEndian.Uint16(message[rtmIndexOffset:])) != m.index {
 		return false
 	}
 	ours := uintptr(binary.NativeEndian.Uint32(message[rtmPIDOffset:])) == m.self
