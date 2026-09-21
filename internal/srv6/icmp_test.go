@@ -56,8 +56,8 @@ func TestLargeOffendingPacketIsQuotedUpToTheMinimumMTU(t *testing.T) {
 	if got := verify(sid, netip.AddrFrom16([16]byte(answer[24:40])), answer[ipv6HeaderLen:]); got != 0 {
 		t.Errorf("a receiver sums the message to %#04x, want zero", got)
 	}
-	if pointer := binary.BigEndian.Uint32(answer[ipv6HeaderLen+4:]); pointer != segmentsLeftOffset {
-		t.Errorf("the pointer is %d, want the segments left field at %d", pointer, segmentsLeftOffset)
+	if pointer := binary.BigEndian.Uint32(answer[ipv6HeaderLen+4:]); pointer != ipv6HeaderLen+segmentsLeftInHeader {
+		t.Errorf("the pointer is %d, want the segments left field at %d", pointer, ipv6HeaderLen+segmentsLeftInHeader)
 	}
 }
 

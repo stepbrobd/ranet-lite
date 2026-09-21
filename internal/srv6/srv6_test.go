@@ -456,3 +456,110 @@ func oversizedV6() []byte {
 	raw := innerV6("payload")
 	return append(raw, make([]byte, 0xffff-len(raw))...)
 }
+
+// RFC 8200 section 4.1 puts a hop-by-hop header ahead of the routing header
+// and allows destination options there too, and ipv6_find_hdr walks to it. A
+// parser that reads only the byte after the fixed header sees no segment list
+// in a packet a kernel acts on, and refuses it as addressed to one of this
+// node's own segments with nothing in it.
+func TestRoutingHeaderIsFoundBehindAnotherExtensionHeader(t *testing.T) {
+	exit := addr("2a0c:b641:69c:98d6::1")
+	inner := innerV6("payload")
+	plain, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{exit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One eight-octet hop-by-hop header with a PadN filling it, between the
+	// fixed header and the routing header.
+	hopByHop := []byte{plain[6], 0, 1, 4, 0, 0, 0, 0}
+	behind := slices.Concat(plain[:ipv6HeaderLen], hopByHop, plain[ipv6HeaderLen:])
+	behind[6] = nextHeaderHopByHop
+	binary.BigEndian.PutUint16(behind[4:], uint16(len(behind)-ipv6HeaderLen))
+
+	header, err := Parse(behind)
+	if err != nil {
+		t.Fatalf("a routing header behind a hop-by-hop header was not found: %v", err)
+	}
+	if header.Offset != ipv6HeaderLen+len(hopByHop) {
+		t.Errorf("the routing header was found at %d", header.Offset)
+	}
+	if len(header.Segments) != 1 || header.Segments[0] != exit {
+		t.Fatalf("the segment list read back as %v", header.Segments)
+	}
+	delivered, family, err := Decap(behind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if family != NextHeaderIPv6 || !bytes.Equal(delivered, inner) {
+		t.Error("an exit did not reach the inner packet past the hop-by-hop header")
+	}
+}
+
+// The chain is walked on bytes a peer chooses, so every shape that could read
+// past the packet or spend this node's time is refused rather than followed.
+func TestExtensionHeaderWalkRefusesWhatAPeerCanChoose(t *testing.T) {
+	for name, build := range map[string]func() []byte{
+		"a header that runs past the packet": func() []byte {
+			raw := segmentRouted(t)
+			out := slices.Concat(raw[:ipv6HeaderLen], []byte{nextHeaderRouting, 40, 0, 0, 0, 0, 0, 0}, raw[ipv6HeaderLen:])
+			out[6] = nextHeaderHopByHop
+			return out
+		},
+		"a header the packet ends inside": func() []byte {
+			raw := segmentRouted(t)[:ipv6HeaderLen+4]
+			raw[6] = nextHeaderHopByHop
+			return raw
+		},
+		"a chain longer than this node walks": func() []byte {
+			raw := segmentRouted(t)
+			chain := []byte(nil)
+			for range maxExtensionHeaders + 2 {
+				chain = append(chain, nextHeaderDestOpts, 0, 1, 4, 0, 0, 0, 0)
+			}
+			out := slices.Concat(raw[:ipv6HeaderLen], chain, raw[ipv6HeaderLen:])
+			out[6] = nextHeaderDestOpts
+			return out
+		},
+		"a fragment": func() []byte {
+			raw := segmentRouted(t)
+			out := slices.Concat(raw[:ipv6HeaderLen], []byte{nextHeaderRouting, 0, 0, 1, 0, 0, 0, 0}, raw[ipv6HeaderLen:])
+			out[6] = nextHeaderFragment
+			return out
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := build()
+			binary.BigEndian.PutUint16(raw[4:], uint16(len(raw)-ipv6HeaderLen))
+			if header, err := Parse(raw); err == nil {
+				t.Errorf("%s was accepted as %+v", name, header)
+			}
+		})
+	}
+}
+
+// Every byte Parse, End and Decap read comes from a peer, and the bounds are
+// arithmetic on fields the peer chose, so the one thing none of them may do is
+// panic. The corpus holds well formed packets, so the mutations start near the
+// shapes that reach the interesting code.
+func FuzzParseNeverPanics(f *testing.F) {
+	f.Add(innerV6("payload"))
+	f.Add(innerV4("payload"))
+	raw, err := Encapsulate(innerV6("payload"), addr("2a0c:b641:69c:8c0::1"),
+		[]netip.Addr{addr("2a0c:b641:69c:98d6::2"), addr("2a0c:b641:69c:29a6::1")})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(raw)
+	f.Add(reducedHeader(&testing.T{}, addr("2a0c:b641:69c:98d6::2"), []netip.Addr{addr("2a0c:b641:69c:29a6::1")}))
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		header, err := Parse(raw)
+		if err == nil && int(header.SegmentsLeft) > len(header.Segments) {
+			t.Fatalf("segments left %d past %d segments was accepted", header.SegmentsLeft, len(header.Segments))
+		}
+		End(bytes.Clone(raw))
+		Decap(bytes.Clone(raw))
+		TimeExceeded(raw, addr("2a0c:b641:69c:8c6::2"))
+		ParameterProblem(raw, addr("2a0c:b641:69c:8c6::2"))
+	})
+}

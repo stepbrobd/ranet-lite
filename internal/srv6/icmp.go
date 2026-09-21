@@ -26,9 +26,9 @@ const (
 	// icmpHeaderLen is the type, the code, the checksum and the four octets
 	// the two messages use differently.
 	icmpHeaderLen = 8
-	// segmentsLeftOffset is where Segments Left sits in a packet whose routing
-	// header follows the fixed header, which is the only shape Parse reads.
-	segmentsLeftOffset = ipv6HeaderLen + 3
+	// segmentsLeftInHeader is where Segments Left sits inside a routing header,
+	// which findRouting says where to find.
+	segmentsLeftInHeader = 3
 )
 
 // TimeExceeded answers a packet whose hop limit ran out at this node, RFC 4443
@@ -42,7 +42,16 @@ func TimeExceeded(offending []byte, source netip.Addr) ([]byte, bool) {
 // 4443 section 3.4, pointing at the Segments Left field that RFC 8986 section
 // 4.1 S10 names.
 func ParameterProblem(offending []byte, source netip.Addr) ([]byte, bool) {
-	return icmpError(offending, source, icmpParameterProblem, icmpErroneousHeader, segmentsLeftOffset)
+	if len(offending) < ipv6HeaderLen {
+		return nil, false
+	}
+	// The pointer names a field, so a packet whose routing header cannot be
+	// found is one this answer has nothing to point at.
+	offset, err := findRouting(offending)
+	if err != nil {
+		return nil, false
+	}
+	return icmpError(offending, source, icmpParameterProblem, icmpErroneousHeader, uint32(offset+segmentsLeftInHeader))
 }
 
 // icmpError builds one message carrying as much of the offending packet as
@@ -97,12 +106,12 @@ func answerable(offending []byte) bool {
 // that an error refused at a segment is not answered with another error.
 func carriesICMPError(offending []byte) bool {
 	next, payload := offending[6], ipv6HeaderLen
-	if next == nextHeaderRouting {
-		if len(offending) < ipv6HeaderLen+srhFixedLen {
+	if offset, err := findRouting(offending); err == nil {
+		if len(offending) < offset+srhFixedLen {
 			return false
 		}
-		next = offending[ipv6HeaderLen]
-		payload = ipv6HeaderLen + srhFixedLen + 8*int(offending[ipv6HeaderLen+1])
+		next = offending[offset]
+		payload = offset + srhFixedLen + extensionUnit*int(offending[offset+1])
 	}
 	// An ICMPv6 type below 128 is an error message, RFC 4443 section 2.1.
 	return next == icmpv6Next && len(offending) > payload && offending[payload] < 128

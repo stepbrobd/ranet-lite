@@ -63,6 +63,13 @@ const (
 	// Next Header values, from the IANA protocol registry. Routing is the
 	// SRH's own, and the two below it announce an encapsulated inner packet.
 	nextHeaderRouting = 43
+	// The headers RFC 8200 section 4.1 allows in front of a routing header,
+	// and the fragment header, which this node refuses rather than walks.
+	nextHeaderHopByHop  = 0
+	nextHeaderDestOpts  = 60
+	nextHeaderFragment  = 44
+	extensionUnit       = 8
+	maxExtensionHeaders = 8
 	// NextHeaderIPv4 and NextHeaderIPv6 name what H.Encaps put inside, which
 	// an End.DT46 has to read to know which stack to deliver to.
 	NextHeaderIPv4 = 4
@@ -124,6 +131,10 @@ type Header struct {
 	// NextHeader names whatever follows the SRH, which for an encapsulated
 	// packet is NextHeaderIPv4 or NextHeaderIPv6.
 	NextHeader uint8
+	// Offset is where the routing header starts, which is not always straight
+	// after the fixed header: RFC 8200 section 4.1 puts a hop-by-hop header in
+	// front of it and allows destination options there too.
+	Offset int
 }
 
 // Path is the segment list in the order a packet visits it, which is how an
@@ -323,10 +334,14 @@ func Parse(raw []byte) (Header, error) {
 	if len(raw) < ipv6HeaderLen {
 		return Header{}, ErrNotSegmentRouted
 	}
-	if raw[0]>>4 != 6 || raw[6] != nextHeaderRouting {
+	if raw[0]>>4 != 6 {
 		return Header{}, ErrNotSegmentRouted
 	}
-	srh := raw[ipv6HeaderLen:]
+	offset, err := findRouting(raw)
+	if err != nil {
+		return Header{}, err
+	}
+	srh := raw[offset:]
 	if len(srh) < srhFixedLen {
 		return Header{}, errors.New("srv6: the routing header is shorter than its fixed part")
 	}
@@ -357,6 +372,7 @@ func Parse(raw []byte) (Header, error) {
 		SegmentsLeft: srh[3],
 		Flags:        srh[5],
 		Tag:          binary.BigEndian.Uint16(srh[6:]),
+		Offset:       offset,
 	}
 	header.Segments = make([]netip.Addr, 0, count)
 	for i := range count {
@@ -373,6 +389,38 @@ func Parse(raw []byte) (Header, error) {
 		return Header{}, fmt.Errorf("%w: segments left %d is past the last entry %d", ErrHeaderInvalid, header.SegmentsLeft, count-1)
 	}
 	return header, nil
+}
+
+// findRouting walks the extension header chain to the routing header. RFC 8200
+// section 4.1 puts a hop-by-hop header ahead of it and allows destination
+// options there as well, and ipv6_find_hdr walks the same chain, so a header a
+// kernel acts on is one this node finds rather than passes over.
+//
+// A fragment is refused rather than walked past, because a segment list spread
+// across fragments needs reassembly this package does not do. The number of
+// headers walked is bounded here rather than by the packet, so a peer cannot
+// choose how much of this node's time one packet costs.
+func findRouting(raw []byte) (int, error) {
+	next, offset := raw[6], ipv6HeaderLen
+	for range maxExtensionHeaders {
+		switch next {
+		case nextHeaderRouting:
+			return offset, nil
+		case nextHeaderHopByHop, nextHeaderDestOpts:
+		case nextHeaderFragment:
+			return 0, fmt.Errorf("%w: a fragment carries no segment list this node can act on", ErrHeaderInvalid)
+		default:
+			return 0, ErrNotSegmentRouted
+		}
+		if len(raw) < offset+extensionUnit {
+			return 0, ErrNotSegmentRouted
+		}
+		next, offset = raw[offset], offset+extensionUnit*(1+int(raw[offset+1]))
+		if offset > len(raw) {
+			return 0, ErrNotSegmentRouted
+		}
+	}
+	return 0, fmt.Errorf("%w: more extension headers than this node walks", ErrHeaderInvalid)
 }
 
 // End is the waypoint behavior of RFC 8986 section 4.1: the packet is not
@@ -394,7 +442,7 @@ func End(raw []byte) (netip.Addr, error) {
 		return netip.Addr{}, ErrHopLimit
 	}
 	raw[7]--
-	srh := raw[ipv6HeaderLen:]
+	srh := raw[header.Offset:]
 	srh[3] = header.SegmentsLeft - 1
 	next := header.Segments[srh[3]]
 	copy(raw[24:], addr16(next))
@@ -420,11 +468,8 @@ func Decap(raw []byte) (inner []byte, family uint8, err error) {
 		return nil, 0, ErrNotSegmentRouted
 	}
 	offset, upper := ipv6HeaderLen, raw[6]
-	if upper == nextHeaderRouting {
-		header, err := Parse(raw)
-		if err != nil {
-			return nil, 0, err
-		}
+	switch header, err := Parse(raw); {
+	case err == nil:
 		if header.SegmentsLeft != 0 {
 			// RFC 8986 section 4.8 runs End.DT46 on the last segment. Reaching
 			// it with segments still to go means the packet was addressed to
@@ -432,7 +477,10 @@ func Decap(raw []byte) (inner []byte, family uint8, err error) {
 			// that does not describe what it wants.
 			return nil, 0, fmt.Errorf("srv6: an exit was reached with %d segments still to go", header.SegmentsLeft)
 		}
-		offset, upper = ipv6HeaderLen+srhFixedLen+8*int(raw[ipv6HeaderLen+1]), header.NextHeader
+		offset = header.Offset + srhFixedLen + extensionUnit*int(raw[header.Offset+1])
+		upper = header.NextHeader
+	case !errors.Is(err, ErrNotSegmentRouted):
+		return nil, 0, err
 	}
 	if upper != NextHeaderIPv4 && upper != NextHeaderIPv6 {
 		return nil, 0, fmt.Errorf("srv6: an exit cannot deliver next header %d, only an encapsulated IPv4 or IPv6 packet", upper)
