@@ -834,17 +834,21 @@ fails validation changes nothing.
 go test ./... -race
 ```
 
-The unit tests need no privileges, with one exception: `internal/kernel` has
-tests that write to a real routing table. They skip unless run as root, and on
-darwin unless `RANET_LITE_DARWIN_NETTEST=1` is also set, because that machine is
-on a live mesh. Nothing in CI runs them, so run them by hand after changing a
-platform backend. Protocol-level interoperability is covered by the NixOS VM
-tests exposed by `flake.nix`. Each boots separate client and gateway VMs; the
-client runs the packaged, user-facing `ranet-lite` binary with a real TUN
-device, while the gateway runs `charon-systemd`/`swanctl`, BIRD, and iperf3. The
-default test verifies an Ed25519-authenticated IKEv2 and Child SA negotiation
-across asymmetric local and remote UDP ports, checks Babel route exchange in
-both directions, and measures TCP bandwidth through the negotiated ESP tunnel:
+The unit tests need no privileges, with two exceptions: `internal/kernel` has
+tests that write to a real routing table, and `internal/egress` one that writes
+into a real packet filter. Both unshare a network namespace and refuse to
+continue unless it is empty, and both skip unless run as root, on darwin unless
+`RANET_LITE_DARWIN_NETTEST=1` is also set, because that machine is on a live
+mesh. The `netlink` VM check runs both binaries as root against a real kernel,
+which is the only place the `nf_tables` encoding is checked against something
+other than the decoder it was written beside. Protocol-level interoperability is
+covered by the NixOS VM tests exposed by `flake.nix`. Each boots separate client
+and gateway VMs; the client runs the packaged, user-facing `ranet-lite` binary
+with a real TUN device, while the gateway runs `charon-systemd`/`swanctl`, BIRD,
+and iperf3. The default test verifies an Ed25519-authenticated IKEv2 and Child
+SA negotiation across asymmetric local and remote UDP ports, checks Babel route
+exchange in both directions, and measures TCP bandwidth through the negotiated
+ESP tunnel:
 
 ```sh
 nix build .#checks.x86_64-linux.integration -L

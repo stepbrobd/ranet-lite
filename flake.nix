@@ -47,15 +47,20 @@
                 # sandbox forbids by default
                 __darwinAllowLocalNetworking = true;
               });
-            # the internal/kernel test binary, to be run as root in a vm where
-            # the netlink round trips it holds are not skipped
+            # the internal/kernel and internal/egress test binaries, to be run
+            # as root in a vm where the netlink round trips they hold are not
+            # skipped
             netlinkTests = self'.packages.default.overrideAttrs (old: {
               pname = "ranet-lite-netlink-tests";
               buildPhase = ''
                 export HOME="$TMPDIR"
                 go test -c -o netlink-tests ./internal/kernel/
+                go test -c -o egress-tests ./internal/egress/
               '';
-              installPhase = ''install -Dm755 netlink-tests "$out/bin/netlink-tests"'';
+              installPhase = ''
+                install -Dm755 netlink-tests "$out/bin/netlink-tests"
+                install -Dm755 egress-tests "$out/bin/egress-tests"
+              '';
             });
           in
           {
