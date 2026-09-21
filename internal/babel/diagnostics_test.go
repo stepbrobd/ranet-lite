@@ -13,7 +13,7 @@ import (
 // announces, which is the half an operator checks first.
 func TestRouteDumpCarriesOriginatedPrefixes(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(Config{}, mesh)
+	speaker, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestRouteDumpCarriesOriginatedPrefixes(t *testing.T) {
 // destination the mesh can no longer reach.
 func TestRouteDumpReportsSelectionAndHolds(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(Config{}, mesh)
+	speaker, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestRouteDumpReportsSelectionAndHolds(t *testing.T) {
 // have a "not measured" state that zero cannot express.
 func TestNeighborStatsCarryBothDirections(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(Config{}, mesh)
+	speaker, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}

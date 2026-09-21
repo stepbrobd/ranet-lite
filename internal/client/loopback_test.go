@@ -155,32 +155,38 @@ func tryLoopbackMesh(t *testing.T) (_, _ *loopbackNode, err error) {
 // running client and the file a reload reads can never drift apart.
 func writeLoopbackConfig(t *testing.T, node, peer *loopbackNode, keyPath, registryPath string, originate []string) *config.Config {
 	t.Helper()
-	body := fmt.Sprintf(`organization: example
-common_name: %s
-port: %d
-endpoints:
-  - serial_number: "0"
-    address_family: ip4
-private_key: %s
-registry: %s
-# Both ends answer as well as dial, which is the full-mesh shape and the one
-# that produces a simultaneous open.
-responder: true
-peers:
-  - common_name: %s
-    serial_number: "0"
-babel:
-  hello_interval: 200ms
-  update_interval: 400ms
-originate:
-`, node.name, node.port, keyPath, registryPath, peer.name)
+	body := fmt.Sprintf(`node:
+  org: example
+  name: %s
+auth:
+  key: %s
+  trust: %s
+link:
+  port: %d
+  endpoints:
+    - serial: "0"
+      family: ip4
+  # Both ends answer as well as dial, which is the full mesh shape and the one
+  # that produces a simultaneous open.
+  listen: true
+dial:
+  to:
+    - name: %s
+      serial: "0"
+cap:
+  babel:
+    hello: 200ms
+    update: 400ms
+  route:
+    announce:
+`, node.name, keyPath, registryPath, node.port, peer.name)
 	for _, prefix := range originate {
-		body += fmt.Sprintf("  - %q\n", prefix)
+		body += fmt.Sprintf("      - %q\n", prefix)
 	}
 	if err := os.WriteFile(node.configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(node.configPath, "", "", false)
+	cfg, err := config.Load(node.configPath)
 	if err != nil {
 		t.Fatalf("%s: %v", node.name, err)
 	}
@@ -306,9 +312,9 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 		return ok && peer != nil
 	})
 
-	writeLoopbackConfig(t, alpha, bravo, alpha.cfg.PrivateKey, alpha.cfg.Registry,
+	writeLoopbackConfig(t, alpha, bravo, alpha.cfg.Auth.Key, alpha.cfg.Auth.Trust,
 		[]string{alpha.prefix.String(), added.String()})
-	if err := alpha.client.Reload(alpha.configPath, "", "", false); err != nil {
+	if err := alpha.client.Reload(alpha.configPath); err != nil {
 		t.Fatalf("adding an originated prefix was refused: %v", err)
 	}
 
@@ -349,7 +355,7 @@ func TestShutdownSaysNothingAboutReconnecting(t *testing.T) {
 	// bravo stays up, loses the node it was dialing and says it will retry,
 	// which is the correct thing for a node whose peer went away: counting its
 	// line as well failed this test in about one run in thirty.
-	dialingBravo := fmt.Sprintf("peer %s/%s", alpha.cfg.Organization, bravo.name)
+	dialingBravo := fmt.Sprintf("peer %s/%s", alpha.cfg.Node.Org, bravo.name)
 	var got []string
 	for _, line := range written.lines("reconnecting in") {
 		if strings.Contains(line, dialingBravo) {

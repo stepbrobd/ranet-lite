@@ -6,7 +6,7 @@ import (
 )
 
 func TestCostFormula(t *testing.T) {
-	p := CostParams{RxCost: 32, RTTMin: 0, RTTMax: 1024 * time.Millisecond, RTTCost: 1024}
+	p := CostParams{RxCost: 32, RTT: RTTCost{Max: dur(1024 * time.Millisecond), Weight: 1024}}
 
 	if c := p.Cost(0, false); c != 32 {
 		t.Errorf("no RTT sample: got %d, want 32", c)

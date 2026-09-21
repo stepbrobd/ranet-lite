@@ -118,7 +118,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 			}
 			if addr != nil {
 				address, ok := netip.AddrFromSlice(addr)
-				if !ok || address != s.cfg.LinkLocalAddr {
+				if !ok || address != s.linkLocal {
 					continue
 				}
 			}
@@ -237,7 +237,7 @@ func (s *Speaker) handlePacketLocked(n *neighborState, raw []byte, now time.Time
 				if route := s.routes.route(n, key); route != nil {
 					adv.routerID, adv.seqno = route.routerID, route.seqno
 				}
-			} else if routerID == s.cfg.RouterID {
+			} else if routerID == s.routerID {
 				// Our own router-id only ever reaches us back through the mesh,
 				// and we never re-advertise it, so this is a reflection.
 				continue
@@ -286,7 +286,7 @@ func (s *Speaker) routeReply(n *neighborState, request RouteRequest, now time.Ti
 	var tlvs []RawTLV
 	var rollback []tlvUndo
 	if request.AE == AEWildcard {
-		if !n.lastFullDump.IsZero() && now.Sub(n.lastFullDump) < s.cfg.UpdateInterval {
+		if !n.lastFullDump.IsZero() && now.Sub(n.lastFullDump) < s.update {
 			return nil
 		}
 		// Taken now, so forty requests in one packet draw one dump, and not
@@ -324,7 +324,7 @@ func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Ti
 		// 8966 section 3.2.2 asks a node not to raise its own sequence number
 		// spontaneously, and every raise re-dirties everything this node
 		// originates.
-		if request.RouterID == s.cfg.RouterID && seqnoGT(request.Seqno, s.originSeqno) && !s.raisedSeqno {
+		if request.RouterID == s.routerID && seqnoGT(request.Seqno, s.originSeqno) && !s.raisedSeqno {
 			s.raisedSeqno = true
 			s.originSeqno++
 			// Everything we originate carries the new sequence number, so the
@@ -345,7 +345,7 @@ func (s *Speaker) seqnoReply(n *neighborState, request SeqnoRequest, now time.Ti
 			return sendTLVs(n, key, advertised, spent)
 		}
 	}
-	if request.RouterID == s.cfg.RouterID || request.HopCount < 2 {
+	if request.RouterID == s.routerID || request.HopCount < 2 {
 		return nil // no other node can raise this node's sequence number
 	}
 	target := s.forwardTarget(key, n)

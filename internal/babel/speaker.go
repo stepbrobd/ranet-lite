@@ -32,7 +32,6 @@ package babel
 import (
 	"cmp"
 	"context"
-	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -133,7 +132,17 @@ type starveRetry struct {
 // Packet transmission always happens after unlocking: a slow peer cannot
 // prevent a route retraction, and in-memory transports may re-enter Receive.
 type Speaker struct {
-	cfg  Config
+	// The capability as resolved at construction: the intervals and the cost
+	// with their defaults filled in, the runtime the caller supplied, and
+	// whether this node relays what it learns. Every one of them is read-only
+	// for the life of the speaker, so a change to any of them is a restart.
+	hello, update time.Duration
+	cost          CostParams
+	routerID      [8]byte
+	linkLocal     netip.Addr
+	packetSize    int
+	noTransit     bool
+
 	mesh *netstack.Mesh
 
 	mu           sync.Mutex
@@ -218,19 +227,28 @@ func (h *PeerHandle) Close() {
 	}
 }
 
-func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
+// New builds the speaker from the two capabilities that configure it and the
+// runtime the caller resolved. cap.route is taken here as well as by
+// SetRoutes, because whether this node relays is read while a packet is being
+// built and is therefore fixed for the speaker's life, while the
+// announcements are not.
+func New(cfg Config, routes Routes, rt Runtime, mesh *netstack.Mesh) (*Speaker, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	cfg.setDefaults()
-	if cfg.RouterID == ([8]byte{}) {
-		rand.Read(cfg.RouterID[:])
+	if err := routes.Validate(); err != nil {
+		return nil, err
 	}
-	if !cfg.LinkLocalAddr.IsValid() {
-		cfg.LinkLocalAddr = randomLinkLocal()
+	rt, err := rt.resolve()
+	if err != nil {
+		return nil, err
 	}
 	s := &Speaker{
-		cfg: cfg, mesh: mesh,
+		hello: cfg.HelloInterval(), update: cfg.UpdateInterval(), cost: cfg.CostEffective(),
+		routerID: rt.RouterID, linkLocal: rt.LinkLocalAddr, packetSize: rt.PacketSize,
+		noTransit: !routes.Transits(),
+		mesh:      mesh,
+
 		neighbors:      make(map[string]*neighborState),
 		originate:      make(map[routeKey]struct{}),
 		pendingSeqno:   make(map[sourceKey]pendingSeqno),
@@ -242,13 +260,14 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 		changed:        make(chan struct{}, 1),
 	}
 	s.routes = newRouteTable(s.installRoute)
-	s.routes.cost = s.cfg.Cost
+	s.routes.cost = s.cost
 	s.routes.forget = func(key routeKey) { s.mesh.Routes.Remove(key.source, key.dest) }
 	// RFC 8966 Appendix A.3 recommends a hysteresis time constant of a small
 	// multiple of the Hello interval. One link's base cost is the scale at
 	// which a metric change is worth a triggered update rather than a wait for
 	// the next periodic dump.
-	s.routes.tau, s.routes.trigger = 3*cfg.HelloInterval, cfg.Cost.RxCost
+	s.routes.tau, s.routes.trigger = 3*s.hello, s.cost.RxCost
+	s.SetRoutes(routes)
 	return s, nil
 }
 
@@ -292,7 +311,7 @@ func (s *Speaker) Receive(peer *netstack.Peer, raw []byte) bool {
 	if !isBabelPacket(raw) {
 		return false
 	}
-	src, payload, err := parsePacket(raw, s.cfg.LinkLocalAddr)
+	src, payload, err := parsePacket(raw, s.linkLocal)
 	if err != nil {
 		return false
 	}
@@ -356,6 +375,11 @@ func (s *Speaker) adoptOriginatedLocked(key routeKey) {
 func (s *Speaker) releaseOriginatedLocked(key routeKey) {
 	s.mesh.Routes.Remove(key.source, key.dest)
 }
+
+// SetRoutes applies the cap.route capability, which a reload may replace. Only
+// the announcements are read: whether this node relays was taken at
+// construction and a reload refuses a change to it, see New.
+func (s *Speaker) SetRoutes(routes Routes) { s.SetOriginated(routes.Originated()) }
 
 // SetOriginated replaces the whole originated set, as a
 // configuration reload needs: a prefix that is no longer configured has to be
@@ -512,7 +536,7 @@ func (s *Speaker) noteSendRetryLocked(now time.Time) {
 // not send. Read from cfg, which New settles and nothing writes afterwards, so
 // the sender goroutine may ask too.
 func (s *Speaker) sendRetryInterval() time.Duration {
-	return max(s.cfg.HelloInterval/4, time.Millisecond)
+	return max(s.hello/4, time.Millisecond)
 }
 
 // deadlineLocked is when the run loop next has to do something on its own,
@@ -572,7 +596,7 @@ func (s *Speaker) Run(ctx context.Context) error {
 		var actions []sendAction
 		helloDue := !now.Before(s.nextHello)
 		if helloDue {
-			s.nextHello = now.Add(s.cfg.HelloInterval)
+			s.nextHello = now.Add(s.hello)
 		}
 		for _, n := range s.neighbors {
 			if helloDue || !n.sentHello {
@@ -583,7 +607,7 @@ func (s *Speaker) Run(ctx context.Context) error {
 			actions = append(actions, s.updateActions(now)...)
 			s.updatePending = false
 			if !now.Before(s.nextUpdate) {
-				s.nextUpdate = now.Add(s.cfg.UpdateInterval)
+				s.nextUpdate = now.Add(s.update)
 			}
 		} else {
 			actions = append(actions, s.triggeredActions(now)...)
@@ -835,7 +859,7 @@ func (s *Speaker) Stats() Stats {
 			Peer:             neighbor.peer.ID,
 			Addr:             neighbor.addr,
 			Alive:            neighbor.isAlive(now),
-			Cost:             neighbor.linkCost(now, s.cfg.Cost),
+			Cost:             neighbor.linkCost(now, s.cost),
 			ReportedCost:     neighbor.reportedCost,
 			HaveReportedCost: neighbor.haveReportedCost,
 			RTT:              neighbor.measuredRTT,

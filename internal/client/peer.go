@@ -31,13 +31,13 @@ func (c *Client) reconnectDelay() time.Duration {
 // than requiring a manual restart.
 func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Peer) {
 	reg := c.registry()
-	name := fmt.Sprintf("%s/%s@%s", p.Organization, p.CommonName, local.SerialNumber)
+	name := fmt.Sprintf("%s/%s@%s", p.Org, p.Name, local.Serial)
 	// A node the registry does not name is not dialed at all. The check runs
 	// whether or not the peer pins a serial number: without it a peer that
 	// pins none enters the retry loop and logs the same lookup failure every
 	// reconnect delay for the life of the process, which a decommissioned
 	// entry left in peers: does.
-	_, node, ok := reg.FindNode(p.Organization, p.CommonName)
+	_, node, ok := reg.FindNode(p.Org, p.Name)
 	if !ok {
 		log.Printf("peer %s: node not found", name)
 		return
@@ -50,24 +50,24 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 	// ordinary configuration: without this the v4 dialer for a v6-only peer
 	// logs the same resolution failure every reconnect delay for the life of
 	// the process.
-	if p.SerialNumber != "" {
-		ep, ok := node.FindEndpoint(p.SerialNumber)
+	if p.Serial != "" {
+		ep, ok := node.FindEndpoint(p.Serial)
 		if !ok {
-			log.Printf("peer %s: endpoint serial %q not found", name, p.SerialNumber)
+			log.Printf("peer %s: endpoint serial %q not found", name, p.Serial)
 			return
 		}
-		if ep.AddressFamily != local.AddressFamily {
-			log.Printf("peer %s: endpoint serial %q is %s, not %s", name, p.SerialNumber, ep.AddressFamily, local.AddressFamily)
+		if ep.AddressFamily != local.Family {
+			log.Printf("peer %s: endpoint serial %q is %s, not %s", name, p.Serial, ep.AddressFamily, local.Family)
 			return
 		}
 		if !ep.Dialable() {
-			log.Printf("peer %s: endpoint serial %q carries no address", name, p.SerialNumber)
+			log.Printf("peer %s: endpoint serial %q carries no address", name, p.Serial)
 			return
 		}
 	} else if !slices.ContainsFunc(node.Endpoints, func(ep registry.Endpoint) bool {
-		return ep.AddressFamily == local.AddressFamily && ep.Dialable()
+		return ep.AddressFamily == local.Family && ep.Dialable()
 	}) {
-		slog.Debug("peer has no endpoint carrying an address in this address family", "peer", name, "family", local.AddressFamily)
+		slog.Debug("peer has no endpoint carrying an address in this address family", "peer", name, "family", local.Family)
 		return
 	}
 	var failure repeatedFailure
@@ -82,7 +82,7 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 		// also makes Reload's "so nothing will dial it" true, which it was not
 		// while syncPeers kept the dialer alive. forgetDialer drops the map
 		// entry, so the next reload starts a new one if the node comes back.
-		if _, _, ok := c.registry().FindNode(p.Organization, p.CommonName); !ok {
+		if _, _, ok := c.registry().FindNode(p.Org, p.Name); !ok {
 			log.Printf("peer %s: no longer in the registry, giving up", name)
 			return
 		}
@@ -177,11 +177,12 @@ func resolveEndpoint(ctx context.Context, node registry.Node, serial, family str
 // the connection is gone; runPeer decides whether/when to retry.
 func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p config.Peer, name string) error {
 	cfg, reg := c.config(), c.registry()
-	org, node, ok := reg.FindNode(p.Organization, p.CommonName)
+	crypto := cfg.Crypto()
+	org, node, ok := reg.FindNode(p.Org, p.Name)
 	if !ok {
-		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)
+		return fmt.Errorf("node %q not found in organization %q", p.Name, p.Org)
 	}
-	ep, remoteIP, err := resolveEndpoint(ctx, node, p.SerialNumber, local.AddressFamily)
+	ep, remoteIP, err := resolveEndpoint(ctx, node, p.Serial, local.Family)
 	if err != nil {
 		return err
 	}
@@ -189,7 +190,7 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	if err != nil {
 		return err
 	}
-	sessionName := fmt.Sprintf("%s/%s/%s@%s", p.Organization, p.CommonName, ep.SerialNumber, local.SerialNumber)
+	sessionName := fmt.Sprintf("%s/%s/%s@%s", p.Org, p.Name, ep.SerialNumber, local.Serial)
 	if c.sessions.holds(sessionName) {
 		// The peer already reached us over this same pair of endpoints. Dialing
 		// anyway opens a second SA that one end or the other has to resolve
@@ -200,30 +201,30 @@ func (c *Client) connectPeer(ctx context.Context, local config.Endpoint, p confi
 	log.Printf("peer %s: dialing %s:%d", sessionName, remoteIP, ep.Port)
 
 	ikeCfg := ike.PeerConfig{
-		Organization:       cfg.Organization,
-		LocalCommonName:    cfg.CommonName,
-		LocalSerial:        local.SerialNumber,
+		Organization:       cfg.Node.Org,
+		LocalCommonName:    cfg.Node.Name,
+		LocalSerial:        local.Serial,
 		LocalPrivateKey:    c.privateKey,
 		RemoteCommonName:   node.CommonName,
-		RemoteOrganization: p.Organization,
+		RemoteOrganization: p.Org,
 		RemoteSerial:       ep.SerialNumber,
 		RemotePublicKey:    remotePub,
 		RemoteAddr:         remoteIP,
 		RemotePort:         int(ep.Port),
 		Hub:                c.hub,
-		ChildRekeyInterval: cfg.ChildRekeyIntervalValue(),
-		IKERekeyInterval:   cfg.IKERekeyIntervalValue(),
-		RekeyMargin:        cfg.RekeyMarginValue(),
-		RekeyJitter:        cfg.RekeyJitterValue(),
-		RekeyRetryInitial:  cfg.RekeyRetryInitialValue(),
-		RekeyRetryMax:      cfg.RekeyRetryMaxValue(),
+		ChildRekeyInterval: crypto.ChildInterval(),
+		IKERekeyInterval:   crypto.IKEInterval(),
+		RekeyMargin:        crypto.Margin(),
+		RekeyJitter:        crypto.Jitter(),
+		RekeyRetryInitial:  crypto.RetryFirst(),
+		RekeyRetryMax:      crypto.RetryMax(),
 	}
 	sess, err := ike.InitiateContext(ctx, ikeCfg)
 	if err != nil {
 		return fmt.Errorf("handshake: %w", err)
 	}
-	localIdentity := ike.Identity{Organization: cfg.Organization, CommonName: cfg.CommonName, SerialNumber: local.SerialNumber}
-	remoteIdentity := ike.Identity{Organization: p.Organization, CommonName: node.CommonName, SerialNumber: ep.SerialNumber}
+	localIdentity := ike.Identity{Organization: cfg.Node.Org, CommonName: cfg.Node.Name, SerialNumber: local.Serial}
+	remoteIdentity := ike.Identity{Organization: p.Org, CommonName: node.CommonName, SerialNumber: ep.SerialNumber}
 	return c.serveSession(ctx, sess, name, sessionName, localIdentity, remoteIdentity, remoteIdentity)
 }
 

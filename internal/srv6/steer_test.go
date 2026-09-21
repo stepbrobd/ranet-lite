@@ -5,9 +5,29 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
+
+	"github.com/NickCao/ranet-lite/internal/schema"
 )
 
-func prefix(s string) netip.Prefix { return netip.MustParsePrefix(s) }
+// The file spellings of the two, for an entry of the capability itself.
+func sprefix(s string) schema.Prefix { return schema.MustPrefix(s) }
+func saddr(s string) schema.Addr     { return schema.MustAddr(s) }
+
+// steering is one entry as the file spells it: the selector, the outer source
+// and the segments it visits.
+func steering(from, to string, source string, path ...string) Steer {
+	entry := Steer{Source: saddr(source)}
+	if from != "" {
+		entry.From = sprefix(from)
+	}
+	if to != "" {
+		entry.To = sprefix(to)
+	}
+	for _, hop := range path {
+		entry.Via = append(entry.Via, saddr(hop))
+	}
+	return entry
+}
 
 func policy(source string, path ...string) Policy {
 	segments := make([]netip.Addr, 0, len(path))
@@ -27,7 +47,7 @@ func TestNoSteeringTableClaimsNothing(t *testing.T) {
 	if absent.Overhead() != 0 || absent.Entries() != nil {
 		t.Error("a nil table reported entries")
 	}
-	table, err := NewSteerTable(nil)
+	table, err := NewSteerTable(nil, schema.Addr{})
 	if err != nil || table != nil {
 		t.Errorf("an empty configuration produced %v (%v), want no table at all", table, err)
 	}
@@ -38,7 +58,9 @@ func TestNoSteeringTableClaimsNothing(t *testing.T) {
 // exactly the packets it reaches there.
 func TestSourceSelectorClaimsOnlyItsOwnTraffic(t *testing.T) {
 	announced := policy("3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1")
-	table, err := NewSteerTable([]Steer{{From: prefix("3fff:a::198:18:104:117/128"), Policy: announced}})
+	table, err := NewSteerTable([]Steer{
+		steering("3fff:a::198:18:104:117/128", "", "3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1"),
+	}, schema.Addr{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,22 +83,42 @@ func TestSourceSelectorClaimsOnlyItsOwnTraffic(t *testing.T) {
 // An entry that selects on nothing would claim the encapsulated packets this
 // node has just produced, which would then be encapsulated again.
 func TestSteeringRefusesWhatWouldClaimItsOwnEncapsulation(t *testing.T) {
-	via := policy("3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1")
+	const source, exit = "3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1"
 	for name, entry := range map[string]Steer{
-		"no selector":    {Policy: via},
-		"no segments":    {From: prefix("2001:db8::/32"), Policy: Policy{Source: addr("3fff:1:69c:8c0::1")}},
-		"a v4 source":    {From: prefix("10.0.0.0/8"), Policy: policy("198.18.104.117", "3fff:1:69c:98d6::1")},
-		"a v4 segment":   {From: prefix("2001:db8::/32"), Policy: policy("3fff:1:69c:8c0::1", "198.18.104.117")},
-		"mixed families": {From: prefix("2001:db8::/32"), To: prefix("10.0.0.0/8"), Policy: via},
+		"no selector":    steering("", "", source, exit),
+		"no segments":    steering("2001:db8::/32", "", source),
+		"a v4 source":    steering("10.0.0.0/8", "", "198.18.104.117", exit),
+		"a v4 segment":   steering("2001:db8::/32", "", source, "198.18.104.117"),
+		"mixed families": steering("2001:db8::/32", "10.0.0.0/8", source, exit),
 		// A v4-mapped prefix goes into the IPv6 half of the trie while a v4
 		// packet is looked up in the v4 half, so it would never match.
-		"a v4-mapped selector": {To: prefix("::ffff:10.0.0.0/104"), Policy: via},
+		"a v4-mapped selector": steering("", "::ffff:10.0.0.0/104", source, exit),
+		// A selector carrying bits below its length steers a whole prefix
+		// where one address was meant, and says nothing.
+		"host bits under a length": steering("2001:db8::1/32", "", source, exit),
+		// Neither the entry nor the block names an outer source, so there is
+		// nothing to send the encapsulation from.
+		"no source at all": {From: sprefix("2001:db8::/32"), Via: []schema.Addr{saddr(exit)}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewSteerTable([]Steer{entry}); err == nil {
+			if _, err := NewSteerTable([]Steer{entry}, schema.Addr{}); err == nil {
 				t.Errorf("%s was accepted", name)
 			}
 		})
+	}
+}
+
+// An entry naming no source of its own takes the block's, which is how the
+// fleet's one `ip sr tunsrc` per node carries over.
+func TestSteeringEntryInheritsTheBlockSource(t *testing.T) {
+	entry := Steer{From: sprefix("2001:db8::/32"), Via: []schema.Addr{saddr("3fff:1:69c:98d6::1")}}
+	table, err := NewSteerTable([]Steer{entry}, saddr("3fff:1:69c:8c0::1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := table.Lookup(addr("2001:db8::5"), addr("2001:4860:4860::8888"))
+	if got == nil || got.Source != addr("3fff:1:69c:8c0::1") {
+		t.Errorf("the entry was steered from %v", got)
 	}
 }
 
@@ -84,24 +126,22 @@ func TestSteeringRefusesWhatWouldClaimItsOwnEncapsulation(t *testing.T) {
 // disagree, and the trie keeps one of them while a diagnostic prints both. The
 // local segment table and the rule list both refuse the same shape.
 func TestSteeringRefusesTwoEntriesWithOneSelector(t *testing.T) {
-	first := policy("3fff:1:69c:8c0::1", "3fff:1:69c:98d6::1")
-	second := policy("3fff:1:69c:8c0::1", "3fff:1:69c:6c46::1")
+	const source = "3fff:1:69c:8c0::1"
+	first := steering("2001:db8::/32", "", source, "3fff:1:69c:98d6::1")
+	second := steering("2001:db8::/32", "", source, "3fff:1:69c:6c46::1")
 	for name, entries := range map[string][]Steer{
-		"written the same way": {
-			{From: prefix("2001:db8::/32"), Policy: first},
-			{From: prefix("2001:db8::/32"), Policy: second},
-		},
+		"written the same way": {first, second},
 		// An omitted destination and one written out as the zero-length
 		// prefix are two spellings of one trie key, so keying the check on
 		// what was written rather than on what the trie stores lets the
 		// second entry quietly replace the first.
 		"an omitted destination against an explicit one": {
-			{From: prefix("2001:db8::/32"), Policy: first},
-			{From: prefix("2001:db8::/32"), To: prefix("::/0"), Policy: second},
+			first,
+			steering("2001:db8::/32", "::/0", source, "3fff:1:69c:6c46::1"),
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewSteerTable(entries); err == nil {
+			if _, err := NewSteerTable(entries, schema.Addr{}); err == nil {
 				t.Error("two entries selecting the same packets were accepted")
 			}
 		})

@@ -1,7 +1,7 @@
 // Command ranet-lite connects a real TUN device to a ranet mesh through
 // userspace IKEv2/ESP and an embedded Babel speaker. Babel exchanges control
-// packets inside ESP. Address and kernel route configuration are external
-// unless the kernel block in the config file turns the reconciler on.
+// packets inside ESP. Address and route configuration are external unless the
+// file carries a cap.table block, which turns the route reconciler on.
 //
 // `ranet-lite daemon` is the node. Every other subcommand reads a running
 // one's control socket; see cli.go.
@@ -15,15 +15,12 @@ import (
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
-	"net/netip"
 	"os"
 	"os/signal"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -57,9 +54,6 @@ func (e exitCode) Error() string { return fmt.Sprintf("exit status %d", int(e)) 
 // options is the daemon's command line after parsing.
 type options struct {
 	configPath         string
-	registryPath       string
-	privateKeyPath     string
-	fullMesh           bool
 	pprofAddr          string
 	metricsAddr        string
 	controlPath        string
@@ -88,10 +82,7 @@ func daemonCommand() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVarP(&o.configPath, "config", "c", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
-	f.StringVar(&o.registryPath, "registry", "", "path to registry.json, overriding the config file; ranet spells it this way and its own config carries no such field")
-	f.StringVar(&o.privateKeyPath, "key", "", "path to the PKCS8 PEM Ed25519 private key, overriding the config file; ranet spells it this way and its own config carries no such field")
-	f.BoolVar(&o.fullMesh, "full-mesh", false, "dial every node the registry names, as ranet does; its own config file has no field to ask for this")
+	f.StringVarP(&o.configPath, "config", "c", "/etc/ranet-lite/config.toml", "path to the ranet-lite config file, .toml, .yaml, .yml or .json")
 	f.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
 	f.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
 	f.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
@@ -137,7 +128,7 @@ func runDaemon(opts options) int {
 		}()
 	}
 
-	cfg, err := config.Load(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return refuseToStart(err)
 	}
@@ -199,22 +190,26 @@ func runDaemon(opts options) int {
 			case <-ctx.Done():
 				return
 			case <-reload:
-				if err := node.Reload(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh); err != nil {
+				if err := node.Reload(*configPath); err != nil {
 					log.Printf("reload: %v", err)
 				}
 			}
 		}
 	}()
 
-	// The reconciler is opt-in, so an existing deployment keeps configuring
-	// the device externally.
+	// The reconciler is one capability, so a deployment that configures its
+	// device externally writes no cap.table and gets none of this.
 	var reconciler sync.WaitGroup
-	if cfg.Kernel.Enabled {
-		kernelCfg, err := kernelConfig(cfg, mesh.Name, node.Underlay)
-		if err != nil {
-			return refuseToStart(err)
+	if table := cfg.Cap.Table; table != nil {
+		// What the file could not say: the device the mesh actually got, the
+		// addresses the transport has to keep reaching, and the prefixes
+		// cap.route announces, which assign_announced puts on that device.
+		runtime := kernel.Runtime{
+			Interface: mesh.Name,
+			Underlay:  node.Underlay,
+			Announced: cfg.Routes().Announced(),
 		}
-		routes, err := kernel.New(kernelCfg, mesh.Routes)
+		routes, err := kernel.New(*table, runtime, mesh.Routes)
 		if err != nil {
 			return refuseToStart(err)
 		}
@@ -326,101 +321,19 @@ func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force fun
 	force()
 }
 
-// kernelRules turns the config file's rules into the reconciler's, resolving
-// each one's address family. A rule that names neither a destination nor a
-// source selects on a mark alone, which belongs to no family, so it says which
-// one it is for; "both" is written once and installed twice, because that is
-// what keeping an underlay out of a mesh table needs and writing it twice by
-// hand is how one of the two goes missing.
-//
-// Everything the reconciler itself judges is left to Rule.validate, so the one
-// place that decides what a rule may say is the one that installs it.
-func kernelRules(rules []config.Rule) ([]kernel.Rule, error) {
-	var out []kernel.Rule
-	for _, rule := range rules {
-		to, err := rulePrefix("to", rule.To)
-		if err != nil {
-			return nil, err
-		}
-		from, err := rulePrefix("from", rule.From)
-		if err != nil {
-			return nil, err
-		}
-		families, err := ruleFamilies(rule, to, from)
-		if err != nil {
-			return nil, err
-		}
-		for _, family := range families {
-			out = append(out, kernel.Rule{
-				Family:   family,
-				To:       to,
-				From:     from,
-				FWMark:   rule.FWMark,
-				FWMask:   rule.FWMask,
-				Table:    uint32(rule.Table),
-				Priority: rule.Priority,
-			})
-		}
-	}
-	return out, nil
-}
-
-// ruleFamilies is the families one configured rule installs for. An address
-// already says which family it belongs to, so naming one as well is refused
-// rather than silently resolved one way or the other.
-func ruleFamilies(rule config.Rule, to, from netip.Prefix) ([]uint8, error) {
-	addressed := to.IsValid() || from.IsValid()
-	named := strings.ToLower(rule.Family)
-	if addressed && named != "" {
-		return nil, fmt.Errorf("config: kernel rule at priority %d names family %q and an address, which already says which family it is", rule.Priority, rule.Family)
-	}
-	if addressed {
-		address := to.Addr()
-		if !to.IsValid() {
-			address = from.Addr()
-		}
-		if address.Is4() {
-			return []uint8{kernel.FamilyIPv4}, nil
-		}
-		return []uint8{kernel.FamilyIPv6}, nil
-	}
-	switch named {
-	case "ipv4":
-		return []uint8{kernel.FamilyIPv4}, nil
-	case "ipv6":
-		return []uint8{kernel.FamilyIPv6}, nil
-	case "both":
-		return []uint8{kernel.FamilyIPv4, kernel.FamilyIPv6}, nil
-	case "":
-		return nil, fmt.Errorf("config: kernel rule at priority %d selects on a mark alone, so it has to name family: ipv4, ipv6 or both", rule.Priority)
-	}
-	return nil, fmt.Errorf("config: kernel rule at priority %d: family %q is not ipv4, ipv6 or both", rule.Priority, rule.Family)
-}
-
-func rulePrefix(name, raw string) (netip.Prefix, error) {
-	if raw == "" {
-		return netip.Prefix{}, nil
-	}
-	prefix, err := netip.ParsePrefix(raw)
-	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("config: kernel rule %s %q: %w", name, raw, err)
-	}
-	return prefix, nil
-}
-
 // kernelStatus is the reconciler as the control surface reports it: what it
 // was configured to own and what its last pass did. The configuration half
-// comes from the resolved kernel.Config rather than from the config file, so
-// the defaults the reconciler filled in are the ones reported.
+// comes from the capability the reconciler resolved rather than from the file,
+// so the defaults it filled in are the ones reported.
 func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
-	cfg, stats := routes.Config(), routes.Stats()
+	table, stats := routes.Table(), routes.Stats()
 	return control.KernelStatus{
 		Enabled:   true,
 		Where:     routes.Where(),
-		Table:     cfg.Table,
-		Protocol:  cfg.Protocol,
-		Metric:    cfg.Metric,
-		VRF:       cfg.VRF,
+		Table:     uint32(table.ID),
+		Protocol:  table.Proto,
+		Metric:    table.Metric,
+		VRF:       table.Name(),
 		PassAt:    stats.At,
 		Installed: stats.Installed,
 		Skipped:   stats.Skipped,
@@ -428,41 +341,4 @@ func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
 		Removed:   stats.Removed,
 		Err:       stats.Err,
 	}
-}
-
-// kernelConfig resolves the config file's kernel block against the device the
-// mesh actually got and the prefixes this node originates. The addresses are
-// parsed here rather than in config.Load, so the reconciler's own validation
-// in kernel.New stays the single place that decides what it accepts.
-func kernelConfig(cfg *config.Config, device string, underlay func() []netip.Addr) (kernel.Config, error) {
-	rules, err := kernelRules(cfg.Kernel.Rules)
-	if err != nil {
-		return kernel.Config{}, err
-	}
-	out := kernel.Config{
-		Interface: device,
-		Underlay:  underlay,
-		Table:     cfg.Kernel.Table,
-		Protocol:  cfg.Kernel.Protocol,
-		Metric:    cfg.Kernel.Metric,
-		VRF:       cfg.Kernel.VRF,
-		CreateVRF: cfg.Kernel.CreateVRF,
-		Rules:     rules,
-	}
-	if cfg.Kernel.ReconcileInterval != nil {
-		out.ReconcileInterval = time.Duration(*cfg.Kernel.ReconcileInterval)
-	}
-	if raw := cfg.Kernel.PrefSrc4; raw != "" {
-		address, err := netip.ParseAddr(raw)
-		if err != nil {
-			return kernel.Config{}, fmt.Errorf("config: kernel.prefsrc4 %q: %w", raw, err)
-		}
-		out.PrefSrc4 = address
-	}
-	addresses, err := cfg.KernelAddresses()
-	if err != nil {
-		return kernel.Config{}, err
-	}
-	out.Addresses = addresses
-	return out, nil
 }

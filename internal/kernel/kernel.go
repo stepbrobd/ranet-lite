@@ -2,13 +2,13 @@
 // table, taking over from the BIRD kernel protocols a ranet deployment runs
 // today. It is a one-way reconciler: internal/netstack keeps owning the
 // forwarding decision and this package only teaches the kernel which packets
-// to hand to the TUN, so every route it installs points at Config.Interface
+// to hand to the TUN, so every route it installs points at the device
 // and the peer in a snapshot entry never selects a kernel next hop.
 //
 // # Ownership
 //
-// On linux, every route this package installs lives in Config.Table, carries
-// rt_proto Config.Protocol and points out of Config.Interface. Those three
+// On linux, every route this package installs lives in the table cap.table names,
+// carries its rt_proto and points out of the mesh device. Those three
 // together are the ownership marker. darwin has neither tables nor rt_proto,
 // so ownership there is the interface and the shape of the route; see
 // platform_darwin.go. The reconciler reads back only routes matching
@@ -22,7 +22,7 @@
 // wants them.
 //
 // Installation asks for the route exclusively, so a key another writer already
-// holds in Config.Table is left alone and reported once rather than taken
+// holds in that table is left alone and reported once rather than taken
 // over. A replace would compare neither rtm_protocol nor the route type, which
 // matters most in a VRF table: the kernel's own local and connected entries
 // for an address on an enslaved link sit at priority 0, where an IPv4 route
@@ -34,7 +34,7 @@
 // reconciler added itself, in this process lifetime, is ever removed again;
 // an address that was already on the link belongs to whoever put it there.
 // The link is enslaved only when it has no master at all, so the reconciler
-// never takes Config.Interface away from systemd-networkd or anything else
+// never takes the device away from systemd-networkd or anything else
 // that claimed it first.
 //
 // # Failure
@@ -61,7 +61,9 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/sadr"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -113,49 +115,196 @@ var ErrUnsupported = errors.New("kernel: route reconciliation is unsupported on 
 // on the next pass, because the route stays in the diff until it is there.
 var errRouteSkipped = errors.New("kernel: route was not installed")
 
-type Config struct {
-	// Interface is the TUN device every installed route points at, named as
-	// the kernel named it (netstack.Mesh.Name, not the requested name).
-	Interface string
-	// Table is the routing table the reconciler owns. Zero uses DefaultTable.
-	Table uint32
-	// Protocol is the rt_proto marking this reconciler's routes. Zero uses
+// Table is the cap.table capability, parsed straight out of the file: the
+// routing table this reconciler owns and everything it writes into it.
+// Writing the block turns the reconciler on, so a deployment configuring its
+// routes externally writes no cap.table and gets no reconciler. Every field is checked by Validate, which the loader calls, and
+// again by New.
+type Table struct {
+	// ID is the routing table the reconciler owns; the fleet uses 200, the
+	// table its policy rules and its End.DT46 look up. Zero uses DefaultTable.
+	ID schema.TableID `yaml:"id,omitempty" json:"id,omitempty" toml:"id,omitempty"`
+	// Proto is the rt_proto stamped on every installed route, and the marker
+	// separating this reconciler's routes from everyone else's. Zero uses
 	// DefaultProtocol.
-	Protocol uint8
+	Proto uint8 `yaml:"proto,omitempty" json:"proto,omitempty" toml:"proto,omitempty"`
 	// Metric is RTA_PRIORITY. Zero takes the kernel's own default, which is 0
-	// for IPv4 and 1024 for IPv6. BIRD's kernel protocols use 32.
-	Metric uint32
+	// for IPv4 and 1024 for IPv6. Do not set it to BIRD's 32 while BIRD is
+	// still exporting to the same table: both daemons would then key on the
+	// same prefix and priority, and since an install refuses a key another
+	// writer holds rather than taking it over, whichever daemon got there
+	// first keeps the prefix and the other loses it quietly.
+	Metric uint32 `yaml:"metric,omitempty" json:"metric,omitempty" toml:"metric,omitempty"`
 	// PrefSrc4 is RTA_PREFSRC on every installed IPv4 route, the attribute
 	// BIRD sets from krt_prefsrc. IPv6 routes carry no preferred source;
 	// source-specific IPv6 routes carry RTA_SRC instead.
-	PrefSrc4 netip.Addr
-	// Addresses are assigned to Interface when absent and removed again at
-	// shutdown. Empty leaves the link's addresses to the operator.
-	Addresses []netip.Prefix
-	// VRF enslaves Interface to that master device, but only while the link
-	// has no master yet. Empty leaves the link's master alone.
-	VRF string
-	// CreateVRF makes the device VRF names when no device of that name
-	// exists, bound to Table, rather than expecting the host's network
-	// manager to have made it. One this reconciler created is removed again
-	// at shutdown; one it found is left alone, the same rule addresses follow.
-	CreateVRF bool
-	// Rules are the policy rules this reconciler owns. Each carries Protocol
-	// in FRA_PROTOCOL, the same ownership marker routes carry, so a dump
-	// reads back only these and a delete can never reach another writer's.
-	// They are withdrawn at shutdown as the routes are: a rule pointing into
-	// an empty table costs only a lookup, and one left behind sends traffic
-	// to a table nothing is writing any more.
-	Rules []Rule
-	// ReconcileInterval is the periodic sweep. Zero uses
-	// DefaultReconcileInterval.
-	ReconcileInterval time.Duration
+	PrefSrc4 schema.Addr `yaml:"prefsrc4,omitempty" json:"prefsrc4,omitempty" toml:"prefsrc4,omitempty"`
+	// Addresses are assigned to the device when absent and removed again at
+	// shutdown; only addresses the reconciler added itself are ever removed.
+	Addresses []schema.Prefix `yaml:"addresses,omitempty" json:"addresses,omitempty" toml:"addresses,omitempty"`
+	// AssignAnnounced assigns every prefix cap.route announces as well, which
+	// is the locally originated address an operator otherwise configures by
+	// hand. A default is announced and never assigned, so it is skipped.
+	AssignAnnounced bool `yaml:"assign_announced,omitempty" json:"assign_announced,omitempty" toml:"assign_announced,omitempty"`
+	// VRF enslaves the device to a master, and optionally creates it. Absent
+	// leaves the link's master alone.
+	VRF *VRF `yaml:"vrf,omitempty" json:"vrf,omitempty" toml:"vrf,omitempty"`
+	// Rules are the policy rules this reconciler owns, in the order written.
+	// Each carries Proto in FRA_PROTOCOL, the same ownership marker routes
+	// carry, so a dump reads back only these and a delete can never reach
+	// another writer's. They are withdrawn at shutdown as the routes are: a
+	// rule pointing into an empty table costs only a lookup, and one left
+	// behind sends traffic to a table nothing is writing any more. linux only:
+	// darwin has one forwarding table and no rules, and a mobile tunnel
+	// provider is handed a route list rather than a table, so a configuration
+	// asking for one there is refused by name.
+	Rules []Rule `yaml:"rules,omitempty" json:"rules,omitempty" toml:"rules,omitempty"`
+	// Reconcile is the periodic sweep correcting drift nothing announced.
+	// Zero uses DefaultReconcileInterval.
+	Reconcile schema.Duration `yaml:"reconcile,omitempty" json:"reconcile,omitempty" toml:"reconcile,omitempty"`
+}
+
+// VRF is the master device the mesh table is bound to.
+type VRF struct {
+	// Name is the device the reconciler enslaves its interface to, and only
+	// while that link has no master, so networkd keeps whatever it claimed.
+	Name string `yaml:"name" json:"name" toml:"name"`
+	// Create makes that device when nothing of the name exists, bound to the
+	// table above, so a deployment does not need its host's network manager to
+	// make it first. One this process created is removed again at shutdown.
+	// linux only: there are no VRFs on the other platforms this builds for,
+	// and a configuration asking for one there is refused by name.
+	Create bool `yaml:"create,omitempty" json:"create,omitempty" toml:"create,omitempty"`
+}
+
+// Runtime is the half the reconciler is handed rather than told: the device
+// the mesh actually got, the addresses this node's transport has to keep
+// reaching, and the prefixes cap.route announces. None of the three is a fact an
+// operator writes down, so none of them is in the capability.
+type Runtime struct {
+	// Interface is the TUN device every installed route points at, named as
+	// the kernel named it (netstack.Mesh.Name, not the requested name).
+	Interface string
 	// Underlay names the addresses this node's own transport has to keep
 	// reaching. The darwin backend asks once per pass and scopes a route that
 	// covers one, see coversAny there; linux reads it never, and keeps the
 	// underlay out with a socket mark instead. Nil decides scope on the
 	// destination alone.
 	Underlay func() []netip.Addr
+	// Announced carries the prefixes cap.route announces, which
+	// Table.AssignAnnounced puts on the device beside the addresses written
+	// here.
+	Announced []netip.Prefix
+}
+
+// Name is the master device, empty for a table bound to none.
+func (t Table) Name() string {
+	if t.VRF == nil {
+		return ""
+	}
+	return t.VRF.Name
+}
+
+// creates reports a VRF this reconciler makes itself rather than expecting to
+// find.
+func (t Table) creates() bool { return t.VRF != nil && t.VRF.Create }
+
+// Assigned is every address the reconciler puts on the device: the ones
+// written in the capability and, when it asks for them, the prefixes
+// cap.route announces. It is exported because a segment this node answers for
+// must not also be an address it carries, and that check spans two
+// capabilities and so is made where the file is read.
+//
+// A default is announced, never assigned: an exit originates "::/0" from its
+// transit prefix, and assigning it would try to put "::/0" on the device on
+// every pass and fail on every one. The test is the address rather than the
+// prefix length, because a prefix length says nothing about whether an address
+// can be assigned; Validate refuses every other zero-length spelling.
+func (t Table) Assigned(announced []netip.Prefix) []netip.Prefix {
+	var out []netip.Prefix
+	seen := make(map[netip.Prefix]bool)
+	add := func(prefix netip.Prefix) {
+		if !prefix.IsValid() || prefix.Addr().IsUnspecified() || seen[prefix] {
+			return
+		}
+		seen[prefix] = true
+		out = append(out, prefix)
+	}
+	for _, prefix := range t.Addresses {
+		add(prefix.Prefix)
+	}
+	if t.AssignAnnounced {
+		for _, prefix := range announced {
+			add(prefix)
+		}
+	}
+	return out
+}
+
+// Validate refuses a capability this reconciler could not honor, naming the
+// field as the operator wrote it. It runs where the file is read, so a node
+// that has no reconciler on this platform still refuses a table it could not
+// have owned.
+func (t Table) Validate() error {
+	if t.Proto != 0 && t.Proto <= protocolStatic {
+		// rtnetlink reserves 0 through 3 for unspec, redirect, kernel and
+		// boot, and 4 is the static protocol systemd-networkd stamps on the
+		// rules it installs. Claiming any of them makes this reconciler's
+		// routes indistinguishable from somebody else's, and since a rule pass
+		// deletes every rule carrying this protocol that the config does not
+		// name, claiming 4 deletes every static rule on the host.
+		return fmt.Errorf("kernel: cap.table proto %d is reserved for the kernel and for networkd, use 5 through 255", t.Proto)
+	}
+	if id := uint32(t.ID); id >= reservedTable && id <= lastByteTable {
+		// rtnetlink reserves 253, 254 and 255 for default, main and local, and
+		// nothing above 255 at all: the linux backend sends RT_TABLE_UNSPEC
+		// plus a 32-bit RTA_TABLE for those, which is how a table id like
+		// 51820 reaches the kernel. Nothing else here would refuse a route in
+		// main, and an announced default is installed unscoped on linux, so
+		// the reconciler would put the whole machine's default out of the tun
+		// and take the ESP underlay with it. collectForeignWriters also stops
+		// reporting the kernel's own entries outside main, which is the one
+		// warning that would have said so.
+		return fmt.Errorf("kernel: cap.table id %d is reserved, use anything else from 1 to %d", id, ^uint32(0))
+	}
+	if address := t.PrefSrc4; address.IsValid() && !address.Unmap().Is4() {
+		return fmt.Errorf("kernel: cap.table prefsrc4 %s is not an IPv4 address", address)
+	}
+	for _, prefix := range t.Addresses {
+		// Assigning the unspecified address is not something an interface can
+		// do, and Assigned skips it, so taking the entry and dropping it
+		// silently is the one outcome that tells the operator nothing.
+		if prefix.Addr().IsUnspecified() {
+			return fmt.Errorf("kernel: cap.table addresses %s is not an address an interface can carry", prefix)
+		}
+		// Its own message rather than the announcement's: an entry here is
+		// assigned to an interface, never announced, so "write ::/0 if that is
+		// what you mean" is advice the check above rejects.
+		if prefix.Bits() == 0 {
+			return fmt.Errorf("kernel: cap.table addresses %s has no prefix length, and an interface carries an address under one", prefix)
+		}
+	}
+	if t.VRF != nil && t.VRF.Name == "" {
+		return errors.New("kernel: cap.table vrf names no device, so there is nothing to join")
+	}
+	if t.Reconcile < 0 {
+		return fmt.Errorf("kernel: cap.table reconcile %s is not an interval", t.Reconcile)
+	}
+	expanded, err := expandRules(t.Rules)
+	if err != nil {
+		return err
+	}
+	for _, rule := range expanded {
+		if err := rule.validate(); err != nil {
+			return err
+		}
+	}
+	for i, rule := range expanded {
+		if slices.Contains(expanded[:i], rule) {
+			return fmt.Errorf("kernel: rule %s is configured twice", rule)
+		}
+	}
+	return nil
 }
 
 // RouteSource is the seam onto internal/netstack: one coalesced wake-up per
@@ -171,7 +320,7 @@ type RouteSource interface {
 // diff key: the table, the protocol and the next hop are the same for every
 // route it installs, so two routes with equal fields are the same route. The
 // metric is in the key even though it comes from the configuration, because
-// the kernel keys routes on it too: changing Config.Metric has to withdraw
+// the kernel keys routes on it too: changing the configured metric has to withdraw
 // the routes installed under the old one rather than leave them behind.
 type Route struct {
 	// Destination is canonical: masked and zoneless.
@@ -259,7 +408,7 @@ type platform interface {
 	// its table, out of its interface.
 	Routes() ([]Route, error)
 	// where names the space this platform gives a reconciler to own.
-	where(Config) string
+	where(Table) string
 
 	AddRoute(Route) error
 	// DelRoute treats a route that is already gone as success.
@@ -287,24 +436,112 @@ type platform interface {
 // and can never make an address unreachable, which keeps the worst outcome of
 // a mistaken rule a lookup in the wrong table rather than a black hole.
 type Rule struct {
-	// Family is AF_INET or AF_INET6. A rule selecting on an address takes its
-	// family from that address; one selecting only on a mark has to name it,
-	// because a mark says nothing about which family it belongs to.
-	Family uint8
-	// To is FRA_DST and From is FRA_SRC, each invalid when unset.
-	To   netip.Prefix
-	From netip.Prefix
+	// To is FRA_DST and From is FRA_SRC, each optional. A rule naming neither
+	// selects on a mark alone and has to name its Family, because a mark
+	// belongs to no address family.
+	To   schema.Prefix `yaml:"to,omitempty" json:"to,omitempty" toml:"to,omitempty"`
+	From schema.Prefix `yaml:"from,omitempty" json:"from,omitempty" toml:"from,omitempty"`
 	// FWMark and FWMask are FRA_FWMARK and FRA_FWMASK. A zero mark means the
 	// rule does not select on one, and a zero mask with a nonzero mark is an
-	// exact match, which is how the kernel reads an absent FRA_FWMASK.
-	FWMark uint32
-	FWMask uint32
-	// Table is the table to look up, the reserved ones included: a rule
-	// pointing at main is ordinary, and keeps an underlay out of a mesh table.
-	Table uint32
-	// Priority is FRA_PRIORITY, the position in the rule list. Zero belongs
-	// to the local table's own rule and is refused.
-	Priority uint32
+	// exact match, which is how the kernel reads an absent FRA_FWMASK. A hex
+	// literal is ordinary in both file formats, so fwmark: 0x726c is written
+	// as it reads elsewhere.
+	FWMark uint32 `yaml:"fwmark,omitempty" json:"fwmark,omitempty" toml:"fwmark,omitempty"`
+	FWMask uint32 `yaml:"fwmask,omitempty" json:"fwmask,omitempty" toml:"fwmask,omitempty"`
+	// Table is the table to look up, as a number or as one of the three names
+	// the kernel reserves: a rule pointing at main is ordinary, and keeps an
+	// underlay out of a mesh table.
+	Table schema.TableID `yaml:"table" json:"table" toml:"table"`
+	// Priority is FRA_PRIORITY, the rule's position in the list. It is
+	// required: leaving it to the kernel puts the rule just above the last
+	// one, which is a different place on every node.
+	Priority uint32 `yaml:"priority" json:"priority" toml:"priority"`
+	// Family is needed only when neither To nor From says which, and "both"
+	// installs the rule once per family. An installed rule always names one,
+	// because expandRules resolves this before anything reaches the kernel.
+	Family Family `yaml:"family,omitempty" json:"family,omitempty" toml:"family,omitempty"`
+}
+
+// Family is the address family a rule belongs to, spelled as an operator
+// writes it rather than as AF_INET and AF_INET6, which are numbers on one
+// platform and absent on the others.
+type Family string
+
+const (
+	// FamilyUnset is a rule taking its family from the address it selects on.
+	FamilyUnset Family = ""
+	FamilyIPv4  Family = "ipv4"
+	FamilyIPv6  Family = "ipv6"
+	// FamilyBoth is written once and installed twice, because keeping an
+	// underlay out of a mesh table needs both and writing them by hand is how
+	// one of the two goes missing.
+	FamilyBoth Family = "both"
+)
+
+func (f *Family) UnmarshalText(text []byte) error {
+	switch Family(strings.ToLower(string(text))) {
+	case FamilyUnset:
+		*f = FamilyUnset
+	case FamilyIPv4:
+		*f = FamilyIPv4
+	case FamilyIPv6:
+		*f = FamilyIPv6
+	case FamilyBoth:
+		*f = FamilyBoth
+	default:
+		return fmt.Errorf("kernel: family %q is not ipv4, ipv6 or both", text)
+	}
+	return nil
+}
+
+func (f Family) MarshalText() ([]byte, error) { return []byte(f), nil }
+
+func (f *Family) UnmarshalYAML(value *yaml.Node) error {
+	return schema.Scalar(value, "a family, ipv4, ipv6 or both", f)
+}
+
+func (f Family) MarshalYAML() (any, error) { return string(f), nil }
+
+// expandRules resolves each configured rule's address family, so that
+// everything below this point names exactly one. A rule that names neither a
+// destination nor a source selects on a mark alone, which belongs to no
+// family, so it says which one it is for; "both" is written once and installed
+// twice.
+//
+// Everything the reconciler itself judges is left to Rule.validate, so the one
+// place deciding what a rule may say is the one that installs it.
+func expandRules(rules []Rule) ([]Rule, error) {
+	var out []Rule
+	for _, rule := range rules {
+		addressed := rule.To.IsValid() || rule.From.IsValid()
+		if addressed && rule.Family != FamilyUnset {
+			return nil, fmt.Errorf("kernel: rule at priority %d names family %q and an address, which already says which family it is", rule.Priority, rule.Family)
+		}
+		if addressed {
+			address := rule.To.Addr()
+			if !rule.To.IsValid() {
+				address = rule.From.Addr()
+			}
+			rule.Family = FamilyIPv4
+			if !address.Is4() {
+				rule.Family = FamilyIPv6
+			}
+			out = append(out, rule)
+			continue
+		}
+		switch rule.Family {
+		case FamilyIPv4, FamilyIPv6:
+			out = append(out, rule)
+		case FamilyBoth:
+			rule.Family = FamilyIPv4
+			out = append(out, rule)
+			rule.Family = FamilyIPv6
+			out = append(out, rule)
+		default:
+			return nil, fmt.Errorf("kernel: rule at priority %d selects on a mark alone, so it has to name family: ipv4, ipv6 or both", rule.Priority)
+		}
+	}
+	return out, nil
 }
 
 func (r Rule) String() string {
@@ -352,11 +589,11 @@ func (r Rule) validate() error {
 	for _, named := range []struct {
 		name   string
 		prefix netip.Prefix
-	}{{"to", r.To}, {"from", r.From}} {
+	}{{"to", r.To.Prefix}, {"from", r.From.Prefix}} {
 		if !named.prefix.IsValid() {
 			continue
 		}
-		if ruleFamily(named.prefix.Addr()) != r.Family {
+		if familyOf(named.prefix.Addr()) != r.Family {
 			return fmt.Errorf("kernel: rule %s: %s %s is not of the rule's family", r, named.name, named.prefix)
 		}
 		if named.prefix.Masked() != named.prefix {
@@ -385,15 +622,7 @@ func (r Rule) validate() error {
 	return nil
 }
 
-// FamilyIPv4 and FamilyIPv6 are AF_INET and AF_INET6, spelled here rather than
-// taken from x/sys so that this file still builds on every platform, including
-// the ones where a rule is refused rather than absent from the type.
-const (
-	FamilyIPv4 uint8 = 2
-	FamilyIPv6 uint8 = 10
-)
-
-func ruleFamily(address netip.Addr) uint8 {
+func familyOf(address netip.Addr) Family {
 	if address.Is4() {
 		return FamilyIPv4
 	}
@@ -401,7 +630,14 @@ func ruleFamily(address netip.Addr) uint8 {
 }
 
 type Reconciler struct {
-	cfg  Config
+	// table is the capability with its defaults filled in, rt what the caller
+	// resolved, and rules and addresses what New made of the two: the rules
+	// with their families expanded and the address set the device is to carry.
+	table     Table
+	rt        Runtime
+	ruleSet   []Rule
+	addresses []netip.Prefix
+
 	src  RouteSource
 	plat platform
 
@@ -467,85 +703,57 @@ func (r *Reconciler) Stats() Stats {
 	return Stats{}
 }
 
-// New validates cfg, fills in its defaults and opens the netlink sockets, so
-// a misconfigured or unsupported deployment fails at startup rather than on
-// the first route. It installs nothing; Run does that.
-func New(cfg Config, src RouteSource) (*Reconciler, error) {
-	if cfg.Interface == "" {
+// New checks the capability, fills in its defaults, resolves it against the
+// runtime the caller supplies and opens the netlink sockets, so a
+// misconfigured or unsupported deployment fails at startup rather than on the
+// first route. It installs nothing; Run does that.
+func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
+	if rt.Interface == "" {
 		return nil, errors.New("kernel: interface is required")
 	}
 	if src == nil {
 		return nil, errors.New("kernel: route source is required")
 	}
-	if cfg.Table == 0 {
-		cfg.Table = DefaultTable
+	// Checked as written and canonicalized afterwards, so a refusal names the
+	// field an operator can find in their own file rather than the one
+	// canonicalization left behind. The loader has already run this; a caller
+	// that built the capability by hand has not.
+	if err := t.Validate(); err != nil {
+		return nil, err
 	}
-	if cfg.Protocol == 0 {
-		cfg.Protocol = DefaultProtocol
+	if t.ID == 0 {
+		t.ID = DefaultTable
 	}
-	if cfg.Protocol <= protocolStatic {
-		// rtnetlink reserves 0 through 3 for unspec, redirect, kernel and
-		// boot, and 4 is the static protocol systemd-networkd stamps on the
-		// rules it installs. Claiming any of them makes this reconciler's
-		// routes indistinguishable from somebody else's, and since a rule
-		// pass deletes every rule carrying this protocol that the config does
-		// not name, claiming 4 deletes every static rule on the host.
-		return nil, fmt.Errorf("kernel: protocol %d is reserved for the kernel and for networkd, use 5 through 255", cfg.Protocol)
+	if t.Proto == 0 {
+		t.Proto = DefaultProtocol
 	}
-	if cfg.Table >= reservedTable && cfg.Table <= lastByteTable {
-		// rtnetlink reserves 253, 254 and 255 for default, main and local, and
-		// nothing above 255 at all: the linux backend sends RT_TABLE_UNSPEC
-		// plus a 32-bit RTA_TABLE for those, which is how a table id like
-		// 51820 reaches the kernel. Nothing else here would refuse a route in
-		// main, and an announced default is installed unscoped on linux, so
-		// the reconciler would put the whole machine's default out of the tun
-		// and take the ESP underlay with it. collectForeignWriters also stops
-		// reporting the kernel's own entries outside main, which is the one
-		// warning that would have said so.
-		return nil, fmt.Errorf("kernel: table %d is reserved, use anything else from 1 to %d", cfg.Table, ^uint32(0))
+	if t.PrefSrc4.IsValid() {
+		t.PrefSrc4 = schema.AddrFrom(t.PrefSrc4.Unmap().WithZone(""))
 	}
-	if cfg.PrefSrc4.IsValid() {
-		if address := cfg.PrefSrc4.Unmap(); address.Is4() {
-			cfg.PrefSrc4 = address.WithZone("")
-		} else {
-			return nil, fmt.Errorf("kernel: prefsrc4 %s is not an IPv4 address", cfg.PrefSrc4)
-		}
+	if t.Reconcile <= 0 {
+		t.Reconcile = schema.Duration(DefaultReconcileInterval)
 	}
-	addresses := make([]netip.Prefix, 0, len(cfg.Addresses))
-	for _, prefix := range cfg.Addresses {
+	addresses := make([]netip.Prefix, 0, len(t.Addresses))
+	for _, prefix := range t.Assigned(rt.Announced) {
 		if _, ok := canonicalPrefix(prefix); !ok {
 			return nil, fmt.Errorf("kernel: address %s is not a valid prefix", prefix)
 		}
 		// an assigned address keeps its host bits; only a route key is masked.
 		addresses = append(addresses, netip.PrefixFrom(prefix.Addr().WithZone(""), prefix.Bits()))
 	}
-	cfg.Addresses = addresses
-	if cfg.ReconcileInterval <= 0 {
-		cfg.ReconcileInterval = DefaultReconcileInterval
-	}
-	// Validated as written and canonicalized afterwards, so a refusal names
-	// the field an operator can find in their own file rather than the one
-	// canonicalization left behind.
-	for _, rule := range cfg.Rules {
-		if err := rule.validate(); err != nil {
-			return nil, err
-		}
-	}
-	cfg.Rules = canonicalRules(cfg.Rules)
-	for i, rule := range cfg.Rules {
-		if slices.Contains(cfg.Rules[:i], rule) {
-			return nil, fmt.Errorf("kernel: rule %s is configured twice", rule)
-		}
-	}
-	plat, err := newPlatform(cfg)
+	rules, err := expandRules(t.Rules)
 	if err != nil {
 		return nil, err
 	}
-	if err := refuseWhatThePlatformLacks(cfg, plat); err != nil {
+	plat, err := newPlatform(t, rt)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseWhatThePlatformLacks(t, plat); err != nil {
 		plat.Close()
 		return nil, err
 	}
-	return newReconciler(cfg, src, plat), nil
+	return newReconciler(t, rt, canonicalRules(rules), addresses, src, plat), nil
 }
 
 // refuseWhatThePlatformLacks stops a startup that asked for a facility this
@@ -557,15 +765,12 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 // configuration and reconciled only the routes would come up with a working
 // mesh and no steering at all, which is the shape of outage that reads as a
 // routing problem for a day.
-func refuseWhatThePlatformLacks(cfg Config, plat platform) error {
-	if _, ok := plat.(ruler); !ok && len(cfg.Rules) > 0 {
-		return fmt.Errorf("kernel: %d policy rules are configured and this platform has no policy routing: %s", len(cfg.Rules), rulesUnavailable)
+func refuseWhatThePlatformLacks(t Table, plat platform) error {
+	if _, ok := plat.(ruler); !ok && len(t.Rules) > 0 {
+		return fmt.Errorf("kernel: %d policy rules are configured and this platform has no policy routing: %s", len(t.Rules), rulesUnavailable)
 	}
-	if _, ok := plat.(vrfMaker); !ok && (cfg.CreateVRF || cfg.VRF != "") {
-		return errors.New("kernel: vrf or vrf_create is set and this platform has no VRFs: there is one forwarding table here and the reconciler already writes it")
-	}
-	if cfg.CreateVRF && cfg.VRF == "" {
-		return errors.New("kernel: vrf_create is set and vrf names no device, so there is nothing to create")
+	if _, ok := plat.(vrfMaker); !ok && t.Name() != "" {
+		return errors.New("kernel: cap.table vrf is set and this platform has no VRFs: there is one forwarding table here and the reconciler already writes it")
 	}
 	return nil
 }
@@ -576,7 +781,7 @@ const rulesUnavailable = "an announced default and a source-specific route are i
 
 // canonicalRules is the configured rules in the spelling the kernel reports
 // back, in a copy: New is handed the caller's slice and a reload compares one
-// Config against another, so rewriting in place would change what that
+// capability against another, so rewriting in place would change what that
 // comparison reads. See Rule.canonical.
 func canonicalRules(rules []Rule) []Rule {
 	out := slices.Clone(rules)
@@ -586,10 +791,10 @@ func canonicalRules(rules []Rule) []Rule {
 	return out
 }
 
-func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
-	cfg.Rules = canonicalRules(cfg.Rules)
+func newReconciler(t Table, rt Runtime, rules []Rule, addresses []netip.Prefix, src RouteSource, plat platform) *Reconciler {
 	r := &Reconciler{
-		cfg: cfg, src: src, plat: plat,
+		table: t, rt: rt, ruleSet: rules, addresses: addresses,
+		src: src, plat: plat,
 		owned:       make(map[netip.Prefix]bool),
 		warnedAddrs: make(map[netip.Prefix]bool),
 		warned:      make(map[Route]bool),
@@ -604,13 +809,13 @@ func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 // Where names the space this reconciler owns, for an operator reading a log
 // line: a routing table where the platform has them, and the interface itself
 // where it does not.
-func (r *Reconciler) Where() string { return r.plat.where(r.cfg) }
+func (r *Reconciler) Where() string { return r.plat.where(r.table) }
 
-// Config is the configuration this reconciler is running, defaults applied.
-// New takes its argument by value and fills the gaps in its own copy, so the
-// caller's is not the one in force and a diagnostic reporting that one names
-// a table of zero on every deployment that left it out.
-func (r *Reconciler) Config() Config { return r.cfg }
+// Table is the capability this reconciler is running, defaults applied. New
+// takes its argument by value and fills the gaps in its own copy, so the
+// caller's is not the one in force and a diagnostic reporting that one names a
+// table of zero on every deployment that left it out.
+func (r *Reconciler) Table() Table { return r.table }
 
 // Run reconciles until ctx is canceled, then withdraws everything this
 // reconciler installed and closes its netlink sockets. It is called once.
@@ -623,16 +828,16 @@ func (r *Reconciler) Config() Config { return r.cfg }
 func (r *Reconciler) Run(ctx context.Context) error {
 	changed := r.src.Changed()
 	notify := r.plat.Notify()
-	ticker := time.NewTicker(r.cfg.ReconcileInterval)
+	ticker := time.NewTicker(r.table.Reconcile.Duration())
 	defer ticker.Stop()
-	retry := time.NewTimer(r.cfg.ReconcileInterval)
+	retry := time.NewTimer(r.table.Reconcile.Duration())
 	stopTimer(retry)
 	defer retry.Stop()
 
 	// The space this reconciler owns comes from the platform: darwin has one
 	// FIB and no rt_proto, so naming a table and a protocol there prints two
 	// settings it refuses to honor.
-	slog.Info("kernel reconciler started", "interface", r.cfg.Interface, "where", r.Where())
+	slog.Info("kernel reconciler started", "interface", r.rt.Interface, "where", r.Where())
 
 	// An install refuses a key another writer already holds, so sharing a table
 	// with another daemon means the routes it refuses are routes the mesh
@@ -644,7 +849,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			slog.Warn("kernel could not check the table for other writers", "err", err)
 		} else if len(writers) > 0 {
 			slog.Warn("kernel is sharing its table with another routing protocol",
-				"table", r.cfg.Table, "protocols", strings.Join(writers, ", "),
+				"table", uint32(r.table.ID), "protocols", strings.Join(writers, ", "),
 				"detail", "an install refuses a key another writer already holds, so give this reconciler a table of its own")
 		}
 	}
@@ -652,7 +857,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	backoff := time.Duration(0)
 	for ctx.Err() == nil {
 		if err := r.reconcile(); err != nil {
-			backoff = min(max(2*backoff, minRetryInterval), r.cfg.ReconcileInterval)
+			backoff = min(max(2*backoff, minRetryInterval), r.table.Reconcile.Duration())
 			slog.Warn("kernel reconcile failed, retrying", "err", err, "retry_in", backoff)
 			stopTimer(retry)
 			retry.Reset(backoff)
@@ -738,16 +943,16 @@ func (r *Reconciler) recordPass(err error) {
 // is, whatever table it is bound to: it belongs to whoever created it, and
 // rebinding somebody else's VRF would move every route in it.
 func (r *Reconciler) applyVRF() error {
-	if r.vrfs == nil || !r.cfg.CreateVRF || r.cfg.VRF == "" {
+	if r.vrfs == nil || !r.table.creates() || r.table.Name() == "" {
 		return nil
 	}
-	created, err := r.vrfs.EnsureVRF(r.cfg.VRF, r.cfg.Table)
+	created, err := r.vrfs.EnsureVRF(r.table.Name(), uint32(r.table.ID))
 	if err != nil {
-		return fmt.Errorf("create vrf %s: %w", r.cfg.VRF, err)
+		return fmt.Errorf("create vrf %s: %w", r.table.Name(), err)
 	}
 	if created {
 		r.madeVRF = true
-		slog.Info("kernel created the mesh vrf", "vrf", r.cfg.VRF, "table", r.cfg.Table)
+		slog.Info("kernel created the mesh vrf", "vrf", r.table.Name(), "table", uint32(r.table.ID))
 	}
 	return nil
 }
@@ -766,8 +971,8 @@ func (r *Reconciler) applyRules() error {
 	}
 	var errs []error
 	added, removed := 0, 0
-	wanted := make(map[Rule]bool, len(r.cfg.Rules))
-	for _, rule := range r.cfg.Rules {
+	wanted := make(map[Rule]bool, len(r.ruleSet))
+	for _, rule := range r.ruleSet {
 		wanted[rule] = true
 	}
 	for _, rule := range actual {
@@ -784,7 +989,7 @@ func (r *Reconciler) applyRules() error {
 	for _, rule := range actual {
 		held[rule] = true
 	}
-	for _, rule := range r.cfg.Rules {
+	for _, rule := range r.ruleSet {
 		if held[rule] {
 			continue
 		}
@@ -882,7 +1087,7 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 		unreachable := entry.Value == netstack.Unreachable
 		route := Route{
 			Destination: destination,
-			Metric:      routeMetric(r.cfg.Metric, destination, unreachable),
+			Metric:      routeMetric(r.table.Metric, destination, unreachable),
 			Unreachable: unreachable,
 		}
 		// A source covering every address is not a source-specific route, and
@@ -919,8 +1124,8 @@ func (r *Reconciler) desired(snapshot []sadr.Route[*netstack.Peer]) []Route {
 			}
 			route.Source = source
 		}
-		if destination.Addr().Is4() && r.cfg.PrefSrc4.IsValid() {
-			route.PrefSrc = r.cfg.PrefSrc4
+		if destination.Addr().Is4() && r.table.PrefSrc4.IsValid() {
+			route.PrefSrc = r.table.PrefSrc4.Addr
 		}
 		out = append(out, route)
 	}
@@ -1069,7 +1274,7 @@ func compareSourceSpecificity(a, b netip.Prefix) int {
 // nothing: an address on the link that is not configured belongs to somebody
 // else, and the only addresses ever removed are the ones recorded in owned.
 func (r *Reconciler) applyAddresses() error {
-	if len(r.cfg.Addresses) == 0 {
+	if len(r.addresses) == 0 {
 		return nil
 	}
 	actual, err := r.plat.Addrs()
@@ -1084,7 +1289,7 @@ func (r *Reconciler) applyAddresses() error {
 	}
 	warned := make(map[netip.Prefix]bool, len(r.warnedAddrs))
 	var errs []error
-	for _, prefix := range r.cfg.Addresses {
+	for _, prefix := range r.addresses {
 		if have[prefix] {
 			continue
 		}
@@ -1099,7 +1304,7 @@ func (r *Reconciler) applyAddresses() error {
 		if existing, taken := held[prefix.Addr()]; taken {
 			if !r.warnedAddrs[prefix] {
 				slog.Warn("kernel is leaving an address another writer holds",
-					"interface", r.cfg.Interface, "address", prefix, "held_as", existing)
+					"interface", r.rt.Interface, "address", prefix, "held_as", existing)
 			}
 			warned[prefix] = true
 			continue
@@ -1108,7 +1313,7 @@ func (r *Reconciler) applyAddresses() error {
 			errs = append(errs, fmt.Errorf("add address %s: %w", prefix, err))
 			continue
 		}
-		slog.Info("kernel address assigned", "interface", r.cfg.Interface, "address", prefix)
+		slog.Info("kernel address assigned", "interface", r.rt.Interface, "address", prefix)
 		r.owned[prefix] = true
 	}
 	r.warnedAddrs = warned
@@ -1119,28 +1324,28 @@ func (r *Reconciler) applyAddresses() error {
 // A link somebody else already enslaved is reported and left alone: taking it
 // over would start a flap war with whatever put it there.
 func (r *Reconciler) applyMaster() error {
-	if r.cfg.VRF == "" {
+	if r.table.Name() == "" {
 		return nil
 	}
 	master, err := r.plat.Master()
 	if err != nil {
-		return fmt.Errorf("read master of %s: %w", r.cfg.Interface, err)
+		return fmt.Errorf("read master of %s: %w", r.rt.Interface, err)
 	}
 	switch master {
-	case r.cfg.VRF:
+	case r.table.Name():
 		r.master = master
 		return nil
 	case "":
-		if err := r.plat.Enslave(r.cfg.VRF); err != nil {
-			return fmt.Errorf("enslave %s to %s: %w", r.cfg.Interface, r.cfg.VRF, err)
+		if err := r.plat.Enslave(r.table.Name()); err != nil {
+			return fmt.Errorf("enslave %s to %s: %w", r.rt.Interface, r.table.Name(), err)
 		}
-		r.enslaved, r.master = true, r.cfg.VRF
-		slog.Info("kernel interface enslaved", "interface", r.cfg.Interface, "master", r.cfg.VRF)
+		r.enslaved, r.master = true, r.table.Name()
+		slog.Info("kernel interface enslaved", "interface", r.rt.Interface, "master", r.table.Name())
 		return nil
 	default:
 		if r.master != master {
 			slog.Warn("kernel leaving interface in the master it already has",
-				"interface", r.cfg.Interface, "master", master, "configured", r.cfg.VRF)
+				"interface", r.rt.Interface, "master", master, "configured", r.table.Name())
 		}
 		r.master = master
 		return nil
@@ -1178,13 +1383,13 @@ func (r *Reconciler) withdraw() error {
 	if err != nil {
 		errs = append(errs, fmt.Errorf("list addresses: %w", err))
 		slog.Warn("kernel is leaving every address it installed, the link would not read back",
-			"interface", r.cfg.Interface, "addresses", len(addresses))
+			"interface", r.rt.Interface, "addresses", len(addresses))
 		addresses = nil
 	}
 	for _, prefix := range addresses {
 		if !slices.Contains(held, prefix) {
 			slog.Warn("kernel is leaving an address it no longer holds as it installed it",
-				"interface", r.cfg.Interface, "address", prefix)
+				"interface", r.rt.Interface, "address", prefix)
 			delete(r.owned, prefix)
 			continue
 		}
@@ -1197,7 +1402,7 @@ func (r *Reconciler) withdraw() error {
 	}
 	if r.enslaved {
 		if err := r.plat.Release(); err != nil {
-			errs = append(errs, fmt.Errorf("release %s from %s: %w", r.cfg.Interface, r.cfg.VRF, err))
+			errs = append(errs, fmt.Errorf("release %s from %s: %w", r.rt.Interface, r.table.Name(), err))
 		} else {
 			r.enslaved = false
 		}
@@ -1223,8 +1428,8 @@ func (r *Reconciler) withdraw() error {
 	// started belongs to whoever made it, and removing it would take every
 	// route in its table with it.
 	if r.madeVRF {
-		if err := r.vrfs.RemoveVRF(r.cfg.VRF); err != nil {
-			errs = append(errs, fmt.Errorf("remove vrf %s: %w", r.cfg.VRF, err))
+		if err := r.vrfs.RemoveVRF(r.table.Name()); err != nil {
+			errs = append(errs, fmt.Errorf("remove vrf %s: %w", r.table.Name(), err))
 		} else {
 			r.madeVRF = false
 		}

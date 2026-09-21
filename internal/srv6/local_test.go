@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"net/netip"
+
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"testing"
 )
 
 // A packet not addressed to one of this node's segments costs a map lookup and
 // goes where it was going, which is almost every packet on the mesh.
 func TestPacketsForSomebodyElsePassThrough(t *testing.T) {
-	table, err := NewLocalTable([]Segment{{SID: addr("3fff:1:69c:8c6::1"), Behavior: BehaviorEndDT46}})
+	table, err := NewLocalTable([]Segment{{SID: saddr("3fff:1:69c:8c6::1"), Behavior: BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,8 +46,8 @@ func TestWaypointAndExitActOnTheirOwnSegments(t *testing.T) {
 	waypoint := addr("3fff:1:69c:8c6::2")
 	exit := addr("3fff:1:69c:98d6::1")
 	table, err := NewLocalTable([]Segment{
-		{SID: waypoint, Behavior: BehaviorEnd},
-		{SID: exit, Behavior: BehaviorEndDT46},
+		{SID: schema.AddrFrom(waypoint), Behavior: BehaviorEnd},
+		{SID: schema.AddrFrom(exit), Behavior: BehaviorEndDT46},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +85,7 @@ func TestWaypointAndExitActOnTheirOwnSegments(t *testing.T) {
 // as an undeliverable IPv6 packet addressed to an address of ours.
 func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
 	sid := addr("3fff:1:69c:8c6::2")
-	waypoint, err := NewLocalTable([]Segment{{SID: sid, Behavior: BehaviorEnd}})
+	waypoint, err := NewLocalTable([]Segment{{SID: schema.AddrFrom(sid), Behavior: BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +106,7 @@ func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
 
 	// An exit reached with segments still to go.
 	exitSID := addr("3fff:1:69c:98d6::1")
-	exit, err := NewLocalTable([]Segment{{SID: exitSID, Behavior: BehaviorEndDT46}})
+	exit, err := NewLocalTable([]Segment{{SID: schema.AddrFrom(exitSID), Behavior: BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,10 +124,10 @@ func TestSegmentsOfOursThatCannotBeActedOnAreDropped(t *testing.T) {
 // names something not implemented, is refused at startup rather than skipped.
 func TestLocalTableRefusesWhatItCannotAnswerFor(t *testing.T) {
 	for name, segments := range map[string][]Segment{
-		"a v4 segment":     {{SID: addr("198.18.104.117"), Behavior: BehaviorEnd}},
-		"a duplicate":      {{SID: addr("2001:db8::1"), Behavior: BehaviorEnd}, {SID: addr("2001:db8::1"), Behavior: BehaviorEndDT46}},
-		"a behavior of no": {{SID: addr("2001:db8::1"), Behavior: 0}},
-		"one not written":  {{SID: addr("2001:db8::1"), Behavior: Behavior(99)}},
+		"a v4 segment":     {{SID: saddr("198.18.104.117"), Behavior: BehaviorEnd}},
+		"a duplicate":      {{SID: saddr("2001:db8::1"), Behavior: BehaviorEnd}, {SID: saddr("2001:db8::1"), Behavior: BehaviorEndDT46}},
+		"a behavior of no": {{SID: saddr("2001:db8::1"), Behavior: 0}},
+		"one not written":  {{SID: saddr("2001:db8::1"), Behavior: Behavior(99)}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewLocalTable(segments); err == nil {
@@ -171,8 +173,8 @@ func TestBehaviorSpellsItselfTheWayTheFleetWritesIt(t *testing.T) {
 // between two reads is one an operator cannot diff.
 func TestSegmentsReportInAStableOrder(t *testing.T) {
 	table, err := NewLocalTable([]Segment{
-		{SID: addr("3fff:1:69c:8c6::2"), Behavior: BehaviorEnd},
-		{SID: addr("3fff:1:69c:8c6::1"), Behavior: BehaviorEndDT46},
+		{SID: saddr("3fff:1:69c:8c6::2"), Behavior: BehaviorEnd},
+		{SID: saddr("3fff:1:69c:8c6::1"), Behavior: BehaviorEndDT46},
 	})
 	if err != nil {
 		t.Fatal(err)

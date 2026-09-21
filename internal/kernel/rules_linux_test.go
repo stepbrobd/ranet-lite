@@ -4,10 +4,10 @@ package kernel
 
 import (
 	"encoding/binary"
-	"net/netip"
 	"slices"
 	"testing"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"golang.org/x/sys/unix"
 )
 
@@ -34,10 +34,10 @@ func ruleAttrs(t *testing.T, body []byte) (hdr []byte, attrs map[uint16][]byte) 
 // lookup in the wrong table rather than a black hole.
 func TestRuleMessageCarriesTheOwnershipMarker(t *testing.T) {
 	plat, _ := writePlatform(t)
-	rule := Rule{Family: FamilyIPv6, From: netip.MustParsePrefix("3fff:a::/36"), Table: 200, Priority: 150}
+	rule := Rule{Family: FamilyIPv6, From: schema.MustPrefix("3fff:a::/36"), Table: 200, Priority: 150}
 	hdr, attrs := ruleAttrs(t, plat.ruleMessage(rule))
 
-	if hdr[0] != FamilyIPv6 {
+	if hdr[0] != afInet6 {
 		t.Errorf("family byte is %d", hdr[0])
 	}
 	if hdr[2] != 36 {
@@ -87,10 +87,10 @@ func TestRuleMessageCarriesTheMarkAndItsMask(t *testing.T) {
 func TestRuleRoundTripsThroughItsOwnEncoding(t *testing.T) {
 	plat, conn := writePlatform(t)
 	for name, rule := range map[string]Rule{
-		"a destination rule": {Family: FamilyIPv4, To: netip.MustParsePrefix("198.18.104.0/24"), Table: 200, Priority: 100},
-		"a source rule":      {Family: FamilyIPv6, From: netip.MustParsePrefix("3fff:1:69c::/48"), Table: 200, Priority: 150},
+		"a destination rule": {Family: FamilyIPv4, To: schema.MustPrefix("198.18.104.0/24"), Table: 200, Priority: 100},
+		"a source rule":      {Family: FamilyIPv6, From: schema.MustPrefix("3fff:1:69c::/48"), Table: 200, Priority: 150},
 		"a mark rule":        {Family: FamilyIPv6, FWMark: 0x726c, Table: 254, Priority: 40},
-		"both selectors":     {Family: FamilyIPv4, To: netip.MustParsePrefix("10.0.0.0/8"), From: netip.MustParsePrefix("10.1.0.0/16"), Table: 7, Priority: 90},
+		"both selectors":     {Family: FamilyIPv4, To: schema.MustPrefix("10.0.0.0/8"), From: schema.MustPrefix("10.1.0.0/16"), Table: 7, Priority: 90},
 	} {
 		t.Run(name, func(t *testing.T) {
 			conn.replies = []nlMessage{{Kind: unix.RTM_NEWRULE, Data: plat.ruleMessage(rule)}}
@@ -132,17 +132,17 @@ func TestExactMarkReadsBackAsTheRuleThatWasWritten(t *testing.T) {
 // that takes the machine's own routing apart.
 func TestRuleDumpKeepsOnlyWhatThisReconcilerOwns(t *testing.T) {
 	plat, conn := writePlatform(t)
-	ours := Rule{Family: FamilyIPv6, From: netip.MustParsePrefix("2001:db8::/32"), Table: 200, Priority: 150}
+	ours := Rule{Family: FamilyIPv6, From: schema.MustPrefix("2001:db8::/32"), Table: 200, Priority: 150}
 
-	other := plat.ruleMessage(Rule{Family: FamilyIPv4, To: netip.MustParsePrefix("10.0.0.0/8"), Table: 200, Priority: 100})
+	other := plat.ruleMessage(Rule{Family: FamilyIPv4, To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 100})
 	// networkd stamps RTPROT_STATIC on the rules it installs, so this is the
 	// marker the fleet's own rules carry today.
 	other = replaceProtocol(t, other, unix.RTPROT_STATIC)
 
-	blackhole := plat.ruleMessage(Rule{Family: FamilyIPv4, To: netip.MustParsePrefix("10.0.0.0/8"), Table: 200, Priority: 101})
+	blackhole := plat.ruleMessage(Rule{Family: FamilyIPv4, To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 101})
 	blackhole[7] = unix.FR_ACT_BLACKHOLE
 
-	unmarked := plat.ruleMessage(Rule{Family: FamilyIPv4, To: netip.MustParsePrefix("192.0.2.0/24"), Table: 200, Priority: 102})
+	unmarked := plat.ruleMessage(Rule{Family: FamilyIPv4, To: schema.MustPrefix("192.0.2.0/24"), Table: 200, Priority: 102})
 	unmarked = stripProtocol(t, unmarked)
 
 	conn.replies = []nlMessage{

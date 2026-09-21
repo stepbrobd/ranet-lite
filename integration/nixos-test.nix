@@ -348,56 +348,37 @@ in
               ];
             }
           ];
+          # Written in the capability schema, and in flow style wherever an
+          # optional block is interpolated: nix strips a nested string's own
+          # indentation, so a multi-line block would land back at column zero.
           "ranet-lite/config.yaml".text = ''
-            organization: testorg
-            common_name: client
-            port: 14000
-            endpoints:
-              - serial_number: "2"
-                address_family: ip4
-            private_key: /etc/ranet-lite/key.pem
-            registry: /etc/ranet-lite/registry.json
-            originate:
-              - "${clientTunnel}/128"
-              - "${clientTunnelV4}/32"
-            ${pkgs.lib.optionalString segments "  - \"${clientSID}/128\"\n"}
-            tun: ranet0
-            child_rekey_interval: ${if profile then "0" else "5s"}
-            ike_rekey_interval: ${if profile then "0" else "15s"}
-            rekey_margin: 0
-            rekey_jitter: 0
-            ${
-              if responder then
-                "responder: true"
-              else
-                ''
-                  peers:
-                    - common_name: server
-                      serial_number: "1"
-                ''
-            }
-            ${pkgs.lib.optionalString segments ''
-              segments:
-                source: "${clientTunnel}"
-                local:
-                  - { sid: "${clientSID}", behavior: "End.DT46" }
-                steer:
-                  - from: "${clientTunnel}/128"
-                    to: "${gatewayBehind}/128"
-                    via: ["${gatewaySID}"]
-            ''}
-            ${pkgs.lib.optionalString kernel ''
-              kernel:
-                enabled: true
-                table: ${toString kernelTable}
-                protocol: ${toString kernelProtocol}
-                metric: 32
-                prefsrc4: ${clientTunnelV4}
-                reconcile_interval: 2s
-            ''}
-            babel:
-              hello_interval: 500ms
-              update_interval: 1s
+            node:
+              org: testorg
+              name: client
+            auth:
+              key: /etc/ranet-lite/key.pem
+              trust: /etc/ranet-lite/registry.json
+            link:
+              port: 14000
+              endpoints: [{ serial: "2", family: ip4 }]
+              tun: ranet0
+              ${pkgs.lib.optionalString responder "listen: true"}
+            ${pkgs.lib.optionalString (!responder) ''dial: { to: [{ name: server, serial: "1" }] }''}
+            cap:
+              route:
+                announce: [
+                  "${clientTunnel}/128",
+                  "${clientTunnelV4}/32"${pkgs.lib.optionalString segments '', "${clientSID}/128"''}
+                ]
+              babel: { hello: 500ms, update: 1s }
+              crypto:
+                rekey:
+                  child: ${if profile then "0" else "5s"}
+                  ike: ${if profile then "0" else "15s"}
+                  margin: 0
+                  jitter: 0
+              ${pkgs.lib.optionalString segments ''segment: { source: "${clientTunnel}", local: [{ sid: "${clientSID}", behavior: "End.DT46" }], steer: [{ from: "${clientTunnel}/128", to: "${gatewayBehind}/128", via: ["${gatewaySID}"] }] }''}
+              ${pkgs.lib.optionalString kernel "table: { id: ${toString kernelTable}, proto: ${toString kernelProtocol}, metric: 32, prefsrc4: ${clientTunnelV4}, reconcile: 2s }"}
           '';
         };
 

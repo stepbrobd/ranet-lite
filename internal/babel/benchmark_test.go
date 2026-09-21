@@ -9,7 +9,7 @@ import (
 )
 
 func BenchmarkReceiveData(b *testing.B) {
-	s, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	s, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		b.Fatal(err)
 	}

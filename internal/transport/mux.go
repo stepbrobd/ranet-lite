@@ -191,7 +191,8 @@ type espDatagramBatch struct {
 // that address as the source for this socket, a "from <mesh address>" rule
 // sends it to the mesh table, and an exit-announced default there carries the
 // underlay into the tun it is supposed to be running under. The rule matching
-// the mark is the operator's to install, since this package writes no rules.
+// the mark is installed by the route reconciler, under cap.table.rules, since
+// this package writes none itself.
 func NewHub(localAddr string, fwmark uint32) (*Hub, error) {
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {

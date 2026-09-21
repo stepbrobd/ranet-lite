@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 )
@@ -64,14 +65,14 @@ func (f *fakeRouteSocket) messages(t *testing.T) []*route.RouteMessage {
 	return out
 }
 
-func testPlatform(t *testing.T, cfg Config) (*routePlatform, *fakeRouteSocket) {
+func testPlatform(t *testing.T, tbl Table, rt Runtime) (*routePlatform, *fakeRouteSocket) {
 	t.Helper()
-	if cfg.Interface == "" {
-		cfg.Interface = "utun9"
+	if rt.Interface == "" {
+		rt.Interface = "utun9"
 	}
 	sock := &fakeRouteSocket{t: t}
 	return &routePlatform{
-		cfg: cfg, index: testIndex, sock: sock,
+		table: tbl, rt: rt, index: testIndex, sock: sock,
 		control4: -1, control6: -1,
 		warned:   make(map[Route]bool),
 		pending:  make(map[Route]bool),
@@ -132,7 +133,7 @@ func dumpRIB(t *testing.T, entries ...dumpEntry) []byte {
 func ourGateway() route.Addr { return &route.LinkAddr{Index: testIndex} }
 
 func TestDarwinRouteMessageNamesInterfaceAsItsGateway(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	if err := plat.AddRoute(Route{Destination: prefix("198.51.100.0/24")}); err != nil {
 		t.Fatalf("add a route: %v", err)
 	}
@@ -192,9 +193,9 @@ func TestDarwinScopesPlainDefaults(t *testing.T) {
 		"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1",
 	} {
 		t.Run(destination, func(t *testing.T) {
-			plat, sock := testPlatform(t, Config{})
+			plat, sock := testPlatform(t, Table{}, Runtime{})
 			announced := Route{Destination: prefix(destination)}
-			announced.Metric = routeMetric(plat.cfg.Metric, announced.Destination, false)
+			announced.Metric = routeMetric(plat.table.Metric, announced.Destination, false)
 			if err := plat.AddRoute(announced); err != nil {
 				t.Fatal(err)
 			}
@@ -234,9 +235,7 @@ func TestDarwinAnnouncedDefaultDoesNotCaptureUnderlay(t *testing.T) {
 	requireNetTest(t)
 	device, tun := createUTUNWithFD(t)
 	setInterfaceUp(t, device)
-	plat, err := newPlatform(Config{
-		Interface: device, Table: DefaultTable, Protocol: DefaultProtocol,
-	})
+	plat, err := newPlatform(Table{ID: DefaultTable, Proto: DefaultProtocol}, Runtime{Interface: device})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +293,7 @@ func TestDarwinAnnouncedDefaultDoesNotCaptureUnderlay(t *testing.T) {
 }
 
 func TestDarwinDumpKeepsOnlyRoutesItOwns(t *testing.T) {
-	plat, _ := testPlatform(t, Config{PrefSrc4: addr("198.51.100.1")})
+	plat, _ := testPlatform(t, Table{PrefSrc4: schema.MustAddr("198.51.100.1")}, Runtime{})
 	elsewhere := &route.LinkAddr{Index: testIndex + 1}
 	// the host route an interface address creates: its gateway is the address,
 	// so it is the kernel's record of the address rather than a route.
@@ -345,7 +344,7 @@ func TestDarwinDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 // or a preferred source the reconciler did not ask for would leave every route
 // on both the add list and the delete list forever.
 func TestDarwinDumpMirrorsDiffKeyFields(t *testing.T) {
-	plat, _ := testPlatform(t, Config{Metric: 32, PrefSrc4: addr("198.51.100.1")})
+	plat, _ := testPlatform(t, Table{Metric: 32, PrefSrc4: schema.MustAddr("198.51.100.1")}, Runtime{})
 	rib := dumpRIB(t,
 		dumpEntry{index: testIndex, flags: unix.RTF_UP, dst: prefix("198.51.100.0/24"), gateway: ourGateway()},
 		dumpEntry{index: testIndex, flags: unix.RTF_UP, dst: prefix("2001:db8::/48"), gateway: ourGateway()},
@@ -365,7 +364,7 @@ func TestDarwinDumpMirrorsDiffKeyFields(t *testing.T) {
 }
 
 func TestDarwinSkipsSourceSpecificRoutes(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	specific := Route{
 		Destination: prefix("::/0"),
 		Source:      prefix("2001:db8::/48"),
@@ -429,7 +428,7 @@ func ifaMessage(t *testing.T, index int, prefix netip.Prefix) []byte {
 }
 
 func TestDarwinInterfaceAddrsKeepsTheirHostBits(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	var rib []byte
 	rib = append(rib, ifaMessage(t, testIndex, prefix("198.51.100.1/24"))...)
 	rib = append(rib, ifaMessage(t, testIndex, prefix("2001:db8::1/48"))...)
@@ -549,21 +548,22 @@ func TestDarwinDeleteRequests(t *testing.T) {
 // VRF, none of which exists here. Refusing at startup is the difference
 // between a deployment that is wrong and one that looks like it works.
 func TestDarwinPlatformRejectsLinuxConfig(t *testing.T) {
-	base := Config{Interface: "utun9", Table: DefaultTable, Protocol: DefaultProtocol}
+	baseTable := Table{ID: DefaultTable, Proto: DefaultProtocol}
+	baseRuntime := Runtime{Interface: "utun9"}
 	for _, test := range []struct {
 		name    string
-		mutate  func(*Config)
+		mutate  func(*Table, *Runtime)
 		mention string
 	}{
-		{"table", func(c *Config) { c.Table = 220 }, "routing tables"},
-		{"protocol", func(c *Config) { c.Protocol = 12 }, "route protocol"},
-		{"vrf", func(c *Config) { c.VRF = "mesh" }, "VRF"},
-		{"name", func(c *Config) { c.Interface = strings.Repeat("u", unix.IFNAMSIZ) }, "ifreq"},
+		{"table", func(c *Table, _ *Runtime) { c.ID = 220 }, "routing tables"},
+		{"protocol", func(c *Table, _ *Runtime) { c.Proto = 12 }, "route protocol"},
+		{"vrf", func(c *Table, _ *Runtime) { c.VRF = &VRF{Name: "mesh"} }, "VRF"},
+		{"name", func(_ *Table, rt *Runtime) { rt.Interface = strings.Repeat("u", unix.IFNAMSIZ) }, "ifreq"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			cfg := base
-			test.mutate(&cfg)
-			plat, err := newPlatform(cfg)
+			tbl, rt := baseTable, baseRuntime
+			test.mutate(&tbl, &rt)
+			plat, err := newPlatform(tbl, rt)
 			if err == nil {
 				_ = plat.Close()
 				t.Fatalf("%s was accepted", test.name)
@@ -576,7 +576,7 @@ func TestDarwinPlatformRejectsLinuxConfig(t *testing.T) {
 }
 
 func TestDarwinHasNoVRF(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	if master, err := plat.Master(); master != "" || err != nil {
 		t.Fatalf("Master reported %q, %v, want the empty string and no error", master, err)
 	}
@@ -619,7 +619,7 @@ func TestDarwinPrefixMaskRoundTrip(t *testing.T) {
 // asked the host about an interface index that names nothing, so every
 // source-specific route took the refusal path.
 func TestDarwinScopesSourceOfOurs(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	local := prefix("198.51.100.0/24")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
 
@@ -660,7 +660,7 @@ func TestDarwinScopesSourceOfOurs(t *testing.T) {
 // recorded made DelRoute report success without deleting, and every later pass
 // then listed the same route for deletion and deleted nothing.
 func TestDarwinWithdrawsScopedRouteAfterItsAddressIsGone(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	local := prefix("198.51.100.0/24")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
 	announced := Route{Destination: prefix("203.0.113.0/24"), Source: local}
@@ -682,7 +682,7 @@ func TestDarwinWithdrawsScopedRouteAfterItsAddressIsGone(t *testing.T) {
 // skipped the route, reported success, and never retried something a retry
 // would have fixed.
 func TestDarwinPropagatesAddressDumpFailure(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	wanted := errors.New("dump failed")
 	plat.addrs = func() ([]netip.Prefix, error) { return nil, wanted }
 
@@ -700,7 +700,7 @@ func TestDarwinPropagatesAddressDumpFailure(t *testing.T) {
 // to the same destination as carrying a source it does not have, and the diff
 // is then satisfied by a route that captures the whole machine.
 func TestDarwinDoesNotRecordScopedRouteThatFailedToInstall(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("198.51.100.1/24")}, nil }
 	sock.err = unix.EPERM
 
@@ -718,7 +718,7 @@ func TestDarwinDoesNotRecordScopedRouteThatFailedToInstall(t *testing.T) {
 // them into one entry, and the unscoped one, which for a default route is the
 // whole machine, is then never withdrawn.
 func TestDarwinDoesNotAttributeSourceToUnscopedRoute(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("::/0")
 	plat.scoped[dest] = prefix("2001:db8::/48")
 
@@ -752,7 +752,7 @@ func TestDarwinDoesNotAttributeSourceToUnscopedRoute(t *testing.T) {
 // A second source prefix for the same destination has nowhere to go: interface
 // scope is one route per destination per interface.
 func TestDarwinRefusesSecondSourceForOneDestination(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	plat.addrs = func() ([]netip.Prefix, error) {
 		return []netip.Prefix{prefix("198.51.100.1/24"), prefix("203.0.113.1/24")}, nil
 	}
@@ -780,9 +780,7 @@ func TestDarwinSpecificRouteStaysReachableWithoutBinding(t *testing.T) {
 	requireNetTest(t)
 	device, tun := createUTUNWithFD(t)
 	setInterfaceUp(t, device)
-	plat, err := newPlatform(Config{
-		Interface: device, Table: DefaultTable, Protocol: DefaultProtocol,
-	})
+	plat, err := newPlatform(Table{ID: DefaultTable, Proto: DefaultProtocol}, Runtime{Interface: device})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +822,7 @@ func TestDarwinSpecificRouteStaysReachableWithoutBinding(t *testing.T) {
 // destination alone: an unscoped route and a scoped one can share a
 // destination, and withdrawing one must not take out the other.
 func TestDarwinDeleteSelectsScopeOfRouteItWithdraws(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	specific := Route{Destination: prefix("203.0.113.0/24")}
 	if err := plat.DelRoute(specific); err != nil {
 		t.Fatal(err)
@@ -858,7 +856,7 @@ func TestDarwinDeleteSelectsScopeOfRouteItWithdraws(t *testing.T) {
 // kernel holds, for as long as the other writer keeps the key; reported as a
 // failure it would put every pass into backoff over something no retry frees.
 func TestDarwinReportsOccupiedRouteAsSkipped(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	announced := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
 	plat.addrs = func() ([]netip.Prefix, error) {
 		return []netip.Prefix{prefix("2001:db8::1/128")}, nil
@@ -882,12 +880,12 @@ func TestDarwinReportsOccupiedRouteAsSkipped(t *testing.T) {
 // and keeps whatever scope its destination would have had: a held default must
 // no more be visible to an unbound socket than a real one.
 func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	held := Route{Destination: prefix("2001:db8:1::/48"), Unreachable: true}
 	// Through the same function the dump answers with. A hold sits last among
 	// the routes to its prefix, and a darwin FIB keeps no metric, so the two
 	// sides of the diff disagree the moment either takes its own answer.
-	held.Metric = routeMetric(plat.cfg.Metric, held.Destination, held.Unreachable)
+	held.Metric = routeMetric(plat.table.Metric, held.Destination, held.Unreachable)
 	if err := plat.AddRoute(held); err != nil {
 		t.Fatal(err)
 	}
@@ -928,7 +926,7 @@ func TestDarwinHoldIsInstalledAsReject(t *testing.T) {
 // EEXIST on every pass for the life of the process, and the destination it
 // names is wrong for just as long.
 func TestDarwinAdoptsScopedRouteItDidNotInstall(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	inherited := []dumpEntry{
 		// an announced default, which this backend always scopes
 		{index: testIndex, flags: unix.RTF_UP | unix.RTF_STATIC | unix.RTF_IFSCOPE,
@@ -972,7 +970,7 @@ func TestDarwinAdoptsScopedRouteItDidNotInstall(t *testing.T) {
 // slot, which is reported as skipped and retried forever, so the destination
 // becomes uninstallable for the life of the process.
 func TestDarwinForgetsScopedRouteThatLeftTheKernel(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
 	dest := prefix("2001:db8:1::/48")
 	if err := plat.AddRoute(Route{Destination: dest, Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}); err != nil {
@@ -1002,7 +1000,7 @@ func TestDarwinForgetsScopedRouteThatLeftTheKernel(t *testing.T) {
 // get EEXIST, and warn that another program holds a route this reconciler
 // wrote itself, and withdraw would never remove it.
 func TestDarwinRefusesWhatItsOwnDumpWouldNeverReport(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	if err := plat.AddRoute(Route{Destination: limitedBroadcast}); !errors.Is(err, errRouteSkipped) {
 		t.Errorf("installing the limited broadcast reported %v, want it reported as not installed", err)
 	}
@@ -1017,7 +1015,7 @@ func TestDarwinRefusesWhatItsOwnDumpWouldNeverReport(t *testing.T) {
 // route that is still installed, and the next pass withdraws and reinstalls it
 // instead of recognizing it.
 func TestDarwinKeepsScopedRecordWhenWithdrawalFails(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
 	specific := Route{Destination: prefix("2001:db8:1::/48"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
 	if err := plat.AddRoute(specific); err != nil {
@@ -1057,7 +1055,7 @@ func TestDarwinKeepsScopedRecordWhenWithdrawalFails(t *testing.T) {
 // comparison entirely made that pair compare equal, and no later pass could
 // ever notice.
 func TestDarwinReplacesAnInheritedScopeTheMeshDoesNotWant(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("2001:db8:1::/48")
 	// What the mesh asks for: a plain route, which this backend never scopes.
 	wanted := Route{Destination: dest, Metric: defaultIPv6Metric}
@@ -1103,7 +1101,7 @@ func TestDarwinReplacesAnInheritedScopeTheMeshDoesNotWant(t *testing.T) {
 // destination is forgotten, and the next dump reports that route as ours and
 // withdraws it.
 func TestDarwinOccupiedRecordSurvivesTheOtherKey(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("2001:db8:1::/48")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
 
@@ -1139,7 +1137,7 @@ func TestDarwinOccupiedRecordSurvivesTheOtherKey(t *testing.T) {
 // its life would otherwise carry a hundred records forever, and a stale one
 // hides a route from the dump that nothing can then withdraw.
 func TestDarwinForgetsOccupiedKeyTheMeshStoppedAsking(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("2001:db8:1::/48")
 	sock.err = unix.EEXIST
 	if err := plat.AddRoute(Route{Destination: dest, Metric: defaultIPv6Metric}); !errors.Is(err, errRouteSkipped) {
@@ -1166,7 +1164,7 @@ func TestDarwinForgetsOccupiedKeyTheMeshStoppedAsking(t *testing.T) {
 // another program held its own route, and never withdrew it. On a default or
 // a hold that is a permanent black hole.
 func TestDarwinOccupiedRecordIsReadWithTheRowsOwnScope(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("2001:db8:1::/48")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
 
@@ -1201,7 +1199,7 @@ func TestDarwinOccupiedRecordIsReadWithTheRowsOwnScope(t *testing.T) {
 // the scoped route's source. It did, and the next pass then tore the scoped
 // route down and reinstalled it.
 func TestDarwinWithdrawingUnscopedKeepsTheScopedSource(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{prefix("2001:db8::1/128")}, nil }
 	announced := Route{Destination: prefix("::/0"), Source: prefix("2001:db8::/48"), Metric: defaultIPv6Metric}
 	if err := plat.AddRoute(announced); err != nil {
@@ -1225,8 +1223,8 @@ func TestDarwinWithdrawingUnscopedKeepsTheScopedSource(t *testing.T) {
 // on darwin it is the interface: there is one FIB and Config.Table
 // means nothing here.
 func TestDarwinOwnsAnInterfaceRatherThanATable(t *testing.T) {
-	plat, _ := testPlatform(t, Config{Interface: "utun9", Table: DefaultTable})
-	if got := plat.where(plat.cfg); got != "interface utun9" {
+	plat, _ := testPlatform(t, Table{ID: DefaultTable}, Runtime{Interface: "utun9"})
+	if got := plat.where(plat.table); got != "interface utun9" {
 		t.Errorf("darwin reports %q, want the interface it owns", got)
 	}
 }
@@ -1238,7 +1236,7 @@ func TestDarwinOwnsAnInterfaceRatherThanATable(t *testing.T) {
 // again, and could never withdraw it: the route is in the kernel and the mesh
 // believes it is not, for the life of the process.
 func TestDarwinKnowsItsOwnRouteFromOneAnotherProgramHolds(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("2001:db8:1::/48")
 	installed := Route{Destination: dest, Metric: defaultIPv6Metric}
 	if err := plat.AddRoute(installed); err != nil {
@@ -1325,7 +1323,7 @@ func TestDarwinMonitorIgnoresItsOwnRefusedWrites(t *testing.T) {
 // exception decodeRoute reads: a foreign route out of this interface would
 // then be reported as ours and reach a delete list.
 func TestDarwinKeepsTheRefusalRecordThroughAnUnparseableDump(t *testing.T) {
-	plat, sock := testPlatform(t, Config{})
+	plat, sock := testPlatform(t, Table{}, Runtime{})
 	dest := prefix("2001:db8:1::/48")
 	sock.err = unix.EEXIST
 	if err := plat.AddRoute(Route{Destination: dest, Metric: defaultIPv6Metric}); !errors.Is(err, errRouteSkipped) {
@@ -1353,14 +1351,14 @@ func TestDarwinKeepsTheRefusalRecordThroughAnUnparseableDump(t *testing.T) {
 // tiebreaker RFC 9079 section 4 applies among equally specific destinations,
 // rather than whichever exit sorts lower by address.
 func TestDarwinKeepsTheMoreSpecificSourceAtOneDestination(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	held := prefix("3fff:a::198:18:104:117/128")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
 
 	wide := Route{Destination: prefix("::/0"), Source: prefix("3fff:a::/36")}
 	narrow := Route{Destination: prefix("::/0"), Source: prefix("3fff:a::/48")}
 	for _, r := range []*Route{&wide, &narrow} {
-		r.Metric = routeMetric(plat.cfg.Metric, r.Destination, false)
+		r.Metric = routeMetric(plat.table.Metric, r.Destination, false)
 	}
 
 	// diffRoutes orders the installs, so the preference has to survive it
@@ -1398,12 +1396,12 @@ func TestDarwinKeepsTheMoreSpecificSourceAtOneDestination(t *testing.T) {
 // announcing a default from a prefix this node has no address in reaches the
 // first case, which on a real mesh is most of them.
 func TestDarwinNamesTheTwoSourceRefusalsApart(t *testing.T) {
-	plat, _ := testPlatform(t, Config{})
+	plat, _ := testPlatform(t, Table{}, Runtime{})
 	held := prefix("3fff:a::198:18:104:117/128")
 	plat.addrs = func() ([]netip.Prefix, error) { return []netip.Prefix{held}, nil }
 
 	foreign := Route{Destination: prefix("::/0"), Source: prefix("3fff:a:a::/48")}
-	foreign.Metric = routeMetric(plat.cfg.Metric, foreign.Destination, foreign.Unreachable)
+	foreign.Metric = routeMetric(plat.table.Metric, foreign.Destination, foreign.Unreachable)
 	if err := plat.AddRoute(foreign); !errors.Is(err, errRouteSkipped) {
 		t.Fatalf("a source holding none of our addresses reported %v", err)
 	}
@@ -1419,19 +1417,19 @@ func TestDarwinNamesTheTwoSourceRefusalsApart(t *testing.T) {
 // no RTA_PREFSRC, and the address a route prefers is whichever one the tun
 // carries.
 func TestDarwinRefusesSettingsItCannotHonor(t *testing.T) {
-	for name, mutate := range map[string]func(*Config){
-		"table":    func(c *Config) { c.Table = DefaultTable + 1 },
-		"protocol": func(c *Config) { c.Protocol = DefaultProtocol + 1 },
-		"vrf":      func(c *Config) { c.VRF = "mesh" },
-		"prefsrc4": func(c *Config) { c.PrefSrc4 = netip.MustParseAddr("198.18.104.117") },
+	for name, mutate := range map[string]func(*Table){
+		"table":    func(c *Table) { c.ID = DefaultTable + 1 },
+		"protocol": func(c *Table) { c.Proto = DefaultProtocol + 1 },
+		"vrf":      func(c *Table) { c.VRF = &VRF{Name: "mesh"} },
+		"prefsrc4": func(c *Table) { c.PrefSrc4 = schema.MustAddr("198.18.104.117") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			// Deliberately a device that does not exist: each refusal has to
 			// come before the interface lookup, or a node only learns on a
 			// host where the tun already exists.
-			cfg := Config{Interface: "utun-absent", Table: DefaultTable, Protocol: DefaultProtocol}
-			mutate(&cfg)
-			_, err := newPlatform(cfg)
+			tbl := Table{ID: DefaultTable, Proto: DefaultProtocol}
+			mutate(&tbl)
+			_, err := newPlatform(tbl, Runtime{Interface: "utun-absent"})
 			if err == nil {
 				t.Fatalf("darwin accepted %s", name)
 			}

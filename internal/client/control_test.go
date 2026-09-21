@@ -3,9 +3,13 @@ package client
 import (
 	"testing"
 
+	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/internal/srv6"
 )
 
 // A field added to the dataplane's counters and not to the wire's is a number
@@ -22,26 +26,42 @@ func TestSegmentCountersDoNotDrift(t *testing.T) {
 // packet to that address: the inbound seam acts on the destination before the
 // tun sees it, and a packet with no routing header is then refused rather than
 // delivered. On linux the two coexist, because there the SID is a route.
+//
+// The check spans cap.segment and cap.table, so it lives where the file is
+// read rather than in either capability.
 func TestLocalSegmentOnOneOfThisNodesAddressesIsRefused(t *testing.T) {
 	cfg := &config.Config{
-		Kernel:   config.Kernel{Addresses: []string{"3fff:1:69c:8c6::1/128"}},
-		Segments: config.Segments{Local: []config.LocalSegment{{SID: "3fff:1:69c:8c6::1", Behavior: "End.DT46"}}},
+		// A node complete enough to load, since the check under test is the
+		// one Validate makes after every capability has passed its own.
+		Node: config.Node{Org: "example", Name: "node"},
+		Auth: config.Auth{Key: "key.pem", Trust: "trust.json"},
+		Link: config.Link{
+			Port:      13000,
+			Listen:    true,
+			Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}},
+		},
+		Cap: config.Caps{
+			Table: &kernel.Table{Addresses: []schema.Prefix{schema.MustPrefix("3fff:1:69c:8c6::1/128")}},
+			Segment: &srv6.Segments{Local: []srv6.Segment{
+				{SID: schema.MustAddr("3fff:1:69c:8c6::1"), Behavior: srv6.BehaviorEndDT46},
+			}},
+		},
 	}
-	if _, err := localSegments(cfg); err == nil {
+	if err := cfg.Validate(); err == nil {
 		t.Error("a segment on one of this node's own addresses was accepted")
 	}
-	cfg.Kernel.Addresses = []string{"3fff:1:69c:8c6::9/128"}
-	if _, err := localSegments(cfg); err != nil {
+	cfg.Cap.Table.Addresses = []schema.Prefix{schema.MustPrefix("3fff:1:69c:8c6::9/128")}
+	if err := cfg.Validate(); err != nil {
 		t.Errorf("a segment beside an unrelated address was refused: %v", err)
 	}
 
-	// assign_originated puts every originated prefix on the device too, so the
+	// assign_announced puts every announced prefix on the device too, so the
 	// check covers everything the reconciler assigns rather than the addresses
 	// list alone.
-	cfg.Kernel.AssignOriginated = true
-	cfg.Originate = []string{"3fff:1:69c:8c6::1/128"}
-	if _, err := localSegments(cfg); err == nil {
-		t.Error("a segment on a prefix this node assigns from originate was accepted")
+	cfg.Cap.Table.AssignAnnounced = true
+	cfg.Cap.Route = &babel.Routes{Announce: announce("3fff:1:69c:8c6::1/128")}
+	if err := cfg.Validate(); err == nil {
+		t.Error("a segment on a prefix this node assigns from cap.route was accepted")
 	}
 }
 
@@ -49,15 +69,18 @@ func TestLocalSegmentOnOneOfThisNodesAddressesIsRefused(t *testing.T) {
 // as the rule list refuses the same typo. Masking steers a whole prefix where
 // one address was meant and says nothing about it.
 func TestSteerSelectorWithHostBitsIsRefused(t *testing.T) {
-	cfg := &config.Config{Segments: config.Segments{
-		Source: "3fff:1:69c:8c0::1",
-		Steer:  []config.SteerEntry{{From: "3fff:a::198:18:104:117/64", Via: []string{"3fff:1:69c:98d6::1"}}},
-	}}
-	if _, err := steerTable(cfg); err == nil {
+	segments := srv6.Segments{
+		Source: schema.MustAddr("3fff:1:69c:8c0::1"),
+		Steer: []srv6.Steer{{
+			From: schema.MustPrefix("3fff:a::198:18:104:117/64"),
+			Via:  []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")},
+		}},
+	}
+	if err := segments.Validate(); err == nil {
 		t.Error("a selector with bits below its prefix length was accepted")
 	}
-	cfg.Segments.Steer[0].From = "3fff:a::198:18:104:117/128"
-	if _, err := steerTable(cfg); err != nil {
+	segments.Steer[0].From = schema.MustPrefix("3fff:a::198:18:104:117/128")
+	if err := segments.Validate(); err != nil {
 		t.Errorf("a host selector was refused: %v", err)
 	}
 }

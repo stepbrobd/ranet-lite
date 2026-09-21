@@ -30,6 +30,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
+	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/internal/transport"
 	yaml "gopkg.in/yaml.v3"
 )
@@ -99,9 +101,9 @@ func runtimeFixture(t *testing.T) (*config.Config, ed25519.PrivateKey, registry.
 		},
 	}}
 	cfg := &config.Config{
-		Organization: "example", CommonName: "local",
-		Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
-		Peers:     []config.Peer{{Organization: "example", CommonName: "gateway", SerialNumber: "1"}},
+		Node: config.Node{Org: "example", Name: "local"},
+		Link: config.Link{Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
+		Dial: config.Dial{To: []config.Peer{{Org: "example", Name: "gateway", Serial: "1"}}},
 	}
 	return cfg, privateKey, reg
 }
@@ -118,7 +120,7 @@ func TestValidateRuntimeConfig(t *testing.T) {
 	if err := validateRuntimeConfig(cfg, wrongKey, reg); err == nil {
 		t.Fatal("accepted a private key from another organization")
 	}
-	cfg.Peers[0].SerialNumber = "missing"
+	cfg.Dial.To[0].Serial = "missing"
 	if err := validateRuntimeConfig(cfg, privateKey, reg); err == nil {
 		t.Fatal("accepted a peer endpoint missing from the registry")
 	}
@@ -136,20 +138,20 @@ func TestStartupSkipsAPeerNoLocalFamilyCanDial(t *testing.T) {
 		CommonName: "v6only",
 		Endpoints:  []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip6", Port: 13000}},
 	})
-	cfg.Peers = append(cfg.Peers, config.Peer{Organization: "example", CommonName: "v6only"})
+	cfg.Dial.To = append(cfg.Dial.To, config.Peer{Org: "example", Name: "v6only"})
 	if err := validateRuntimeConfig(cfg, privateKey, reg); err != nil {
 		t.Fatalf("a v6-only peer stopped a v4-only node from starting: %v", err)
 	}
 
 	// The same peer named by a serial is somebody writing the wrong thing
 	// down rather than the shape of the registry, and still refuses.
-	cfg.Peers[len(cfg.Peers)-1].SerialNumber = "0"
+	cfg.Dial.To[len(cfg.Dial.To)-1].Serial = "0"
 	if err := validateRuntimeConfig(cfg, privateKey, reg); err == nil {
 		t.Error("a peer endpoint named by serial in a family this node has not is accepted")
 	}
 
 	// And a node the registry has never heard of still refuses.
-	cfg.Peers[len(cfg.Peers)-1] = config.Peer{Organization: "example", CommonName: "absent"}
+	cfg.Dial.To[len(cfg.Dial.To)-1] = config.Peer{Org: "example", Name: "absent"}
 	if err := validateRuntimeConfig(cfg, privateKey, reg); err == nil {
 		t.Error("a peer the registry does not name is accepted")
 	}
@@ -172,152 +174,77 @@ func TestFullMeshDialsEveryNodeTheRegistryNames(t *testing.T) {
 		Nodes: []registry.Node{{CommonName: "far", Endpoints: []registry.Endpoint{{SerialNumber: "0", AddressFamily: "ip4", Port: 13000}}}},
 	})
 
-	if got := effectivePeers(cfg, reg); len(got) != 1 || got[0].CommonName != "gateway" {
+	if got := effectivePeers(cfg, reg); len(got) != 1 || got[0].Name != "gateway" {
 		t.Fatalf("without full_mesh the peers list is not honored: %v", got)
 	}
 
 	// The configured entry stays, and stays first, because it can pin a
 	// serial_number that a generated entry cannot. Generating a second one for
 	// the same node would dial both of its endpoints.
-	cfg.FullMesh = true
+	cfg.Dial.All = true
 	got := effectivePeers(cfg, reg)
 	var names []string
 	for _, peer := range got {
-		names = append(names, peer.Organization+"/"+peer.CommonName)
+		names = append(names, peer.Org+"/"+peer.Name)
 	}
 	want := []string{"example/gateway", "example/other", "elsewhere/far"}
 	if !slices.Equal(names, want) {
 		t.Errorf("full_mesh dials %v, want %v", names, want)
 	}
-	if got[0].SerialNumber != "1" {
-		t.Errorf("the configured entry lost its pinned serial, got %q", got[0].SerialNumber)
+	if got[0].Serial != "1" {
+		t.Errorf("the configured entry lost its pinned serial, got %q", got[0].Serial)
 	}
 	// Every organization, not only this node's own: the registry is the trust
 	// root for the whole community and ranet dials all of it.
 	for _, peer := range got {
-		if peer.Organization == cfg.Organization && peer.CommonName == cfg.CommonName {
-			t.Error("full_mesh dialed this node itself")
+		if peer.Org == cfg.Node.Org && peer.Name == cfg.Node.Name {
+			t.Error("dial.all dialed this node itself")
 		}
 	}
 }
 
-// Endpoint is compared with == to decide whether a reload may proceed, so
-// every field it gains has to compare by value. ranet's own config carries an
-// address and an updown path on each endpoint, and holding either behind a
-// pointer made two loads of one file differ: the node then refused every
-// SIGHUP with "local endpoints changed", which is the reload that exists so a
-// node joining the mesh does not restart every other node's dataplane.
-func TestReloadSurvivesRanetsEndpointFields(t *testing.T) {
-	const body = `{"organization":"example","common_name":"laptop","full_mesh":true,
-		"registry":"r","private_key":"k",
-		"endpoints":[
-			{"serial_number":"0","address_family":"ip6","port":13000,
-			 "address":"laptop.example.invalid","updown":"/nix/store/x-updown","fwmark":"0x726c"},
-			{"serial_number":"1","address_family":"ip4","port":13000,"address":null}]}`
+// A local endpoint is compared by value to decide whether a reload may
+// proceed, so two loads of one file have to report the same endpoints. The
+// reload exists so a node joining the mesh does not restart every other node's
+// dataplane, and a file that reads differently on every load refuses all of
+// them.
+func TestReloadSurvivesRereadingOneFile(t *testing.T) {
+	const body = `{"node":{"org":"example","name":"laptop"},
+		"auth":{"key":"k","trust":"r"},
+		"dial":{"all":true},
+		"link":{"port":13000,"endpoints":[
+			{"serial":"0","family":"ip6"},
+			{"serial":"1","family":"ip4"}]}}`
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := config.Load(path, "", "", false)
+	first, err := config.Load(path)
 	if err != nil {
-		t.Fatalf("a null address was refused: %v", err)
+		t.Fatalf("a json configuration was refused: %v", err)
 	}
-	second, err := config.Load(path, "", "", false)
+	second, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sameEndpoints(first.Endpoints, second.Endpoints) {
+	if !slices.Equal(first.Link.Endpoints, second.Link.Endpoints) {
 		t.Fatal("two loads of one file report different endpoints, so every reload is refused")
 	}
 	if err := reloadable(first, second); err != nil {
 		t.Fatalf("reloading an unchanged file was refused: %v", err)
 	}
 
-	// An endpoint's address and updown path change nothing this node runs on,
-	// so editing one must not force a restart. A redeploy that renames a host
-	// rewrites exactly those.
-	cosmetic := *second
-	cosmetic.Endpoints = slices.Clone(second.Endpoints)
-	cosmetic.Endpoints[0].Address = "renamed.if.example.co"
-	cosmetic.Endpoints[0].UpDown = "/nix/store/y-updown"
-	if err := reloadable(first, &cosmetic); err != nil {
-		t.Errorf("a changed address or updown forced a restart: %v", err)
-	}
-
-	// The two that do reach something still do.
+	// Both halves of an endpoint reach something built once at startup.
 	for name, change := range map[string]func(*config.Config){
-		"family": func(c *config.Config) { c.Endpoints[0].AddressFamily = "ip4" },
-		"serial": func(c *config.Config) { c.Endpoints[0].SerialNumber = "9" },
+		"family": func(c *config.Config) { c.Link.Endpoints[0].Family = "ip4" },
+		"serial": func(c *config.Config) { c.Link.Endpoints[0].Serial = "9" },
 	} {
 		altered := *second
-		altered.Endpoints = slices.Clone(second.Endpoints)
+		altered.Link.Endpoints = slices.Clone(second.Link.Endpoints)
 		change(&altered)
 		if err := reloadable(first, &altered); err == nil {
 			t.Errorf("a changed endpoint %s was accepted in place", name)
 		}
-	}
-}
-
-// ranet's config names neither the registry nor the key, so a node started
-// against it takes both from the command line. Reload re-reads the file, and
-// reading it without those paths makes it invalid: the node would then refuse
-// every reload it ever saw, and the registry is rewritten whenever any node
-// joins the mesh, so that is every reload that matters.
-func TestReloadKeepsThePathsTheCommandLineSupplied(t *testing.T) {
-	dir := t.TempDir()
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalPKIXPublicKey(publicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	publicPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
-	reg := registry.Registry{{
-		Organization: "example", PublicKey: publicPEM,
-		Nodes: []registry.Node{
-			{CommonName: "laptop", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
-			{CommonName: "exit", Endpoints: []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}}},
-		},
-	}}
-	registryPath := filepath.Join(dir, "registry.json")
-	writeRegistry(t, registryPath, reg)
-	keyPath := filepath.Join(dir, "key.pem")
-	writeKey(t, keyPath, privateKey)
-
-	// ranet's own shape: no registry, no private_key, the port on the endpoint.
-	configPath := filepath.Join(dir, "config.json")
-	body := `{"organization":"example","common_name":"laptop","full_mesh":true,
-		"endpoints":[{"serial_number":"1","address_family":"ip4","port":13000}]}`
-	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(configPath, registryPath, keyPath, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	c := &Client{
-		ctx: ctx, cancel: cancel, privateKey: privateKey,
-		speaker: speaker, dialers: make(map[string]*dialer),
-	}
-	c.cfg.Store(cfg)
-	c.reg.Store(&reg)
-	defer func() { cancel(); c.peers.Wait() }()
-
-	if err := c.Reload(configPath, registryPath, keyPath, false); err != nil {
-		t.Fatalf("reloading with the paths the command line supplied: %v", err)
-	}
-	if err := c.Reload(configPath, "", "", false); err == nil {
-		t.Error("reloading without them was accepted, so the fixture proves nothing")
 	}
 }
 
@@ -370,13 +297,12 @@ func TestSyncPeersStartsAndStopsDialers(t *testing.T) {
 	defer cancel()
 	c := &Client{ctx: ctx, cancel: cancel, dialers: make(map[string]*dialer)}
 	c.cfg.Store(&config.Config{
-		Organization: "example",
-		CommonName:   "node",
-		Endpoints:    []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
-		Peers: []config.Peer{
-			{Organization: "example", CommonName: "a"},
-			{Organization: "example", CommonName: "b"},
-		},
+		Node: config.Node{Org: "example", Name: "node"},
+		Link: config.Link{Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
+		Dial: config.Dial{To: []config.Peer{
+			{Org: "example", Name: "a"},
+			{Org: "example", Name: "b"},
+		}},
 	})
 	// Both nodes are in the registry carrying an address, so each dialer stays
 	// in its retry loop against a port nothing answers on rather than giving
@@ -401,10 +327,9 @@ func TestSyncPeersStartsAndStopsDialers(t *testing.T) {
 
 	// Dropping one peer stops exactly that dialer and leaves the other alone.
 	c.cfg.Store(&config.Config{
-		Organization: "example",
-		CommonName:   "node",
-		Endpoints:    []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
-		Peers:        []config.Peer{{Organization: "example", CommonName: "a"}},
+		Node: config.Node{Org: "example", Name: "node"},
+		Link: config.Link{Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
+		Dial: config.Dial{To: []config.Peer{{Org: "example", Name: "a"}}},
 	})
 	c.syncPeers()
 	if got := dialerCount(c); got != 1 {
@@ -436,8 +361,8 @@ func hasDialer(c *Client, path string) bool {
 
 func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 	base := &config.Config{
-		Organization: "example", CommonName: "node", Port: 13000,
-		Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
+		Node: config.Node{Org: "example", Name: "node"},
+		Link: config.Link{Port: 13000, Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
 	}
 	rxcost := uint16(64)
 	window := uint32(8192)
@@ -446,15 +371,23 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 	// report a reload that changed nothing, or leave the node running two
 	// policies at the same time.
 	for name, change := range map[string]func(*config.Config){
-		"identity":  func(c *config.Config) { c.CommonName = "other" },
-		"fwmark":    func(c *config.Config) { c.FWMark = 0x726c },
-		"port":      func(c *config.Config) { c.Port = 14000 },
-		"tun":       func(c *config.Config) { c.TUN = "ranet9" },
-		"responder": func(c *config.Config) { c.Responder = !c.Responder },
-		"endpoints": func(c *config.Config) { c.Endpoints = []config.Endpoint{{SerialNumber: "1", AddressFamily: "ip6"}} },
-		"babel":     func(c *config.Config) { c.Babel.RxCost = &rxcost },
-		"kernel":    func(c *config.Config) { c.Kernel.Table = 201 },
-		"rekey":     func(c *config.Config) { c.ReplayWindow = &window },
+		"node":   func(c *config.Config) { c.Node.Name = "other" },
+		"mark":   func(c *config.Config) { c.Link.Mark = 0x726c },
+		"port":   func(c *config.Config) { c.Link.Port = 14000 },
+		"tun":    func(c *config.Config) { c.Link.TUN = "ranet9" },
+		"listen": func(c *config.Config) { c.Link.Listen = !c.Link.Listen },
+		"endpoints": func(c *config.Config) {
+			c.Link.Endpoints = []config.Endpoint{{Serial: "1", Family: "ip6"}}
+		},
+		"cap.babel":  func(c *config.Config) { c.Cap.Babel = &babel.Config{Cost: babel.CostParams{RxCost: rxcost}} },
+		"cap.route":  func(c *config.Config) { c.Cap.Route = &babel.Routes{Transit: new(bool)} },
+		"cap.table":  func(c *config.Config) { c.Cap.Table = &kernel.Table{ID: 201} },
+		"cap.crypto": func(c *config.Config) { c.Cap.Crypto = &ike.Crypto{Replay: &window} },
+		"cap.segment": func(c *config.Config) {
+			c.Cap.Segment = &srv6.Segments{Local: []srv6.Segment{
+				{SID: schema.MustAddr("2001:db8::1"), Behavior: srv6.BehaviorEnd},
+			}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			next := *base
@@ -465,7 +398,7 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 		})
 	}
 	unchanged := *base
-	unchanged.Peers = []config.Peer{{Organization: "example", CommonName: "a"}}
+	unchanged.Dial.To = []config.Peer{{Org: "example", Name: "a"}}
 	if err := reloadable(base, &unchanged); err != nil {
 		t.Fatalf("adding a peer was refused: %v", err)
 	}
@@ -478,16 +411,16 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 // and every later one, and with it every registry the node would have picked
 // up.
 func TestReloadTakesABabelDefaultWrittenOut(t *testing.T) {
-	omitted := &config.Config{Organization: "example", CommonName: "node", Port: 13000}
-	hello := config.Duration(4 * time.Second)
-	update := config.Duration(16 * time.Second)
+	omitted := &config.Config{Node: config.Node{Org: "example", Name: "node"}, Link: config.Link{Port: 13000}}
 	written := *omitted
-	written.Babel.HelloInterval, written.Babel.UpdateInterval = hello, update
+	written.Cap.Babel = &babel.Config{
+		Hello:  schema.Duration(4 * time.Second),
+		Update: schema.Duration(16 * time.Second),
+	}
 	if err := reloadable(omitted, &written); err != nil {
 		t.Errorf("writing out the intervals already running was refused: %v", err)
 	}
-	other := config.Duration(8 * time.Second)
-	written.Babel.HelloInterval = other
+	written.Cap.Babel = &babel.Config{Hello: schema.Duration(8 * time.Second)}
 	if err := reloadable(omitted, &written); err == nil {
 		t.Error("a changed hello interval was accepted, and the speaker is built once")
 	}
@@ -518,17 +451,19 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 	keyPath := filepath.Join(dir, "key.pem")
 	writeKey(t, keyPath, privateKey)
 	configPath := filepath.Join(dir, "config.json")
-	body := `{"organization":"example","common_name":"laptop","full_mesh":true,
-		"endpoints":[{"serial_number":"1","address_family":"ip4","port":13000}]}`
+	body := fmt.Sprintf(`{"node":{"org":"example","name":"laptop"},
+		"auth":{"key":%q,"trust":%q},
+		"dial":{"all":true},
+		"link":{"port":13000,"endpoints":[{"serial":"1","family":"ip4"}]}}`, keyPath, registryPath)
 	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(configPath, registryPath, keyPath, false)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
+	speaker, err := babel.New(babel.Config{}, babel.Routes{}, babel.Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +474,7 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 	c.reg.Store(&reg)
 	defer func() { cancel(); c.peers.Wait() }()
 
-	if err := c.Reload(configPath, registryPath, keyPath, false); err != nil {
+	if err := c.Reload(configPath); err != nil {
 		t.Fatalf("reloading on the key this node started with: %v", err)
 	}
 	// Rotated in place, which is how one is staged, so the path in the config
@@ -549,65 +484,67 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeKey(t, keyPath, rotated)
-	if err := c.Reload(configPath, registryPath, keyPath, false); err == nil {
+	if err := c.Reload(configPath); err == nil {
 		t.Error("a reload reported success while the node kept signing with the key it started on")
 	}
 	if err := os.Remove(keyPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Reload(configPath, registryPath, keyPath, false); err == nil {
+	if err := c.Reload(configPath); err == nil {
 		t.Error("a key file that no longer exists reported a successful reload")
 	}
 }
 
 func TestReloadRefusesAssignedAddressChanges(t *testing.T) {
 	for name, change := range map[string]func(*config.Config){
-		"top-level addition": func(c *config.Config) {
-			c.Originate = []string{"fd00:1::1/64", "fd00:2::1/64"}
+		"an addition": func(c *config.Config) {
+			c.Cap.Route = &babel.Routes{Announce: announce("fd00:1::1/64", "fd00:2::1/64")}
 		},
-		"top-level removal": func(c *config.Config) { c.Originate = nil },
-		"babel addition": func(c *config.Config) {
-			c.Babel.Originate = []config.OriginatePrefix{{
-				Prefix: netip.MustParsePrefix("fd00:2::1/64"), From: netip.MustParsePrefix("fd00:3::/64"),
+		"a removal": func(c *config.Config) { c.Cap.Route = &babel.Routes{} },
+		"a source-specific addition": func(c *config.Config) {
+			c.Cap.Route = &babel.Routes{Announce: []schema.Announce{
+				{Prefix: schema.MustPrefix("fd00:1::1/64")},
+				{Prefix: schema.MustPrefix("fd00:2::1/64"), From: schema.MustPrefix("fd00:3::/64")},
 			}}
 		},
-		"host address change": func(c *config.Config) { c.Originate = []string{"fd00:1::2/64"} },
+		"a host address change": func(c *config.Config) {
+			c.Cap.Route = &babel.Routes{Announce: announce("fd00:1::2/64")}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c, path := reloadFixture(t)
 			old := c.config()
-			old.Kernel = config.Kernel{Enabled: true, AssignOriginated: true}
-			old.Originate = []string{"fd00:1::1/64"}
+			old.Cap.Table = &kernel.Table{AssignAnnounced: true}
+			old.Cap.Route = &babel.Routes{Announce: announce("fd00:1::1/64")}
 			next := *old
 			change(&next)
 			writeConfig(t, path, &next)
-			if _, err := config.Load(path, "", "", false); err != nil {
+			if _, err := config.Load(path); err != nil {
 				t.Fatalf("invalid reload fixture: %v", err)
 			}
-			if err := c.Reload(path, "", "", false); err == nil {
+			if err := c.Reload(path); err == nil {
 				t.Fatal("reload accepted an assigned address change")
 			}
-			if !slices.Equal(c.config().Originate, old.Originate) ||
-				!slices.Equal(c.config().Babel.Originate, old.Babel.Originate) {
-				t.Error("refused reload changed the active originations")
+			if !slices.Equal(c.config().Routes().Announce, old.Routes().Announce) {
+				t.Error("refused reload changed the active announcements")
 			}
 		})
 	}
 }
 
 func TestReloadAllowsUnchangedAssignedAddresses(t *testing.T) {
-	base := &config.Config{
-		Kernel:    config.Kernel{Enabled: true, AssignOriginated: true},
-		Originate: []string{"fd00:1::1/64", "fd00:2::1/64"},
-	}
+	base := &config.Config{Cap: config.Caps{
+		Table: &kernel.Table{AssignAnnounced: true},
+		Route: &babel.Routes{Announce: announce("fd00:1::1/64", "fd00:2::1/64")},
+	}}
 	for name, change := range map[string]func(*config.Config){
 		"reorder and duplicate": func(c *config.Config) {
-			c.Originate = []string{"fd00:2::1/64", "fd00:1::1/64", "fd00:2::1/64"}
+			c.Cap.Route = &babel.Routes{Announce: announce("fd00:2::1/64", "fd00:1::1/64", "fd00:2::1/64")}
 		},
-		"move into babel": func(c *config.Config) {
-			c.Originate = []string{"fd00:1::1/64"}
-			c.Babel.Originate = []config.OriginatePrefix{{
-				Prefix: netip.MustParsePrefix("fd00:2::1/64"), From: netip.MustParsePrefix("fd00:3::/64"),
+		"one of them given a source": func(c *config.Config) {
+			c.Cap.Route = &babel.Routes{Announce: []schema.Announce{
+				{Prefix: schema.MustPrefix("fd00:1::1/64")},
+				{Prefix: schema.MustPrefix("fd00:2::1/64"), From: schema.MustPrefix("fd00:3::/64")},
 			}}
 		},
 	} {
@@ -619,29 +556,37 @@ func TestReloadAllowsUnchangedAssignedAddresses(t *testing.T) {
 			}
 		})
 	}
-	for _, kernel := range []config.Kernel{
-		{Enabled: true},
-		{AssignOriginated: true},
-	} {
-		old := &config.Config{Kernel: kernel}
+	// A reconciler that assigns nothing, and no reconciler at all: an
+	// announcement changes what the mesh hears and nothing the device carries.
+	for _, table := range []*kernel.Table{{}, nil} {
+		old := &config.Config{Cap: config.Caps{Table: table}}
 		next := *old
-		next.Originate = []string{"fd00:4::/64"}
+		next.Cap.Route = &babel.Routes{Announce: announce("fd00:4::/64")}
 		if err := reloadable(old, &next); err != nil {
 			t.Fatalf("announcement-only change was refused: %v", err)
 		}
 	}
 }
 
+// announce is the capability's list built from the prefixes a test holds.
+func announce(prefixes ...string) []schema.Announce {
+	out := make([]schema.Announce, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		out = append(out, schema.Announce{Prefix: schema.MustPrefix(prefix)})
+	}
+	return out
+}
+
 func reloadFixture(t *testing.T) (*Client, string) {
 	t.Helper()
 	cfg, privateKey, reg := runtimeFixture(t)
 	dir := t.TempDir()
-	cfg.Port = 13000
-	cfg.PrivateKey = filepath.Join(dir, "key.pem")
-	cfg.Registry = filepath.Join(dir, "registry.json")
-	writeKey(t, cfg.PrivateKey, privateKey)
-	writeRegistry(t, cfg.Registry, reg)
-	speaker, err := babel.New(cfg.Babel.SpeakerConfig(), &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	cfg.Link.Port = 13000
+	cfg.Auth.Key = filepath.Join(dir, "key.pem")
+	cfg.Auth.Trust = filepath.Join(dir, "registry.json")
+	writeKey(t, cfg.Auth.Key, privateKey)
+	writeRegistry(t, cfg.Auth.Trust, reg)
+	speaker, err := babel.New(cfg.Babel(), cfg.Routes(), babel.Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +603,7 @@ func reloadFixture(t *testing.T) (*Client, string) {
 
 func TestMetricsExposesBabelAndSessionState(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
+	speaker, err := babel.New(babel.Config{}, babel.Routes{}, babel.Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -950,10 +895,9 @@ func TestSyncPeersRestartsDialerThatGaveUp(t *testing.T) {
 	// A serial number sends runPeer through the pre-checks, which fail against
 	// an empty registry and return rather than looping.
 	c.cfg.Store(&config.Config{
-		Organization: "example",
-		CommonName:   "node",
-		Endpoints:    []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
-		Peers:        []config.Peer{{Organization: "example", CommonName: "a", SerialNumber: "1"}},
+		Node: config.Node{Org: "example", Name: "node"},
+		Link: config.Link{Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
+		Dial: config.Dial{To: []config.Peer{{Org: "example", Name: "a", Serial: "1"}}},
 	})
 	reg := registry.Registry{}
 	c.reg.Store(&reg)
@@ -989,10 +933,9 @@ func TestSyncPeersNoticesChangedSerialNumber(t *testing.T) {
 	c := &Client{ctx: ctx, cancel: cancel, dialers: make(map[string]*dialer)}
 	base := func(serial string) *config.Config {
 		return &config.Config{
-			Organization: "example",
-			CommonName:   "node",
-			Endpoints:    []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
-			Peers:        []config.Peer{{Organization: "example", CommonName: "a", SerialNumber: serial}},
+			Node: config.Node{Org: "example", Name: "node"},
+			Link: config.Link{Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
+			Dial: config.Dial{To: []config.Peer{{Org: "example", Name: "a", Serial: serial}}},
 		}
 	}
 	// The peer is in the registry with no address yet, so each dialer retries
@@ -1036,16 +979,16 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
 	writeRegistry(t, registryPath, reg)
-	cfg.Registry = registryPath
-	cfg.Originate = []string{"fd00:1::/64"}
+	cfg.Auth.Trust = registryPath
+	cfg.Cap.Route = &babel.Routes{Announce: announce("fd00:1::/64")}
 	// Load validates the whole file, so the fixture has to be a config a node
 	// could actually run.
-	cfg.Port = 13000
-	cfg.PrivateKey = filepath.Join(dir, "key.pem")
-	writeKey(t, cfg.PrivateKey, privateKey)
+	cfg.Link.Port = 13000
+	cfg.Auth.Key = filepath.Join(dir, "key.pem")
+	writeKey(t, cfg.Auth.Key, privateKey)
 
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
+	speaker, err := babel.New(babel.Config{}, babel.Routes{}, babel.Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,14 +1006,14 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	// A second node joins and this node starts announcing another prefix,
 	// the shape of a registry rewrite together with a config edit.
 	next := *cfg
-	next.Peers = append(slices.Clone(cfg.Peers),
-		config.Peer{Organization: "example", CommonName: "third", SerialNumber: "1"})
-	next.Originate = []string{"fd00:1::/64", "fd00:2::/64"}
-	// A source-specific announcement too, which only the babel block can
-	// express and which reaches the speaker through its own loop.
-	next.Babel.Originate = []config.OriginatePrefix{{
-		Prefix: netip.MustParsePrefix("fd00:3::/64"),
-		From:   netip.MustParsePrefix("fd00:a::/64"),
+	next.Dial.To = append(slices.Clone(cfg.Dial.To),
+		config.Peer{Org: "example", Name: "third", Serial: "1"})
+	// A source-specific announcement among them, the spelling an exit uses,
+	// which reaches the speaker the same way the plain ones do.
+	next.Cap.Route = &babel.Routes{Announce: []schema.Announce{
+		{Prefix: schema.MustPrefix("fd00:1::/64")},
+		{Prefix: schema.MustPrefix("fd00:2::/64")},
+		{Prefix: schema.MustPrefix("fd00:3::/64"), From: schema.MustPrefix("fd00:a::/64")},
 	}}
 	grown := slices.Clone(reg)
 	grown[0].Nodes = append(slices.Clone(reg[0].Nodes), registry.Node{
@@ -1081,10 +1024,10 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	writeConfig(t, configPath, &next)
 
-	if err := c.Reload(configPath, "", "", false); err != nil {
+	if err := c.Reload(configPath); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if got := len(c.config().Peers); got != 2 {
+	if got := len(c.config().Dial.To); got != 2 {
 		t.Errorf("the reloaded config has %d peers, want 2", got)
 	}
 	if _, _, ok := c.registry().FindNode("example", "third"); !ok {
@@ -1142,11 +1085,11 @@ func writeKey(t *testing.T, path string, key ed25519.PrivateKey) {
 // started once by Run. Accepting the change would report a reload that turned
 // the responder on while nobody answered.
 func TestReloadRefusesResponderChange(t *testing.T) {
-	base := &config.Config{Organization: "example", CommonName: "node", Port: 13000}
+	base := &config.Config{Node: config.Node{Org: "example", Name: "node"}, Link: config.Link{Port: 13000}}
 	next := *base
-	next.Responder = !base.Responder
+	next.Link.Listen = !base.Link.Listen
 	if err := reloadable(base, &next); err == nil {
-		t.Error("a responder change was accepted, and nothing applies it")
+		t.Error("a listen change was accepted, and nothing applies it")
 	}
 }
 
@@ -1156,35 +1099,36 @@ func TestReloadRefusesResponderChange(t *testing.T) {
 // already uses, would have been enough to make every later SIGHUP fail.
 func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 	base := &config.Config{
-		Organization: "example", CommonName: "node", Port: 13000,
-		Endpoints: []config.Endpoint{{SerialNumber: "0", AddressFamily: "ip4"}},
+		Node: config.Node{Org: "example", Name: "node"},
+		Link: config.Link{Port: 13000, Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
+		// The reconciler is on in both, since the presence of the block is
+		// what turns it on and adding one is a change by itself.
+		Cap: config.Caps{Table: &kernel.Table{}},
 	}
-	defaults := base.Babel.SpeakerConfig()
-	rxcost, rttCost := defaults.Cost.RxCost, defaults.Cost.RTTCost
-	rttMin, rttMax := config.Duration(defaults.Cost.RTTMin), config.Duration(defaults.Cost.RTTMax)
-	reconcile := config.Duration(kernel.DefaultReconcileInterval)
+	defaults := base.Babel().CostEffective()
 
-	for name, next := range map[string]*config.Config{
-		"babel costs": {
-			Organization: "example", CommonName: "node", Port: 13000, Endpoints: base.Endpoints,
-			Babel: config.Babel{RxCost: &rxcost, RTTCost: &rttCost, RTTMin: &rttMin, RTTMax: &rttMax},
+	for name, write := range map[string]func(*config.Config){
+		"babel costs": func(c *config.Config) {
+			c.Cap.Babel = &babel.Config{Cost: defaults}
 		},
-		"reconcile interval": {
-			Organization: "example", CommonName: "node", Port: 13000, Endpoints: base.Endpoints,
-			Kernel: config.Kernel{ReconcileInterval: &reconcile},
+		"the reconcile interval": func(c *config.Config) {
+			c.Cap.Table = &kernel.Table{Reconcile: schema.Duration(kernel.DefaultReconcileInterval)}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := reloadable(base, next); err != nil {
+			next := *base
+			write(&next)
+			if err := reloadable(base, &next); err != nil {
 				t.Errorf("writing a default out in full was refused: %v", err)
 			}
 		})
 	}
 
 	// A real change is still refused, or the comparison would be useless.
-	louder := uint16(rxcost + 1)
+	louder := defaults
+	louder.RxCost++
 	changed := *base
-	changed.Babel = config.Babel{RxCost: &louder}
+	changed.Cap.Babel = &babel.Config{Cost: louder}
 	if err := reloadable(base, &changed); err == nil {
 		t.Error("a changed link cost was accepted, which the speaker would never see")
 	}
@@ -1243,13 +1187,13 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	cfg, privateKey, reg := runtimeFixture(t)
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
-	cfg.Registry = registryPath
-	cfg.Port = 13000
-	cfg.PrivateKey = filepath.Join(dir, "key.pem")
-	writeKey(t, cfg.PrivateKey, privateKey)
+	cfg.Auth.Trust = registryPath
+	cfg.Link.Port = 13000
+	cfg.Auth.Key = filepath.Join(dir, "key.pem")
+	writeKey(t, cfg.Auth.Key, privateKey)
 	// Two peers to start with, so the reload below can be seen to keep one.
-	cfg.Peers = append(slices.Clone(cfg.Peers),
-		config.Peer{Organization: "example", CommonName: "third", SerialNumber: "1"})
+	cfg.Dial.To = append(slices.Clone(cfg.Dial.To),
+		config.Peer{Org: "example", Name: "third", Serial: "1"})
 	joined := slices.Clone(reg)
 	joined[0].Nodes = append(slices.Clone(reg[0].Nodes), registry.Node{
 		CommonName: "third",
@@ -1258,7 +1202,7 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	writeRegistry(t, registryPath, joined)
 
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
+	speaker, err := babel.New(babel.Config{}, babel.Routes{}, babel.Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1297,7 +1241,7 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	writeConfig(t, configPath, cfg)
 
-	if err := c.Reload(configPath, "", "", false); err != nil {
+	if err := c.Reload(configPath); err != nil {
 		t.Fatalf("one stale peer refused the whole reload: %v", err)
 	}
 	if _, _, ok := c.registry().FindNode("example", "fourth"); !ok {
@@ -1370,8 +1314,8 @@ func TestDialerStandsDownForSessionPeerOpened(t *testing.T) {
 	c.sessions.close = func(*ike.Session) {}
 	c.sessions.active = func(*ike.Session) bool { return true }
 
-	local := cfg.Endpoints[0]
-	peer := cfg.Peers[0]
+	local := cfg.Link.Endpoints[0]
+	peer := cfg.Dial.To[0]
 	name := "example/gateway/1@0"
 	if _, adopted := c.sessions.adoptPreferred(name, &ike.Session{}, false, nil); !adopted {
 		t.Fatal("the session the peer opened was not adopted")
@@ -1408,14 +1352,14 @@ func TestDialerGivesUpOnAPeerItCannotReach(t *testing.T) {
 		Endpoints:  []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip6", Port: 13000}},
 	})
 	for name, peer := range map[string]config.Peer{
-		"pinned to a serial":  {Organization: "example", CommonName: "gone", SerialNumber: "1"},
-		"pinned to none":      {Organization: "example", CommonName: "gone"},
-		"wrong family":        {Organization: "example", CommonName: "v6only"},
-		"wrong family pinned": {Organization: "example", CommonName: "v6only", SerialNumber: "1"},
+		"pinned to a serial":  {Org: "example", Name: "gone", Serial: "1"},
+		"pinned to none":      {Org: "example", Name: "gone"},
+		"wrong family":        {Org: "example", Name: "v6only"},
+		"wrong family pinned": {Org: "example", Name: "v6only", Serial: "1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			done := make(chan struct{})
-			go func() { defer close(done); c.runPeer(ctx, cfg.Endpoints[0], peer) }()
+			go func() { defer close(done); c.runPeer(ctx, cfg.Link.Endpoints[0], peer) }()
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
@@ -1538,7 +1482,7 @@ func TestMetricsLabelsUseOnlyTheEscapesTheFormatDefines(t *testing.T) {
 	// And the rendered line carries it, so nothing above the helper reaches
 	// for %q again.
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
+	speaker, err := babel.New(babel.Config{}, babel.Routes{}, babel.Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1671,7 +1615,7 @@ func TestDialerRepeatingOneFailureSaysItOnce(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(previous) })
 
 	done := make(chan struct{})
-	go func() { c.runPeer(ctx, cfg.Endpoints[0], cfg.Peers[0]); close(done) }()
+	go func() { c.runPeer(ctx, cfg.Link.Endpoints[0], cfg.Dial.To[0]); close(done) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for written.count("reconnecting in") == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -1769,12 +1713,12 @@ func TestDialerGivesUpOnAPeerWithNoAddress(t *testing.T) {
 	// The registry names the node and the address family matches this local
 	// endpoint. Only the address is absent.
 	for name, peer := range map[string]config.Peer{
-		"pinned to a serial": cfg.Peers[0],
-		"unpinned":           {Organization: "example", CommonName: "gateway"},
+		"pinned to a serial": cfg.Dial.To[0],
+		"unpinned":           {Org: "example", Name: "gateway"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			done := make(chan struct{})
-			go func() { c.runPeer(ctx, cfg.Endpoints[0], peer); close(done) }()
+			go func() { c.runPeer(ctx, cfg.Link.Endpoints[0], peer); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
@@ -1845,12 +1789,12 @@ func TestValidatePeersReportsAnEndpointWithNoAddress(t *testing.T) {
 	cfg, _, reg := runtimeFixture(t)
 	families := map[string]struct{}{"ip4": {}}
 	for name, peers := range map[string][]config.Peer{
-		"pinned to a serial": cfg.Peers,
-		"unpinned":           {{Organization: "example", CommonName: "gateway"}},
+		"pinned to a serial": cfg.Dial.To,
+		"unpinned":           {{Org: "example", Name: "gateway"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			named := *cfg
-			named.Peers = peers
+			named.Dial.To = peers
 			refuse, skip := validatePeers(&named, reg, families)
 			if len(refuse) != 0 {
 				t.Errorf("a peer the registry describes but cannot reach stopped the startup: %v", refuse)
@@ -1879,8 +1823,8 @@ func TestDialerGivesUpOnANodeAReloadRemoved(t *testing.T) {
 	c.cfg.Store(cfg)
 	c.reg.Store(&reg)
 
-	local, named := cfg.Endpoints[0], cfg.Peers[0]
-	if _, _, ok := reg.FindNode(named.Organization, named.CommonName); !ok {
+	local, named := cfg.Link.Endpoints[0], cfg.Dial.To[0]
+	if _, _, ok := reg.FindNode(named.Org, named.Name); !ok {
 		t.Fatal("the fixture's own peer is not in its registry, so this proves nothing")
 	}
 	// A name the dialer takes and the resolver refuses, so the loop comes

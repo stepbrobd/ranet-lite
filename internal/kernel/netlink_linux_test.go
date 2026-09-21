@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,8 +43,8 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 	}
 	setLinkFlags(t, conn, index, unix.IFF_UP)
 
-	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
-	opened, err := newPlatform(cfg)
+	tbl, rt := platformFor(device)
+	opened, err := newPlatform(tbl, rt)
 	if err != nil {
 		t.Fatalf("open the netlink platform: %v", err)
 	}
@@ -107,11 +108,11 @@ func TestNetlinkPlatformInNetworkNamespace(t *testing.T) {
 	// another table may show up in a dump, because anything that does is on
 	// the delete list at withdrawal.
 	other := &netlinkPlatform{
-		cfg:   Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol + 1},
+		table: Table{ID: DefaultTable, Proto: DefaultProtocol + 1}, rt: Runtime{Interface: device},
 		index: plat.index, conn: plat.conn,
 	}
 	elsewhere := &netlinkPlatform{
-		cfg:   Config{Interface: device, Table: DefaultTable + 1, Protocol: DefaultProtocol},
+		table: Table{ID: DefaultTable + 1, Proto: DefaultProtocol}, rt: Runtime{Interface: device},
 		index: plat.index, conn: plat.conn,
 	}
 	foreign := Route{Destination: prefix("198.51.100.0/24")}
@@ -197,15 +198,15 @@ func TestNetlinkReportsOccupiedRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	setLinkFlags(t, conn, index, unix.IFF_UP)
-	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
-	opened, err := newPlatform(cfg)
+	tbl, rt := platformFor(device)
+	opened, err := newPlatform(tbl, rt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = opened.Close() })
 	plat := opened.(*netlinkPlatform)
-	cfg.Protocol++
-	foreign := &netlinkPlatform{cfg: cfg, index: index, conn: conn}
+	tbl.Proto++
+	foreign := &netlinkPlatform{table: tbl, rt: rt, index: index, conn: conn}
 	announced := Route{Destination: prefix("198.51.100.0/24")}
 	if err := foreign.AddRoute(announced); err != nil {
 		t.Fatal(err)
@@ -228,7 +229,7 @@ func TestNetlinkReportsOccupiedRoute(t *testing.T) {
 func testVRFEnslavement(t *testing.T, conn *nlConn, plat *netlinkPlatform) {
 	t.Helper()
 	const master = "vrftest0"
-	data := putAttrU32(nil, unix.IFLA_VRF_TABLE, plat.cfg.Table)
+	data := putAttrU32(nil, unix.IFLA_VRF_TABLE, uint32(plat.table.ID))
 	if err := createLink(conn, master, "vrf", data); err != nil {
 		t.Skipf("no vrf support in this kernel: %v", err)
 	}
@@ -376,7 +377,7 @@ func TestNetlinkHoldsRetractedPrefix(t *testing.T) {
 	}
 	setLinkFlags(t, conn, index, unix.IFF_UP)
 	plat := &netlinkPlatform{
-		cfg:      Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol},
+		table: Table{ID: DefaultTable, Proto: DefaultProtocol}, rt: Runtime{Interface: device},
 		index:    index,
 		conn:     conn,
 		occupied: map[Route]bool{}, refused: map[Route]bool{},
@@ -426,8 +427,8 @@ func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
 
 	const device = "ranettest0"
 	createTUN(t, device)
-	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
-	opened, err := newPlatform(cfg)
+	tbl, rt := platformFor(device)
+	opened, err := newPlatform(tbl, rt)
 	if err != nil {
 		t.Fatalf("open the netlink platform: %v", err)
 	}
@@ -441,8 +442,8 @@ func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
 	}
 
 	want := []Rule{
-		{Family: FamilyIPv4, To: prefix("198.18.104.0/24"), Table: DefaultTable, Priority: 100},
-		{Family: FamilyIPv6, From: prefix("3fff:1:69c::/48"), Table: DefaultTable, Priority: 150},
+		{Family: FamilyIPv4, To: schema.MustPrefix("198.18.104.0/24"), Table: DefaultTable, Priority: 100},
+		{Family: FamilyIPv6, From: schema.MustPrefix("3fff:1:69c::/48"), Table: DefaultTable, Priority: 150},
 		{Family: FamilyIPv4, FWMark: 0x726c, Table: 254, Priority: 40},
 		{Family: FamilyIPv6, FWMark: 0x726c, Table: 254, Priority: 40},
 	}
@@ -464,7 +465,7 @@ func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
 
 	// A rule written by somebody else is invisible here, which is the property
 	// the whole delete path rests on.
-	foreign := plat.ruleMessage(Rule{Family: FamilyIPv4, To: prefix("192.0.2.0/24"), Table: DefaultTable, Priority: 101})
+	foreign := plat.ruleMessage(Rule{Family: FamilyIPv4, To: schema.MustPrefix("192.0.2.0/24"), Table: DefaultTable, Priority: 101})
 	foreign = replaceProtocol(t, foreign, unix.RTPROT_STATIC)
 	if _, err := conn.execute(unix.RTM_NEWRULE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, foreign); err != nil {
 		t.Fatalf("install another writer's rule: %v", err)

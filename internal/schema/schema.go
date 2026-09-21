@@ -52,7 +52,7 @@ func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	// Value is empty for a mapping or a sequence, so without the check the
 	// error is `invalid duration ""` with nothing pointing at the line.
-	return scalar(value, "a duration such as 4s", d)
+	return Scalar(value, "a duration such as 4s", d)
 }
 
 func (d Duration) MarshalYAML() (any, error) { return d.String(), nil }
@@ -74,6 +74,12 @@ func ParsePrefix(s string) (Prefix, error) {
 // MustPrefix is ParsePrefix for a literal written in this tree.
 func MustPrefix(s string) Prefix { return Prefix{netip.MustParsePrefix(s)} }
 
+// IsZero decides whether an omitempty field is written out. It is spelled out
+// because yaml.v3 judges emptiness by walking a struct's exported fields, and
+// every field of a netip.Prefix is private, so without this every prefix in the
+// tree reads as empty and is dropped on the way out.
+func (p Prefix) IsZero() bool { return !p.IsValid() }
+
 func (p *Prefix) UnmarshalText(text []byte) error {
 	parsed, err := ParsePrefix(string(text))
 	if err != nil {
@@ -91,7 +97,7 @@ func (p Prefix) MarshalText() ([]byte, error) {
 }
 
 func (p *Prefix) UnmarshalYAML(value *yaml.Node) error {
-	return scalar(value, "a prefix such as 2001:db8::/48", p)
+	return Scalar(value, "a prefix such as 2001:db8::/48", p)
 }
 
 func (p Prefix) MarshalYAML() (any, error) { return p.String(), nil }
@@ -113,6 +119,9 @@ func ParseAddr(s string) (Addr, error) {
 // MustAddr is ParseAddr for a literal written in this tree.
 func MustAddr(s string) Addr { return Addr{netip.MustParseAddr(s)} }
 
+// IsZero is Prefix.IsZero for an address, and is there for the same reason.
+func (a Addr) IsZero() bool { return !a.IsValid() }
+
 func (a *Addr) UnmarshalText(text []byte) error {
 	parsed, err := ParseAddr(string(text))
 	if err != nil {
@@ -130,7 +139,7 @@ func (a Addr) MarshalText() ([]byte, error) {
 }
 
 func (a *Addr) UnmarshalYAML(value *yaml.Node) error {
-	return scalar(value, "an address such as 2001:db8::1", a)
+	return Scalar(value, "an address such as 2001:db8::1", a)
 }
 
 func (a Addr) MarshalYAML() (any, error) { return a.String(), nil }
@@ -183,7 +192,7 @@ func (t *TableID) UnmarshalText(text []byte) error {
 func (t TableID) MarshalText() ([]byte, error) { return []byte(t.String()), nil }
 
 func (t *TableID) UnmarshalYAML(value *yaml.Node) error {
-	return scalar(value, "a table as a number or a name such as main", t)
+	return Scalar(value, "a table as a number or a name such as main", t)
 }
 
 func (t TableID) MarshalYAML() (any, error) { return t.String(), nil }
@@ -218,7 +227,7 @@ func (a *Announce) UnmarshalText(text []byte) error {
 
 func (a *Announce) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind == yaml.ScalarNode {
-		return scalar(value, "an announcement", a)
+		return Scalar(value, "an announcement", a)
 	}
 	if value.Kind != yaml.MappingNode {
 		return fmt.Errorf("line %d: an announcement is a prefix or a prefix and from mapping, not %s", value.Line, nodeKind(value.Kind))
@@ -300,9 +309,12 @@ func (a Announce) MarshalYAML() (any, error) {
 	}{a.Prefix, a.From}, nil
 }
 
-// scalar decodes one yaml scalar through the text half, so both decoders read
-// the same spellings and only the wrapping differs.
-func scalar(value *yaml.Node, want string, target interface{ UnmarshalText([]byte) error }) error {
+// Scalar decodes one yaml scalar through the text half, so both decoders read
+// the same spellings and only the wrapping differs. It is exported because a
+// capability package with a scalar of its own, a behavior or a link quality,
+// needs the same dispatch and the same refusal for a mapping written where a
+// word belongs.
+func Scalar(value *yaml.Node, want string, target interface{ UnmarshalText([]byte) error }) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("line %d: %s is a scalar, not %s", value.Line, want, nodeKind(value.Kind))
 	}

@@ -279,7 +279,7 @@ func (s *Speaker) reserveTo(n *neighborState, destination netip.Addr, tlvs []Raw
 			}
 		}
 	}
-	pkt := buildPacket(s.cfg.LinkLocalAddr, destination, EncodePacket(tlvs))
+	pkt := buildPacket(s.linkLocal, destination, EncodePacket(tlvs))
 	reserved, err := n.peer.ReserveRawOrDrop(pkt, esp.NextHeaderIPv6)
 	switch {
 	case errors.Is(err, netstack.ErrSendQueueFull):
@@ -348,7 +348,7 @@ func (s *Speaker) reserveBatchesTo(action sendAction) ([]reservedPacket, []tlvUn
 			trimmed = group[1:]
 		}
 		groupSize := encoded(trimmed)
-		if len(batch) > 0 && size+groupSize > s.cfg.PacketSize {
+		if len(batch) > 0 && size+groupSize > s.packetSize {
 			take(batch, batchFrom, i)
 			batch, size, inEffect, batchFrom = nil, headerLen, nil, i
 			trimmed, groupSize = group, encoded(group)
@@ -368,7 +368,7 @@ func (s *Speaker) reserveBatchesTo(action sendAction) ([]reservedPacket, []tlvUn
 
 // The action builders below require s.mu. They never perform I/O.
 func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
-	centis := uint16(s.cfg.HelloInterval / (10 * time.Millisecond))
+	centis := uint16(s.hello / (10 * time.Millisecond))
 	n.sentHello = true
 	n.helloSeqno++
 	// The rxcost is the only thing that tells the far end about the direction
@@ -378,7 +378,7 @@ func (s *Speaker) helloAction(n *neighborState, now time.Time) sendAction {
 	// keeps selecting routes through a direction that is dead. A neighbor never
 	// heard from is a different thing and keeps the nominal cost, so a new
 	// adjacency forms in one exchange rather than two.
-	rxcost := s.cfg.Cost.rxCost(&n.multicastHistory)
+	rxcost := s.cost.rxCost(&n.multicastHistory)
 	if n.heard && !n.isAlive(now) {
 		rxcost = MetricInfinity
 	}
@@ -411,9 +411,9 @@ func (s *Speaker) advertisementFor(key routeKey) (advertisement, *neighborState,
 	if _, local := s.originate[key]; local {
 		// RFC 8966 section 3.7: a locally injected route carries this node's
 		// router-id and sequence number with an arbitrary finite metric.
-		return advertisement{routerID: s.cfg.RouterID, seqno: s.originSeqno}, nil, true
+		return advertisement{routerID: s.routerID, seqno: s.originSeqno}, nil, true
 	}
-	if s.cfg.NoTransit {
+	if s.noTransit {
 		// Reported as unknown rather than as a retraction of this node's own
 		// making. advertiseTo synthesizes the identical infinite
 		// advertisement for a prefix nothing here knows, so the two are the
@@ -449,7 +449,7 @@ func (s *Speaker) advertisementFor(key routeKey) (advertisement, *neighborState,
 func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now time.Time) ([]RawTLV, bool) {
 	adv, nextHop, known := s.advertisementFor(key)
 	if !known {
-		adv = advertisement{routerID: s.cfg.RouterID, seqno: s.originSeqno, metric: MetricInfinity}
+		adv = advertisement{routerID: s.routerID, seqno: s.originSeqno, metric: MetricInfinity}
 	}
 	if nextHop == n {
 		// Section 3.7.4: split horizon, which these point-to-point ESP tunnels
@@ -485,7 +485,7 @@ func (s *Speaker) advertiseTo(n *neighborState, key routeKey, force bool, now ti
 		s.routes.observe(key, adv, s.selectedPeer(key), now)
 		n.advertised[key] = struct{}{}
 	}
-	return updateTLVs(key, adv, s.cfg.UpdateInterval), spent
+	return updateTLVs(key, adv, s.update), spent
 }
 
 // selectedPeer names the neighbor whose route this node has chosen for a

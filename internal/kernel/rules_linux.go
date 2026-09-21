@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"golang.org/x/sys/unix"
 )
 
@@ -24,6 +25,24 @@ import (
 // to RTPROT_STATIC on the rules it installs, so the fleet's own rules and this
 // reconciler's are already distinguishable on a running node.
 
+// afInet and afInet6 are AF_INET and AF_INET6, and af is one rule's family as
+// this backend writes it into the header. They live with the netlink encoder
+// rather than beside the Family type, because a family is a word everywhere
+// else in this tree and a number only here.
+const (
+	afInet  uint8 = 2
+	afInet6 uint8 = 10
+)
+
+// af never sees an unresolved family: expandRules names one on every rule and
+// validate refuses anything else.
+func (f Family) af() uint8 {
+	if f == FamilyIPv4 {
+		return afInet
+	}
+	return afInet6
+}
+
 // sizeofFibRuleHdr is struct fib_rule_hdr, which has the same shape as rtmsg:
 // family, dst_len, src_len, tos, table, res1, res2, action, then a 32-bit
 // flags field. x/sys/unix exports no type for it, so the twelve bytes are
@@ -37,7 +56,7 @@ const sizeofFibRuleHdr = 12
 // 255 reaches the kernel at all. routeMessage splits it the same way.
 func (p *netlinkPlatform) ruleMessage(rule Rule) []byte {
 	body := make([]byte, sizeofFibRuleHdr)
-	body[0] = rule.Family
+	body[0] = rule.Family.af()
 	if rule.To.IsValid() {
 		body[1] = uint8(rule.To.Bits())
 	}
@@ -47,8 +66,8 @@ func (p *netlinkPlatform) ruleMessage(rule Rule) []byte {
 	// body[4] is the legacy table field, left at RT_TABLE_UNSPEC.
 	body[7] = unix.FR_ACT_TO_TBL
 	body = putAttrU32(body, unix.FRA_PRIORITY, rule.Priority)
-	body = putAttrU32(body, unix.FRA_TABLE, rule.Table)
-	body = putAttr(body, unix.FRA_PROTOCOL, []byte{p.cfg.Protocol})
+	body = putAttrU32(body, unix.FRA_TABLE, uint32(rule.Table))
+	body = putAttr(body, unix.FRA_PROTOCOL, []byte{p.table.Proto})
 	if rule.To.IsValid() {
 		body = putAttr(body, unix.FRA_DST, addressBytes(rule.To.Addr()))
 	}
@@ -93,7 +112,7 @@ func (p *netlinkPlatform) decodeRule(message nlMessage) (Rule, bool) {
 		return Rule{}, false
 	}
 	family := message.Data[0]
-	if family != FamilyIPv4 && family != FamilyIPv6 {
+	if family != afInet && family != afInet6 {
 		return Rule{}, false
 	}
 	// Only the action this file writes. A rule that blackholes or that reaches
@@ -103,16 +122,19 @@ func (p *netlinkPlatform) decodeRule(message nlMessage) (Rule, bool) {
 	if message.Data[7] != unix.FR_ACT_TO_TBL {
 		return Rule{}, false
 	}
-	rule := Rule{Family: family}
+	rule := Rule{Family: FamilyIPv6}
+	if family == afInet {
+		rule.Family = FamilyIPv4
+	}
 	dstLen, srcLen := message.Data[1], message.Data[2]
 	ours := false
 	for kind, value := range message.attributes(sizeofFibRuleHdr) {
 		switch kind {
 		case unix.FRA_PROTOCOL:
-			ours = len(value) == 1 && value[0] == p.cfg.Protocol
+			ours = len(value) == 1 && value[0] == p.table.Proto
 		case unix.FRA_TABLE:
 			if len(value) == 4 {
-				rule.Table = binary.NativeEndian.Uint32(value)
+				rule.Table = schema.TableID(binary.NativeEndian.Uint32(value))
 			}
 		case unix.FRA_PRIORITY:
 			if len(value) == 4 {
@@ -128,11 +150,11 @@ func (p *netlinkPlatform) decodeRule(message nlMessage) (Rule, bool) {
 			}
 		case unix.FRA_DST:
 			if address, ok := addressFromBytes(value); ok {
-				rule.To = netip.PrefixFrom(address, int(dstLen))
+				rule.To = schema.PrefixFrom(netip.PrefixFrom(address, int(dstLen)))
 			}
 		case unix.FRA_SRC:
 			if address, ok := addressFromBytes(value); ok {
-				rule.From = netip.PrefixFrom(address, int(srcLen))
+				rule.From = schema.PrefixFrom(netip.PrefixFrom(address, int(srcLen)))
 			}
 		}
 	}

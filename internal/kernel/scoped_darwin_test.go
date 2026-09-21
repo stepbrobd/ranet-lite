@@ -23,8 +23,8 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 
 	device, tun := createUTUNWithFD(t)
 	setInterfaceUp(t, device)
-	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
-	opened, err := newPlatform(cfg)
+	tbl, rt := platformFor(device)
+	opened, err := newPlatform(tbl, rt)
 	if err != nil {
 		t.Fatalf("open the darwin platform on %s: %v", device, err)
 	}
@@ -154,7 +154,7 @@ func TestDarwinScopedRouteSelection(t *testing.T) {
 // both state rested on the destination's own length alone.
 func TestDarwinScopesARouteThatCoversTheUnderlay(t *testing.T) {
 	peer := netip.MustParseAddr("2001:db8:beef::1")
-	plat, _ := testPlatform(t, Config{Underlay: func() []netip.Addr { return []netip.Addr{peer} }})
+	plat, _ := testPlatform(t, Table{}, Runtime{Underlay: func() []netip.Addr { return []netip.Addr{peer} }})
 	capturing := Route{Destination: prefix("2000::/3")}
 	elsewhere := Route{Destination: prefix("3fff:1::/32")}
 	if plat.scopeRoute(capturing) {

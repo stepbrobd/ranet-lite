@@ -42,7 +42,7 @@ func writePlatform(t *testing.T) (*netlinkPlatform, *fakeNetlink) {
 	t.Helper()
 	conn := &fakeNetlink{}
 	return &netlinkPlatform{
-		cfg:      Config{Interface: "ranet0", Table: 200, Protocol: DefaultProtocol},
+		table: Table{ID: 200, Proto: DefaultProtocol}, rt: Runtime{Interface: "ranet0"},
 		index:    7,
 		conn:     conn,
 		occupied: map[Route]bool{}, refused: map[Route]bool{},
@@ -221,7 +221,7 @@ func TestForeignWriterReportNamesAnUnclaimedProtocolByNumber(t *testing.T) {
 // operator reads in the startup line and what the policy rules look up.
 func TestLinuxOwnsATable(t *testing.T) {
 	plat, _ := writePlatform(t)
-	if got := plat.where(plat.cfg); got != "table 200 protocol 155" {
+	if got := plat.where(plat.table); got != "table 200 protocol 155" {
 		t.Errorf("linux reports %q, want the table it owns", got)
 	}
 }

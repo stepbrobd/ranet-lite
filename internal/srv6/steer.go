@@ -3,9 +3,9 @@ package srv6
 import (
 	"fmt"
 	"net/netip"
-	"slices"
 	"strings"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/sadr"
 )
 
@@ -49,21 +49,43 @@ func (p *Policy) Overhead() int {
 	return Overhead(len(p.Path))
 }
 
-// Steer is one configured entry: which packets, and through what.
+// Steer is one entry of the cap.segment capability, parsed straight out of the
+// file: which of this node's own packets go through a segment list, and which
+// list.
 type Steer struct {
-	// From and To select the packets. An invalid prefix matches every address
-	// of the family the other one names, and a policy naming neither would
+	// From and To select the packets. An omitted prefix matches every address
+	// of the family the other one names, and an entry naming neither would
 	// steer this node's own underlay into its own tunnel, so it is refused.
-	From netip.Prefix
-	To   netip.Prefix
-	Policy
+	From schema.Prefix `yaml:"from,omitempty" json:"from,omitempty" toml:"from,omitempty"`
+	To   schema.Prefix `yaml:"to,omitempty" json:"to,omitempty" toml:"to,omitempty"`
+	// Source overrides the block's own outer source for this entry alone.
+	Source schema.Addr `yaml:"source,omitempty" json:"source,omitempty" toml:"source,omitempty"`
+	// Via is the segments the packet visits, in that order, so an operator
+	// writes the waypoints and then the exit.
+	Via []schema.Addr `yaml:"via" json:"via" toml:"via"`
+}
+
+// policy is the entry as the dataplane takes it, the block's source filled in
+// where the entry names none.
+func (s Steer) policy(fallback schema.Addr) Policy {
+	source := s.Source
+	if !source.IsValid() {
+		source = fallback
+	}
+	path := make([]netip.Addr, 0, len(s.Via))
+	for _, hop := range s.Via {
+		path = append(path, hop.Addr)
+	}
+	return Policy{Source: source.Addr, Path: path}
 }
 
 // SteerTable answers which policy applies to one packet. A nil table steers
 // nothing, which is every node that configures none, and Lookup works on one.
 type SteerTable struct {
-	table   sadr.Table[*Policy]
-	entries []Steer
+	table sadr.Table[*Policy]
+	// policies is every entry in the order it was configured, for a
+	// diagnostic: each carries the line that describes it.
+	policies []*Policy
 	// overhead is the largest any policy here adds, which a tunnel takes off
 	// its MTU so the dataplane is never handed a packet that will not fit
 	// once encapsulated.
@@ -71,30 +93,45 @@ type SteerTable struct {
 }
 
 // NewSteerTable builds the table, refusing an entry that cannot mean what it
-// says.
-func NewSteerTable(entries []Steer) (*SteerTable, error) {
+// says. source is the block's own outer source, which an entry naming none
+// inherits.
+func NewSteerTable(entries []Steer, source schema.Addr) (*SteerTable, error) {
 	if len(entries) == 0 {
 		return nil, nil
 	}
-	out := &SteerTable{entries: slices.Clone(entries)}
-	seen := make(map[[2]netip.Prefix]bool, len(out.entries))
-	for i := range out.entries {
-		entry := &out.entries[i]
-		if err := CheckPath(entry.Source, entry.Path); err != nil {
+	out := &SteerTable{}
+	seen := make(map[[2]netip.Prefix]bool, len(entries))
+	for _, entry := range entries {
+		from, to := entry.From.Prefix, entry.To.Prefix
+		policy := entry.policy(source)
+		if !policy.Source.IsValid() {
+			return nil, fmt.Errorf("srv6: steering entry %s needs a source, its own or the block's", steerName(entry, &policy))
+		}
+		if err := CheckPath(policy.Source, policy.Path); err != nil {
 			return nil, err
 		}
-		if !entry.From.IsValid() && !entry.To.IsValid() {
+		if !from.IsValid() && !to.IsValid() {
 			// Every packet this node sends is matched, the babel traffic that
 			// carries the mesh's own routing included, so the steering would
 			// take out the adjacency that makes its own segments reachable.
 			return nil, fmt.Errorf("srv6: a steering entry selecting neither a source nor a destination would steer every packet this node sends")
 		}
-		if entry.From.IsValid() && entry.To.IsValid() && entry.From.Addr().Is4() != entry.To.Addr().Is4() {
-			return nil, fmt.Errorf("srv6: steering entry from %s to %s names two address families", entry.From, entry.To)
+		if from.IsValid() && to.IsValid() && from.Addr().Is4() != to.Addr().Is4() {
+			return nil, fmt.Errorf("srv6: steering entry from %s to %s names two address families", from, to)
 		}
-		for _, prefix := range [2]netip.Prefix{entry.From, entry.To} {
-			if prefix.IsValid() && prefix.Addr().Is4In6() {
+		for _, prefix := range [2]netip.Prefix{from, to} {
+			if !prefix.IsValid() {
+				continue
+			}
+			if prefix.Addr().Is4In6() {
 				return nil, fmt.Errorf("srv6: steering entry selector %s is a v4-mapped prefix, which no packet is looked up under", prefix)
+			}
+			// Refused rather than masked, as kernel.Rule.validate refuses the
+			// same typo. Masking a host address written with the wrong length
+			// steers a whole prefix where one address was meant, and says
+			// nothing.
+			if prefix.Masked() != prefix {
+				return nil, fmt.Errorf("srv6: steering entry selector %s has bits set below its prefix length", prefix)
 			}
 		}
 		// The trie is keyed by destination first and has no entry for "any
@@ -102,30 +139,32 @@ func NewSteerTable(entries []Steer) (*SteerTable, error) {
 		// zero-length prefix of the family its source is in. An invalid
 		// source needs no such treatment: the trie already reads one as
 		// matching every address.
-		destination := entry.To
+		destination := to
 		if !destination.IsValid() {
-			destination = anyDestination(entry.From)
+			destination = anyDestination(from)
 		}
 		// Keyed on what the trie is keyed on rather than on what was written,
 		// because those differ: an omitted destination and one written out as
 		// the zero-length prefix are two spellings the trie stores under one
 		// key, so keying on the spelling lets the second entry overwrite the
 		// first while a diagnostic goes on reporting both.
-		selector := [2]netip.Prefix{entry.From, destination}
+		selector := [2]netip.Prefix{from, destination}
 		if seen[selector] {
-			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(*entry))
+			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(entry, &policy))
 		}
 		seen[selector] = true
-		entry.name = steerName(*entry)
-		out.overhead = max(out.overhead, entry.Policy.Overhead())
-		out.table.Set(entry.From, destination, &entry.Policy)
+		policy.name = steerName(entry, &policy)
+		stored := &policy
+		out.policies = append(out.policies, stored)
+		out.overhead = max(out.overhead, stored.Overhead())
+		out.table.Set(from, destination, stored)
 	}
 	return out, nil
 }
 
 // steerName is the line a diagnostic prints for one entry, in the order an
 // operator wrote it.
-func steerName(entry Steer) string {
+func steerName(entry Steer, policy *Policy) string {
 	selector := "any"
 	switch {
 	case entry.From.IsValid() && entry.To.IsValid():
@@ -135,8 +174,8 @@ func steerName(entry Steer) string {
 	case entry.To.IsValid():
 		selector = "to " + entry.To.String()
 	}
-	hops := make([]string, 0, len(entry.Path))
-	for _, segment := range entry.Path {
+	hops := make([]string, 0, len(policy.Path))
+	for _, segment := range policy.Path {
 		hops = append(hops, segment.String())
 	}
 	return fmt.Sprintf("%s via %s", selector, strings.Join(hops, ","))
@@ -178,9 +217,9 @@ func (t *SteerTable) Entries() []string {
 	if t == nil {
 		return nil
 	}
-	out := make([]string, 0, len(t.entries))
-	for _, entry := range t.entries {
-		out = append(out, entry.name)
+	out := make([]string, 0, len(t.policies))
+	for _, policy := range t.policies {
+		out = append(out, policy.name)
 	}
 	return out
 }

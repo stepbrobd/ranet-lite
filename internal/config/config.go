@@ -1,643 +1,231 @@
-// Package config defines ranet-lite's own local configuration format.
-// Unlike internal/registry (which mirrors ranet's registry.json and key
-// files byte-for-byte so a deployment can reuse them unchanged), this file
-// format is specific to ranet-lite: a slim client dialing out to one or a
-// few existing mesh nodes rather than participating in ranet's full N-to-N
-// reconciliation, so its config only needs "who am I" and "who do I dial".
+// Package config reads the file that says what this node is and what it does.
+//
+// The top level says what the node is: its name, the keys it authenticates
+// with, the socket it speaks on and the peers it dials. Everything it does
+// lives under cap, one block per capability, and the presence of a block is
+// what turns that capability on. A default deployment writes node, auth, link
+// and dial and nothing else.
+//
+// A capability block is defined by the package that implements it, carries its
+// own serialization tags and validates itself; see [babel.Routes],
+// [babel.Config], [kernel.Table], [srv6.Segments] and [ike.Crypto]. Nothing
+// here mirrors those definitions, so a field added to a capability reaches the
+// file, the control plane's wire form and the subsystem at once. What is left
+// here is the node's own facts and the checks that span two capabilities,
+// which is the one thing no capability can make for itself.
 package config
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/netip"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
-	"time"
+
+	"github.com/BurntSushi/toml"
+	"gopkg.in/yaml.v3"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/srv6"
-	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	// Identity: must match an entry in Registry's Nodes for Organization,
-	// and PrivateKey must be that organization's shared Ed25519 key.
-	Organization string     `yaml:"organization"`
-	CommonName   string     `yaml:"common_name"`
-	Port         uint16     `yaml:"port"`
-	Endpoints    []Endpoint `yaml:"endpoints"`
+	Node Node `yaml:"node" json:"node" toml:"node"`
+	Auth Auth `yaml:"auth" json:"auth" toml:"auth"`
+	Link Link `yaml:"link" json:"link" toml:"link"`
+	Dial Dial `yaml:"dial,omitempty" json:"dial,omitempty" toml:"dial,omitempty"`
+	Cap  Caps `yaml:"cap,omitempty" json:"cap,omitempty" toml:"cap,omitempty"`
+}
 
-	PrivateKey string `yaml:"private_key"` // path to a PKCS8 PEM Ed25519 key
-	Registry   string `yaml:"registry"`    // path to a ranet registry.json
+// Node is who this is. Both halves have to match an entry in the document
+// auth.trust names, since every peer checks the identity against that document.
+type Node struct {
+	Org  string `yaml:"org" json:"org" toml:"org"`
+	Name string `yaml:"name" json:"name" toml:"name"`
+}
 
-	Originate []string `yaml:"originate"` // CIDR prefixes this node announces via babel
-	// TUN names an existing TUN device to attach to, or the device to create
-	// when it does not exist. Empty creates an automatically named ranet%d.
-	TUN string `yaml:"tun"`
-	// ReplayWindow controls the ESP receive window: omitted uses 4096 for
-	// high-speed multicore senders, while an explicit 0 disables checking.
-	ReplayWindow *uint32 `yaml:"replay_window"`
-	// Rekey intervals default to one hour for Child SAs and three hours for
-	// IKE SAs. An explicit zero disables the corresponding proactive rekey.
-	ChildRekeyInterval *Duration `yaml:"child_rekey_interval"`
-	IKERekeyInterval   *Duration `yaml:"ike_rekey_interval"`
-	// Rekeys run before their interval expires: margin is always subtracted
-	// and jitter is independently randomized from zero through its value.
-	RekeyMargin *Duration `yaml:"rekey_margin"`
-	RekeyJitter *Duration `yaml:"rekey_jitter"`
-	// A failed scheduled rekey is retried with capped exponential backoff.
-	RekeyRetryInitial *Duration `yaml:"rekey_retry_initial"`
-	RekeyRetryMax     *Duration `yaml:"rekey_retry_max"`
+// Auth is the key this node signs with and the document naming who it talks to.
+type Auth struct {
+	// Key is this node's own private key, a PKCS8 PEM Ed25519 file.
+	Key string `yaml:"key" json:"key" toml:"key"`
+	// Trust is the document naming who may join, a ranet registry.json today.
+	Trust string `yaml:"trust" json:"trust" toml:"trust"`
+}
 
-	// Responder answers peers that dial us. It is off by default because a
-	// leaf never needs it: it has no reachable address to be dialed at, and
-	// an open responder is the one surface an unauthenticated peer can reach.
-	// A full mesh needs it on, since every node both dials and answers.
-	Responder bool `yaml:"responder"`
-
-	// FullMesh dials every node the registry names, the N-to-N reconciliation
-	// ranet performs. Reach on this fleet needs it: the BIRD side exports only
-	// its own directly connected routes, so a node learns a prefix from the
-	// node originating it or not at all, and dialing a few exits reaches those
-	// exits and nothing behind them. Peers still apply, and an entry there
-	// wins for its node, which is the only way to pin a serial_number since a
-	// generated peer names none.
-	FullMesh bool `yaml:"full_mesh"`
-
-	// FWMark is set with SO_MARK on the one UDP socket carrying IKE and ESP,
+// Link is the underlay: the one socket carrying IKE and ESP, and the device
+// the mesh is carried on.
+type Link struct {
+	Port      uint16     `yaml:"port" json:"port" toml:"port"`
+	Endpoints []Endpoint `yaml:"endpoints" json:"endpoints" toml:"endpoints"`
+	// Listen answers peers that dial this node. Off by default because a leaf
+	// never needs it: it has no reachable address to be dialed at, and an open
+	// listener is the one surface an unauthenticated peer can reach. A full
+	// mesh needs it on, since every node both dials and answers.
+	Listen bool `yaml:"listen,omitempty" json:"listen,omitempty" toml:"listen,omitempty"`
+	// TUN names an existing device to attach to, or the device to create when
+	// it does not exist. Empty creates an automatically named one.
+	TUN string `yaml:"tun,omitempty" json:"tun,omitempty" toml:"tun,omitempty"`
+	// Mark is set with SO_MARK on the one UDP socket carrying IKE and ESP,
 	// linux only, so a policy rule can keep the underlay in a table of the
 	// operator's choosing. Needed on a node whose mesh address is the only
 	// global address of its family: the kernel then sources this socket from
-	// it, the fleet's "from <mesh address>" rule sends it to the mesh table,
-	// and an exit-announced default there routes the underlay into the tun
-	// carrying it. ranet-lite writes no rules, so the matching rule, such as
-	// "ip rule add fwmark <mark> lookup main", belongs with the ones the
-	// deployment already owns. Pick a mark nothing else on the host uses.
-	FWMark uint32 `yaml:"fwmark"`
-
-	Peers    []Peer   `yaml:"peers"`
-	Babel    Babel    `yaml:"babel"`
-	Kernel   Kernel   `yaml:"kernel"`
-	Segments Segments `yaml:"segments"`
-	// Experimental is ranet's block, carried so its config parses here.
-	Experimental Experimental `yaml:"experimental"`
+	// it, a "from <mesh address>" rule sends it to the mesh table, and an
+	// exit-announced default there routes the underlay into the tun carrying
+	// it. Pair it with a rule under cap.table, such as
+	// { fwmark = 0x726c, table = "main", priority = 40, family = "both" }.
+	// Pick a mark nothing else on the host uses.
+	Mark uint32 `yaml:"mark,omitempty" json:"mark,omitempty" toml:"mark,omitempty"`
 }
 
-// Kernel configures the optional kernel route reconciler in internal/kernel,
-// which mirrors the mesh forwarding table into the routing table on linux and
-// into the single FIB on darwin. It is
-// off unless enabled, so a deployment that configures routes externally is
-// unaffected. Every field is validated by kernel.New at startup.
-type Kernel struct {
-	Enabled bool `yaml:"enabled"`
-	// Table is the routing table the reconciler owns; the fleet uses 200,
-	// the table the policy rules and End.DT46 look up.
-	Table uint32 `yaml:"table"`
-	// Protocol is the rt_proto stamped on every installed route, and the
-	// marker that separates this reconciler's routes from everyone else's.
-	Protocol uint8 `yaml:"protocol"`
-	// Metric is RTA_PRIORITY, and omitting it leaves the kernel default, 0 for
-	// IPv4 and 1024 for IPv6. Do not set it to BIRD's 32 while BIRD is still
-	// exporting to the same table: both daemons would then key on the same
-	// prefix and priority, and since an install refuses a key another writer
-	// holds rather than taking it over, whichever daemon got there first keeps
-	// the prefix and the other loses it quietly.
-	Metric uint32 `yaml:"metric"`
-	// PrefSrc4 is RTA_PREFSRC on every installed IPv4 route, taking over from
-	// krt_prefsrc on BIRD's kbabel4. IPv6 source-specific routes carry
-	// RTA_SRC from the babel source prefix instead.
-	PrefSrc4 string `yaml:"prefsrc4"`
-	// Addresses are assigned to the TUN and removed again at shutdown; only
-	// addresses the reconciler added itself are ever removed.
-	Addresses []string `yaml:"addresses"`
-	// AssignOriginated assigns every prefix in Originate as well, which is
-	// the locally originated address the operator configures by hand today.
-	AssignOriginated bool `yaml:"assign_originated"`
-	// VRF enslaves the TUN to that master device, but only while the link has
-	// no master, so networkd keeps whatever it already claimed.
-	VRF string `yaml:"vrf"`
-	// CreateVRF makes that device when nothing of the name exists, bound to
-	// Table, so a deployment does not need its host's network manager to make
-	// it first. One this process created is removed again at shutdown. linux
-	// only: there are no VRFs on the other platforms this builds for, and a
-	// configuration asking for one there is refused by name.
-	CreateVRF bool `yaml:"vrf_create"`
-	// Rules are the policy rules the reconciler owns, in the order written.
-	// linux only, for the same reason and with the same refusal: darwin has
-	// one forwarding table and no rules, and a mobile tunnel provider is
-	// handed a route list rather than a table. What a rule expresses carries
-	// across anyway, and each platform reaches it its own way; see the
-	// platform notes in readme.md.
-	Rules []Rule `yaml:"rules"`
-	// ReconcileInterval is the periodic sweep that corrects drift nothing
-	// announced. Omitted uses the package default.
-	ReconcileInterval *Duration `yaml:"reconcile_interval"`
-}
-
-// refuseWhatDisablingIgnores stops a start that configured the reconciler and
-// left it off. Nothing below Enabled is read at all in that case, so a node
-// that meant to write rules and forgot the one line comes up with a working
-// mesh, no rules and no message, which is the outage that reads as a routing
-// problem for a day.
-func (k Kernel) refuseWhatDisablingIgnores() error {
-	if k.Enabled {
-		return nil
-	}
-	if set := k.configured(); set != "" {
-		return fmt.Errorf("config: kernel.%s is set and kernel.enabled is false, so nothing would be written", set)
-	}
-	return nil
-}
-
-// configured names the first field that only the reconciler reads.
-func (k Kernel) configured() string {
-	switch {
-	case len(k.Rules) > 0:
-		return "rules"
-	case len(k.Addresses) > 0:
-		return "addresses"
-	case k.VRF != "":
-		return "vrf"
-	case k.CreateVRF:
-		return "vrf_create"
-	case k.PrefSrc4 != "":
-		return "prefsrc4"
-	case k.Table != 0:
-		return "table"
-	case k.Protocol != 0:
-		return "protocol"
-	case k.Metric != 0:
-		return "metric"
-	case k.AssignOriginated:
-		return "assign_originated"
-	case k.ReconcileInterval != nil:
-		return "reconcile_interval"
-	}
-	return ""
-}
-
-// Segments configures segment routing, RFC 8986, which this tree performs in
-// the dataplane rather than in a kernel. That makes it the one piece of the
-// fleet's steering that works the same on every platform: darwin has no
-// segment routing and a mobile tunnel provider has no forwarding table at all,
-// and neither needs one when the process carrying the packet is the one acting
-// on the header.
-type Segments struct {
-	// Source is the outer source address an encapsulation is sent from, which
-	// the fleet sets once per node with `ip sr tunsrc`. A steering entry
-	// inherits it unless it names its own.
-	Source string `yaml:"source"`
-	// Local is the segments this node answers for. The fleet spells them as
-	// seg6local routes under its own /60, `<base>6::1` for End.DT46 and
-	// `<base>6::2` for End, and the same two addresses go here unchanged.
-	Local []LocalSegment `yaml:"local"`
-	// Steer decides which of this node's own packets go through a segment
-	// list, which an operator installs by hand today: the traffic sourced from this
-	// node's announced address, through the waypoints and out at a chosen
-	// exit.
-	Steer []SteerEntry `yaml:"steer"`
-}
-
-// SteerEntry is one steering decision. From and To select the packets, the
-// same pair the forwarding table is keyed by, and an entry naming neither is
-// refused because it would steer its own encapsulation.
-type SteerEntry struct {
-	From string `yaml:"from"`
-	To   string `yaml:"to"`
-	// Source overrides the block's own for this entry alone.
-	Source string `yaml:"source"`
-	// Via is the segments the packet visits, in that order, so an operator
-	// writes the waypoints and then the exit.
-	Via []string `yaml:"via"`
-}
-
-// LocalSegment is one address this node answers for and what it does with a
-// packet that arrives on it.
-type LocalSegment struct {
-	SID string `yaml:"sid"`
-	// Behavior is spelled as RFC 8986 spells it and as
-	// `ip route ... encap seg6local action` takes it, so a converted
-	// configuration reads the same: End for a waypoint, End.DT46 for an exit.
-	Behavior string `yaml:"behavior"`
-}
-
-// Rule is one policy rule as the file spells it. The strings are parsed where
-// the reconciler is configured rather than here, so the one place that decides
-// what a rule may say is the one that installs it.
-type Rule struct {
-	// To and From are the destination and source prefixes this rule selects
-	// on, each optional. A rule naming neither selects on a mark alone and has
-	// to name its Family, because a mark belongs to no address family.
-	To   string `yaml:"to"`
-	From string `yaml:"from"`
-	// FWMark and FWMask select on the packet's mark. A hex literal is
-	// ordinary YAML, so fwmark: 0x726c is written as it reads elsewhere.
-	FWMark uint32 `yaml:"fwmark"`
-	FWMask uint32 `yaml:"fwmask"`
-	// Table is the table this rule looks up, as a number or as one of the
-	// three names the kernel reserves.
-	Table TableID `yaml:"table"`
-	// Priority is the rule's position in the list. It is required: leaving it
-	// to the kernel puts the rule just above the last one, which is a
-	// different place on every node.
-	Priority uint32 `yaml:"priority"`
-	// Family is "ipv4", "ipv6" or "both", and is needed only when neither To
-	// nor From says which. "both" installs the rule once per family.
-	Family string `yaml:"family"`
-}
-
-// TableID accepts a routing table as a number or as one of the names the
-// kernel reserves, so a rule that sends the underlay to the main table reads
-// as "table: main" rather than as "table: 254".
-type TableID uint32
-
-// Reserved table numbers, from linux/rtnetlink.h. Named here rather than taken
-// from x/sys so that the config package still builds on every platform.
-const (
-	TableDefault TableID = 253
-	TableMain    TableID = 254
-	TableLocal   TableID = 255
-)
-
-func (t *TableID) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind != yaml.ScalarNode {
-		return fmt.Errorf("line %d: a table is a number or a name such as main, not %s", value.Line, nodeKindName(value.Kind))
-	}
-	switch strings.ToLower(value.Value) {
-	case "main":
-		*t = TableMain
-		return nil
-	case "local":
-		*t = TableLocal
-		return nil
-	case "default":
-		*t = TableDefault
-		return nil
-	}
-	number, err := strconv.ParseUint(value.Value, 0, 32)
-	if err != nil {
-		return fmt.Errorf("line %d: table %q is neither a number nor one of main, local and default", value.Line, value.Value)
-	}
-	*t = TableID(number)
-	return nil
-}
-
-func (t TableID) String() string {
-	switch t {
-	case TableMain:
-		return "main"
-	case TableLocal:
-		return "local"
-	case TableDefault:
-		return "default"
-	}
-	return strconv.FormatUint(uint64(t), 10)
-}
-
-// KernelAddresses keeps startup and reload checking the same assigned-address
-// set. Host bits belong to interface addresses, unlike Babel route keys.
-func (c *Config) KernelAddresses() ([]netip.Prefix, error) {
-	originated := c.Originate
-	if !c.Kernel.AssignOriginated {
-		originated = nil
-	}
-	var addresses []netip.Prefix
-	seen := make(map[netip.Prefix]bool)
-	// A default is announced, never assigned: an exit originates "::/0" from
-	// its transit prefix, and assign_originated would otherwise try to put
-	// "::/0" on the tun on every pass and fail on every one. The test is the
-	// address rather than the prefix length, because a prefix length says
-	// nothing about whether an address can be assigned. validate refuses every
-	// other zero-length spelling, on both originate lists and on
-	// kernel.addresses, so this is the one that is left.
-	add := func(prefix netip.Prefix) {
-		if prefix.Addr().IsUnspecified() || seen[prefix] {
-			return
-		}
-		seen[prefix] = true
-		addresses = append(addresses, prefix)
-	}
-	for _, raw := range c.Kernel.Addresses {
-		prefix, err := netip.ParsePrefix(raw)
-		if err != nil {
-			return nil, fmt.Errorf("config: kernel.addresses %q: %w", raw, err)
-		}
-		add(prefix)
-	}
-	// The originated lists are the same prefixes babel announces, so an entry
-	// here is reported as what it is written as rather than as an address.
-	for _, raw := range originated {
-		prefix, err := netip.ParsePrefix(raw)
-		if err != nil {
-			return nil, fmt.Errorf("config: originate %q: %w", raw, err)
-		}
-		add(prefix)
-	}
-	if c.Kernel.AssignOriginated {
-		for _, entry := range c.Babel.Originate {
-			add(entry.Prefix)
-		}
-	}
-	return addresses, nil
-}
-
-// Duration accepts standard Go duration strings and a bare YAML zero.
-// The latter keeps `child_rekey_interval: 0` concise when disabling rekeys.
-type Duration time.Duration
-
-func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind != yaml.ScalarNode {
-		// Value is empty for a mapping or a sequence, so without this the
-		// error is `invalid duration ""` with nothing pointing at the line.
-		return fmt.Errorf("line %d: a duration is a scalar such as 4s, not %s", value.Line, nodeKindName(value.Kind))
-	}
-	if value.Tag == "!!int" && value.Value == "0" {
-		*d = 0
-		return nil
-	}
-	parsed, err := time.ParseDuration(value.Value)
-	if err != nil {
-		return err
-	}
-	*d = Duration(parsed)
-	return nil
-}
-
-func nodeKindName(kind yaml.Kind) string {
-	switch kind {
-	case yaml.MappingNode:
-		return "a mapping"
-	case yaml.SequenceNode:
-		return "a sequence"
-	case yaml.AliasNode:
-		return "an alias"
-	default:
-		return "a document"
-	}
-}
-
-func (c *Config) ReplayWindowSize() uint32 {
-	if c.ReplayWindow == nil {
-		return 4096
-	}
-	return *c.ReplayWindow
-}
-
-func (c *Config) ChildRekeyIntervalValue() time.Duration {
-	if c.ChildRekeyInterval == nil {
-		return time.Hour
-	}
-	return time.Duration(*c.ChildRekeyInterval)
-}
-
-func (c *Config) IKERekeyIntervalValue() time.Duration {
-	if c.IKERekeyInterval == nil {
-		return 3 * time.Hour
-	}
-	return time.Duration(*c.IKERekeyInterval)
-}
-
-func (c *Config) RekeyMarginValue() time.Duration {
-	if c.RekeyMargin == nil {
-		return 5 * time.Minute
-	}
-	return time.Duration(*c.RekeyMargin)
-}
-
-func (c *Config) RekeyJitterValue() time.Duration {
-	if c.RekeyJitter == nil {
-		return time.Minute
-	}
-	return time.Duration(*c.RekeyJitter)
-}
-
-func (c *Config) RekeyRetryInitialValue() time.Duration {
-	if c.RekeyRetryInitial == nil {
-		return 5 * time.Second
-	}
-	return time.Duration(*c.RekeyRetryInitial)
-}
-
-func (c *Config) RekeyRetryMaxValue() time.Duration {
-	if c.RekeyRetryMax == nil {
-		return 5 * time.Minute
-	}
-	return time.Duration(*c.RekeyRetryMax)
-}
-
-// Endpoint mirrors the identity portion of ranet's endpoint configuration.
-// Socket address selection is global: the transport binds Config.Port for
-// every family the platform gives it, one dual-stack socket on darwin and one
-// per family on linux, and the kernel selects the source address by route.
-// Endpoint carries ranet's own endpoint fields as well as ranet-lite's, so a
-// deployment can point this at the `config.json` its module already generates
-// rather than maintaining a second description of the same node. The fields
-// ranet acts on and this does not are named here rather than left unknown: the
-// loader refuses what it does not recognize, and an operator whose file is
-// rejected over `updown` learns nothing from "field not found".
+// Endpoint is one local socket identity. Address selection is global: the
+// transport binds Link.Port for every family the platform gives it, one
+// dual-stack socket on darwin and one per family on linux, and the kernel
+// selects the source address by route. Each entry has to match an endpoint the
+// trust document gives this node, since a peer dials that entry.
 type Endpoint struct {
-	SerialNumber  string `yaml:"serial_number"`
-	AddressFamily string `yaml:"address_family"`
-	// Port is ranet's spelling of the one this node listens on. Every endpoint
-	// must agree, which ranet's own module already asserts, and it satisfies
-	// the top-level port when that is absent.
-	Port uint16 `yaml:"port"`
-	// Address, UpDown and FWMark are plain strings rather than pointers
-	// because absent and empty ask for the same thing, and because Endpoint is
-	// compared with == to decide whether a reload may proceed: a pointer would
-	// make two loads of one file differ and refuse every reload.
-	//
-	// Address is the endpoint's public address in ranet's config. The
-	// transport binds the wildcard and lets the kernel pick the source by
-	// route, so this selects nothing here; a node that sets it is told so once
-	// rather than left to wonder.
-	Address string `yaml:"address"`
-	// UpDown is ranet's per-peer interface hook, which strongSwan runs to
-	// create one xfrm interface per Child SA. This binary has one tun for the
-	// whole mesh and no per-peer interfaces, so there is nothing for a hook to
-	// create and none is run.
-	UpDown string `yaml:"updown"`
-	// FWMark is ranet's per-endpoint mark, which it passes to strongSwan as
-	// set_mark_out. That is an XFRM mark on the outbound SA, not a mark on the
-	// socket carrying IKE and ESP, and strongSwan spells it value[/mask] or
-	// %unique besides. It is named here so the file is not rejected over it
-	// and reported once as having no effect; the top-level fwmark is this
-	// tree's own socket mark and is set separately.
-	FWMark string `yaml:"fwmark"`
+	Serial string `yaml:"serial" json:"serial" toml:"serial"`
+	Family string `yaml:"family" json:"family" toml:"family"`
 }
 
-// Experimental mirrors ranet's block of the same name so its config parses
-// here. Nothing in it is implemented, so anything switched on is refused
-// rather than accepted and ignored.
-type Experimental struct {
-	IPTFS bool `yaml:"iptfs"`
+// Dial is who this node opens sessions to.
+type Dial struct {
+	// All dials every node the trust document names, the N-to-N
+	// reconciliation ranet performs. Reach on a fleet whose other speaker
+	// exports only its own directly connected routes needs it: a node learns
+	// a prefix from the node originating it or not at all, so dialing a few
+	// exits reaches those exits and nothing behind them. To still applies,
+	// and an entry there wins for its node, which is the only way to pin a
+	// serial since a generated peer names none.
+	All bool   `yaml:"all,omitempty" json:"all,omitempty" toml:"all,omitempty"`
+	To  []Peer `yaml:"to,omitempty" json:"to,omitempty" toml:"to,omitempty"`
 }
 
 type Peer struct {
-	// Organization defaults to the top-level Organization if empty —
-	// almost always what you want, since ranet shares one keypair across
-	// an entire organization; only cross-organization deployments need to
-	// override it per peer.
-	Organization string `yaml:"organization"`
-	CommonName   string `yaml:"common_name"`
-	// SerialNumber selects a specific endpoint; if empty, the first
-	// endpoint of a matching address family is used.
-	SerialNumber string `yaml:"serial_number"`
+	// Org defaults to this node's own, which is almost always what is wanted;
+	// only a cross-organization peer names its own.
+	Org  string `yaml:"org,omitempty" json:"org,omitempty" toml:"org,omitempty"`
+	Name string `yaml:"name" json:"name" toml:"name"`
+	// Serial selects one of the peer's endpoints; empty takes the first of a
+	// matching address family.
+	Serial string `yaml:"serial,omitempty" json:"serial,omitempty" toml:"serial,omitempty"`
 }
 
-type Babel struct {
-	// Spelled with the same Duration as every other interval in this file.
-	// yaml.v3 decodes a bare time.Duration from a duration string and from
-	// nothing else, so `hello_interval: 0` was a parse error while every other
-	// duration in the file takes zero for "leave the default alone", and one
-	// block disagreed with itself about the spelling. Zero here still means
-	// the speaker's own default.
-	HelloInterval  Duration `yaml:"hello_interval"`
-	UpdateInterval Duration `yaml:"update_interval"`
-	// Link cost, named after the BIRD babel interface options it mirrors: a
-	// fixed rxcost plus up to rtt_cost scaled linearly between rtt_min and
-	// rtt_max. An unset field keeps the speaker's default.
-	RxCost  *uint16   `yaml:"rxcost"`
-	RTTCost *uint16   `yaml:"rtt_cost"`
-	RTTMin  *Duration `yaml:"rtt_min"`
-	RTTMax  *Duration `yaml:"rtt_max"`
-	// LinkQuality names the estimator that turns Hello loss into a cost,
-	// spelled as BIRD spells it: "etx", which the fleet runs on these same
-	// tunnels, or "none" to cost every live link the same whatever it drops.
-	LinkQuality string `yaml:"link_quality"`
-	// Originate announces source-specific prefixes, which the plain top-level
-	// originate list cannot express.
-	Originate []OriginatePrefix `yaml:"originate"`
-	// NoTransit advertises only this node's own prefixes and never relays a
-	// route it learned. The fleet's BIRD already behaves this way, and a leaf
-	// wants it. Off by default, because a converted fleet needs the relaying
-	// and turning it off silently would break the mesh it is replacing.
-	NoTransit bool `yaml:"no_transit"`
+// Caps is everything this node does. Every member is a pointer and every one
+// is absent by default: writing the block turns that capability on, so there is
+// no enabled field to forget and no block that parses and does nothing.
+type Caps struct {
+	Route   *babel.Routes  `yaml:"route,omitempty" json:"route,omitempty" toml:"route,omitempty"`
+	Babel   *babel.Config  `yaml:"babel,omitempty" json:"babel,omitempty" toml:"babel,omitempty"`
+	Table   *kernel.Table  `yaml:"table,omitempty" json:"table,omitempty" toml:"table,omitempty"`
+	Segment *srv6.Segments `yaml:"segment,omitempty" json:"segment,omitempty" toml:"segment,omitempty"`
+	Crypto  *ike.Crypto    `yaml:"crypto,omitempty" json:"crypto,omitempty" toml:"crypto,omitempty"`
 }
 
-// maskedDefault refuses a prefix that announces the default route while
-// carrying host bits, which is always a typo: originatedKey masks it, so the
-// node announces "::/0" to the whole mesh and claims to be its exit. A real
-// default is written "::/0" and is refused nothing.
-func maskedDefault(prefix netip.Prefix) error {
-	if prefix.Bits() != 0 || prefix.Addr().IsUnspecified() {
-		return nil
+// Routes, Babel, Segments and Crypto are the capability in force, which for an
+// absent block is its zero value: the defaults every one of them documents.
+// They exist so that a caller reads one shape whether or not the block was
+// written, rather than checking a pointer at each use.
+func (c *Config) Routes() babel.Routes {
+	if c.Cap.Route == nil {
+		return babel.Routes{}
 	}
-	unspecified := "::"
-	if prefix.Addr().Is4() {
-		unspecified = "0.0.0.0"
-	}
-	return fmt.Errorf("announces a default route, write %s/0 to mean that", unspecified)
+	return *c.Cap.Route
 }
 
-// OriginatePrefix is either a bare CIDR prefix or a mapping carrying a source
-// prefix, so both entries below are valid:
+func (c *Config) Babel() babel.Config {
+	if c.Cap.Babel == nil {
+		return babel.Config{}
+	}
+	return *c.Cap.Babel
+}
+
+func (c *Config) Segments() srv6.Segments {
+	if c.Cap.Segment == nil {
+		return srv6.Segments{}
+	}
+	return *c.Cap.Segment
+}
+
+func (c *Config) Crypto() ike.Crypto {
+	if c.Cap.Crypto == nil {
+		return ike.Crypto{}
+	}
+	return *c.Cap.Crypto
+}
+
+// Load reads a configuration, picking the decoder by file extension: .toml
+// goes to the TOML decoder and .yaml, .yml and .json to the YAML one, since
+// valid JSON is valid YAML. An extension neither knows is refused by name
+// rather than sniffed, because a file whose contents and whose name disagree
+// is one somebody is going to have to debug.
 //
-//	babel:
-//	  originate:
-//	    - 2001:db8::/48
-//	    - prefix: ::/0
-//	      from: 3fff:a::/36
-type OriginatePrefix struct {
-	Prefix netip.Prefix
-	From   netip.Prefix
+// Both decoders run strict, so an unknown key is an error under either: a
+// typo'd capability that silently does nothing is the worst failure a
+// configuration file has.
+func Load(path string) (*Config, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: read %s: %w", path, err)
+	}
+	var c Config
+	switch extension := strings.ToLower(filepath.Ext(path)); extension {
+	case ".toml":
+		err = decodeTOML(body, &c)
+	case ".yaml", ".yml", ".json":
+		err = decodeYAML(body, &c)
+	default:
+		return nil, fmt.Errorf("config: %s: a configuration is written as .toml, .yaml, .yml or .json, and %q is none of those", path, extension)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	c.setDefaults()
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
-func (o *OriginatePrefix) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind == yaml.ScalarNode {
-		prefix, err := netip.ParsePrefix(value.Value)
-		if err != nil {
-			return fmt.Errorf("config: originate %q: %w", value.Value, err)
-		}
-		if err := maskedDefault(prefix); err != nil {
-			return fmt.Errorf("config: originate %q %w", value.Value, err)
-		}
-		o.Prefix = prefix
-		return nil
+func decodeTOML(body []byte, c *Config) error {
+	metadata, err := toml.Decode(string(body), c)
+	if err != nil {
+		return err
 	}
-	if value.Kind != yaml.MappingNode {
-		return fmt.Errorf("config: originate entry must be a prefix or a prefix and from mapping")
-	}
-	// Walked by hand rather than decoded into a helper struct: a nested
-	// decoder would not inherit the top-level decoder's rejection of unknown
-	// fields.
-	for i := 0; i+1 < len(value.Content); i += 2 {
-		key, item := value.Content[i], value.Content[i+1]
-		target := &o.Prefix
-		switch key.Value {
-		case "prefix":
-		case "from":
-			target = &o.From
-		default:
-			return fmt.Errorf("config: originate: unknown field %q", key.Value)
-		}
-		prefix, err := netip.ParsePrefix(item.Value)
-		if err != nil {
-			return fmt.Errorf("config: originate %q: %w", item.Value, err)
-		}
-		*target = prefix
-	}
-	// In this order, so an entry whose prefix and from are both wrong names
-	// the same one every time it is loaded.
-	for _, field := range []struct {
-		name   string
-		prefix netip.Prefix
-	}{{"prefix", o.Prefix}, {"from", o.From}} {
-		if !field.prefix.IsValid() {
-			continue
-		}
-		if err := maskedDefault(field.prefix); err != nil {
-			return fmt.Errorf("config: originate %s %q %w", field.name, field.prefix, err)
-		}
-	}
-	switch {
-	case !o.Prefix.IsValid():
-		return fmt.Errorf("config: originate: prefix is required")
-	case o.From.IsValid() && o.From.Bits() == 0:
-		// originatedKey keeps a source only when it is shorter than the whole
-		// address space, so this one is dropped and the entry silently becomes
-		// an ordinary announcement of its destination.
-		return fmt.Errorf("config: originate %s from %s: a source covering every address is not a source-specific route, drop the from", o.Prefix, o.From)
-	case o.From.IsValid() && o.From.Addr().Is4() != o.Prefix.Addr().Is4():
-		// The source prefix is encoded under the destination's address
-		// encoding, so the pair has no representation on the wire.
-		return fmt.Errorf("config: originate %s from %s: mismatched address families", o.Prefix, o.From)
-	case o.From.IsValid() && o.Prefix.Addr().Is4():
-		// Nothing consumes an IPv4 source-specific route. BIRD's
-		// babel_read_source_prefix drops the whole Update unless the channel
-		// is NET_IP6_SADR, and it has no IPv4 SADR channel; the Linux IPv4 FIB
-		// has no source-address-dependent lookup either, so internal/kernel
-		// refuses to install one. Announcing it would be a prefix that
-		// reaches nobody.
-		return fmt.Errorf("config: originate %s from %s: source-specific routes are IPv6 only", o.Prefix, o.From)
+	// The TOML decoder has no KnownFields of its own: it records what it did
+	// not consume and leaves the judgment to the caller. Reported one key at a
+	// time and in the order the document wrote them, so the message names a
+	// line an operator can find.
+	if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
+		return fmt.Errorf("unknown field %q", undecoded[0].String())
 	}
 	return nil
 }
 
-// SpeakerConfig is the babel configuration this block describes. Cost fields
-// left unset keep the speaker's own defaults.
-func (b Babel) SpeakerConfig() babel.Config {
-	cost := babel.DefaultCostParams()
-	if b.RxCost != nil {
-		cost.RxCost = *b.RxCost
+func decodeYAML(body []byte, c *Config) error {
+	decoder := yaml.NewDecoder(strings.NewReader(string(body)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(c); err != nil {
+		return err
 	}
-	if b.RTTCost != nil {
-		cost.RTTCost = *b.RTTCost
+	// KnownFields catches a stray key inside the document; this catches a
+	// second document after it. A file assembled by concatenation, or half
+	// pasted below a stray "---", otherwise starts on the first half alone and
+	// validates cleanly, so a node comes up with the listener off or the wrong
+	// peer set and nothing says so. registry.Load refuses the identical case
+	// in JSON.
+	var trailing yaml.Node
+	switch err := decoder.Decode(&trailing); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
+		return err
+	case !emptyDocument(&trailing):
+		return errors.New("a second document follows the first")
 	}
-	if b.RTTMin != nil {
-		cost.RTTMin = time.Duration(*b.RTTMin)
-	}
-	if b.RTTMax != nil {
-		cost.RTTMax = time.Duration(*b.RTTMax)
-	}
-	if b.LinkQuality == "none" {
-		cost.LinkQuality = babel.LinkQualityNone
-	}
-	return babel.Config{HelloInterval: time.Duration(b.HelloInterval),
-		UpdateInterval: time.Duration(b.UpdateInterval), Cost: cost, NoTransit: b.NoTransit}
+	return nil
 }
 
 // emptyDocument reports a document carrying nothing, which a file ending in a
@@ -652,232 +240,106 @@ func emptyDocument(node *yaml.Node) bool {
 	return child.Kind == yaml.ScalarNode && child.Tag == "!!null"
 }
 
-// Load reads a configuration. registryPath and privateKeyPath override the
-// file's own when non-empty and fullMesh turns that field on, so ranet's
-// config.json runs here unchanged: it names none of the three, and ranet takes
-// the first two on its own command line and the third by always behaving that
-// way.
-func Load(path, registryPath, privateKeyPath string, fullMesh bool) (*Config, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("config: read %s: %w", path, err)
-	}
-	var c Config
-	decoder := yaml.NewDecoder(strings.NewReader(string(b)))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&c); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
-	}
-	// KnownFields catches a stray key inside the document; this catches a
-	// second document after it. A file assembled by concatenation, or half
-	// pasted below a stray "---", otherwise starts on the first half alone and
-	// validates cleanly, so a node comes up with the responder off or the
-	// wrong peer set and nothing says so. registry.Load refuses the identical
-	// case in JSON.
-	var trailing yaml.Node
-	switch err := decoder.Decode(&trailing); {
-	case errors.Is(err, io.EOF):
-	case err != nil:
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
-	case !emptyDocument(&trailing):
-		return nil, fmt.Errorf("config: parse %s: a second document follows the first", path)
-	}
-	if err := c.adoptRanetEndpointFields(); err != nil {
-		return nil, fmt.Errorf("config: %s: %w", path, err)
-	}
-	// Applied before validation, not after: ranet's own config file has
-	// nowhere to name the registry or the key, so a file that carries neither
-	// is valid exactly when the command line supplies them. Both take ranet's
-	// spelling, so its file runs here unchanged.
-	if registryPath != "" {
-		c.Registry = registryPath
-	}
-	if privateKeyPath != "" {
-		c.PrivateKey = privateKeyPath
-	}
-	if fullMesh {
-		c.FullMesh = true
-	}
-	c.setDefaults()
-	return &c, c.validate()
-}
-
-// adoptRanetEndpointFields lets ranet's own config.json stand in for this one,
-// since valid JSON is valid YAML and the two schemas differ in where they put
-// the same facts rather than in the facts themselves. ranet carries the port
-// and the socket mark per endpoint while this binds one socket for all of
-// them, so each is adopted only when every endpoint agrees and the top-level
-// spelling is absent. A disagreement is refused instead of picked from,
-// because ranet's own module already asserts that the ports match and a file
-// where they do not is one nothing should run.
-func (c *Config) adoptRanetEndpointFields() error {
-	for _, ep := range c.Endpoints {
-		if ep.Port == 0 {
-			continue
-		}
-		switch {
-		case c.Port == 0:
-			c.Port = ep.Port
-		case c.Port != ep.Port:
-			return fmt.Errorf("endpoint %q says port %d and the top level says %d", ep.SerialNumber, ep.Port, c.Port)
-		}
-	}
-	for _, ep := range c.Endpoints {
-		// Said once per endpoint rather than dropped. Both fields change what
-		// ranet does, so a file carrying them was written expecting an effect,
-		// and an operator who is not told keeps expecting it.
-		if ep.Address != "" {
-			log.Printf("config: endpoint %q address %q is not used: the transport binds every interface and lets the kernel pick the source by route", ep.SerialNumber, ep.Address)
-		}
-		if ep.UpDown != "" {
-			log.Printf("config: endpoint %q updown %q is not run: there are no per-peer interfaces here, one tun carries the whole mesh", ep.SerialNumber, ep.UpDown)
-		}
-		if ep.FWMark != "" {
-			log.Printf("config: endpoint %q fwmark %q is not applied: ranet hands that to strongSwan as set_mark_out, an XFRM mark on the outbound SA, and the top-level fwmark here is SO_MARK on the socket, which is a different thing set in a different place", ep.SerialNumber, ep.FWMark)
-		}
-	}
-	if c.Experimental.IPTFS {
-		// Accepted as a field so ranet's config parses, refused as a setting
-		// because this tree has no IP-TFS: taking it and carrying on would
-		// leave a node believing its traffic is padded when it is not.
-		return errors.New("experimental.iptfs is not implemented here")
-	}
-	return nil
-}
-
 func (c *Config) setDefaults() {
-	for i := range c.Peers {
-		if c.Peers[i].Organization == "" {
-			c.Peers[i].Organization = c.Organization
+	for i := range c.Dial.To {
+		if c.Dial.To[i].Org == "" {
+			c.Dial.To[i].Org = c.Node.Org
 		}
 	}
 }
 
-func (c *Config) validate() error {
+// Validate checks what this node says about itself, then asks each capability
+// to check itself, then makes the two checks that span capabilities. The split
+// is deliberate: a rule about what a rule may say belongs with the reconciler
+// that installs it, and repeating it here is how the two come to disagree.
+func (c *Config) Validate() error {
+	if err := c.validateNode(); err != nil {
+		return err
+	}
+	for _, capability := range []interface{ Validate() error }{
+		c.Routes(), c.Babel(), c.Segments(), c.Crypto(),
+	} {
+		if err := capability.Validate(); err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+	}
+	if c.Cap.Table != nil {
+		if err := c.Cap.Table.Validate(); err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+	}
+	return c.validateAcrossCapabilities()
+}
+
+func (c *Config) validateNode() error {
 	switch {
-	case c.Organization == "":
-		return fmt.Errorf("config: organization is required")
-	case c.CommonName == "":
-		return fmt.Errorf("config: common_name is required")
-	case c.Port == 0:
-		return fmt.Errorf("config: port is required")
-	case c.Port == 500:
+	case c.Node.Org == "":
+		return errors.New("config: node.org is required")
+	case c.Node.Name == "":
+		return errors.New("config: node.name is required")
+	case c.Link.Port == 0:
+		return errors.New("config: link.port is required")
+	case c.Link.Port == 500:
 		// Every IKE datagram here carries the non-ESP marker so IKE and ESP
 		// can share one socket, and RFC 7296 section 2.23 says "UDP
 		// encapsulation MUST NOT be done on port 500". A peer on 500 would
 		// read the marker as the start of a header.
-		return fmt.Errorf("config: port 500 cannot carry UDP-encapsulated IKE, use 4500 or a private port")
-	case len(c.Endpoints) == 0:
-		return fmt.Errorf("config: at least one endpoint is required")
-	case c.PrivateKey == "":
-		return fmt.Errorf("config: private_key is required")
-	case c.Registry == "":
-		return fmt.Errorf("config: registry is required")
-	case len(c.Peers) == 0 && !c.Responder && !c.FullMesh:
-		// A responder needs no peers: it answers whoever the registry knows.
-		// Without one, a node with neither would do nothing at all.
-		return fmt.Errorf("config: at least one peer is required unless responder or full_mesh is set")
-	case c.ReplayWindow != nil && *c.ReplayWindow > 1<<20:
-		return fmt.Errorf("config: replay_window must not exceed %d", uint32(1<<20))
-	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
-		return fmt.Errorf("config: child_rekey_interval must be nonnegative when set")
-	case c.IKERekeyInterval != nil && time.Duration(*c.IKERekeyInterval) < 0:
-		return fmt.Errorf("config: ike_rekey_interval must be nonnegative when set")
-	case c.RekeyMargin != nil && time.Duration(*c.RekeyMargin) < 0:
-		return fmt.Errorf("config: rekey_margin must be nonnegative when set")
-	case c.RekeyJitter != nil && time.Duration(*c.RekeyJitter) < 0:
-		return fmt.Errorf("config: rekey_jitter must be nonnegative when set")
-	case c.RekeyRetryInitial != nil && time.Duration(*c.RekeyRetryInitial) <= 0:
-		return fmt.Errorf("config: rekey_retry_initial must be positive when set")
-	case c.RekeyRetryMax != nil && time.Duration(*c.RekeyRetryMax) <= 0:
-		return fmt.Errorf("config: rekey_retry_max must be positive when set")
-	case c.RekeyRetryInitialValue() > c.RekeyRetryMaxValue():
-		return fmt.Errorf("config: rekey_retry_initial must not exceed rekey_retry_max")
-	case !validRekeyTiming(c.ChildRekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
-		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than child_rekey_interval")
-	case !validRekeyTiming(c.IKERekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
-		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than ike_rekey_interval")
+		return errors.New("config: link.port 500 cannot carry UDP-encapsulated IKE, use 4500 or a private port")
+	case len(c.Link.Endpoints) == 0:
+		return errors.New("config: at least one link.endpoints entry is required")
+	case c.Auth.Key == "":
+		return errors.New("config: auth.key is required")
+	case c.Auth.Trust == "":
+		return errors.New("config: auth.trust is required")
+	case len(c.Dial.To) == 0 && !c.Link.Listen && !c.Dial.All:
+		// A listener needs no peers: it answers whoever the trust document
+		// knows. Without one, a node with neither would do nothing at all.
+		return errors.New("config: at least one dial.to entry is required unless link.listen or dial.all is set")
 	}
-	// Validate the whole speaker configuration, link costs included, so a bad
-	switch c.Babel.LinkQuality {
-	case "", "etx", "none":
-	default:
-		return fmt.Errorf("config: babel.link_quality %q is not etx or none", c.Babel.LinkQuality)
-	}
-	// rxcost fails at load rather than at speaker construction.
-	if err := c.Babel.SpeakerConfig().Validate(); err != nil {
-		return fmt.Errorf("config: %w", err)
-	}
-	endpointSerials := make(map[string]struct{}, len(c.Endpoints))
-	for _, ep := range c.Endpoints {
-		if ep.SerialNumber == "" || (ep.AddressFamily != "ip4" && ep.AddressFamily != "ip6") {
-			return fmt.Errorf("config: endpoints require serial_number and address_family (ip4 or ip6)")
+	serials := make(map[string]struct{}, len(c.Link.Endpoints))
+	for _, endpoint := range c.Link.Endpoints {
+		if endpoint.Serial == "" || (endpoint.Family != "ip4" && endpoint.Family != "ip6") {
+			return errors.New("config: link.endpoints entries require serial and family (ip4 or ip6)")
 		}
-		if _, exists := endpointSerials[ep.SerialNumber]; exists {
-			return fmt.Errorf("config: duplicate endpoint serial_number %q", ep.SerialNumber)
+		if _, exists := serials[endpoint.Serial]; exists {
+			return fmt.Errorf("config: duplicate link.endpoints serial %q", endpoint.Serial)
 		}
-		endpointSerials[ep.SerialNumber] = struct{}{}
+		serials[endpoint.Serial] = struct{}{}
 	}
-	peers := make(map[string]struct{}, len(c.Peers))
-	for _, peer := range c.Peers {
-		if peer.Organization == "" || peer.CommonName == "" {
-			return fmt.Errorf("config: peers require organization and common_name")
+	peers := make(map[string]struct{}, len(c.Dial.To))
+	for _, peer := range c.Dial.To {
+		if peer.Org == "" || peer.Name == "" {
+			return errors.New("config: dial.to entries require org and name")
 		}
-		key := peer.Organization + "\x00" + peer.CommonName + "\x00" + peer.SerialNumber
+		key := peer.Org + "\x00" + peer.Name + "\x00" + peer.Serial
 		if _, exists := peers[key]; exists {
-			return fmt.Errorf("config: duplicate peer %s/%s endpoint %q", peer.Organization, peer.CommonName, peer.SerialNumber)
+			return fmt.Errorf("config: duplicate dial.to entry %s/%s endpoint %q", peer.Org, peer.Name, peer.Serial)
 		}
 		peers[key] = struct{}{}
-	}
-	for _, raw := range c.Originate {
-		prefix, err := netip.ParsePrefix(raw)
-		if err != nil {
-			return fmt.Errorf("config: originate %q: %w", raw, err)
-		}
-		if err := maskedDefault(prefix); err != nil {
-			return fmt.Errorf("config: originate %q %w", raw, err)
-		}
-	}
-	if err := c.Kernel.refuseWhatDisablingIgnores(); err != nil {
-		return err
-	}
-	if c.Segments.Source != "" {
-		// Checked against what an encapsulation will accept rather than only
-		// for parseability, because nothing else reads this field until a
-		// steer entry needs it, and a node that steers nothing yet would
-		// otherwise carry a source it can never send from.
-		source, err := netip.ParseAddr(c.Segments.Source)
-		if err != nil {
-			return fmt.Errorf("config: segments.source %q: %w", c.Segments.Source, err)
-		}
-		if !srv6.Usable(source) {
-			return fmt.Errorf("config: segments.source %s cannot address a segment routed packet", source)
-		}
-	}
-	for _, raw := range c.Kernel.Addresses {
-		prefix, err := netip.ParsePrefix(raw)
-		if err != nil {
-			return fmt.Errorf("config: kernel.addresses %q: %w", raw, err)
-		}
-		// Assigning the unspecified address is not something an interface can
-		// do, and KernelAddresses skips it, so accepting the entry and
-		// dropping it silently is the one outcome that tells the operator
-		// nothing. A masked default is refused for the same reason it is in
-		// originate: an interface carries the address under a length, and
-		// zero is not one an operator can have meant.
-		if prefix.Addr().IsUnspecified() {
-			return fmt.Errorf("config: kernel.addresses %q is not an address an interface can carry", raw)
-		}
-		// Its own message rather than maskedDefault's: an entry here is
-		// assigned to an interface, never announced, so "write ::/0 if that is
-		// what you mean" is advice the check above rejects.
-		if prefix.Bits() == 0 {
-			return fmt.Errorf("config: kernel.addresses %q has no prefix length, and an interface carries an address under one", raw)
-		}
 	}
 	return nil
 }
 
-func validRekeyTiming(interval, margin, jitter time.Duration) bool {
-	return interval == 0 || (margin < interval && jitter < interval-margin)
+// validateAcrossCapabilities is the part no capability can check alone,
+// because each half is in a different block.
+func (c *Config) validateAcrossCapabilities() error {
+	// A SID this node also carries as an ordinary address would go dark: the
+	// inbound seam acts on a packet by its destination before the tun sees it,
+	// so every packet to that address would be refused as carrying no routing
+	// header, with nothing but a rate-limited warning to say why. On linux the
+	// two coexist because a SID is a route rather than an address. Here they
+	// cannot.
+	if c.Cap.Table == nil || c.Cap.Segment == nil {
+		return nil
+	}
+	carried := make(map[netip.Addr]bool)
+	for _, prefix := range c.Cap.Table.Assigned(c.Routes().Announced()) {
+		carried[prefix.Addr()] = true
+	}
+	for _, segment := range c.Cap.Segment.Local {
+		if carried[segment.SID.Addr] {
+			return fmt.Errorf("config: cap.segment local %s is an address cap.table assigns to this node's own device, so every packet to it would be taken as a segment", segment.SID)
+		}
+	}
+	return nil
 }

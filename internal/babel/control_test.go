@@ -72,7 +72,7 @@ func TestReceiveFromReplacedPeerCannotChangeRoutes(t *testing.T) {
 func TestExpiryUsesRemoteDeadlines(t *testing.T) {
 	for _, expiry := range []string{"update", "ihu", "hello"} {
 		t.Run(expiry, func(t *testing.T) {
-			s, _, _ := captureSpeaker(t, Config{HelloInterval: time.Second, UpdateInterval: 4 * time.Second})
+			s, _, _ := captureSpeaker(t, Config{Hello: dur(time.Second), Update: dur(4 * time.Second)})
 			p := addReachablePeer(s, "remote", 10)
 			dest := netip.MustParsePrefix("10.5.0.0/16")
 			interval := uint16(1000)
@@ -203,7 +203,7 @@ func TestZeroIHUIntervalIsIgnoredRatherThanHonored(t *testing.T) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cost := s.neighbors[a.ID].linkCost(time.Now(), s.cfg.Cost); cost == MetricInfinity {
+	if cost := s.neighbors[a.ID].linkCost(time.Now(), s.cost); cost == MetricInfinity {
 		t.Error("an IHU with a zero interval took the link cost to infinity")
 	}
 }
@@ -214,7 +214,7 @@ func TestZeroIHUIntervalIsIgnoredRatherThanHonored(t *testing.T) {
 // with such an assertion still passing.
 func TestStatsCountWhatEachNeighborSent(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	s, err := New(Config{}, mesh)
+	s, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}

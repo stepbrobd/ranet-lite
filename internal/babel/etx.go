@@ -1,5 +1,12 @@
 package babel
 
+import (
+	"fmt"
+
+	"github.com/NickCao/ranet-lite/internal/schema"
+	"gopkg.in/yaml.v3"
+)
+
 // Hello history and the link-quality estimators of RFC 8966 Appendix A.
 //
 // A node keeps, per neighbor and per kind of Hello, a 16-bit vector in which a
@@ -131,6 +138,33 @@ const (
 	LinkQualityNone
 )
 
+func (q LinkQuality) String() string {
+	if q == LinkQualityNone {
+		return "none"
+	}
+	return "etx"
+}
+
+func (q *LinkQuality) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case "", "etx":
+		*q = LinkQualityETX
+	case "none":
+		*q = LinkQualityNone
+	default:
+		return fmt.Errorf("babel: quality %q is not etx or none", text)
+	}
+	return nil
+}
+
+func (q LinkQuality) MarshalText() ([]byte, error) { return []byte(q.String()), nil }
+
+func (q *LinkQuality) UnmarshalYAML(value *yaml.Node) error {
+	return schema.Scalar(value, "a link quality, etx or none", q)
+}
+
+func (q LinkQuality) MarshalYAML() (any, error) { return q.String(), nil }
+
 // rxCost is the figure this node advertises in its IHU, C/beta of A.2.2 with
 // the nominal hop cost C in place of the RFC's 256. Using the configured
 // rxcost keeps a lossless link at exactly that figure, so the fleet's tuning
@@ -143,7 +177,7 @@ const (
 // better than three Hellos in eight.
 func (p CostParams) rxCost(history *helloHistory) uint16 {
 	received, window, ok := history.beta()
-	if p.LinkQuality != LinkQualityETX || !ok {
+	if p.Quality != LinkQualityETX || !ok {
 		return p.RxCost
 	}
 	if received == 0 {
@@ -174,7 +208,7 @@ func (p CostParams) linkQualityCost(history *helloHistory, txcost uint16) uint16
 		// where it holds only because the product happens to saturate.
 		return MetricInfinity
 	}
-	if p.LinkQuality != LinkQualityETX {
+	if p.Quality != LinkQualityETX {
 		return txcost
 	}
 	received, window, ok := history.beta()

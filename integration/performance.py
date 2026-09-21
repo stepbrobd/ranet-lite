@@ -617,28 +617,35 @@ protocol babel {
         )
     )
     if ranet_peer:
-        # The same registry and organization key, a second identity, and no
-        # peers list: this instance only answers. Its tunnel addresses are
+        # The same trust document and organization key, a second identity, and
+        # nothing to dial: this instance only answers. Its tunnel addresses are
         # swan0's, so both modes measure the same path between the same two
         # endpoints.
         peer_conf = args.output / "peer.yaml"
-        peer_conf.write_text(f"""organization: testorg
-common_name: server
-port: 13000
-endpoints:
-  - serial_number: "1"
-    address_family: ip4
-private_key: {args.repo / "integration/org-key.pem"}
-registry: {registry}
-originate: ["fd00:99::/64"]
-replay_window: {args.replay_window}
-tun: ranet1
-child_rekey_interval: 0
-ike_rekey_interval: 0
-responder: true
-babel:
-  hello_interval: 500ms
-  update_interval: 1s
+        peer_conf.write_text(f"""node:
+  org: testorg
+  name: server
+auth:
+  key: {args.repo / "integration/org-key.pem"}
+  trust: {registry}
+link:
+  port: 13000
+  endpoints:
+    - serial: "1"
+      family: ip4
+  tun: ranet1
+  listen: true
+cap:
+  route:
+    announce: ["fd00:99::/64"]
+  babel:
+    hello: 500ms
+    update: 1s
+  crypto:
+    replay: {args.replay_window}
+    rekey:
+      child: 0
+      ike: 0
 """)
         peer_command = [
             str(args.client),
@@ -673,25 +680,33 @@ babel:
         ]:
             run(command, gateway=True)
     client_conf = args.output / "client.yaml"
-    client_conf.write_text(f"""organization: testorg
-common_name: client
-port: 14000
-endpoints:
-  - serial_number: "2"
-    address_family: ip4
-private_key: {args.repo / "integration/org-key.pem"}
-registry: {registry}
-originate: ["fd00:88::2/128"]
-replay_window: {args.replay_window}
-tun: ranet0
-child_rekey_interval: 0
-ike_rekey_interval: 0
-peers:
-  - common_name: server
-    serial_number: "1"
-babel:
-  hello_interval: 500ms
-  update_interval: 1s
+    client_conf.write_text(f"""node:
+  org: testorg
+  name: client
+auth:
+  key: {args.repo / "integration/org-key.pem"}
+  trust: {registry}
+link:
+  port: 14000
+  endpoints:
+    - serial: "2"
+      family: ip4
+  tun: ranet0
+dial:
+  to:
+    - name: server
+      serial: "1"
+cap:
+  route:
+    announce: ["fd00:88::2/128"]
+  babel:
+    hello: 500ms
+    update: 1s
+  crypto:
+    replay: {args.replay_window}
+    rekey:
+      child: 0
+      ike: 0
 """)
     client_command = [
         str(args.client),
