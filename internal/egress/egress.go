@@ -623,9 +623,14 @@ func sameRules(held []Installed, desired []Rule) bool {
 	return true
 }
 
-// desired is the rules this configuration asks for, in the order they are
-// installed. The Out rules come first because they are the ones every
-// deployment has, and a chain reads top to bottom.
+// desired is the rules this configuration asks for, grouped by family and
+// then in the order a packet meets them within one chain. The grouping is not
+// presentation: each family is a table of its own, so a backend reads them back
+// one family at a time, and a list ordered any other way would never compare
+// equal to its own readback and would be rewritten on every pass forever.
+//
+// Within a family the Out rule comes first, because every deployment has one
+// and a chain reads top to bottom.
 func (t *Translator) desired() []Rule {
 	var out []Rule
 	for _, family := range t.cfg.families() {
@@ -634,11 +639,9 @@ func (t *Translator) desired() []Rule {
 			rule.Source = source.Addr
 		}
 		out = append(out, rule)
-	}
-	if !t.cfg.Return {
-		return out
-	}
-	for _, family := range t.cfg.families() {
+		if !t.cfg.Return {
+			continue
+		}
 		// Resolved again rather than remembered, and its error dropped,
 		// because New refused every configuration that cannot answer it.
 		source, err := returnSource(t.cfg, t.rt, family)
@@ -649,14 +652,14 @@ func (t *Translator) desired() []Rule {
 			if addressFamily(prefix.Addr()) != family {
 				continue
 			}
-			rule := Rule{Family: family, Direction: In, Interface: t.rt.Interface, Source: source}
+			inbound := Rule{Family: family, Direction: In, Interface: t.rt.Interface, Source: source}
 			// A prefix covering every address narrows nothing, and a rule
 			// carrying it would encode a mask no packet fails, so it is left
 			// off and the rule selects on the direction alone.
 			if prefix.Bits() > 0 {
-				rule.From = prefix
+				inbound.From = prefix
 			}
-			out = append(out, rule)
+			out = append(out, inbound)
 		}
 	}
 	return out

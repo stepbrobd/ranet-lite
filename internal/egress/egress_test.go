@@ -41,6 +41,10 @@ func (f *fakeBackend) Rules() ([]Installed, error) {
 	return out, nil
 }
 
+// Apply stores the rules grouped by family, as the nftables backend does: each
+// family is a table of its own, written and read back one at a time. A fake
+// that kept the order it was handed would hide a desired list ordered any other
+// way, which never compares equal to its own readback.
 func (f *fakeBackend) Apply(rules []Rule) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -49,8 +53,12 @@ func (f *fakeBackend) Apply(rules []Rule) error {
 	}
 	f.applied++
 	f.held = nil
-	for _, rule := range rules {
-		f.held = append(f.held, Installed{Spec: rule.String()})
+	for _, family := range []uint8{FamilyIPv4, FamilyIPv6} {
+		for _, rule := range rules {
+			if rule.Family == family {
+				f.held = append(f.held, Installed{Spec: rule.String()})
+			}
+		}
 	}
 	return nil
 }
@@ -183,6 +191,36 @@ func TestReturnRuleForADefaultCarriesNoPrefixMatch(t *testing.T) {
 	}
 	if got := be.specs(); !slices.Equal(got, want) {
 		t.Errorf("installed %q, want %q", got, want)
+	}
+}
+
+// Each family is a table of its own, written and read back one at a time, so
+// the rules a pass asks for have to be grouped by family. A list ordered any
+// other way never compares equal to its own readback, and the ruleset is
+// rewritten on every pass for the life of the node.
+func TestRulesAreGroupedByFamilyAsTheyAreReadBack(t *testing.T) {
+	cfg := Config{Enable: true, Return: true, Advertise: prefixes(t, "198.51.100.0/24", "2001:db8:1::/48")}
+	rt := Runtime{MeshAddresses: []netip.Addr{
+		netip.MustParseAddr("10.88.0.2"), netip.MustParseAddr("2001:db8::2"),
+	}}
+	be := &fakeBackend{}
+	tr := translator(t, cfg, rt, be)
+	want := []string{
+		"out via ranet0 ipv4 masquerade",
+		"in via ranet0 ipv4 from 198.51.100.0/24 source 10.88.0.2",
+		"out via ranet0 ipv6 masquerade",
+		"in via ranet0 ipv6 from 2001:db8:1::/48 source 2001:db8::2",
+	}
+	for range 3 {
+		if err := tr.reconcile(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := be.specs(); !slices.Equal(got, want) {
+		t.Errorf("installed %q, want %q", got, want)
+	}
+	if be.applied != 1 {
+		t.Errorf("wrote the ruleset %d times over three passes, want once", be.applied)
 	}
 }
 
