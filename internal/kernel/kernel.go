@@ -57,6 +57,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -250,6 +251,35 @@ type Reconciler struct {
 	// warned holds the routes already reported as unrepresentable. It is
 	// rebuilt from each pass, so it stays bounded by the snapshot.
 	warned map[Route]bool
+
+	// stats is the last route pass as an operator reads it. The single
+	// reconcile goroutine publishes a whole value and a reader takes one, so
+	// this needs no lock and a reader can never see half a pass.
+	stats atomic.Pointer[Stats]
+}
+
+// Stats is one finished route pass. Installed counts the routes the kernel
+// holds for this reconciler once the pass has applied, and Skipped the ones it wanted
+// and did not get: one the platform cannot represent, or one whose key
+// another writer already holds. A prefix the mesh has and the kernel does not
+// is explained by Skipped or by Err and by nothing else.
+type Stats struct {
+	At        time.Time
+	Desired   int
+	Installed int
+	Skipped   int
+	Added     int
+	Removed   int
+	Err       string
+}
+
+// Stats reports the last route pass, and the zero value before the first one
+// has run. A caller that wants to tell those apart reads At.
+func (r *Reconciler) Stats() Stats {
+	if s := r.stats.Load(); s != nil {
+		return *s
+	}
+	return Stats{}
 }
 
 // New validates cfg, fills in its defaults and opens the netlink sockets, so
@@ -325,6 +355,12 @@ func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
 // line: a routing table where the platform has them, and the interface itself
 // where it does not.
 func (r *Reconciler) Where() string { return r.plat.where(r.cfg) }
+
+// Config is the configuration this reconciler is running, defaults applied.
+// New takes its argument by value and fills the gaps in its own copy, so the
+// caller's is not the one in force and a diagnostic reporting that one names
+// a table of zero on every deployment that left it out.
+func (r *Reconciler) Config() Config { return r.cfg }
 
 // Run reconciles until ctx is canceled, then withdraws everything this
 // reconciler installed and closes its netlink sockets. It is called once.
@@ -430,9 +466,10 @@ func (r *Reconciler) applyRoutes() error {
 	if err != nil {
 		return fmt.Errorf("list routes: %w", err)
 	}
-	add, del := diffRoutes(r.desired(r.src.Snapshot()), actual, r.platformScopes())
+	desired := r.desired(r.src.Snapshot())
+	add, del := diffRoutes(desired, actual, r.platformScopes())
 	var errs []error
-	added, removed := 0, 0
+	added, removed, skipped := 0, 0, 0
 	// Withdraw before installing. An install refuses a key another writer
 	// already holds rather than taking it over, so a route of ours that
 	// changed only in an attribute the kernel does not key on, a preferred
@@ -449,7 +486,9 @@ func (r *Reconciler) applyRoutes() error {
 	for _, route := range add {
 		if err := r.plat.AddRoute(route); err == nil {
 			added++
-		} else if !errors.Is(err, errRouteSkipped) {
+		} else if errors.Is(err, errRouteSkipped) {
+			skipped++
+		} else {
 			errs = append(errs, fmt.Errorf("add route %s: %w", route, err))
 		}
 	}
@@ -461,7 +500,23 @@ func (r *Reconciler) applyRoutes() error {
 	if added > 0 || removed > 0 {
 		slog.Info("kernel routes reconciled", "added", added, "removed", removed)
 	}
-	return errors.Join(errs...)
+	err = errors.Join(errs...)
+	// Installed is counted rather than re-listed: the kernel held len(actual)
+	// when the pass started and every add and delete below was confirmed, so
+	// the sum is exact and costs no second dump.
+	stats := Stats{
+		At:        time.Now(),
+		Desired:   len(desired),
+		Installed: len(actual) - removed + added,
+		Skipped:   skipped,
+		Added:     added,
+		Removed:   removed,
+	}
+	if err != nil {
+		stats.Err = err.Error()
+	}
+	r.stats.Store(&stats)
+	return err
 }
 
 // desired projects one forwarding table snapshot onto the routes the kernel

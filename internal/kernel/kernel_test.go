@@ -941,3 +941,49 @@ func TestAddressReportIsNotRepeatedEveryPass(t *testing.T) {
 		t.Errorf("the address was reported %d times across %d passes, want once", got, passes)
 	}
 }
+
+// A prefix the mesh has and the kernel does not is explained by Skipped, by
+// Err, or by nothing at all, so both have to survive a pass rather than being
+// counted only into a log line.
+func TestStatsReportWhatThePassDidAndDidNotInstall(t *testing.T) {
+	reconciler, table, fake := harness(t, Config{})
+	if before := reconciler.Stats(); !before.At.IsZero() {
+		t.Fatalf("stats before the first pass read %+v, want the zero value", before)
+	}
+
+	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
+	table.Set(netip.Prefix{}, prefix("2602:f590::/36"), nil)
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	first := reconciler.Stats()
+	if first.At.IsZero() {
+		t.Fatal("a finished pass left no timestamp")
+	}
+	if first.Desired != 2 || first.Installed != 2 || first.Added != 2 || first.Removed != 0 || first.Skipped != 0 {
+		t.Fatalf("the first pass reports %+v, want two desired, installed and added", first)
+	}
+
+	// A route another writer holds is refused rather than taken over, which
+	// the platform reports as errRouteSkipped.
+	refused := Route{Destination: prefix("10.1.0.0/16")}
+	fake.failAdd[refused] = errRouteSkipped
+	table.Set(netip.Prefix{}, prefix("10.1.0.0/16"), nil)
+	table.Remove(netip.Prefix{}, prefix("10.0.0.0/8"))
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	second := reconciler.Stats()
+	if second.Skipped != 1 {
+		t.Errorf("a refused install reports %+v, want one skipped", second)
+	}
+	if second.Removed != 1 || second.Added != 0 {
+		t.Errorf("the second pass reports %+v, want one removed and none added", second)
+	}
+	if second.Installed != 1 {
+		t.Errorf("the second pass reports %d installed, want the one route the kernel still holds", second.Installed)
+	}
+	if second.Err != "" {
+		t.Errorf("a skipped route was reported as a failure: %s", second.Err)
+	}
+}
