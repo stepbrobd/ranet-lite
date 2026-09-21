@@ -128,6 +128,23 @@ babel:
 #   local:
 #     - { sid: "2a0c:b641:69c:8c6::1", behavior: "End.DT46" }
 #     - { sid: "2a0c:b641:69c:8c6::2", behavior: "End" }
+#
+#   # The outer source an encapsulation is sent from, which the fleet sets once
+#   # per node with `ip sr tunsrc`. A steer entry below inherits it.
+#   source: "2a0c:b641:69c:8c0::1"
+#
+#   # Which of this node's own packets go through a segment list, and which
+#   # list, which `gv` installs by hand today: the traffic sourced from this
+#   # node's announced address, through the waypoints and out at a chosen exit.
+#   # from and to select the packets, the same pair the forwarding table is
+#   # keyed by, and an entry naming neither is refused because it would claim
+#   # its own encapsulation. via is in the order the packet visits.
+#   #
+#   # Every steered packet carries the list inside the tunnel, so the device's
+#   # MTU comes down by the longest list configured, and one long enough to
+#   # take it under the 1280 IPv6 requires is refused rather than installed.
+#   steer:
+#     - { from: "2602:f590::23:161:104:117/128", via: ["2a0c:b641:69c:98d6::1"] }
 
 # Optional: mirror the routes babel learns into a routing table of its own,
 # taking over from BIRD's kernel protocols. Off unless enabled. The reconciler
