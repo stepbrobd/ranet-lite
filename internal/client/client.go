@@ -119,11 +119,11 @@ func underlayAddrs(reg registry.Registry) []netip.Addr {
 }
 
 func New(cfg *config.Config) (_ *Client, err error) {
-	privateKey, err := registry.LoadPrivateKey(cfg.PrivateKey)
+	privateKey, err := registry.LoadPrivateKey(cfg.Auth.Key)
 	if err != nil {
 		return nil, err
 	}
-	reg, err := registry.Load(cfg.Registry)
+	reg, err := registry.Load(cfg.Auth.Trust)
 	if err != nil {
 		return nil, err
 	}
@@ -134,11 +134,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	warnVRFWithoutL3mdev(cfg)
 	// Before the tun exists, so a segment this node could not answer for
 	// refuses the startup without a device to clean up.
-	segments, err := localSegments(cfg)
-	if err != nil {
-		return nil, err
-	}
-	steering, err := steerTable(cfg)
+	segments, steering, err := cfg.Segments().Tables()
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +148,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 	if err != nil {
 		return nil, err
 	}
-	mesh, err := netstack.NewNamed(mtu, cfg.TUN)
+	mesh, err := netstack.NewNamed(mtu, cfg.Link.TUN)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +186,7 @@ func steeredMTU(steering *srv6.SteerTable) (int, error) {
 // newClient is New with the loading done, so a test can stand up a client
 // around a mesh it built itself rather than a privileged TUN.
 func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.Registry, mesh *netstack.Mesh) (_ *Client, err error) {
-	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Port), cfg.FWMark)
+	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Link.Port), cfg.Link.Mark)
 	if err != nil {
 		return nil, err
 	}
@@ -199,18 +195,12 @@ func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.R
 			_ = hub.Close()
 		}
 	}()
-	speaker, err := babel.New(cfg.Babel.SpeakerConfig(), mesh)
+	// Two capabilities configure the speaker: cap.babel is the protocol's own
+	// timers and cost, and cap.route the prefixes this node puts into the mesh.
+	speaker, err := babel.New(cfg.Babel(), cfg.Routes(), babel.Runtime{}, mesh)
 	if err != nil {
 		return nil, err
 	}
-	// The plain list and babel.originate together. The latter carries the
-	// source-specific announcements the former cannot express, which is how an
-	// exit announces a default from a prefix.
-	originated, err := originatedRoutes(cfg)
-	if err != nil {
-		return nil, err
-	}
-	speaker.SetOriginated(originated)
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		Mesh: mesh, privateKey: privateKey,
@@ -244,7 +234,7 @@ func (c *Client) Run(ctx context.Context) error {
 		c.cancel()
 	}
 	c.syncPeers()
-	if c.config().Responder {
+	if c.config().Link.Listen {
 		c.peers.Go(func() {
 			if err := c.acceptPeers(c.ctx); err != nil && c.ctx.Err() == nil {
 				log.Printf("responder: %v", err)

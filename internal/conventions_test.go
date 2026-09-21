@@ -23,7 +23,7 @@ func goFiles(t *testing.T) []string { return treeFiles(t, map[string]int{".go": 
 // about Go, and every widening so far has found violations in the files it
 // reached for the first time.
 func proseFiles(t *testing.T) []string {
-	return treeFiles(t, map[string]int{".go": 50, ".md": 1, ".yaml": 1, ".nix": 5, ".py": 1})
+	return treeFiles(t, map[string]int{".go": 50, ".md": 1, ".yaml": 1, ".nix": 5, ".py": 1, ".toml": 2})
 }
 
 // least is per suffix rather than a total. The tree holds well over a hundred
@@ -119,7 +119,8 @@ func TestNoArticleLeadingTestName(t *testing.T) {
 // that was widened past them is guarded by naming them.
 func TestProseChecksReachTheDocuments(t *testing.T) {
 	want := map[string]bool{"../readme.md": false, "../examples/config.yaml": false,
-		"../integration/nixos-test.nix": false, "../integration/performance.py": false}
+		"../examples/config.toml": false, "../integration/nixos-test.nix": false,
+		"../integration/performance.py": false}
 	for _, path := range proseFiles(t) {
 		if _, named := want[path]; named {
 			want[path] = true

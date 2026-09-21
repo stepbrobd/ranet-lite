@@ -33,7 +33,8 @@ type netlinkConn interface {
 // enforces the ownership marker on the way back in, so a route without the
 // reconciler's protocol, table and interface never reaches the diff.
 type netlinkPlatform struct {
-	cfg     Config
+	table   Table
+	rt      Runtime
 	index   uint32
 	conn    netlinkConn
 	monitor *routeMonitor
@@ -52,7 +53,7 @@ type netlinkPlatform struct {
 	refused  map[Route]bool
 }
 
-func newPlatform(cfg Config) (platform, error) {
+func newPlatform(t Table, rt Runtime) (platform, error) {
 	conn, err := dialNetlink()
 	if err != nil {
 		return nil, err
@@ -60,17 +61,17 @@ func newPlatform(cfg Config) (platform, error) {
 	// the index is resolved once: netstack owns the TUN for the whole
 	// process lifetime, so a changed index means a different device and the
 	// routes of the old one are already gone with it.
-	index, _, err := conn.link(cfg.Interface)
+	index, _, err := conn.link(rt.Interface)
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("kernel: look up interface %s: %w", cfg.Interface, err)
+		return nil, fmt.Errorf("kernel: look up interface %s: %w", rt.Interface, err)
 	}
-	monitor, err := newRouteMonitor(cfg.Table)
+	monitor, err := newRouteMonitor(uint32(t.ID))
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
-	return &netlinkPlatform{cfg: cfg, index: index, conn: conn, monitor: monitor,
+	return &netlinkPlatform{table: t, rt: rt, index: index, conn: conn, monitor: monitor,
 		occupied: make(map[Route]bool), refused: make(map[Route]bool)}, nil
 }
 
@@ -115,7 +116,7 @@ func (p *netlinkPlatform) decodeRoute(message nlMessage) (Route, bool) {
 	}
 	family, dstLen, srcLen := message.Data[0], message.Data[1], message.Data[2]
 	table, protocol, kind := uint32(message.Data[4]), message.Data[5], message.Data[7]
-	if protocol != p.cfg.Protocol || (kind != unix.RTN_UNICAST && kind != unix.RTN_UNREACHABLE) {
+	if protocol != p.table.Proto || (kind != unix.RTN_UNICAST && kind != unix.RTN_UNREACHABLE) {
 		return Route{}, false
 	}
 	if family != unix.AF_INET && family != unix.AF_INET6 {
@@ -148,7 +149,7 @@ func (p *netlinkPlatform) decodeRoute(message nlMessage) (Route, bool) {
 	}
 	// An unreachable hold names no device, so only the table and the protocol
 	// identify it. Both are this reconciler's own marker.
-	if table != p.cfg.Table || (kind == unix.RTN_UNICAST && oif != p.index) {
+	if table != uint32(p.table.ID) || (kind == unix.RTN_UNICAST && oif != p.index) {
 		return Route{}, false
 	}
 	if !destination.IsValid() {
@@ -203,8 +204,8 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 		srcLen = route.Source.Bits()
 	}
 	table := uint8(unix.RT_TABLE_UNSPEC)
-	if p.cfg.Table <= 255 {
-		table = uint8(p.cfg.Table)
+	if uint32(p.table.ID) <= 255 {
+		table = uint8(p.table.ID)
 	}
 
 	body := make([]byte, unix.SizeofRtMsg)
@@ -212,10 +213,10 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 	body[1] = uint8(route.Destination.Bits())
 	body[2] = uint8(srcLen)
 	body[4] = table
-	body[5] = p.cfg.Protocol
+	body[5] = p.table.Proto
 	body[6] = scope
 	body[7] = kind
-	body = putAttrU32(body, unix.RTA_TABLE, p.cfg.Table)
+	body = putAttrU32(body, unix.RTA_TABLE, uint32(p.table.ID))
 	if route.Destination.Bits() > 0 {
 		body = putAttr(body, unix.RTA_DST, addressBytes(route.Destination.Addr()))
 	}
@@ -236,8 +237,8 @@ func (p *netlinkPlatform) routeMessage(route Route, del bool) []byte {
 
 // where is the routing table this reconciler owns and the protocol it stamps,
 // which together with the interface make a route on linux its own.
-func (p *netlinkPlatform) where(cfg Config) string {
-	return fmt.Sprintf("table %d protocol %d", cfg.Table, cfg.Protocol)
+func (p *netlinkPlatform) where(t Table) string {
+	return fmt.Sprintf("table %d protocol %d", uint32(t.ID), t.Proto)
 }
 
 func (p *netlinkPlatform) AddRoute(route Route) error {
@@ -264,7 +265,7 @@ func (p *netlinkPlatform) AddRoute(route Route) error {
 		if !p.occupied[route] {
 			p.occupied[route] = true
 			slog.Warn("kernel is leaving a route that another writer holds",
-				"route", route, "table", p.cfg.Table,
+				"route", route, "table", uint32(p.table.ID),
 				"detail", "something else holds this prefix at this metric in this table, so it was not installed")
 		}
 		// Not a failure and not an install. Reported as an error it would put
@@ -389,7 +390,7 @@ func (p *netlinkPlatform) DelAddr(prefix netip.Prefix) error {
 }
 
 func (p *netlinkPlatform) Master() (string, error) {
-	_, master, err := p.conn.link(p.cfg.Interface)
+	_, master, err := p.conn.link(p.rt.Interface)
 	if err != nil {
 		return "", err
 	}
@@ -548,7 +549,7 @@ func (p *netlinkPlatform) foreignWriters() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		collectForeignWriters(replies, p.cfg.Table, p.cfg.Protocol, seen)
+		collectForeignWriters(replies, uint32(p.table.ID), p.table.Proto, seen)
 	}
 	// Labeled here rather than by the caller, because rt_proto is a linux
 	// registry and kernel.go is the portable half. Returning the numbers bare

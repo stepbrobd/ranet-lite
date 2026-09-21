@@ -19,7 +19,7 @@ import (
 func TestLinuxDumpKeepsOnlyRoutesItOwns(t *testing.T) {
 	const ourIndex, ourTable, ourProtocol = 7, 200, DefaultProtocol
 	plat := &netlinkPlatform{
-		cfg:      Config{Interface: "ranet0", Table: ourTable, Protocol: ourProtocol},
+		table: Table{ID: ourTable, Proto: ourProtocol}, rt: Runtime{Interface: "ranet0"},
 		index:    ourIndex,
 		occupied: map[Route]bool{}, refused: map[Route]bool{},
 	}

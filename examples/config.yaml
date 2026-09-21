@@ -1,222 +1,91 @@
-# Example ranet-lite config. See internal/config/config.go for the full
-# schema and defaults, and internal/registry/testdata/registry.json for a
-# worked example of the registry.json this points at.
+# The same schema under the other decoder. A configuration file is read by the
+# extension it carries. A .toml file goes to the TOML parser, and .yaml, .yml
+# and .json go to the YAML one. The keys are identical under both, so a
+# deployment that prefers YAML writes this and one that prefers TOML writes
+# examples/config.toml.
 #
-# Optional YAML lines start with "# " followed by a lowercase key or list
-# item, possibly indented. Enable an option by removing only "# ", keeping
-# the remaining indentation. Enable its parent keys and list items together.
-
-# Identity: must match an entry for this org/node/serial in the registry
-# below, and private_key must be that organization's shared Ed25519 key.
-organization: example
-common_name: my-laptop
-port: 13000
-endpoints:
-  - serial_number: "0"
-    address_family: ip4
-
-private_key: /etc/ranet-lite/key.pem      # PKCS8 PEM Ed25519 private key
-registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
-
-# Prefixes this node announces via babel as reachable through itself
-# (e.g. its own tunnel address). Leave empty if this node only consumes
-# routes and never originates any.
-originate:
-  - "10.66.0.5/32"
-
-# Optional anti-replay window, in packets. Omitted it is 4096, which is wider
-# than the interoperable minimum on purpose: a multicore sender reorders bursts
-# by more than 32 before they reach userspace. Set 0 to disable replay checking.
-# replay_window: 4096
-
-# Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
-# Set either to 0 to disable it. Rekeys run interval minus the 5m margin and
-# an independently random 0-1m jitter. Margin plus jitter must be shorter
-# than every enabled interval.
-# child_rekey_interval: 1h
-# ike_rekey_interval: 3h
-# rekey_margin: 5m
-# rekey_jitter: 1m
-# Failed scheduled rekeys retry after 5s, doubling up to 5m. Both must be
-# positive and the initial delay cannot exceed the maximum.
-# rekey_retry_initial: 5s
-# rekey_retry_max: 5m
-
-# Mark the one UDP socket carrying IKE and ESP, linux only, so a policy rule
-# can keep the underlay in a table of your choosing. Set it on a node whose
-# mesh address is the only global address of its family: the kernel sources
-# this socket from that address, a "from <mesh address>" rule sends it to the
-# mesh table, and an exit-announced default there routes the underlay into the
-# tun carrying it. ranet-lite writes no rules, so add the matching one with the
-# rest of the deployment's, e.g. ip rule add fwmark 0x726c lookup main.
-# fwmark: 0x726c
-
-# Answer peers that dial us as well as dialing. Off by default; required for a
-# full mesh, where every node both dials and answers.
-# responder: true
-
-# Dial every node the registry names, the N-to-N reconciliation ranet does.
-# Needed for reach against a fleet whose BIRD exports only its own directly
-# connected routes: a node hears about a prefix from the node that originates
-# it or not at all, so dialing a few exits reaches those exits and nothing
-# behind them. The peers below still apply and win for their node, which is the
-# only way to pin a serial_number.
-# full_mesh: true
-
-# One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
-# endpoint only dials remote endpoints with the same address family.
-peers:
-  - organization: example       # optional, defaults to the top-level organization
-    common_name: gateway
-    serial_number: "0"          # optional, picks a specific endpoint if the node has several
-
-babel:
-  # Omitted these default to 4s and 16s, which BIRD and RFC 8966
-  # Appendix B use and what the fleet configures. Raise them on a node that
-  # would rather wake less often.
-  hello_interval: 4s
-  update_interval: 16s
-
-  # Optional link costs use the BIRD interface option names.
-  # rxcost: 96
-  # rtt_cost: 1024
-  # rtt_min: 10ms
-  # rtt_max: 1024ms
-
-  # How a link's Hello loss becomes a cost, RFC 8966 Appendix A.2, spelled the
-  # way BIRD spells it. The fleet runs the default "etx" on these same
-  # tunnels, and a link dropping one Hello in six then costs a fifth more.
-  # Setting "none" costs every live link alike however much it drops, the
-  # behavior this had before it kept any Hello history.
-  # link_quality: etx
-
-  # Advertise only this node's own prefixes and never relay a route learned
-  # from a peer. Off by default, because a converted fleet needs the relaying.
-  # Turn it on for a leaf: a node that redistributes is offering to carry the
-  # mesh, and a laptop on a home or cellular uplink should not.
-  # no_transit: true
-
-  # Optional announcements also support a source prefix, which the top-level
-  # originate list cannot express. Enable the list and its entries together.
-  # originate:
-  #   - 2001:db8:1::/48                      # a plain prefix, same as originate
-  #   - { prefix: "::/0", from: "2001:db8:1::/48" }  # an exit's default
-
-# Optional: use this TUN name. WireGuard's TUN backend attaches when the
-# interface already exists, or creates it if it does not. Omit it to create
-# an automatically named ranet%d interface.
-# tun: ranet0
-
-# ranet-lite creates a TUN device by default (its name is logged on startup) but
-# never touches its address or routes itself unless kernel mode is enabled.
-# Otherwise, after starting it, assign an address and add routes yourself, e.g.:
-#   ip addr add 10.66.0.5/32 dev ranet0
-#   ip route add ::/0 dev ranet0
-
-# Optional: the segments this node answers for, RFC 8986. This tree acts on a
-# segment routing header in the dataplane rather than asking a kernel to, so
-# these work the same on every platform: darwin has no segment routing and a
-# mobile tunnel provider has no forwarding table at all, and neither needs one
-# when the process carrying the packet is the one acting on the header.
+# Every key is documented there. This file is the short form: what a node that
+# joins a mesh and announces one address has to say about itself.
 #
-# A packet arriving for one of these is acted on before it reaches the tun.
-# End sends it to its next segment, End.DT46 strips the outer header and hands
-# what was inside to the stack. The spelling is the one
-# `ip route ... encap seg6local action` takes, so a fleet's own SIDs move here
-# unchanged.
-# segments:
-#   local:
-#     - { sid: "3fff:1:69c:8c6::1", behavior: "End.DT46" }
-#     - { sid: "3fff:1:69c:8c6::2", behavior: "End" }
-#
-#   # The outer source an encapsulation is sent from, which the fleet sets once
-#   # per node with `ip sr tunsrc`. A steer entry below inherits it.
-#   source: "3fff:1:69c:8c0::1"
-#
-#   # Which of this node's own packets go through a segment list, and which
-#   # list, which an operator installs by hand today: the traffic sourced from this
-#   # node's announced address, through the waypoints and out at a chosen exit.
-#   # from and to select the packets, the same pair the forwarding table is
-#   # keyed by, and an entry naming neither is refused because it would steer
-#   # every packet this node sends, babel's own included. via is in the order
-#   # the packet visits.
-#   #
-#   # Every steered packet carries the list inside the tunnel, so the device's
-#   # MTU comes down by the longest list configured, and one long enough to
-#   # take it under the 1280 byte minimum IPv6 requires is refused rather than
-#   # installed.
-#   steer:
-#     - { from: "3fff:a::198:18:104:117/128", via: ["3fff:1:69c:98d6::1"] }
+# An optional YAML line starts with "# " followed by a lowercase key or a list
+# item, possibly indented. Enable one by removing only "# ", keeping the
+# remaining indentation, and enable its parent keys together with it.
 
-# Optional: mirror the routes babel learns into a routing table of its own,
-# taking over from BIRD's kernel protocols. Off unless enabled. The reconciler
-# deletes only routes carrying its own protocol, in its own table, out of the
-# TUN, and an install refuses a key another writer already holds rather than
-# taking it over. Give it a table no other daemon writes, or the routes it
-# refuses are routes the mesh wanted.
-# kernel:
-#   enabled: true
-#   table: 200
-#   protocol: 155
-#   metric: 64                    # BIRD's kbabel uses 32, so not 32 while it shares this table
-#   prefsrc4: 10.66.0.5            # linux only, refused on darwin, which has no preferred source
-#   addresses: ["10.66.0.5/32"]
-#   assign_originated: false
-#   vrf: mesh
-#   vrf_create: true               # linux only: make the vrf rather than expect networkd to have
-#   reconcile_interval: 30s
-#
-#   # Policy rules the reconciler owns, linux only. Each carries the protocol
-#   # above, so a dump reads back only these and a delete can never reach
-#   # another writer's rule, and they are withdrawn at shutdown with the
-#   # routes. darwin has one forwarding table and no rules, and refuses these
-#   # by name; it scopes an announced default and a source-specific route to
-#   # the tun instead, which reaches the same two ends.
-#   #
-#   # A rule naming an address takes that address's family. One selecting on a
-#   # mark alone says which family it is for, and "both" installs it once per
-#   # family, which keeping the underlay out of the mesh table needs.
-#   # table takes a number or one of main, local and default.
-#   rules:
-#     - { fwmark: 0x726c, table: main, priority: 40, family: both }
-#     - { to: "3fff:1:69c::/48", table: 200, priority: 100 }
-#     - { from: "10.66.0.5/32", table: 200, priority: 150 }
+# Who this node is. Both halves have to match an entry in the document
+# auth.trust names.
+node:
+  org: example
+  name: my-laptop
 
-# Optional: carry other nodes' traffic out of the mesh, the one action behind
-# an exit node and a subnet router. linux only: the translation is an nftables
-# table named after this tool, and the capability is refused by name where
-# there is no packet filter to write into. Off unless enabled.
-#
-# The table, its one nat postrouting chain and its rules are this tool's alone.
-# Nothing outside them is read, replaced or deleted, they are withdrawn whole
-# at shutdown, and other source translation found at the same hook is reported
-# rather than fought over, since the first chain to claim a connection keeps it.
-#
-# advertise names the prefixes this node offers to carry, and decides which
-# families are translated as well as which are announced. A prefix here is announced
-# only while its rule is installed and the kernel forwards its family, so an
-# exit that cannot translate stops attracting traffic it would drop. Do not
-# repeat one of these in originate, which would announce it either way.
-# egress:
-#   enable: true
-#   advertise: ["0.0.0.0/0", "::/0"]      # a subnet router names its own prefixes here
-#
-#   # The address a translated packet leaves under, per family. Omitted, or
-#   # written as auto, the host's own routes decide it per packet, which is the
-#   # only answer a deployment that owns no address block has. An address
-#   # written out is used unchanged, which is how a deployment with its own
-#   # block pins the address return traffic comes back to.
-#   source4: auto
-#   source6: auto
-#
-#   # Translate the other direction too, so a packet from one of the advertised
-#   # prefixes enters the mesh under this node's own mesh address. A subnet
-#   # router needs it where the mesh has no route back to the LAN. An exit node
-#   # does not: nothing sits behind it to start a flow. A node carrying more
-#   # than one mesh address of a family is refused rather than picked from, so
-#   # name the one to use in source4 or source6.
-#   return: true
-#
-#   # The periodic sweep, which reinstalls a table somebody removed and re-reads
-#   # the forwarding sysctls. Omitted it is 30s.
-#   interval: 30s
+# This node's own key, a PKCS8 PEM Ed25519 file, and the document saying who
+# may join, which is a ranet registry.json today.
+auth:
+  key: /etc/ranet-lite/key.pem
+  trust: /etc/ranet-lite/trust.json
+
+# The one socket carrying IKE and ESP, and the device the mesh runs on.
+link:
+  port: 13000
+  endpoints:
+    - serial: "0"
+      family: ip4
+  # Answer peers that dial this node as well as dialing. Off by default, and
+  # required for a full mesh, where every node both dials and answers.
+  # listen: true
+  # tun: ranet0
+  # mark: 0x726c
+
+# Who this node dials. An entry's org defaults to node.org above.
+dial:
+  # all: true
+  to:
+    - name: gateway
+      serial: "0"
+
+# Everything this node does. A block written here turns that capability on.
+cap:
+  route:
+    # Either a bare prefix or a prefix and the source it is reachable from,
+    # which is how an exit announces a default out of its transit prefix.
+    announce:
+      - "10.66.0.5/32"
+      # - { prefix: "::/0", from: "2001:db8:1::/48" }
+    # transit: false
+  babel:
+    hello: 4s
+    update: 16s
+    # quality: etx
+    # cost:
+    #   rx: 96
+    #   rtt: { weight: 1024, min: 10ms, max: 1024ms }
+  # table:
+  #   id: 200
+  #   proto: 155
+  #   metric: 64
+  #   addresses: ["10.66.0.5/32"]
+  #   assign_announced: false
+  #   reconcile: 30s
+  #   vrf: { name: mesh, create: true }
+  #   rules:
+  #     - { fwmark: 0x726c, table: main, priority: 40, family: both }
+  #     - { to: "3fff:1:69c::/48", table: 200, priority: 100 }
+  # segment:
+  #   source: "3fff:1:69c:8c0::1"
+  #   local:
+  #     - { sid: "3fff:1:69c:8c6::1", behavior: "End.DT46" }
+  #   steer:
+  #     - { from: "3fff:a::198:18:104:117/128", via: ["3fff:1:69c:98d6::1"] }
+  # crypto:
+  #   replay: 4096
+  #   rekey:
+  #     child: 1h
+  #     ike: 3h
+  #     margin: 5m
+  #     jitter: 1m
+  #     retry: { first: 5s, max: 5m }
+  # egress:
+  #   advertise: ["198.51.100.0/24", "2001:db8:2::/48"]
+  #   source4: auto
+  #   source6: auto
+  #   return: true
+  #   sweep: 30s

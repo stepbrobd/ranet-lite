@@ -25,13 +25,23 @@ type meshFabric struct {
 	handles  map[string]*PeerHandle
 	sentMu   sync.Mutex
 	sent     map[string][]RawTLV
+	// routes is the cap.route capability every node in the fabric runs, which
+	// decides whether they relay each other's prefixes.
+	routes Routes
 }
 
 // newMeshFabric builds the topology described by links of the form "a-b".
 func newMeshFabric(t *testing.T, cfg Config, links ...string) *meshFabric {
+	return newRoutedFabric(t, cfg, Routes{}, links...)
+}
+
+// newRoutedFabric is newMeshFabric for a topology whose nodes carry a cap.route
+// of their own, which today is a leaf that does not relay.
+func newRoutedFabric(t *testing.T, cfg Config, routes Routes, links ...string) *meshFabric {
 	t.Helper()
 	f := &meshFabric{
 		t:        t,
+		routes:   routes,
 		speakers: make(map[string]*Speaker),
 		meshes:   make(map[string]*netstack.Mesh),
 		handles:  make(map[string]*PeerHandle),
@@ -53,9 +63,10 @@ func (f *meshFabric) node(cfg Config, name string) *Speaker {
 	}
 	// A router-id derived from the name keeps failures readable and keeps the
 	// origin of a route distinguishable from its relay.
-	copy(cfg.RouterID[:], name)
+	var id [8]byte
+	copy(id[:], name)
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	s, err := New(cfg, mesh)
+	s, err := New(cfg, f.routes, Runtime{RouterID: id}, mesh)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -534,7 +545,7 @@ func TestWildcardRouteRequestDumpsAtMostOncePerInterval(t *testing.T) {
 	// The next interval may dump again, or a neighbor that genuinely lost its
 	// table could never recover it.
 	n := fabric.neighbor("a", "b")
-	n.lastFullDump = n.lastFullDump.Add(-2 * fabric.speakers["a"].cfg.UpdateInterval)
+	n.lastFullDump = n.lastFullDump.Add(-2 * fabric.speakers["a"].update)
 	fabric.reset()
 	fabric.inject("a", "b", EncodeRouteRequest(RouteRequest{AE: AEWildcard}))
 	again := 0
@@ -1065,7 +1076,7 @@ func TestOriginSeqnoRisesAtMostOncePerPacket(t *testing.T) {
 // without the starvation retry in the deadline the repeat waits for whatever
 // happens to wake the loop next, which on the link this matters for is nothing.
 func TestRunLoopWakesForStarvationRetry(t *testing.T) {
-	quiet := Config{HelloInterval: time.Minute, UpdateInterval: time.Minute}
+	quiet := Config{Hello: dur(time.Minute), Update: dur(time.Minute)}
 	fabric := newMeshFabric(t, quiet, "a-b", "b-c", "a-d")
 	dest := netip.MustParsePrefix("fd00:c::/64")
 	key := routeKey{dest: dest}
@@ -1349,7 +1360,7 @@ func TestSpentRetryGivesItsNeighborTheShareBack(t *testing.T) {
 // learned route advertised to every peer, and the community forwarding
 // third-party traffic through the laptop within minutes.
 func TestNoTransitAdvertisesOnlyWhatThisNodeOriginates(t *testing.T) {
-	fabric := newMeshFabric(t, Config{NoTransit: true}, "a-b", "b-c")
+	fabric := newRoutedFabric(t, Config{}, Routes{Transit: new(bool)}, "a-b", "b-c")
 	far := netip.MustParsePrefix("fd00:c::/64")
 	own := netip.MustParsePrefix("fd00:b::/64")
 	fabric.speakers["c"].Originate(far)

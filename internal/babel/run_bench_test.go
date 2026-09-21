@@ -21,7 +21,7 @@ func fillRouteTable(tb testing.TB, neighbors, prefixes int) *Speaker {
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	tb.Cleanup(func() { slog.SetDefault(previous) })
-	s, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	s, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		tb.Fatal(err)
 	}

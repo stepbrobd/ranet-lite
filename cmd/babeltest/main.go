@@ -21,6 +21,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/schema"
 )
 
 func loadPriv(path string) ed25519.PrivateKey {
@@ -101,7 +102,7 @@ func main() {
 		return sequenceRange.SealBatchInto, nil
 	}, sess.Mux().SendESPBatch)
 
-	speaker, err := babel.New(babel.Config{HelloInterval: 4 * time.Second}, mesh)
+	speaker, err := babel.New(babel.Config{Hello: schema.Duration(4 * time.Second)}, babel.Routes{}, babel.Runtime{}, mesh)
 	if err != nil {
 		log.Fatal(err)
 	}

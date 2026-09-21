@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// The renderers below are the default output of the subcommands, with -json
+// The renderers below are the default output of the subcommands, with --json
 // giving the wire form instead. They are here rather than in the command so
 // that a test can hold the columns still: the column set is the promise the
 // subcommands make, and a rename of one is a change an operator's scripts see.

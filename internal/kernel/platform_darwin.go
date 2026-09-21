@@ -21,7 +21,7 @@ import (
 //
 // darwin has neither routing tables nor rt_proto, so the three-part marker the
 // linux backend stamps on a route does not exist. The output interface takes
-// its place: a route belongs to this reconciler when it leaves Config.Interface
+// its place: a route belongs to this reconciler when it leaves the mesh device
 // with the shape this reconciler installs, a unicast prefix route whose gateway
 // is the interface itself and not a next hop. A route out of our own utun that
 // this process did not install is adopted and withdrawn with the rest, which is
@@ -32,7 +32,7 @@ import (
 // The kernel's own entries for the interface are excluded by shape. An address
 // creates a host route whose gateway is the address, and the per-interface
 // broadcast and multicast entries carry RTF_BROADCAST or RTF_MULTICAST.
-// Nothing outside Config.Interface is read, written or deleted.
+// Nothing outside the mesh device is read, written or deleted.
 //
 // # What the darwin FIB cannot hold
 //
@@ -49,7 +49,8 @@ import (
 // are diff key fields computed from that same configuration, and reporting
 // anything else would make every pass add and delete the same route forever.
 type routePlatform struct {
-	cfg   Config
+	table Table
+	rt    Runtime
 	index int
 
 	sock     rtSocket
@@ -95,46 +96,46 @@ type routePlatform struct {
 
 	pending map[Route]bool
 
-	// underlay is Config.Underlay as of the current pass. Taken once in
+	// underlay is Runtime.Underlay as of the current pass. Taken once in
 	// Routes, so every scope decision of a pass reads the same list: a route
 	// installed scoped under one answer and deleted under another leaves the
 	// kernel holding a key nothing will name again.
 	underlay []netip.Addr
 }
 
-func newPlatform(cfg Config) (platform, error) {
+func newPlatform(t Table, rt Runtime) (platform, error) {
 	// a linux-shaped configuration names a table and a protocol that mean
 	// nothing here. Rejecting them is the difference between a deployment that
 	// is wrong at startup and one that looks like it works.
-	if cfg.Table != DefaultTable {
-		return nil, fmt.Errorf("kernel: darwin has no routing tables, table %d has no meaning here", cfg.Table)
+	if uint32(t.ID) != DefaultTable {
+		return nil, fmt.Errorf("kernel: darwin has no routing tables, table %d has no meaning here", uint32(t.ID))
 	}
-	if cfg.Protocol != DefaultProtocol {
-		return nil, fmt.Errorf("kernel: darwin has no route protocol, protocol %d has no meaning here", cfg.Protocol)
+	if t.Proto != DefaultProtocol {
+		return nil, fmt.Errorf("kernel: darwin has no route protocol, protocol %d has no meaning here", t.Proto)
 	}
-	if cfg.VRF != "" {
-		return nil, fmt.Errorf("kernel: darwin has no VRF, %s cannot be enslaved to %s", cfg.Interface, cfg.VRF)
+	if t.Name() != "" {
+		return nil, fmt.Errorf("kernel: darwin has no VRF, %s cannot be enslaved to %s", rt.Interface, t.Name())
 	}
-	if cfg.PrefSrc4.IsValid() {
+	if t.PrefSrc4.IsValid() {
 		// The same reasoning as the three above. There is no RTA_PREFSRC here,
 		// and the address a route prefers is whichever one the interface
 		// carries, so a configuration that names one is asking for something
 		// this platform decides for itself. Put the address on the tun with
 		// kernel.addresses and source selection reaches the same answer.
-		return nil, fmt.Errorf("kernel: darwin has no preferred source, prefsrc4 %s has no meaning here", cfg.PrefSrc4)
+		return nil, fmt.Errorf("kernel: darwin has no preferred source, prefsrc4 %s has no meaning here", t.PrefSrc4)
 	}
-	if len(cfg.Interface) >= unix.IFNAMSIZ {
-		return nil, fmt.Errorf("kernel: interface name %q does not fit an ifreq", cfg.Interface)
+	if len(rt.Interface) >= unix.IFNAMSIZ {
+		return nil, fmt.Errorf("kernel: interface name %q does not fit an ifreq", rt.Interface)
 	}
 	// the index is resolved once: netstack owns the utun for the whole process
 	// lifetime, so a changed index means a different device and the routes of
 	// the old one went with it.
-	device, err := net.InterfaceByName(cfg.Interface)
+	device, err := net.InterfaceByName(rt.Interface)
 	if err != nil {
-		return nil, fmt.Errorf("kernel: look up interface %s: %w", cfg.Interface, err)
+		return nil, fmt.Errorf("kernel: look up interface %s: %w", rt.Interface, err)
 	}
 	plat := &routePlatform{
-		cfg: cfg, index: device.Index,
+		table: t, rt: rt, index: device.Index,
 		control4: -1, control6: -1,
 		scoped:   make(map[netip.Prefix]netip.Prefix),
 		warned:   make(map[Route]bool),
@@ -206,8 +207,8 @@ func (p *routePlatform) Close() error {
 // routeMetric answers for the metric. Without that the diff key differs from
 // what the reconciler asked for on every pass.
 func (p *routePlatform) prefSrc(destination netip.Prefix) netip.Addr {
-	if destination.Addr().Is4() && p.cfg.PrefSrc4.IsValid() {
-		return p.cfg.PrefSrc4
+	if destination.Addr().Is4() && p.table.PrefSrc4.IsValid() {
+		return p.table.PrefSrc4.Addr
 	}
 	return netip.Addr{}
 }
@@ -235,8 +236,8 @@ func (p *routePlatform) rotateWarnings() {
 }
 
 func (p *routePlatform) Routes() ([]Route, error) {
-	if p.cfg.Underlay != nil {
-		p.underlay = p.cfg.Underlay()
+	if p.rt.Underlay != nil {
+		p.underlay = p.rt.Underlay()
 	}
 	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
 	if err != nil {
@@ -410,7 +411,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 		// from what this process installed for that destination.
 		Source:  source,
 		PrefSrc: p.prefSrc(prefix),
-		Metric:  routeMetric(p.cfg.Metric, prefix, rm.Flags&unix.RTF_REJECT != 0),
+		Metric:  routeMetric(p.table.Metric, prefix, rm.Flags&unix.RTF_REJECT != 0),
 		// Read back rather than re-derived, because the kernel keys on it: an
 		// unscoped default and a scoped one are two routes, and a withdrawal
 		// that guessed from the destination would take out the wrong one and
@@ -553,7 +554,7 @@ func (p *routePlatform) AddRoute(r Route) error {
 		if !p.occupied[key] {
 			p.occupied[key] = true
 			slog.Warn("kernel is leaving a route that another program holds",
-				"destination", r.Destination, "interface", p.cfg.Interface,
+				"destination", r.Destination, "interface", p.rt.Interface,
 				"detail", "darwin cannot replace a route, so this one was not installed")
 		}
 		return errRouteSkipped
@@ -699,7 +700,7 @@ func (p *routePlatform) Addrs() ([]netip.Prefix, error) {
 	}
 	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeInterface, p.index)
 	if err != nil {
-		return nil, fmt.Errorf("kernel: dump the addresses of %s: %w", p.cfg.Interface, err)
+		return nil, fmt.Errorf("kernel: dump the addresses of %s: %w", p.rt.Interface, err)
 	}
 	return p.interfaceAddrs(rib)
 }
@@ -749,12 +750,12 @@ func (p *routePlatform) AddAddr(prefix netip.Prefix) error {
 	if !prefix.Addr().Is4() {
 		name, fd, number, build = "SIOCAIFADDR_IN6", p.control6, siocAIfAddrIn6, aliasRequest6
 	}
-	request, err := build(p.cfg.Interface, prefix)
+	request, err := build(p.rt.Interface, prefix)
 	if err != nil {
 		return err
 	}
 	if err := ioctlRequest(fd, number, request); err != nil {
-		return fmt.Errorf("%s on %s: %w", name, p.cfg.Interface, err)
+		return fmt.Errorf("%s on %s: %w", name, p.rt.Interface, err)
 	}
 	return nil
 }
@@ -770,8 +771,8 @@ func (p *routePlatform) DelAddr(prefix netip.Prefix) error {
 	if !prefix.Addr().Is4() {
 		name, fd, number, build = "SIOCDIFADDR_IN6", p.control6, siocDIfAddrIn6, deleteRequest6
 	}
-	if err := ioctlRequest(fd, number, build(p.cfg.Interface, prefix)); err != nil && !gone(err) {
-		return fmt.Errorf("%s on %s: %w", name, p.cfg.Interface, err)
+	if err := ioctlRequest(fd, number, build(p.rt.Interface, prefix)); err != nil && !gone(err) {
+		return fmt.Errorf("%s on %s: %w", name, p.rt.Interface, err)
 	}
 	return nil
 }
@@ -782,7 +783,7 @@ func (p *routePlatform) DelAddr(prefix netip.Prefix) error {
 func (p *routePlatform) Master() (string, error) { return "", nil }
 
 func (p *routePlatform) Enslave(master string) error {
-	return fmt.Errorf("kernel: darwin has no VRF, %s cannot be enslaved to %s", p.cfg.Interface, master)
+	return fmt.Errorf("kernel: darwin has no VRF, %s cannot be enslaved to %s", p.rt.Interface, master)
 }
 
 // Release is unreachable: the reconciler releases only what it enslaved, and
@@ -790,7 +791,7 @@ func (p *routePlatform) Enslave(master string) error {
 func (p *routePlatform) Release() error { return nil }
 
 // where is the interface itself: darwin has one FIB and no routing tables.
-func (p *routePlatform) where(cfg Config) string { return "interface " + cfg.Interface }
+func (p *routePlatform) where(Table) string { return "interface " + p.rt.Interface }
 
 // scopes is scopeRoute as the diff reads it.
 func (p *routePlatform) scopes(r Route) bool { return p.scopeRoute(r) }

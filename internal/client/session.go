@@ -29,7 +29,7 @@ func (c *Client) serveSession(ctx context.Context, sess *ike.Session, name, sess
 	defer sess.Mux().Close()
 	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
 
-	tunnel := &tunnel{replayWindow: c.config().ReplayWindowSize(), started: time.Now()}
+	tunnel := &tunnel{replayWindow: c.config().Crypto().ReplayWindow(), started: time.Now()}
 	tunnel.askedAt.Store(-int64(rekeyAskInterval))
 	// requestRekey owns the goroutine and the one-at-a-time guard, so this
 	// runs on its own and may block.

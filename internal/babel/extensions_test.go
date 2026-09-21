@@ -46,7 +46,7 @@ func TestIPv4ViaIPv6RequestsAndAnnouncements(t *testing.T) {
 	for _, ae := range []uint8{AEIPv4, AEIPv4ViaIPv6} {
 		for _, request := range []RawTLV{
 			EncodeRouteRequest(RouteRequest{AE: ae, Prefix: prefix}),
-			EncodeSeqnoRequest(SeqnoRequest{AE: ae, Prefix: prefix, RouterID: s.cfg.RouterID, Seqno: 1, HopCount: 64}),
+			EncodeSeqnoRequest(SeqnoRequest{AE: ae, Prefix: prefix, RouterID: s.routerID, Seqno: 1, HopCount: 64}),
 		} {
 			*packets = nil
 			s.handlePacket(neighbor, EncodePacket([]RawTLV{request}))

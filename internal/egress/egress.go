@@ -8,7 +8,7 @@
 //
 // On linux the translation is an nftables table named after this tool, one per
 // address family, holding one nat postrouting chain. That name is the ownership
-// marker, the way Config.Protocol is the reconciler's in internal/kernel. This
+// marker, the way Table.Proto is the reconciler's in internal/kernel. This
 // package creates the table, writes only inside it, withdraws it whole at
 // shutdown and never reads, replaces or deletes a table, a chain or a rule it
 // did not create. Other source translation already on the host is reported
@@ -48,6 +48,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/NickCao/ranet-lite/internal/schema"
 )
 
 const (
@@ -57,10 +59,8 @@ const (
 	TableName = "ranet-lite"
 	// ChainName is the one chain in that table, a nat postrouting base chain.
 	ChainName = "postrouting"
-	// DefaultInterval is the periodic sweep. It reinstalls a table somebody
-	// removed and re-reads the forwarding sysctls, which is the half of
-	// readiness that can change under a running node.
-	DefaultInterval = 30 * time.Second
+	// DefaultSweep is the periodic pass a capability that names none takes.
+	DefaultSweep = 30 * time.Second
 	// minRetryInterval is the first delay after a failed pass; it doubles up
 	// to the sweep interval, as in internal/kernel.
 	minRetryInterval = time.Second
@@ -80,41 +80,38 @@ const (
 // and is not written yet.
 var ErrUnsupported = errors.New("egress: source translation is unsupported on this platform")
 
-// Config is the egress capability, parsed straight from the file and carried
-// unchanged on the wire. It is defined here rather than mirrored in
-// internal/config so that the package deciding what a field means is the one
-// that acts on it.
-type Config struct {
-	// Enable turns the capability on. Everything below it is read only while
-	// it is set, so a block written with it left out is refused rather than
-	// accepted and ignored.
-	Enable bool `yaml:"enable" json:"enable"`
-	// Source4 and Source6 are the address a translated packet leaves under,
-	// per family. See Source: "auto" is the address this node's own routes
-	// would have used, which is the only answer available to a deployment that
-	// owns no address block.
-	Source4 Source `yaml:"source4,omitempty" json:"source4,omitzero"`
-	Source6 Source `yaml:"source6,omitempty" json:"source6,omitzero"`
+// Egress is the cap.egress capability: this node carries other nodes' traffic
+// out of the mesh, the one action behind an exit node and a subnet router.
+// Writing the block turns it on; there is no enable field to forget.
+type Egress struct {
 	// Advertise names the prefixes this node offers to carry: 0.0.0.0/0 and
 	// ::/0 for an exit node, the prefixes behind it for a subnet router. It
 	// decides which families are translated as well as which are announced,
 	// because a family this node does not offer to carry is one it has no
 	// reason to translate.
-	Advertise []netip.Prefix `yaml:"advertise,omitempty" json:"advertise,omitempty"`
+	Advertise []schema.Prefix `yaml:"advertise,omitempty" json:"advertise,omitempty" toml:"advertise,omitempty"`
+	// Source4 and Source6 are the address a translated packet leaves under,
+	// per family. See Source: "auto" is the address this node's own routes
+	// would have used, which is the only answer available to a deployment that
+	// owns no address block.
+	Source4 Source `yaml:"source4,omitempty" json:"source4,omitempty" toml:"source4,omitempty"`
+	Source6 Source `yaml:"source6,omitempty" json:"source6,omitempty" toml:"source6,omitempty"`
 	// Return translates the other direction too: a packet arriving from one of
 	// the advertised prefixes and leaving through the mesh goes out under this
 	// node's own mesh address. A subnet router needs it where the mesh has no
 	// route back to the LAN, which is every deployment that advertises a
 	// prefix the far end does not hold a route for. An exit node does not:
 	// nothing sits behind it to start a flow.
-	Return bool `yaml:"return,omitempty" json:"return,omitempty"`
-	// Interval is the periodic sweep. Zero uses DefaultInterval.
-	Interval Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Return bool `yaml:"return,omitempty" json:"return,omitempty" toml:"return,omitempty"`
+	// Sweep is the periodic pass. It reinstalls a table somebody removed and
+	// re-reads the forwarding sysctls, which is the half of readiness that
+	// changes under a running node. Zero uses DefaultSweep.
+	Sweep schema.Duration `yaml:"sweep,omitempty" json:"sweep,omitempty" toml:"sweep,omitempty"`
 }
 
 // Runtime holds the values the command resolves at startup rather than the
-// ones a file carries, kept beside Config rather than inside it so that a
-// generated or round-tripped capability holds only the fields an operator can
+// ones a file carries, kept beside the capability rather than inside it so
+// that a generated or round-tripped one holds only the fields an operator can
 // write.
 type Runtime struct {
 	// Interface is the mesh device, named as the kernel named it. A packet
@@ -139,28 +136,23 @@ type Runtime struct {
 // Validate refuses a capability that cannot mean anything, in the package that
 // knows what its fields mean. It runs at load, so a mistake costs a refusal to
 // start rather than an exit that advertises and drops.
-func (c Config) Validate() error {
-	if !c.Enable {
-		if set := c.configured(); set != "" {
-			return fmt.Errorf("config: egress.%s is set and egress.enable is false, so nothing would be translated", set)
-		}
-		return nil
+func (e Egress) Validate() error {
+	if len(e.Advertise) == 0 {
+		return errors.New("egress: cap.egress advertise is empty, so this node would translate nothing and offer nothing: name the prefixes it carries, or 0.0.0.0/0 and ::/0 for an exit node")
 	}
-	if len(c.Advertise) == 0 {
-		return errors.New("config: egress.advertise is empty, so this node would translate nothing and offer nothing: name the prefixes it carries, or 0.0.0.0/0 and ::/0 for an exit node")
-	}
-	for _, prefix := range c.Advertise {
+	for _, entry := range e.Advertise {
+		prefix := entry.Prefix
 		if !prefix.IsValid() {
-			return fmt.Errorf("config: egress.advertise %s is not a prefix", prefix)
+			return fmt.Errorf("egress: cap.egress advertise %s is not a prefix", entry)
 		}
 		if prefix.Masked() != prefix {
 			// Refused rather than masked, as internal/kernel refuses the same
 			// typo on a rule: masking it advertises a whole prefix where one
 			// address was written, and says nothing.
-			return fmt.Errorf("config: egress.advertise %s has bits set below its prefix length", prefix)
+			return fmt.Errorf("egress: cap.egress advertise %s has bits set below its prefix length", prefix)
 		}
 		if prefix.Addr().Zone() != "" {
-			return fmt.Errorf("config: egress.advertise %s carries a zone, which no prefix the mesh announces can", prefix)
+			return fmt.Errorf("egress: cap.egress advertise %s carries a zone, which no prefix the mesh announces can", prefix)
 		}
 		if prefix.Addr().Is4In6() {
 			// Refused rather than unmapped, because the two spellings send the
@@ -168,24 +160,24 @@ func (c Config) Validate() error {
 			// translated by an IPv6 rule matching an address family no packet
 			// on the wire carries, and the node would advertise a prefix it
 			// silently never acts on.
-			return fmt.Errorf("config: egress.advertise %s is an IPv4 prefix written as IPv6, so write it as %s", prefix, netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96))
+			return fmt.Errorf("egress: cap.egress advertise %s is an IPv4 prefix written as IPv6, so write it as %s", prefix, netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96))
 		}
 	}
-	for i, prefix := range c.Advertise {
-		if slices.Contains(c.Advertise[:i], prefix) {
-			return fmt.Errorf("config: egress.advertise %s is written twice", prefix)
+	for i, entry := range e.Advertise {
+		if slices.ContainsFunc(e.Advertise[:i], func(other schema.Prefix) bool { return other.Prefix == entry.Prefix }) {
+			return fmt.Errorf("egress: cap.egress advertise %s is written twice", entry)
 		}
 	}
 	for _, named := range []struct {
 		field  string
 		source Source
 		is4    bool
-	}{{"source4", c.Source4, true}, {"source6", c.Source6, false}} {
+	}{{"source4", e.Source4, true}, {"source6", e.Source6, false}} {
 		if !named.source.Addr.IsValid() {
 			continue
 		}
 		if named.source.Addr.Is4() != named.is4 {
-			return fmt.Errorf("config: egress.%s %s is not of that family", named.field, named.source.Addr)
+			return fmt.Errorf("egress: cap.egress %s %s is not of that family", named.field, named.source.Addr)
 		}
 		if !named.source.Addr.IsGlobalUnicast() && !named.source.Addr.IsPrivate() {
 			// A translated packet has to be answerable, and a loopback,
@@ -193,39 +185,21 @@ func (c Config) Validate() error {
 			// check is here rather than in the backend because the backend
 			// would install it and the failure would only show up as a flow
 			// that never completes.
-			return fmt.Errorf("config: egress.%s %s is not an address a reply can be sent to", named.field, named.source.Addr)
+			return fmt.Errorf("egress: cap.egress %s %s is not an address a reply can be sent to", named.field, named.source.Addr)
 		}
 	}
-	if time.Duration(c.Interval) < 0 {
-		return fmt.Errorf("config: egress.interval %s is negative", time.Duration(c.Interval))
+	if e.Sweep < 0 {
+		return fmt.Errorf("egress: cap.egress sweep %s is negative", e.Sweep)
 	}
 	return nil
-}
-
-// configured names the first field only a running translator reads, so a block
-// left switched off is refused by the field an operator can find in the file.
-func (c Config) configured() string {
-	switch {
-	case len(c.Advertise) > 0:
-		return "advertise"
-	case c.Source4.Auto || c.Source4.Addr.IsValid():
-		return "source4"
-	case c.Source6.Auto || c.Source6.Addr.IsValid():
-		return "source6"
-	case c.Return:
-		return "return"
-	case c.Interval != 0:
-		return "interval"
-	}
-	return ""
 }
 
 // families is the address families this configuration covers, derived from the
 // prefixes it advertises. A family nothing is advertised for is one this node
 // has no reason to translate, so no table is created for it.
-func (c Config) families() []uint8 {
+func (e Egress) families() []uint8 {
 	var out []uint8
-	for _, prefix := range c.Advertise {
+	for _, prefix := range e.Advertise {
 		family := FamilyIPv6
 		if prefix.Addr().Is4() {
 			family = FamilyIPv4
@@ -238,19 +212,19 @@ func (c Config) families() []uint8 {
 	return out
 }
 
-func (c Config) source(family uint8) Source {
+func (e Egress) source(family uint8) Source {
 	if family == FamilyIPv4 {
-		return c.Source4
+		return e.Source4
 	}
-	return c.Source6
+	return e.Source6
 }
 
-// interval is the sweep with its default applied.
-func (c Config) interval() time.Duration {
-	if c.Interval <= 0 {
-		return DefaultInterval
+// sweep is the interval with its default applied.
+func (e Egress) sweep() time.Duration {
+	if e.Sweep <= 0 {
+		return DefaultSweep
 	}
-	return time.Duration(c.Interval)
+	return e.Sweep.Duration()
 }
 
 // Direction says which way through this node a packet is going, which decides
@@ -345,7 +319,7 @@ type backend interface {
 	Withdraw() error
 	Close() error
 	// where names the space this backend owns, for a log line.
-	where(Config) string
+	where(Egress) string
 }
 
 // Stats is one finished pass as an operator reads it. Installed counts the
@@ -368,7 +342,7 @@ type Stats struct {
 // Translator owns the capability on one node: the rules, the tables they live
 // in, and the advertisement that depends on both.
 type Translator struct {
-	cfg Config
+	cfg Egress
 	rt  Runtime
 	be  backend
 
@@ -388,10 +362,7 @@ type Translator struct {
 // New validates the capability against the platform and opens whatever the
 // backend needs, so a deployment that cannot have it fails at startup rather
 // than on the first packet. It installs nothing; Run does that.
-func New(cfg Config, rt Runtime) (*Translator, error) {
-	if !cfg.Enable {
-		return nil, errors.New("egress: the capability is not enabled, so there is nothing to translate")
-	}
+func New(cfg Egress, rt Runtime) (*Translator, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -420,7 +391,7 @@ func New(cfg Config, rt Runtime) (*Translator, error) {
 // with several is refused rather than picked from, because the choice decides
 // which address every flow out of this node's LAN appears as and guessing it
 // would change under an unrelated edit to the address list.
-func returnSource(cfg Config, rt Runtime, family uint8) (netip.Addr, error) {
+func returnSource(cfg Egress, rt Runtime, family uint8) (netip.Addr, error) {
 	if !cfg.Return {
 		return netip.Addr{}, nil
 	}
@@ -470,8 +441,8 @@ func addressFamily(address netip.Addr) uint8 {
 	return FamilyIPv6
 }
 
-// Config is the capability this translator is running, defaults applied.
-func (t *Translator) Config() Config { return t.cfg }
+// Capability is the block this translator is running, as the file spelled it.
+func (t *Translator) Capability() Egress { return t.cfg }
 
 // Where names the space this translator owns, for an operator reading a log
 // line.
@@ -506,16 +477,16 @@ func (t *Translator) Announce() []netip.Prefix {
 func (t *Translator) Run(ctx context.Context) error {
 	slog.Info("egress translator started", "interface", t.rt.Interface, "where", t.Where(),
 		"advertise", len(t.cfg.Advertise))
-	ticker := time.NewTicker(t.cfg.interval())
+	ticker := time.NewTicker(t.cfg.sweep())
 	defer ticker.Stop()
-	retry := time.NewTimer(t.cfg.interval())
+	retry := time.NewTimer(t.cfg.sweep())
 	stopTimer(retry)
 	defer retry.Stop()
 
 	backoff := time.Duration(0)
 	for ctx.Err() == nil {
 		if err := t.reconcile(); err != nil {
-			backoff = min(max(2*backoff, minRetryInterval), t.cfg.interval())
+			backoff = min(max(2*backoff, minRetryInterval), t.cfg.sweep())
 			slog.Warn("egress pass failed, retrying", "err", err, "retry_in", backoff)
 			stopTimer(retry)
 			retry.Reset(backoff)
@@ -593,9 +564,9 @@ func (t *Translator) reconcile() error {
 		}
 	}
 	announced := make([]netip.Prefix, 0, len(t.cfg.Advertise))
-	for _, prefix := range t.cfg.Advertise {
-		if ready[addressFamily(prefix.Addr())] {
-			announced = append(announced, prefix)
+	for _, entry := range t.cfg.Advertise {
+		if ready[addressFamily(entry.Addr())] {
+			announced = append(announced, entry.Prefix)
 		}
 	}
 	t.publish(announced)
@@ -668,7 +639,7 @@ func (t *Translator) desired() []Rule {
 			// carrying it would encode a mask no packet fails, so it is left
 			// off and the rule selects on the direction alone.
 			if prefix.Bits() > 0 {
-				inbound.From = prefix
+				inbound.From = prefix.Prefix
 			}
 			out = append(out, inbound)
 		}

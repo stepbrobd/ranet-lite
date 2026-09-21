@@ -66,7 +66,7 @@ type nftables struct {
 	families []uint8
 }
 
-func newBackend(cfg Config, _ Runtime) (backend, error) {
+func newBackend(cfg Egress, _ Runtime) (backend, error) {
 	conn, err := dialNetfilter()
 	if err != nil {
 		return nil, err
@@ -87,7 +87,7 @@ func newBackend(cfg Config, _ Runtime) (backend, error) {
 func (n *nftables) Close() error { return n.conn.Close() }
 
 // where names the tables this backend owns, for a log line.
-func (n *nftables) where(Config) string {
+func (n *nftables) where(Egress) string {
 	names := make([]string, 0, len(n.families))
 	for _, family := range n.families {
 		names = append(names, tableFamilyName(family))

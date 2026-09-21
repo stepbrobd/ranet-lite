@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
+
+	"github.com/NickCao/ranet-lite/internal/schema"
 )
 
 // fakeBackend stands in for a kernel. Everything above the backend seam is
@@ -79,7 +82,7 @@ func (f *fakeBackend) Withdraw() error {
 
 func (f *fakeBackend) Close() error { return nil }
 
-func (f *fakeBackend) where(Config) string { return "a fake host" }
+func (f *fakeBackend) where(Egress) string { return "a fake host" }
 
 func (f *fakeBackend) specs() []string {
 	f.mu.Lock()
@@ -93,7 +96,7 @@ func (f *fakeBackend) specs() []string {
 
 // translator builds one around a fake backend, bypassing New so that a test
 // does not need a packet filter to reach the portable half.
-func translator(t *testing.T, cfg Config, rt Runtime, be backend) *Translator {
+func translator(t *testing.T, cfg Egress, rt Runtime, be backend) *Translator {
 	t.Helper()
 	if rt.Forwarding == nil {
 		rt.Forwarding = func() (bool, bool) { return true, true }
@@ -104,15 +107,24 @@ func translator(t *testing.T, cfg Config, rt Runtime, be backend) *Translator {
 	return &Translator{cfg: cfg, rt: rt, be: be}
 }
 
-func prefixes(t *testing.T, raw ...string) []netip.Prefix {
+func prefixes(t *testing.T, raw ...string) []schema.Prefix {
 	t.Helper()
-	out := make([]netip.Prefix, 0, len(raw))
+	out := make([]schema.Prefix, 0, len(raw))
 	for _, one := range raw {
-		prefix, err := netip.ParsePrefix(one)
+		prefix, err := schema.ParsePrefix(one)
 		if err != nil {
 			t.Fatal(err)
 		}
 		out = append(out, prefix)
+	}
+	return out
+}
+
+// plain is the file's spelling of a prefix list as the announcement carries it.
+func plain(entries []schema.Prefix) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.Prefix)
 	}
 	return out
 }
@@ -122,7 +134,7 @@ func prefixes(t *testing.T, raw ...string) []netip.Prefix {
 // is somebody else's transit, and rewriting its source would put this node's
 // address on a packet it is only relaying.
 func TestRulesMatchBothInterfacesSoTransitIsNotTranslated(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0", "::/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0", "::/0")}
 	be := &fakeBackend{}
 	tr := translator(t, cfg, Runtime{}, be)
 	if err := tr.reconcile(); err != nil {
@@ -140,8 +152,7 @@ func TestRulesMatchBothInterfacesSoTransitIsNotTranslated(t *testing.T) {
 // A configured source is used unchanged, which is how a deployment that owns
 // an address block pins the address return traffic comes back to.
 func TestConfiguredSourceReplacesTheHostsOwnChoice(t *testing.T) {
-	cfg := Config{
-		Enable:    true,
+	cfg := Egress{
 		Source4:   Source{Addr: netip.MustParseAddr("198.51.100.7")},
 		Advertise: prefixes(t, "0.0.0.0/0"),
 	}
@@ -159,7 +170,7 @@ func TestConfiguredSourceReplacesTheHostsOwnChoice(t *testing.T) {
 // this node holds, and narrows that rule to the prefixes it claimed rather
 // than to every packet that happens to reach the mesh device.
 func TestReturnDirectionTranslatesUnderTheMeshAddress(t *testing.T) {
-	cfg := Config{Enable: true, Return: true, Advertise: prefixes(t, "198.51.100.0/24", "192.0.2.5/32")}
+	cfg := Egress{Return: true, Advertise: prefixes(t, "198.51.100.0/24", "192.0.2.5/32")}
 	rt := Runtime{MeshAddresses: []netip.Addr{netip.MustParseAddr("10.88.0.2")}}
 	be := &fakeBackend{}
 	if err := translator(t, cfg, rt, be).reconcile(); err != nil {
@@ -179,7 +190,7 @@ func TestReturnDirectionTranslatesUnderTheMeshAddress(t *testing.T) {
 // carry it selects on the direction alone rather than on a mask no packet
 // fails.
 func TestReturnRuleForADefaultCarriesNoPrefixMatch(t *testing.T) {
-	cfg := Config{Enable: true, Return: true, Advertise: prefixes(t, "0.0.0.0/0")}
+	cfg := Egress{Return: true, Advertise: prefixes(t, "0.0.0.0/0")}
 	rt := Runtime{MeshAddresses: []netip.Addr{netip.MustParseAddr("10.88.0.2")}}
 	be := &fakeBackend{}
 	if err := translator(t, cfg, rt, be).reconcile(); err != nil {
@@ -199,7 +210,7 @@ func TestReturnRuleForADefaultCarriesNoPrefixMatch(t *testing.T) {
 // other way never compares equal to its own readback, and the ruleset is
 // rewritten on every pass for the life of the node.
 func TestRulesAreGroupedByFamilyAsTheyAreReadBack(t *testing.T) {
-	cfg := Config{Enable: true, Return: true, Advertise: prefixes(t, "198.51.100.0/24", "2001:db8:1::/48")}
+	cfg := Egress{Return: true, Advertise: prefixes(t, "198.51.100.0/24", "2001:db8:1::/48")}
 	rt := Runtime{MeshAddresses: []netip.Addr{
 		netip.MustParseAddr("10.88.0.2"), netip.MustParseAddr("2001:db8::2"),
 	}}
@@ -229,7 +240,7 @@ func TestRulesAreGroupedByFamilyAsTheyAreReadBack(t *testing.T) {
 // the node was carrying traffic, and each rewrite would drop the counters it
 // had just read.
 func TestUnchangedRulesAreNotRewritten(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0")}
 	be := &fakeBackend{flows: 11}
 	tr := translator(t, cfg, Runtime{}, be)
 	for range 3 {
@@ -249,7 +260,7 @@ func TestUnchangedRulesAreNotRewritten(t *testing.T) {
 // no way to learn that a node it selected will drop the traffic, so the only
 // end that can act on it is this one.
 func TestNothingIsAnnouncedWhileTheRuleWillNotInstall(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0", "::/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0", "::/0")}
 	be := &fakeBackend{failApply: true}
 	var announced [][]netip.Prefix
 	rt := Runtime{Announce: func(p []netip.Prefix) { announced = append(announced, p) }}
@@ -272,7 +283,7 @@ func TestNothingIsAnnouncedWhileTheRuleWillNotInstall(t *testing.T) {
 	if err := tr.reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if got := tr.Announce(); !slices.Equal(got, cfg.Advertise) {
+	if got := tr.Announce(); !slices.Equal(got, plain(cfg.Advertise)) {
 		t.Errorf("announced %v after the rules installed, want %v", got, cfg.Advertise)
 	}
 }
@@ -280,14 +291,14 @@ func TestNothingIsAnnouncedWhileTheRuleWillNotInstall(t *testing.T) {
 // Readiness is per family, because a host can forward one and not the other
 // and an exit that withheld both would take away a working half.
 func TestOnlyTheForwardableFamilyIsAnnounced(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0", "::/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0", "::/0")}
 	rt := Runtime{Forwarding: func() (bool, bool) { return false, true }}
 	tr := translator(t, cfg, rt, &fakeBackend{})
 	if err := tr.reconcile(); err != nil {
 		t.Fatal(err)
 	}
 	want := prefixes(t, "::/0")
-	if got := tr.Announce(); !slices.Equal(got, want) {
+	if got := tr.Announce(); !slices.Equal(got, plain(want)) {
 		t.Errorf("announced %v, want %v", got, want)
 	}
 }
@@ -295,7 +306,7 @@ func TestOnlyTheForwardableFamilyIsAnnounced(t *testing.T) {
 // A rule somebody removed under a running node is reinstalled by the next
 // sweep, and the advertisement is withheld for as long as it is missing.
 func TestRemovedRuleIsReinstalledAndTheAdvertisementWaits(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0")}
 	be := &fakeBackend{}
 	tr := translator(t, cfg, Runtime{}, be)
 	if err := tr.reconcile(); err != nil {
@@ -317,7 +328,7 @@ func TestRemovedRuleIsReinstalledAndTheAdvertisementWaits(t *testing.T) {
 // this node while the table comes down is a peer whose traffic leaves
 // untranslated, and the retraction is the only thing that tells it otherwise.
 func TestShutdownRetractsBeforeItWithdraws(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0")}
 	be := &fakeBackend{}
 	tr := translator(t, cfg, Runtime{}, be)
 	withdrawnWhenRetracted := -1
@@ -354,7 +365,7 @@ func TestShutdownRetractsBeforeItWithdraws(t *testing.T) {
 // coexist at the same hook and the first to claim a connection keeps it, so a
 // tool that deleted its neighbours' rules would break whatever installed them.
 func TestConflictsAreReportedRatherThanRemoved(t *testing.T) {
-	cfg := Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0")}
+	cfg := Egress{Advertise: prefixes(t, "0.0.0.0/0")}
 	be := &fakeBackend{conflicts: []string{"ip table nat chain POSTROUTING at priority 100"}}
 	tr := translator(t, cfg, Runtime{}, be)
 	if err := tr.reconcile(); err != nil {
@@ -368,59 +379,28 @@ func TestConflictsAreReportedRatherThanRemoved(t *testing.T) {
 	}
 }
 
-// A capability the file switched off but went on describing is refused by the
-// field that was written, because nothing below enable is read and a node that
-// meant to be an exit would come up as an ordinary leaf with no message.
-func TestDisabledCapabilityRefusesTheFieldsItWouldIgnore(t *testing.T) {
-	for _, one := range []struct {
-		name string
-		cfg  Config
-		want string
-	}{
-		{"advertise", Config{Advertise: prefixes(t, "0.0.0.0/0")}, "egress.advertise"},
-		{"source4", Config{Source4: Source{Auto: true}}, "egress.source4"},
-		{"source6", Config{Source6: Source{Addr: netip.MustParseAddr("2001:db8::1")}}, "egress.source6"},
-		{"return", Config{Return: true}, "egress.return"},
-		{"interval", Config{Interval: Duration(time.Second)}, "egress.interval"},
-		{"nothing at all", Config{}, ""},
-	} {
-		t.Run(one.name, func(t *testing.T) {
-			err := one.cfg.Validate()
-			if one.want == "" {
-				if err != nil {
-					t.Fatalf("an empty block was refused: %v", err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), one.want) {
-				t.Fatalf("refused with %v, want a message naming %s", err, one.want)
-			}
-		})
-	}
-}
-
 // Validation runs in this package rather than in internal/config, so a
 // capability that arrived from a control plane is judged by the same rules a
 // written one is.
 func TestValidateRefusesWhatCannotBeTranslated(t *testing.T) {
 	for _, one := range []struct {
 		name string
-		cfg  Config
+		cfg  Egress
 		want string
 	}{
 		{
 			"an exit that advertises nothing",
-			Config{Enable: true},
+			Egress{},
 			"advertise is empty",
 		},
 		{
 			"a prefix with bits under its length",
-			Config{Enable: true, Advertise: []netip.Prefix{netip.MustParsePrefix("198.51.100.7/24")}},
+			Egress{Advertise: []schema.Prefix{schema.MustPrefix("198.51.100.7/24")}},
 			"bits set below its prefix length",
 		},
 		{
 			"the same prefix twice",
-			Config{Enable: true, Advertise: prefixes(t, "::/0", "::/0")},
+			Egress{Advertise: prefixes(t, "::/0", "::/0")},
 			"written twice",
 		},
 		{
@@ -428,22 +408,22 @@ func TestValidateRefusesWhatCannotBeTranslated(t *testing.T) {
 			// would be translated by an IPv6 rule matching an address family
 			// no packet on the wire carries.
 			"an IPv4 prefix written as IPv6",
-			Config{Enable: true, Advertise: prefixes(t, "::ffff:198.51.100.0/120")},
+			Egress{Advertise: prefixes(t, "::ffff:198.51.100.0/120")},
 			"written as IPv6, so write it as 198.51.100.0/24",
 		},
 		{
 			"a source of the other family",
-			Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0"), Source4: Source{Addr: netip.MustParseAddr("2001:db8::1")}},
+			Egress{Advertise: prefixes(t, "0.0.0.0/0"), Source4: Source{Addr: netip.MustParseAddr("2001:db8::1")}},
 			"is not of that family",
 		},
 		{
 			"a source nothing can reply to",
-			Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0"), Source4: Source{Addr: netip.MustParseAddr("127.0.0.1")}},
+			Egress{Advertise: prefixes(t, "0.0.0.0/0"), Source4: Source{Addr: netip.MustParseAddr("127.0.0.1")}},
 			"not an address a reply can be sent to",
 		},
 		{
 			"a negative sweep",
-			Config{Enable: true, Advertise: prefixes(t, "0.0.0.0/0"), Interval: Duration(-time.Second)},
+			Egress{Advertise: prefixes(t, "0.0.0.0/0"), Sweep: schema.Duration(-time.Second)},
 			"is negative",
 		},
 	} {
@@ -461,7 +441,7 @@ func TestValidateRefusesWhatCannotBeTranslated(t *testing.T) {
 // every flow out of this node's LAN appears as, and guessing it would change
 // under an unrelated edit to the address list.
 func TestReturnWithoutOneMeshAddressIsRefusedByName(t *testing.T) {
-	cfg := Config{Enable: true, Return: true, Advertise: prefixes(t, "198.51.100.0/24")}
+	cfg := Egress{Return: true, Advertise: prefixes(t, "198.51.100.0/24")}
 	for _, one := range []struct {
 		name      string
 		addresses []netip.Addr
@@ -491,16 +471,19 @@ func TestReturnWithoutOneMeshAddressIsRefusedByName(t *testing.T) {
 	}
 }
 
-// A capability written in a file and one sent as JSON are the same capability,
-// so a control plane and an operator cannot disagree about a field's spelling.
-func TestCapabilityRoundTripsThroughBothSerializations(t *testing.T) {
-	want := Config{
-		Enable:    true,
+// A capability written in a file and one sent on the wire are the same
+// capability, so an operator and a control plane cannot disagree about a
+// field's spelling. All three decoders are checked, because the two the file
+// reader dispatches on ask a type for different interfaces, and a field
+// carrying one and not the other parses under one extension and is refused
+// under the other.
+func TestCapabilityRoundTripsThroughEverySerialization(t *testing.T) {
+	want := Egress{
+		Advertise: prefixes(t, "0.0.0.0/0", "2001:db8:1::/48"),
 		Source4:   Source{Auto: true},
 		Source6:   Source{Addr: netip.MustParseAddr("2001:db8::1")},
-		Advertise: prefixes(t, "0.0.0.0/0", "2001:db8:1::/48"),
 		Return:    true,
-		Interval:  Duration(90 * time.Second),
+		Sweep:     schema.Duration(90 * time.Second),
 	}
 	for _, one := range []struct {
 		name    string
@@ -510,6 +493,7 @@ func TestCapabilityRoundTripsThroughBothSerializations(t *testing.T) {
 	}{
 		{"yaml", yaml.Marshal, yaml.Unmarshal, "source4: auto"},
 		{"json", json.Marshal, json.Unmarshal, `"source4":"auto"`},
+		{"toml", encodeTOML, decodeTOML, `source4 = "auto"`},
 	} {
 		t.Run(one.name, func(t *testing.T) {
 			raw, err := one.encode(want)
@@ -519,29 +503,50 @@ func TestCapabilityRoundTripsThroughBothSerializations(t *testing.T) {
 			if !strings.Contains(string(raw), one.written) {
 				t.Errorf("wrote %s, which does not carry %s", raw, one.written)
 			}
-			var got Config
+			var got Egress
 			if err := one.decode(raw, &got); err != nil {
 				t.Fatalf("%s: %v", raw, err)
 			}
-			if !sameConfig(got, want) {
+			if !sameCapability(got, want) {
 				t.Errorf("came back as %+v, want %+v", got, want)
 			}
 		})
 	}
 }
 
-// sameConfig compares two capabilities field by field, since a prefix slice
-// does not compare with ==.
-func sameConfig(a, b Config) bool {
-	return a.Enable == b.Enable && a.Source4 == b.Source4 && a.Source6 == b.Source6 &&
-		a.Return == b.Return && a.Interval == b.Interval && slices.Equal(a.Advertise, b.Advertise)
+func encodeTOML(value any) ([]byte, error) {
+	var out strings.Builder
+	if err := toml.NewEncoder(&out).Encode(value); err != nil {
+		return nil, err
+	}
+	return []byte(out.String()), nil
+}
+
+func decodeTOML(body []byte, target any) error {
+	_, err := toml.Decode(string(body), target)
+	return err
+}
+
+// sameCapability compares two capabilities field by field, since a prefix
+// slice does not compare with ==.
+func sameCapability(a, b Egress) bool {
+	if len(a.Advertise) != len(b.Advertise) {
+		return false
+	}
+	for i := range a.Advertise {
+		if a.Advertise[i].Prefix != b.Advertise[i].Prefix {
+			return false
+		}
+	}
+	return a.Source4 == b.Source4 && a.Source6 == b.Source6 &&
+		a.Return == b.Return && a.Sweep == b.Sweep
 }
 
 // An absent source and one written as auto ask for the same thing, and neither
 // reads back as an address the operator did not write.
 func TestAbsentSourceStaysAbsent(t *testing.T) {
-	var cfg Config
-	if err := yaml.Unmarshal([]byte("enable: true\nadvertise: [\"::/0\"]\n"), &cfg); err != nil {
+	var cfg Egress
+	if err := yaml.Unmarshal([]byte("advertise: [\"::/0\"]\n"), &cfg); err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.Source4.IsZero() || !cfg.Source6.IsZero() {
@@ -556,31 +561,38 @@ func TestAbsentSourceStaysAbsent(t *testing.T) {
 	}
 }
 
-// A duration is a scalar in both spellings. Reading the value off a mapping
+// A duration is a scalar in every spelling. Reading the value off a sequence
 // gives the empty string, and `invalid duration ""` names neither the line nor
 // what was written there.
-func TestDurationRefusesWhatIsNotAScalar(t *testing.T) {
-	var cfg Config
-	err := yaml.Unmarshal([]byte("enable: true\ninterval: [30s]\n"), &cfg)
+func TestSweepRefusesWhatIsNotAScalar(t *testing.T) {
+	var cfg Egress
+	err := yaml.Unmarshal([]byte("sweep: [30s]\n"), &cfg)
 	if err == nil || !strings.Contains(err.Error(), "a sequence") {
 		t.Fatalf("refused with %v, want a message saying what was written instead", err)
 	}
 }
 
 // A source is auto or an address and nothing else, said in those words rather
-// than as a parse error nobody can act on.
+// than as a parse error nobody can act on, under either decoder. The two ask a
+// type for different interfaces, so a scalar answering only one of them parses
+// under one file extension and is refused under the other.
 func TestSourceRefusesWhatIsNeitherAutoNorAnAddress(t *testing.T) {
-	var cfg Config
-	err := yaml.Unmarshal([]byte("enable: true\nsource4: eth0\n"), &cfg)
+	var cfg Egress
+	err := yaml.Unmarshal([]byte("source4: eth0\n"), &cfg)
 	if err == nil || !strings.Contains(err.Error(), "auto or an address") {
-		t.Fatalf("refused with %v, want a message naming both spellings", err)
+		t.Fatalf("yaml refused with %v, want a message naming both spellings", err)
+	}
+	cfg = Egress{}
+	err = decodeTOML([]byte("source4 = \"eth0\"\n"), &cfg)
+	if err == nil || !strings.Contains(err.Error(), "auto or an address") {
+		t.Fatalf("toml refused with %v, want a message naming both spellings", err)
 	}
 }
 
 // New refuses before it opens anything, so a capability that names a source
 // the return direction cannot resolve fails with nothing to clean up.
 func TestNewRefusesAnUnresolvableReturnBeforeOpeningTheBackend(t *testing.T) {
-	cfg := Config{Enable: true, Return: true, Advertise: prefixes(t, "198.51.100.0/24")}
+	cfg := Egress{Return: true, Advertise: prefixes(t, "198.51.100.0/24")}
 	_, err := New(cfg, Runtime{Interface: "ranet0", Forwarding: func() (bool, bool) { return true, true }})
 	if err == nil || !strings.Contains(err.Error(), "egress.source4") {
 		t.Fatalf("New returned %v, want a refusal naming the field that settles it", err)

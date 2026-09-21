@@ -17,12 +17,13 @@ import (
 // ctx ends or the hub's socket is gone.
 func (c *Client) acceptPeers(ctx context.Context) error {
 	cfg := c.config()
-	local := make([]ike.Identity, 0, len(cfg.Endpoints))
-	for _, endpoint := range cfg.Endpoints {
+	crypto := cfg.Crypto()
+	local := make([]ike.Identity, 0, len(cfg.Link.Endpoints))
+	for _, endpoint := range cfg.Link.Endpoints {
 		local = append(local, ike.Identity{
-			Organization: cfg.Organization,
-			CommonName:   cfg.CommonName,
-			SerialNumber: endpoint.SerialNumber,
+			Organization: cfg.Node.Org,
+			CommonName:   cfg.Node.Name,
+			SerialNumber: endpoint.Serial,
 		})
 	}
 	responder, err := ike.NewResponder(ike.ResponderConfig{
@@ -30,12 +31,12 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 		Local:              local,
 		LocalPrivateKey:    c.privateKey,
 		Lookup:             c.lookupPeerKey,
-		ChildRekeyInterval: cfg.ChildRekeyIntervalValue(),
-		IKERekeyInterval:   cfg.IKERekeyIntervalValue(),
-		RekeyMargin:        cfg.RekeyMarginValue(),
-		RekeyJitter:        cfg.RekeyJitterValue(),
-		RekeyRetryInitial:  cfg.RekeyRetryInitialValue(),
-		RekeyRetryMax:      cfg.RekeyRetryMaxValue(),
+		ChildRekeyInterval: crypto.ChildInterval(),
+		IKERekeyInterval:   crypto.IKEInterval(),
+		RekeyMargin:        crypto.Margin(),
+		RekeyJitter:        crypto.Jitter(),
+		RekeyRetryInitial:  crypto.RetryFirst(),
+		RekeyRetryMax:      crypto.RetryMax(),
 	})
 	if err != nil {
 		return err
@@ -104,7 +105,7 @@ func (c *Client) peerKey(peer ike.Identity) (ed25519.PublicKey, registry.Node, b
 	if !ok {
 		return nil, registry.Node{}, false
 	}
-	if peer.Organization == cfg.Organization && peer.CommonName == cfg.CommonName {
+	if peer.Organization == cfg.Node.Org && peer.CommonName == cfg.Node.Name {
 		// Our own name in another node's IDi is either a misconfiguration or
 		// an attempt to reuse the organization key under our identity.
 		return nil, registry.Node{}, false

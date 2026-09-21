@@ -120,7 +120,7 @@
                     export DENO_DIR="$TMPDIR/deno"
                     deno fmt --check readme.md
                     nixfmt --check *.nix integration/*.nix
-                    taplo format --check atelier.toml gomod2nix.toml
+                    taplo format --check atelier.toml examples/*.toml gomod2nix.toml
                     touch "$out"
                   '';
             }

@@ -179,7 +179,7 @@ func TestNoHistoryAndNoEstimatorKeepTheReportedCost(t *testing.T) {
 		t.Errorf("an unmeasured link costs %d, want the reported 42", got)
 	}
 	off := DefaultCostParams()
-	off.LinkQuality = LinkQualityNone
+	off.Quality = LinkQualityNone
 	lossy := &helloHistory{}
 	for i := range betaWindow {
 		lossy.record(uint16(i*2 + 1)) // every other Hello lost
@@ -223,7 +223,7 @@ func TestSilenceDegradesTheLinkBeforeItDies(t *testing.T) {
 // one drives Hellos through Receive and the clock through sweepExpiredLocked
 // and reads back the cost selection would use.
 func TestHelloLossReachesTheCostSelectionUses(t *testing.T) {
-	s, _, _ := captureSpeaker(t, Config{HelloInterval: time.Second})
+	s, _, _ := captureSpeaker(t, Config{Hello: dur(time.Second)})
 	a := addReachablePeer(s, "a", 100)
 	hello := func(seqno uint16) {
 		s.Receive(a, buildPacket(netip.MustParseAddr("fe80::2"), multicastGroup,
@@ -235,7 +235,7 @@ func TestHelloLossReachesTheCostSelectionUses(t *testing.T) {
 	cost := func() uint16 {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.neighbors[a.ID].linkCost(time.Now(), s.cfg.Cost)
+		return s.neighbors[a.ID].linkCost(time.Now(), s.cost)
 	}
 
 	for seqno := uint16(1); seqno <= betaWindow; seqno++ {
@@ -260,10 +260,10 @@ func TestHelloLossReachesTheCostSelectionUses(t *testing.T) {
 	// cost to infinity and the assertion would pass either way.
 	s.mu.Lock()
 	quiet := s.neighbors[a.ID]
-	before := quiet.linkCost(time.Now(), s.cfg.Cost)
+	before := quiet.linkCost(time.Now(), s.cost)
 	later := time.Now().Add(3 * time.Second)
 	s.sweepExpiredLocked(later)
-	after := quiet.linkCost(later, s.cfg.Cost)
+	after := quiet.linkCost(later, s.cost)
 	s.mu.Unlock()
 	if after == MetricInfinity {
 		t.Fatal("the neighbor expired instead of degrading, so this proves nothing")
@@ -279,7 +279,7 @@ func TestHelloLossReachesTheCostSelectionUses(t *testing.T) {
 // nominal.
 func TestLinkThatComesBackIsNotCostedByItsOutage(t *testing.T) {
 	const interval = time.Second
-	s, _, _ := captureSpeaker(t, Config{HelloInterval: interval})
+	s, _, _ := captureSpeaker(t, Config{Hello: dur(interval)})
 	a := addReachablePeer(s, "a", 96)
 	start := time.Now()
 	// The peer numbers its Hellos whether or not they arrive, one per
@@ -298,7 +298,7 @@ func TestLinkThatComesBackIsNotCostedByItsOutage(t *testing.T) {
 	}
 	s.mu.Lock()
 	n := s.neighbors[a.ID]
-	healthy := n.linkCost(start, s.cfg.Cost)
+	healthy := n.linkCost(start, s.cost)
 	s.mu.Unlock()
 	if healthy != 96 {
 		t.Fatalf("a link that lost nothing costs %d, want the configured 96", healthy)
@@ -319,7 +319,7 @@ func TestLinkThatComesBackIsNotCostedByItsOutage(t *testing.T) {
 	sent++
 	deliver()
 	s.mu.Lock()
-	back := n.linkCost(time.Now(), s.cfg.Cost)
+	back := n.linkCost(time.Now(), s.cost)
 	s.mu.Unlock()
 	if back != healthy {
 		t.Errorf("the link came back costing %d against %d before the outage", back, healthy)
@@ -334,7 +334,7 @@ func TestLinkThatComesBackIsNotCostedByItsOutage(t *testing.T) {
 // direction that is dead.
 func TestIHUSaysWhatThisNodeHearsFromTheNeighbor(t *testing.T) {
 	const interval = time.Second
-	s, _, _ := captureSpeaker(t, Config{HelloInterval: interval})
+	s, _, _ := captureSpeaker(t, Config{Hello: dur(interval)})
 	a := addReachablePeer(s, "a", 96)
 	start := time.Now()
 	rxcost := func(at time.Time) uint16 {
@@ -367,7 +367,7 @@ func TestIHUSaysWhatThisNodeHearsFromTheNeighbor(t *testing.T) {
 		t.Errorf("a neighbor gone quiet is advertised %d, so the far end keeps selecting a dead direction", got)
 	}
 
-	fresh, _, _ := captureSpeaker(t, Config{HelloInterval: interval})
+	fresh, _, _ := captureSpeaker(t, Config{Hello: dur(interval)})
 	b := netstack.NewPeer("b", func(raw []byte, _ byte) ([]byte, error) { return raw, nil }, func([]byte) error { return nil })
 	handle := fresh.AddPeer(b)
 	defer func() { handle.Close(); b.Close() }()
@@ -402,7 +402,7 @@ func TestIHUSaysWhatThisNodeHearsFromTheNeighbor(t *testing.T) {
 // TestACongestedPeerDoesNotReopenTheWakePerPacket already covers. This pins
 // the Hello's own rollback.
 func TestRefusedHelloDoesNotSpendASequenceNumber(t *testing.T) {
-	s, _, _ := captureSpeaker(t, Config{HelloInterval: time.Second})
+	s, _, _ := captureSpeaker(t, Config{Hello: dur(time.Second)})
 	addReachablePeer(s, "a", 96)
 
 	s.mu.Lock()

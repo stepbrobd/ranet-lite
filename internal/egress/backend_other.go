@@ -13,17 +13,17 @@ import "fmt"
 // darwin gets a pf anchor of its own, which is not written yet. iOS and
 // android have no packet filter a process may write at all, and a phone has to
 // use an exit node rather than be one.
-func newBackend(cfg Config, _ Runtime) (backend, error) {
+func newBackend(cfg Egress, _ Runtime) (backend, error) {
 	return nil, refuseWhatThisPlatformLacks(cfg)
 }
 
 // refuseWhatThisPlatformLacks is the refusal on its own, so that a capability
-// nobody switched on is not refused for a facility it never asked for. New
-// returns before this on a disabled capability, so the backend it hands back
-// there reaches no caller.
-func refuseWhatThisPlatformLacks(cfg Config) error {
-	if !cfg.Enable {
+// asking for nothing is not refused for a facility it never named. New refuses
+// an empty advertise list before this, so the nil backend that arm hands back
+// reaches no caller.
+func refuseWhatThisPlatformLacks(cfg Egress) error {
+	if len(cfg.Advertise) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%w: egress.enable asks this node to translate a source address, and nftables is a linux facility", ErrUnsupported)
+	return fmt.Errorf("%w: cap.egress asks this node to translate a source address, and nftables is a linux facility", ErrUnsupported)
 }

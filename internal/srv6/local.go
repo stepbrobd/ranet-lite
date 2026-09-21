@@ -5,6 +5,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+
+	"github.com/NickCao/ranet-lite/internal/schema"
 )
 
 // This file is the receiving half: the segments this node answers for, and
@@ -56,10 +58,13 @@ func ParseBehavior(name string) (Behavior, error) {
 	return 0, fmt.Errorf("srv6: behavior %q is not End or End.DT46", name)
 }
 
-// Segment is one local SID and what this node does with it.
+// Segment is one entry of the cap.segment capability: one local SID and what
+// this node does with a packet that arrives on it. The behavior is spelled as
+// RFC 8986 spells it and as `ip route ... encap seg6local action` takes it, so
+// a converted configuration reads the same.
 type Segment struct {
-	SID      netip.Addr
-	Behavior Behavior
+	SID      schema.Addr `yaml:"sid" json:"sid" toml:"sid"`
+	Behavior Behavior    `yaml:"behavior" json:"behavior" toml:"behavior"`
 }
 
 func (s Segment) String() string { return s.SID.String() + " " + s.Behavior.String() }
@@ -81,16 +86,16 @@ func NewLocalTable(segments []Segment) (*LocalTable, error) {
 	}
 	entries := make(map[netip.Addr]Behavior, len(segments))
 	for _, segment := range segments {
-		if !Usable(segment.SID) {
+		if !Usable(segment.SID.Addr) {
 			return nil, fmt.Errorf("srv6: local segment %s cannot address a segment routed packet", segment.SID)
 		}
 		if segment.Behavior != BehaviorEnd && segment.Behavior != BehaviorEndDT46 {
 			return nil, fmt.Errorf("srv6: local segment %s: %s is not implemented", segment.SID, segment.Behavior)
 		}
-		if existing, dup := entries[segment.SID]; dup {
+		if existing, dup := entries[segment.SID.Addr]; dup {
 			return nil, fmt.Errorf("srv6: local segment %s is configured as both %s and %s", segment.SID, existing, segment.Behavior)
 		}
-		entries[segment.SID] = segment.Behavior
+		entries[segment.SID.Addr] = segment.Behavior
 	}
 	return &LocalTable{entries: entries}, nil
 }
@@ -102,9 +107,9 @@ func (t *LocalTable) Segments() []Segment {
 	}
 	out := make([]Segment, 0, len(t.entries))
 	for sid, behavior := range t.entries {
-		out = append(out, Segment{SID: sid, Behavior: behavior})
+		out = append(out, Segment{SID: schema.AddrFrom(sid), Behavior: behavior})
 	}
-	slices.SortFunc(out, func(a, b Segment) int { return a.SID.Compare(b.SID) })
+	slices.SortFunc(out, func(a, b Segment) int { return a.SID.Compare(b.SID.Addr) })
 	return out
 }
 

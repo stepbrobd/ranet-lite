@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/internal/srv6"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -18,9 +19,9 @@ import (
 func TestOutboundSeamRoutesBySegmentRatherThanByDestination(t *testing.T) {
 	exit := segAddr("3fff:1:69c:98d6::1")
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("3fff:a::17/128"),
-		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{exit}},
-	}})
+		From: schema.PrefixFrom(segPrefix("3fff:a::17/128")),
+		Via:  []schema.Addr{schema.AddrFrom(exit)},
+	}}, schema.MustAddr("3fff:1:69c:8c0::1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,9 +75,9 @@ func TestOutboundSeamRoutesBySegmentRatherThanByDestination(t *testing.T) {
 // traffic disappears and nothing anywhere says so.
 func TestSteeredPacketWithNoRouteIsCounted(t *testing.T) {
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("3fff:a::17/128"),
-		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{segAddr("3fff:1:69c:98d6::1")}},
-	}})
+		From: schema.PrefixFrom(segPrefix("3fff:a::17/128")),
+		Via:  []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")},
+	}}, schema.MustAddr("3fff:1:69c:8c0::1"))
 	if err != nil {
 		t.Fatal(err)
 	}

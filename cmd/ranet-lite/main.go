@@ -1,15 +1,16 @@
 // Command ranet-lite connects a real TUN device to a ranet mesh through
 // userspace IKEv2/ESP and an embedded Babel speaker. Babel exchanges control
-// packets inside ESP. Address and kernel route configuration are external
-// unless the kernel block in the config file turns the reconciler on.
+// packets inside ESP. Address and route configuration are external unless the
+// file carries a cap.table block, which turns the route reconciler on.
+//
+// `ranet-lite daemon` is the node. Every other subcommand reads a running
+// one's control socket; see cli.go.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -19,118 +20,101 @@ import (
 	"os/signal"
 	"runtime"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/NickCao/ranet-lite/internal/client"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
-	"github.com/NickCao/ranet-lite/internal/version"
 )
 
-func main() { os.Exit(run()) }
+// main runs the command tree and turns what it returns into a process status.
+// A daemon that refused to start has already said why through the handler an
+// operator's log level selects, so its status comes back as an exitCode and is
+// not written a second time.
+func main() {
+	if err := newRoot().Execute(); err != nil {
+		var code exitCode
+		if errors.As(err, &code) {
+			os.Exit(int(code))
+		}
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-// options is the command line after parsing.
+// exitCode carries a process status out through cobra's error return, which is
+// the only way back to main from a command body.
+type exitCode int
+
+func (e exitCode) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+
+// options is the daemon's command line after parsing.
 type options struct {
 	configPath         string
-	registryPath       string
-	privateKeyPath     string
-	fullMesh           bool
 	pprofAddr          string
 	metricsAddr        string
 	controlPath        string
-	version            bool
 	contentionProfiles bool
 	level              slog.Level
 }
 
-// parseOptions reads the command line and refuses what it cannot act on. It
-// takes the arguments rather than reading them from the process, and returns
-// an error rather than exiting, so that every refusal is reachable from a
-// test and so that -h can be told from a mistake.
-func parseOptions(args []string, usage io.Writer) (options, error) {
-	fs := flag.NewFlagSet("ranet-lite", flag.ContinueOnError)
-	fs.SetOutput(usage)
+// daemonCommand is the node itself. Its flags are its own rather than the
+// root's: a reader's --control names a socket to read and this one names a
+// socket to bind, and the two would share a description that fits neither.
+func daemonCommand() *cobra.Command {
 	var o options
-	fs.StringVar(&o.configPath, "config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
-	fs.StringVar(&o.registryPath, "registry", "", "path to registry.json, overriding the config file; ranet spells it this way and its own config carries no such field")
-	fs.StringVar(&o.privateKeyPath, "key", "", "path to the PKCS8 PEM Ed25519 private key, overriding the config file; ranet spells it this way and its own config carries no such field")
-	fs.BoolVar(&o.fullMesh, "full-mesh", false, "dial every node the registry names, as ranet does; its own config file has no field to ask for this")
-	fs.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
-	fs.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
-	fs.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
-	fs.StringVar(&o.controlPath, "control", control.DefaultSocket, "unix socket serving the read-only control surface the subcommands read; empty disables it")
-	fs.BoolVar(&o.version, "version", false, "print the version this binary was built from and exit")
-	logLevel := fs.String("log-level", "info", "minimum log level: debug, info, warn, or error")
-	if err := fs.Parse(args); err != nil {
-		return options{}, err
+	var logLevel string
+	cmd := &cobra.Command{
+		Use:   "daemon",
+		Short: "run this node: IKEv2, ESP, the babel speaker and the optional route reconciler",
+		Args:  noArguments,
+		RunE: func(*cobra.Command, []string) error {
+			if err := o.level.UnmarshalText([]byte(logLevel)); err != nil {
+				return fmt.Errorf("invalid --log-level %q: %w", logLevel, err)
+			}
+			if code := runDaemon(o); code != 0 {
+				return exitCode(code)
+			}
+			return nil
+		},
 	}
-	if fs.NArg() != 0 {
-		// A missing dash is the way this happens: `ranet-lite config.yaml`
-		// otherwise starts silently against the default path. A first
-		// argument is dispatched as a subcommand before this, so anything
-		// reaching here followed a flag and names neither.
-		return options{}, fmt.Errorf("unexpected argument %q: the config path is given with -config, and a subcommand comes first (%s)",
-			fs.Arg(0), strings.Join(commandNames(), ", "))
-	}
-	if err := o.level.UnmarshalText([]byte(*logLevel)); err != nil {
-		return options{}, fmt.Errorf("invalid -log-level %q: %w", *logLevel, err)
-	}
-	return o, nil
+	f := cmd.Flags()
+	f.StringVarP(&o.configPath, "config", "c", "/etc/ranet-lite/config.toml", "path to the ranet-lite config file, .toml, .yaml, .yml or .json")
+	f.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
+	f.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
+	f.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
+	f.StringVar(&o.controlPath, "control", control.DefaultSocket, "unix socket serving the read-only control surface the other subcommands read; empty disables it")
+	f.StringVar(&logLevel, "log-level", "info", "minimum log level: debug, info, warn, or error")
+	return cmd
 }
 
 // refuseToStart reports a startup this node will not attempt, at the level an
-// operator filters for. The standard logger writes through slog at INFO, which
-// -log-level warn and above drop, so every refusal below was a process that
-// exited 1 having written nothing at all.
+// operator filters for. The standard logger writes through slog at INFO,
+// which --log-level warn and above drop, so every refusal below was a process
+// that exited 1 having written nothing at all.
 func refuseToStart(err error) int {
 	slog.Error("ranet-lite is not starting", "err", err)
 	return 1
 }
 
-// run is main's body so that every deferred close runs before the process
-// exits with a status. A failure reported only in the log and then exited zero
-// tells a supervisor the node stopped cleanly when it did not, and the route
-// withdrawal at shutdown is one of the things that reports this way.
-func run() int {
-	// A first argument that is not a flag asks for the client half rather than
-	// the daemon, so `ranet-lite -config ...` still starts a node and a
-	// deployment needs no change. See cli.go.
-	if name, rest, ok := subcommand(os.Args[1:]); ok {
-		return runCommand(name, rest, os.Stdout, os.Stderr)
-	}
-
-	// Before slog.SetDefault below, so this one refusal reaches stderr through
-	// the standard logger's own writer rather than through a handler that has
-	// not been installed. Every later one goes through refuseToStart.
-	opts, err := parseOptions(os.Args[1:], os.Stderr)
-	if errors.Is(err, flag.ErrHelp) {
-		// The flag package has already written the usage that was asked for.
-		// Reporting the sentinel as a failure prints "flag: help requested"
-		// under it and exits 1 on a request that was answered.
-		return 0
-	}
-	if err != nil {
-		log.Print(err)
-		return 1
-	}
-	if opts.version {
-		// Asked of the binary rather than of a node, because the question
-		// comes up before a node is running and on a host where one will not.
-		fmt.Fprintln(os.Stdout, version.String())
-		return 0
-	}
+// runDaemon is the node's body, in a function of its own so that every
+// deferred close runs before the process exits with a status. A failure
+// reported only in the log and then exited zero tells a supervisor the node
+// stopped cleanly when it did not, and the route withdrawal at shutdown is one
+// of the things that reports this way.
+func runDaemon(opts options) int {
 	configPath, pprofAddr := &opts.configPath, &opts.pprofAddr
 	metricsAddr, contentionProfiles := &opts.metricsAddr, &opts.contentionProfiles
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: opts.level})))
 
-	// Set by anything that fails on a goroutine or after run has committed to
-	// a clean shutdown. run returns nonzero if any of them did.
+	// Set by anything that fails on a goroutine or after runDaemon has
+	// committed to a clean shutdown. It returns nonzero if any of them did.
 	var failed atomic.Bool
 
 	if *pprofAddr != "" {
@@ -147,7 +131,7 @@ func run() int {
 		}()
 	}
 
-	cfg, err := config.Load(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return refuseToStart(err)
 	}
@@ -209,22 +193,26 @@ func run() int {
 			case <-ctx.Done():
 				return
 			case <-reload:
-				if err := node.Reload(*configPath, opts.registryPath, opts.privateKeyPath, opts.fullMesh); err != nil {
+				if err := node.Reload(*configPath); err != nil {
 					log.Printf("reload: %v", err)
 				}
 			}
 		}
 	}()
 
-	// The reconciler is opt-in, so an existing deployment keeps configuring
-	// the device externally.
+	// The reconciler is one capability, so a deployment that configures its
+	// device externally writes no cap.table and gets none of this.
 	var reconciler sync.WaitGroup
-	if cfg.Kernel.Enabled {
-		kernelCfg, err := kernelConfig(cfg, mesh.Name, node.Underlay)
-		if err != nil {
-			return refuseToStart(err)
+	if table := cfg.Cap.Table; table != nil {
+		// What the file could not say: the device the mesh actually got, the
+		// addresses the transport has to keep reaching, and the prefixes
+		// cap.route announces, which assign_announced puts on that device.
+		runtime := kernel.Runtime{
+			Interface: mesh.Name,
+			Underlay:  node.Underlay,
+			Announced: cfg.Routes().Announced(),
 		}
-		routes, err := kernel.New(kernelCfg, mesh.Routes)
+		routes, err := kernel.New(*table, runtime, mesh.Routes)
 		if err != nil {
 			return refuseToStart(err)
 		}
@@ -248,12 +236,12 @@ func run() int {
 			mesh.Name, mesh.QueueCount())
 	}
 
-	// The egress capability is opt-in the same way, and is built after the
+	// cap.egress is written or absent the same way, and is built after the
 	// reconciler because the two share a shutdown order: the translator
 	// withdraws its tables while the tun still exists, as the reconciler
 	// withdraws its routes.
-	if cfg.Egress.Enable {
-		translator, err := egress.New(cfg.Egress, egress.Runtime{
+	if exit := cfg.Egress(); exit != nil {
+		translator, err := egress.New(*exit, egress.Runtime{
 			Interface:     mesh.Name,
 			MeshAddresses: meshAddresses(cfg),
 			Forwarding:    client.Forwarding,
@@ -262,7 +250,7 @@ func run() int {
 			// withholds its advertisement instead of attracting traffic it
 			// would drop. The prefixes are read back from the translator, so
 			// this callback only has to say that they changed.
-			Announce: func([]netip.Prefix) { node.RepublishOriginated() },
+			Announce: func([]netip.Prefix) { node.Republish() },
 		})
 		if err != nil {
 			return refuseToStart(err)
@@ -279,7 +267,7 @@ func run() int {
 				failed.Store(true)
 			}
 		})
-		log.Printf("egress translating for %d prefixes in %s", len(cfg.Egress.Advertise), translator.Where())
+		log.Printf("egress translating for %d prefixes in %s", len(exit.Advertise), translator.Where())
 	}
 
 	// The control socket is bound rather than served here, so a path an
@@ -287,7 +275,7 @@ func run() int {
 	// leaving a node nobody has a way to ask anything. The default path is the
 	// one case that warns and carries on: it is on without being asked for, so
 	// a node whose unit cannot reach /var/run would otherwise stop starting on
-	// upgrade over a diagnostic it never requested. -control "" is the opt-out.
+	// upgrade over a diagnostic it never requested. --control "" is the opt-out.
 	if opts.controlPath != "" {
 		listener, err := control.Listen(opts.controlPath)
 		if err != nil && opts.controlPath == control.DefaultSocket {
@@ -370,101 +358,19 @@ func watchSignals(signals <-chan os.Signal, cancel context.CancelFunc, force fun
 	force()
 }
 
-// kernelRules turns the config file's rules into the reconciler's, resolving
-// each one's address family. A rule that names neither a destination nor a
-// source selects on a mark alone, which belongs to no family, so it says which
-// one it is for; "both" is written once and installed twice, because that is
-// what keeping an underlay out of a mesh table needs and writing it twice by
-// hand is how one of the two goes missing.
-//
-// Everything the reconciler itself judges is left to Rule.validate, so the one
-// place that decides what a rule may say is the one that installs it.
-func kernelRules(rules []config.Rule) ([]kernel.Rule, error) {
-	var out []kernel.Rule
-	for _, rule := range rules {
-		to, err := rulePrefix("to", rule.To)
-		if err != nil {
-			return nil, err
-		}
-		from, err := rulePrefix("from", rule.From)
-		if err != nil {
-			return nil, err
-		}
-		families, err := ruleFamilies(rule, to, from)
-		if err != nil {
-			return nil, err
-		}
-		for _, family := range families {
-			out = append(out, kernel.Rule{
-				Family:   family,
-				To:       to,
-				From:     from,
-				FWMark:   rule.FWMark,
-				FWMask:   rule.FWMask,
-				Table:    uint32(rule.Table),
-				Priority: rule.Priority,
-			})
-		}
-	}
-	return out, nil
-}
-
-// ruleFamilies is the families one configured rule installs for. An address
-// already says which family it belongs to, so naming one as well is refused
-// rather than silently resolved one way or the other.
-func ruleFamilies(rule config.Rule, to, from netip.Prefix) ([]uint8, error) {
-	addressed := to.IsValid() || from.IsValid()
-	named := strings.ToLower(rule.Family)
-	if addressed && named != "" {
-		return nil, fmt.Errorf("config: kernel rule at priority %d names family %q and an address, which already says which family it is", rule.Priority, rule.Family)
-	}
-	if addressed {
-		address := to.Addr()
-		if !to.IsValid() {
-			address = from.Addr()
-		}
-		if address.Is4() {
-			return []uint8{kernel.FamilyIPv4}, nil
-		}
-		return []uint8{kernel.FamilyIPv6}, nil
-	}
-	switch named {
-	case "ipv4":
-		return []uint8{kernel.FamilyIPv4}, nil
-	case "ipv6":
-		return []uint8{kernel.FamilyIPv6}, nil
-	case "both":
-		return []uint8{kernel.FamilyIPv4, kernel.FamilyIPv6}, nil
-	case "":
-		return nil, fmt.Errorf("config: kernel rule at priority %d selects on a mark alone, so it has to name family: ipv4, ipv6 or both", rule.Priority)
-	}
-	return nil, fmt.Errorf("config: kernel rule at priority %d: family %q is not ipv4, ipv6 or both", rule.Priority, rule.Family)
-}
-
-func rulePrefix(name, raw string) (netip.Prefix, error) {
-	if raw == "" {
-		return netip.Prefix{}, nil
-	}
-	prefix, err := netip.ParsePrefix(raw)
-	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("config: kernel rule %s %q: %w", name, raw, err)
-	}
-	return prefix, nil
-}
-
 // kernelStatus is the reconciler as the control surface reports it: what it
 // was configured to own and what its last pass did. The configuration half
-// comes from the resolved kernel.Config rather than from the config file, so
-// the defaults the reconciler filled in are the ones reported.
+// comes from the capability the reconciler resolved rather than from the file,
+// so the defaults it filled in are the ones reported.
 func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
-	cfg, stats := routes.Config(), routes.Stats()
+	table, stats := routes.Table(), routes.Stats()
 	return control.KernelStatus{
 		Enabled:   true,
 		Where:     routes.Where(),
-		Table:     cfg.Table,
-		Protocol:  cfg.Protocol,
-		Metric:    cfg.Metric,
-		VRF:       cfg.VRF,
+		Table:     uint32(table.ID),
+		Protocol:  table.Proto,
+		Metric:    table.Metric,
+		VRF:       table.Name(),
 		PassAt:    stats.At,
 		Installed: stats.Installed,
 		Skipped:   stats.Skipped,
@@ -479,14 +385,18 @@ func kernelStatus(routes *kernel.Reconciler) control.KernelStatus {
 // so a block that never became a translator reports as off rather than
 // describing rules nobody installed.
 func egressStatus(translator *egress.Translator) control.EgressStatus {
-	cfg, stats := translator.Config(), translator.Stats()
+	cfg, stats := translator.Capability(), translator.Stats()
+	advertise := make([]netip.Prefix, 0, len(cfg.Advertise))
+	for _, entry := range cfg.Advertise {
+		advertise = append(advertise, entry.Prefix)
+	}
 	return control.EgressStatus{
 		Enabled:   true,
 		Where:     translator.Where(),
 		Source4:   cfg.Source4.String(),
 		Source6:   cfg.Source6.String(),
 		Return:    cfg.Return,
-		Advertise: cfg.Advertise,
+		Advertise: advertise,
 		Announced: stats.Announced,
 		PassAt:    stats.At,
 		Installed: stats.Installed,
@@ -497,20 +407,13 @@ func egressStatus(translator *egress.Translator) control.EgressStatus {
 	}
 }
 
-// meshAddresses is every address this node carries on the mesh, which the
-// egress capability translates into the mesh under. It is the reconciler's
-// assigned set plus the host prefixes this node announces, because a node that
-// configures its tun externally assigns nothing here and still has exactly one
-// address the mesh returns to.
+// meshAddresses is every address this node carries on the mesh, which
+// cap.egress translates into the mesh under. It is the announced host prefixes
+// plus whatever cap.table assigns, because a node that configures its tun
+// externally assigns nothing and still has exactly one address the mesh
+// returns to.
 func meshAddresses(cfg *config.Config) []netip.Addr {
-	assigned, err := cfg.KernelAddresses()
-	if err != nil {
-		// Reported by KernelAddresses' own caller in kernelConfig, and by
-		// config.validate before either. Returning nothing here leaves the
-		// capability to refuse by name rather than to translate to an address
-		// this node does not hold.
-		return nil
-	}
+	announced := cfg.Routes().Announced()
 	var out []netip.Addr
 	add := func(prefix netip.Prefix) {
 		// Only a host prefix. A shorter one is a range this node carries
@@ -521,53 +424,13 @@ func meshAddresses(cfg *config.Config) []netip.Addr {
 		}
 		out = append(out, prefix.Addr())
 	}
-	for _, prefix := range assigned {
+	for _, prefix := range announced {
 		add(prefix)
 	}
-	for _, raw := range cfg.Originate {
-		if prefix, err := netip.ParsePrefix(raw); err == nil {
+	if table := cfg.Cap.Table; table != nil {
+		for _, prefix := range table.Assigned(announced) {
 			add(prefix)
 		}
 	}
-	for _, entry := range cfg.Babel.Originate {
-		add(entry.Prefix)
-	}
 	return out
-}
-
-// kernelConfig resolves the config file's kernel block against the device the
-// mesh actually got and the prefixes this node originates. The addresses are
-// parsed here rather than in config.Load, so the reconciler's own validation
-// in kernel.New stays the single place that decides what it accepts.
-func kernelConfig(cfg *config.Config, device string, underlay func() []netip.Addr) (kernel.Config, error) {
-	rules, err := kernelRules(cfg.Kernel.Rules)
-	if err != nil {
-		return kernel.Config{}, err
-	}
-	out := kernel.Config{
-		Interface: device,
-		Underlay:  underlay,
-		Table:     cfg.Kernel.Table,
-		Protocol:  cfg.Kernel.Protocol,
-		Metric:    cfg.Kernel.Metric,
-		VRF:       cfg.Kernel.VRF,
-		CreateVRF: cfg.Kernel.CreateVRF,
-		Rules:     rules,
-	}
-	if cfg.Kernel.ReconcileInterval != nil {
-		out.ReconcileInterval = time.Duration(*cfg.Kernel.ReconcileInterval)
-	}
-	if raw := cfg.Kernel.PrefSrc4; raw != "" {
-		address, err := netip.ParseAddr(raw)
-		if err != nil {
-			return kernel.Config{}, fmt.Errorf("config: kernel.prefsrc4 %q: %w", raw, err)
-		}
-		out.PrefSrc4 = address
-	}
-	addresses, err := cfg.KernelAddresses()
-	if err != nil {
-		return kernel.Config{}, err
-	}
-	out.Addresses = addresses
-	return out, nil
 }

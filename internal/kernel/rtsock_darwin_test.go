@@ -82,8 +82,8 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 
 	device := createUTUN(t)
 	setInterfaceUp(t, device)
-	cfg := Config{Interface: device, Table: DefaultTable, Protocol: DefaultProtocol}
-	opened, err := newPlatform(cfg)
+	tbl, rt := platformFor(device)
+	opened, err := newPlatform(tbl, rt)
 	if err != nil {
 		t.Fatalf("open the darwin platform on %s: %v", device, err)
 	}
@@ -133,7 +133,7 @@ func TestDarwinPlatformOnRealKernel(t *testing.T) {
 		hold,
 	}
 	for i := range want {
-		want[i].Metric = routeMetric(cfg.Metric, want[i].Destination, want[i].Unreachable)
+		want[i].Metric = routeMetric(tbl.Metric, want[i].Destination, want[i].Unreachable)
 		want[i].Scoped = plat.scopes(want[i])
 	}
 	slices.SortFunc(want, compareRoutes)

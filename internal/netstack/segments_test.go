@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/internal/srv6"
 )
 
@@ -72,7 +73,7 @@ func TestBatchWithoutSegmentsIsUntouched(t *testing.T) {
 // place of it, so the batch that comes back carries the inner packet.
 func TestExitDeliversWhatWasInside(t *testing.T) {
 	exit := segAddr("3fff:1:69c:8c6::1")
-	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: exit, Behavior: srv6.BehaviorEndDT46}})
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: schema.AddrFrom(exit), Behavior: srv6.BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestExitDeliversWhatWasInside(t *testing.T) {
 func TestWaypointForwardsInsteadOfDelivering(t *testing.T) {
 	waypoint := segAddr("3fff:1:69c:8c6::2")
 	exit := segAddr("3fff:1:69c:98d6::1")
-	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: schema.AddrFrom(waypoint), Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +144,7 @@ func TestWaypointForwardsInsteadOfDelivering(t *testing.T) {
 // where they would arrive as undeliverable packets addressed to us.
 func TestSegmentsThatCannotBeActedOnAreDropped(t *testing.T) {
 	waypoint := segAddr("3fff:1:69c:8c6::2")
-	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: schema.AddrFrom(waypoint), Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +182,7 @@ func TestSegmentsThatCannotBeActedOnAreDropped(t *testing.T) {
 // its own backing array.
 func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
 	exit := segAddr("3fff:1:69c:8c6::1")
-	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: exit, Behavior: srv6.BehaviorEndDT46}})
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: schema.AddrFrom(exit), Behavior: srv6.BehaviorEndDT46}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,9 +215,9 @@ func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
 func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 	exit := segAddr("3fff:1:69c:98d6::1")
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("3fff:a::17/128"),
-		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{exit}},
-	}})
+		From: schema.PrefixFrom(segPrefix("3fff:a::17/128")),
+		Via:  []schema.Addr{schema.AddrFrom(exit)},
+	}}, schema.MustAddr("3fff:1:69c:8c0::1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,9 +254,9 @@ func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
 // the counter says it happened.
 func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 	table, err := srv6.NewSteerTable([]srv6.Steer{{
-		From:   segPrefix("3fff:a::17/128"),
-		Policy: srv6.Policy{Source: segAddr("3fff:1:69c:8c0::1"), Path: []netip.Addr{segAddr("3fff:1:69c:98d6::1")}},
-	}})
+		From: schema.PrefixFrom(segPrefix("3fff:a::17/128")),
+		Via:  []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")},
+	}}, schema.MustAddr("3fff:1:69c:8c0::1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +288,7 @@ func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
 // machine and a peer can spend this node's whole allowance to a third peer.
 func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
 	waypoint := segAddr("3fff:1:69c:8c6::2")
-	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: schema.AddrFrom(waypoint), Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +350,7 @@ func TestWaypointBatchTakesOnePlacePerPeer(t *testing.T) {
 // record.
 func TestRefusedPacketsAreAnsweredAtABoundedRate(t *testing.T) {
 	waypoint := segAddr("3fff:1:69c:8c6::2")
-	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: waypoint, Behavior: srv6.BehaviorEnd}})
+	table, err := srv6.NewLocalTable([]srv6.Segment{{SID: schema.AddrFrom(waypoint), Behavior: srv6.BehaviorEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,8 +406,8 @@ const ipv6HeaderOffsetSegmentsLeft = 40 + 3
 func TestTwoSegmentsOfThisNodeInOneListAreBothActedOn(t *testing.T) {
 	waypoint, exit := segAddr("3fff:1:69c:8c6::2"), segAddr("3fff:1:69c:8c6::1")
 	table, err := srv6.NewLocalTable([]srv6.Segment{
-		{SID: waypoint, Behavior: srv6.BehaviorEnd},
-		{SID: exit, Behavior: srv6.BehaviorEndDT46},
+		{SID: schema.AddrFrom(waypoint), Behavior: srv6.BehaviorEnd},
+		{SID: schema.AddrFrom(exit), Behavior: srv6.BehaviorEndDT46},
 	})
 	if err != nil {
 		t.Fatal(err)

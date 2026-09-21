@@ -49,37 +49,38 @@ from the mechanism the RFC provides rather than from an inability to relay. A
 node that advertises transit still has to be able to forward it, which is three
 things this binary does not do for you: `net.ipv4.ip_forward` and
 `net.ipv6.conf.all.forwarding` have to be on, the learned routes have to reach a
-kernel table the node actually consults, which the `kernel` block below is for,
-and the TUN has to be allowed to forward back out of itself. Advertising transit
-without them means announced paths blackhole. The `egress` block below acts on
-the same fact rather than warning about it: a prefix an exit node offers to
-carry is advertised only while its translation rule is installed and the kernel
-forwards its family, and is retracted the moment either stops being true.
+kernel table the node actually consults, which `cap.table` below is for, and the
+TUN has to be allowed to forward back out of itself. Advertising transit without
+them means announced paths blackhole. `cap.egress` below acts on the same fact
+rather than warning about it: a prefix an exit node offers to carry is
+advertised only while its translation rule is installed and the kernel forwards
+its family, and is retracted the moment either stops being true.
 
-`full_mesh` dials every node the registry names, the N-to-N reconciliation ranet
-performs. Entries in `peers` still apply and win for their node, which is the
-only way to pin a `serial_number`. Reach against a fleet running BIRD requires
+`dial.all` dials every node the trust document names, the N-to-N reconciliation
+ranet performs. Entries in `dial.to` still apply and win for their node, which
+is the only way to pin a `serial`. Reach against a fleet running BIRD requires
 it, because that Babel channel exports only its own directly connected routes: a
 node learns a prefix from the node that originates it or not at all, so dialing
 a few exits reaches those exits and nothing behind them.
 
 A node whose mesh address is the only global address of its family should also
-set `fwmark`, on linux. The transport binds the wildcard and lets the kernel
+set `link.mark`, on linux. The transport binds the wildcard and lets the kernel
 pick the source by route, and where the mesh address is the only candidate the
 kernel picks it, a `from <mesh address>` policy rule sends the datagram to the
 mesh table, and an exit-announced default there routes the ESP underlay into the
-tun that is carrying it. `SO_MARK` plus a rule of your own keeps it out. This
-package writes no policy rules, so the rule belongs with the ones the deployment
-already owns. darwin needs none: the reconciler installs a route
-interface-scoped when it is a default or when it covers one of the registry's
-endpoint addresses, and an unbound socket never sees a scoped route. A hostname
-endpoint is not covered, because resolving one is a network call and the scope
-decision is made once per reconcile pass.
+tun that is carrying it. `SO_MARK` plus a rule matching it keeps it out, and the
+reconciler installs that rule itself: write it under `cap.table.rules`, as
+`{ fwmark = 0x726c, table = "main", priority = 40, family = "both" }`. darwin
+needs none: the reconciler installs a route interface-scoped when it is a
+default or when it covers one of the registry's endpoint addresses, and an
+unbound socket never sees a scoped route. A hostname endpoint is not covered,
+because resolving one is a network call and the scope decision is made once per
+reconcile pass.
 
-A leaf should set `babel.no_transit`, which advertises only the prefixes this
-node originates and never relays one it learned. Redistribution serves a
-converted fleet and turns a laptop into a transit router for everybody else. The
-BIRD side of a ranet fleet draws the same line with
+A leaf should write `transit = false` under `cap.route`, which advertises only
+the prefixes this node announces and never relays one it learned. Redistribution
+serves a converted fleet and turns a laptop into a transit router for everybody
+else. The BIRD side of a ranet fleet draws the same line with
 `export where proto = "dbabel0"`. Refusing to advertise cannot close a loop, so
 this only narrows what the feasibility condition already bounds.
 
@@ -205,7 +206,7 @@ additional Child SAs are both within the
 
 This fork adds the responder role, which upstream lists as out of scope, because
 a full mesh needs every node to answer as well as dial. It is off unless
-`responder` is set. Identities are compared by name rather than by their DER
+`link.listen` is set. Identities are compared by name rather than by their DER
 bytes: ranet writes `O` and `CN` as `UTF8String` while strongSwan picks the
 string type from the value, so one name legitimately reaches the wire in two
 encodings. AUTH signs the bytes as received either way, so the name only selects
@@ -233,7 +234,7 @@ capability granted to the binary).
 ## Running
 
 ```sh
-sudo ./ranet-lite -config /etc/ranet-lite/config.yaml
+sudo ./ranet-lite daemon --config /etc/ranet-lite/config.toml
 ```
 
 On startup it logs the TUN device's name (e.g. `ranet0`). Traffic won't flow
@@ -244,148 +245,87 @@ ip addr add 10.66.0.5/32 dev ranet0
 ip route add 10.66.0.0/16 dev ranet0
 ```
 
-The same binary is also the client. A first argument that is not a flag asks a
-running daemon a question over its control socket rather than starting a node,
-so `ranet-lite status` and its siblings work alongside a deployment's own
-`ranet-lite -config ...` with no second binary and no second unit. See
-[Control socket](#control-socket).
+`daemon` is the node; every other subcommand asks a running one a question over
+its control socket, so `ranet-lite status` and its siblings work alongside a
+deployment's own `ranet-lite daemon` with no second binary and no second unit.
+See [Control socket](#control-socket). `ranet-lite completion bash|zsh|fish`
+writes the shell's completion script, generated from the command tree so a
+command added without one is completed anyway.
 
 ## Configuration
 
 ranet-lite needs two files:
 
-- A **registry.json**, in the exact format ranet itself uses (see
-  `internal/registry/testdata/registry.json` for a fully worked, synthetic
-  example spanning multiple organizations, nodes, and endpoint address
+- A **trust document**, today a `registry.json` in the exact format ranet itself
+  uses (see `internal/registry/testdata/registry.json` for a fully worked,
+  synthetic example spanning multiple organizations, nodes, and endpoint address
   families).
-- A **config.yaml** in ranet-lite's own format, see
-  [`examples/config.yaml`](examples/config.yaml):
+- A **configuration file**, read by the extension it carries: `.toml` goes to
+  the TOML parser, and `.yaml`, `.yml` and `.json` go to the YAML one, since
+  valid JSON is valid YAML. An extension neither knows is refused by name rather
+  than sniffed. Both decoders are strict, so an unknown key is an error under
+  either: a mistyped capability that silently does nothing is the worst failure
+  a configuration file has. See [`examples/config.toml`](examples/config.toml)
+  for the annotated reference and [`examples/config.yaml`](examples/config.yaml)
+  for the same schema in YAML.
 
-```yaml
-organization: example
-common_name: my-laptop
-port: 13000
-endpoints:
-  - serial_number: "0"
-    address_family: ip4
+The top level says what the node **is**. Everything it **does** lives under
+`cap`, one block per capability, and writing the block turns that capability on.
+There is no `enabled` field to forget. A default deployment writes `node`,
+`auth`, `link` and `dial` and stops:
 
-private_key: /etc/ranet-lite/key.pem # PKCS8 PEM Ed25519 private key
-registry: /etc/ranet-lite/registry.json # same registry.json ranet itself uses
+```toml
+[node]
+org = "example"
+name = "my-laptop"
 
-# Prefixes this node announces via babel as reachable through itself.
-originate:
-  - "10.66.0.5/32"
+[auth]
+key = "/etc/ranet-lite/key.pem"     # this node's own PKCS8 PEM Ed25519 key
+trust = "/etc/ranet-lite/trust.json" # the document saying who may join
 
-# Optional anti-replay window. Omit for the high-speed default of 4096
-# packets; RFC 4303 section 3.4.3 recommends increasing it for high-speed
-# environments. Set it to 0 only to explicitly disable replay checking.
-# replay_window: 4096
+[link]
+port = 13000
+endpoints = [{ serial = "0", family = "ip4" }]
+# listen = true                     # answer peers that dial this node
+# tun = "ranet0"                    # attach to this device rather than a new one
+# mark = 0x726c                     # SO_MARK on the underlay socket, linux only
 
-# Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
-# Set either to 0 to disable it. Rekeys run interval minus the 5m margin and
-# an independently random 0-1m jitter. Margin plus jitter must be shorter
-# than every enabled interval.
-# child_rekey_interval: 1h
-# ike_rekey_interval: 3h
-# rekey_margin: 5m
-# rekey_jitter: 1m
-# Failed rekeys retry after 5s, doubling up to 5m.
-# rekey_retry_initial: 5s
-# rekey_retry_max: 5m
+[dial]
+# all = true                        # dial every node the trust document names
+to = [{ name = "gateway", serial = "0" }]
 
-# The existing strongSwan netns test rig can exercise short rekey lifetimes:
-# go run ./cmd/iketest -child-rekey=5s -ike-rekey=15s -run=45
-
-# Optional fixed TUN name. It attaches to an existing compatible device
-# (which must be multiqueue on multicore) or creates it when absent. Omit to
-# create an automatically named ranet%d device on Linux, or the next free
-# utun on darwin, whose control accepts only "utun" or "utunN".
-# tun: ranet0
-
-# Answer peers that dial us, rather than only dialing. Off by default: a leaf
-# has no address to be dialed at, and an open responder is the one surface an
-# unauthenticated peer can reach. Any node in the registry may then dial us;
-# the peers list below says who we dial, not who we answer.
-# responder: true
-
-# One or more existing mesh nodes to dial as IKEv2/babel peers. Not required
-# when responder is set.
-peers:
-  - organization: example # optional, defaults to the top-level organization
-    common_name: gateway
-    serial_number: "0" # optional, picks a specific endpoint if the node has several
-
-babel:
-  hello_interval: 4s
-  update_interval: 16s
-
-# Optional: mirror the routes babel learns into a routing table of its own, taking
-# over from BIRD's kernel protocols. Off unless enabled. The reconciler deletes
-# only routes carrying its own protocol, in its own table, out of the TUN, and
-# an install refuses a key another writer already holds rather than taking it
-# over. Give it a table no other daemon writes, or the routes it refuses are
-# routes the mesh wanted.
-# kernel:
-#   enabled: true
-#   table: 200                     # the table the policy rules look up
-#   protocol: 155                  # rt_proto marking this reconciler's routes and rules
-#   metric: 64                     # BIRD's kbabel uses 32, so not 32 while it shares this table
-#   prefsrc4: 10.66.0.5            # linux only: RTA_PREFSRC on v4 routes, as krt_prefsrc
-#   addresses: ["10.66.0.5/32"]    # assigned to the TUN, removed again at exit
-#   assign_originated: false       # also assign every prefix in originate
-#   vrf: mesh                   # joined only while the link has no master
-#   vrf_create: true               # linux only: make it rather than expect networkd to have
-#   reconcile_interval: 30s
-#   rules:                         # linux only, see the platform notes below
-#     - { fwmark: 0x726c, table: main, priority: 40, family: both }
-#     - { to: "3fff:1:69c::/48", table: 200, priority: 100 }
-#     - { from: "10.66.0.5/32", table: 200, priority: 150 }
-
-# Optional: segment routing, performed here rather than by a kernel, so it is
-# the same on every platform. local names the segments this node answers for,
-# steer which of this node's own packets go through a segment list. Every
-# steered packet carries its list inside the tunnel, so the device's MTU comes
-# down by the longest list configured.
-# segments:
-#   source: "3fff:1:69c:8c0::1" # the outer source, as `ip sr tunsrc` sets it
-#   local:
-#     - { sid: "3fff:1:69c:8c6::1", behavior: "End.DT46" }
-#     - { sid: "3fff:1:69c:8c6::2", behavior: "End" }
-#   steer:
-#     - { from: "3fff:a::198:18:104:117/128", via: ["3fff:1:69c:98d6::1"] }
-
-# Optional: carry other nodes' traffic out of the mesh, the one action behind an
-# exit node and a subnet router. linux only, refused by name elsewhere. Each
-# advertised prefix is announced only while its rule is installed and the
-# kernel forwards its family, so do not repeat one of them in originate.
-# egress:
-#   enable: true
-#   advertise: ["0.0.0.0/0", "::/0"] # a subnet router names its own prefixes
-#   source4: auto                    # or an address; auto lets the host's routes decide
-#   source6: auto
-#   return: true                     # also translate into the mesh, for a subnet router
-#   interval: 30s
+[cap.route]
+announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
+# transit = false                   # stop relaying what this node learns
 ```
 
-Required fields: `organization`, `common_name`, `port`, at least one local
-`endpoints` entry, `private_key`, `registry`, and, unless `responder` or
-`full_mesh` is set, at least one entry in `peers`.
+Required: `node.org`, `node.name`, `auth.key`, `auth.trust`, `link.port`, at
+least one `link.endpoints` entry, and, unless `link.listen` or `dial.all` is
+set, at least one `dial.to` entry. Everything else has a default, and an absent
+capability is its own default: a node with no `cap.babel` runs the 4s and 16s
+intervals of RFC 8966 Appendix B, and a node with no `cap.route` announces
+nothing and still carries transit.
 
-ranet's own `config.json` runs here unchanged, since valid JSON is valid YAML,
-given the three flags below that supply what the file never names. Its
-per-endpoint `port` and `fwmark` satisfy the top-level fields when those are
-absent, every endpoint having to agree; `address` and `updown` are named so the
-file is not rejected over them and reported once as having no effect, because
-this binds every interface and carries the whole mesh on one tun; and
-`-registry`, `-key` and `-full-mesh` supply what that file has no field for:
-ranet takes the first two on its own command line and always behaves as the
-third asks. `experimental.iptfs` parses and is refused if set, since there is no
-IP-TFS here. What that file cannot carry is everything replacing BIRD, so
-`originate`, `kernel` and the babel costs still have to be added to it.
-Everything else has a default (`peers[].organization` defaults to the top-level
-`organization`, and the babel intervals default to 4s/16s).
+The capabilities, each documented in full in the example:
 
-**Your `registry.json` and private key are sensitive.** They identify and
+| block         | what it turns on                                                             |
+| ------------- | ---------------------------------------------------------------------------- |
+| `cap.route`   | what this node announces, and whether it relays what it learns               |
+| `cap.babel`   | the speaker's own timers, link quality estimator and costs                   |
+| `cap.table`   | the route reconciler: a routing table, addresses, a VRF and policy rules     |
+| `cap.segment` | segment routing, RFC 8986: the SIDs this node answers for and what it steers |
+| `cap.crypto`  | the replay window and the rekey timers                                       |
+
+A capability is defined once, by the package that implements it, and validates
+itself there: `cap.table` is the type `internal/kernel` takes, `cap.segment`'s
+members are `internal/srv6`'s, and `internal/babel` takes `cap.babel` and
+`cap.route` directly. `internal/config` holds the node's own facts and the
+checks that span two capabilities, such as a SID that is also an address the
+reconciler assigns. The scalar spellings, a duration, a prefix, an address, a
+table and an announcement, live in `internal/schema` and carry both decoders, so
+a field parses the same way whichever extension the file has.
+
+**Your trust document and private key are sensitive.** They identify and
 authenticate a real node in a real mesh. Never commit real copies of either;
 only synthetic fixtures belong in version control (see `.gitignore`).
 
@@ -404,11 +344,11 @@ kernel protocols, as routes installed and skipped, when its last pass finished
 and whether that pass failed; segment routing, which replaced `seg6local`, as
 what this node did for peers (forwarded, delivered, dropped, answered) and what
 it did with its own traffic (steered, and dropped with a reason); and the
-`egress` capability, as rules installed, connections translated, other
-translation found at the same hook, and the two prefix counts whose difference
-says this node is withholding an advertisement it cannot stand behind. A node
-with the reconciler or the capability off writes none of its series rather than
-zeroes that read as a subsystem installing nothing.
+`cap.egress`, as rules installed, connections translated, other translation
+found at the same hook, and the two prefix counts whose difference says this
+node is withholding an advertisement it cannot stand behind. A node with the
+reconciler or the capability off writes none of its series rather than zeroes
+that read as a subsystem installing nothing.
 
 Everything is read from live state at scrape time, so a scrape reflects the
 instant it happened rather than a sampled snapshot. What a counter cannot carry,
@@ -433,19 +373,19 @@ is acted on before it reaches the tun. `internal/srv6` implements
 [RFC 8986](https://www.rfc-editor.org/rfc/rfc8986)'s H.Encaps, End and End.DT46,
 and the same code runs on every platform.
 
-`segments.local` names the addresses this node answers for. `End` moves a packet
-to its next segment and sends it on; `End.DT46` strips the outer header and
-hands what was inside to the stack. The spelling is the one
+`cap.segment.local` names the addresses this node answers for. `End` moves a
+packet to its next segment and sends it on; `End.DT46` strips the outer header
+and hands what was inside to the stack. The spelling is the one
 `ip route ... encap seg6local action` takes, so a fleet's own SIDs move across
 unchanged.
 
-`segments.steer` is which of this node's own packets go through a segment list.
-It is keyed by source and destination prefix together, the pair the forwarding
-table is keyed by, because that is the selector a steering tool on such a fleet
-uses: the traffic sourced from this node's announced address, through the
-waypoints and out at a chosen exit. An entry naming neither a source nor a
-destination is refused, since it would claim the encapsulated packets this node
-has just produced.
+`cap.segment.steer` is which of this node's own packets go through a segment
+list. It is keyed by source and destination prefix together, the pair the
+forwarding table is keyed by, because that is the selector a steering tool on
+such a fleet uses: the traffic sourced from this node's announced address,
+through the waypoints and out at a chosen exit. An entry naming neither a source
+nor a destination is refused, since it would claim the encapsulated packets this
+node has just produced.
 
 Every steered packet carries its segment list inside the tunnel, so the device
 comes up with the longest configured list taken off its MTU, and a list long
@@ -473,19 +413,19 @@ and removing the SID leaves the encapsulated packet arriving with nothing coming
 out of it. The other direction, a header the kernel writes and this tree acts
 on, is held by the unit tests in `internal/srv6` against a reconstruction of
 what `__seg6_do_srh_encap` produces, and by no VM arm: no arm configures
-`segments.local`, so `End` and `End.DT46` have no end-to-end coverage.
+`cap.segment.local`, so `End` and `End.DT46` have no end-to-end coverage.
 
 ## Exit nodes and subnet routers
 
-The `egress` block makes this node carry other nodes' traffic out of the mesh.
-One action covers both features a customer asks for: an exit node advertises
-`0.0.0.0/0` and `::/0`, a subnet router advertises the prefixes behind it, and
-each ends at the same operation. A packet arrives on the TUN, its source is
-translated to an address the far side can answer, and the host forwards it by
-its ordinary routes. linux only for now; the capability is refused by name where
-there is no packet filter to write into, because a node that accepted the
-configuration and translated nothing would advertise itself and then drop every
-flow that took it.
+The `cap.egress` block makes this node carry other nodes' traffic out of the
+mesh. One action covers both features a customer asks for: an exit node
+advertises `0.0.0.0/0` and `::/0`, a subnet router advertises the prefixes
+behind it, and each ends at the same operation. A packet arrives on the TUN, its
+source is translated to an address the far side can answer, and the host
+forwards it by its ordinary routes. linux only for now; the capability is
+refused by name where there is no packet filter to write into, because a node
+that accepted the configuration and translated nothing would advertise itself
+and then drop every flow that took it.
 
 Both interfaces are matched, never one. A packet that arrives on the TUN and
 leaves by it again is mesh transit, and rewriting its source would put this
@@ -529,8 +469,17 @@ because this end is the only one that knows.
 The return path is conntrack's. A reply arriving for a translated flow has its
 destination put back before the forwarding lookup runs, so the route to the peer
 has to be in a table that lookup consults: with the mesh's routes in a table of
-the reconciler's own, that means a `kernel.rules` entry sending the mesh
+the reconciler's own, that means a `cap.table.rules` entry sending the mesh
 prefixes there. Without one the translation works and every reply is dropped.
+
+```toml
+[cap.egress]
+advertise = ["198.51.100.0/24"] # an exit node writes ["0.0.0.0/0", "::/0"]
+# source4 = "auto"                # or an address; auto lets the host's routes decide
+# source6 = "auto"
+# return = true                   # also translate into the mesh, for a subnet router
+# sweep = "30s"
+```
 
 ## What each platform gives the reconciler
 
@@ -540,25 +489,25 @@ kernel allows. A backend that cannot reach something refuses the configuration
 by name at startup rather than coming up with a working mesh and no steering,
 which is the failure that reads as a routing problem for a day.
 
-**linux** has policy rules and 2^32 tables. `kernel.rules` are installed with
-`FRA_PROTOCOL` set to `kernel.protocol`, the same ownership marker the routes
+**linux** has policy rules and 2^32 tables. `cap.table.rules` are installed with
+`FRA_PROTOCOL` set to `cap.table.proto`, the same ownership marker the routes
 carry, so a dump reads back only this reconciler's and a delete can never reach
 another writer's. systemd-networkd stamps `RTPROT_STATIC` on the rules it
 writes, so a node mid-migration keeps the two sets apart on its own.
-`kernel.vrf_create` makes the master device the mesh table is bound to when no
-device of that name exists. One this process created is removed again at
+`cap.table.vrf.create` makes the master device the mesh table is bound to when
+no device of that name exists. One this process created is removed again at
 shutdown. One it found is left alone with everything in its table, whatever
 table that is: a device somebody else bound to another table is adopted as it
-stands, so the tun's lookups go there rather than to `kernel.table`.
+stands, so the tun's lookups go there rather than to `cap.table.id`.
 
 **darwin** has one forwarding table, no rules and no VRFs, and refuses
-`kernel.rules`, `kernel.vrf`, `kernel.vrf_create` and `prefsrc4` by name. It
-reaches the two ends the rules exist for with interface scope instead: an
-announced default and a source-specific route are installed scoped to the tun,
-so no unbound socket can select either, which keeps the machine from being
-captured and the ESP underlay out of the tunnel carrying it. `fwmark` is refused
-there for the same reason, since there is nothing for a mark to select and
-nothing to select it with.
+`cap.table.rules`, `cap.table.vrf` and `cap.table.prefsrc4` by name. It reaches
+the two ends the rules exist for with interface scope instead: an announced
+default and a source-specific route are installed scoped to the tun, so no
+unbound socket can select either, which keeps the machine from being captured
+and the ESP underlay out of the tunnel carrying it. `link.mark` is refused there
+for the same reason, since there is nothing for a mark to select and nothing to
+select it with.
 
 **iOS and Android**, planned rather than present, have less again: the tunnel is
 a `NEPacketTunnelProvider` or a `VpnService`, the process is handed a list of
@@ -576,16 +525,16 @@ over the extension's own channel.
 
 ## Control socket
 
-`-control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
+`--control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
 the default, so a node is askable without having been configured to be.
-`-control ""` turns it off. The socket is mode 0660 and the unit names the group
-that can read it. Nothing on the socket writes, and a reader is bounded by an
-idle timeout and by a limit on the connections open at once across every reader,
-because a client that accumulates them costs the daemon a descriptor apiece and
-a node out of descriptors is one that cannot be asked anything at all. Past that
-limit a connection is closed as it is accepted, so a client holding every place
-is refused at once rather than left waiting, and a shutdown is not held up
-behind it.
+`--control ""` turns it off. The socket is mode 0660 and the unit names the
+group that can read it. Nothing on the socket writes, and a reader is bounded by
+an idle timeout and by a limit on the connections open at once across every
+reader, because a client that accumulates them costs the daemon a descriptor
+apiece and a node out of descriptors is one that cannot be asked anything at
+all. Past that limit a connection is closed as it is accepted, so a client
+holding every place is refused at once rather than left waiting, and a shutdown
+is not held up behind it.
 
 Which process owns the path is settled by an exclusive lock on a sibling file
 rather than by dialing the socket to see whether anything answers, since a live
@@ -598,10 +547,11 @@ having been asked for.
 
 The version a node reports is `version.txt` and the commit the binary was built
 from, because `version.txt` moves once per release and a fleet is converted one
-node at a time in between. `ranet-lite -version` asks the binary the same
-question without a node running.
+node at a time in between. `ranet-lite version` asks the binary the same
+question without a node running, and `ranet-lite version --daemon` asks the
+node, which is how the two are told apart during a conversion.
 
-The subcommands read it and print a table, or the wire form with `-json`:
+The subcommands read it and print a table, or the wire form with `--json`:
 
 ```
 $ ranet-lite status
@@ -641,7 +591,7 @@ no equivalent of. `routes` answers `birdc show route`, over the Babel route
 table rather than the forwarding table, so a prefix every neighbor has retracted
 is still a row, which is the case an operator is looking for. `sessions` answers
 `swanctl --list-sas`. `peers` lists who this node dials, from the config file or
-from the registry under `full_mesh`, and whether it got there.
+from the trust document under `dial.all`, and whether it got there.
 
 No subcommand changes anything. A node's configuration is its file, a reload is
 SIGHUP, and a socket that could write would need an authorization story to
@@ -654,8 +604,8 @@ the process starts.
 
 ranet-lite is built to run next to Tailscale, NetBird, ZeroTier, an SD-WAN
 agent, or anything else that owns interfaces and routes on the same box, and the
-reconciler's ownership rules make that true rather than a hope. The `egress`
-capability follows the same rules in the host's packet filter, see below.
+reconciler's ownership rules make that true rather than a hope. `cap.egress`
+follows the same rules in the host's packet filter, see below.
 
 On Linux it reads back only routes whose table, `rt_proto` and output interface
 all match its own, so a delete list can never contain another writer's route,
@@ -730,17 +680,17 @@ VRF only while it has no master at all, so systemd-networkd keeps whatever it
 already claimed. The device itself is created by asking for the next free unit,
 so it never takes a name another tunnel is using.
 
-The `egress` capability writes into the packet filter, where the same three
-rules hold. It creates an nftables table named after this tool, one per address
-family, holding one nat postrouting chain; that name is the whole of its
-ownership claim, as `rt_proto` is the reconciler's. It writes only inside those
-tables, reads back only rules it wrote, replaces the chain's contents in one
-transaction rather than editing it rule by rule, so no packet is ever evaluated
-against half a ruleset, and removes both tables at shutdown. A table left behind
-by an earlier instance carries the same name and is adopted, then brought to
-what the configuration now asks for, and one in a family the configuration no
-longer covers is removed at startup rather than left translating under rules
-nothing is maintaining.
+`cap.egress` writes into the packet filter, where the same three rules hold. It
+creates an nftables table named after this tool, one per address family, holding
+one nat postrouting chain; that name is the whole of its ownership claim, as
+`rt_proto` is the reconciler's. It writes only inside those tables, reads back
+only rules it wrote, replaces the chain's contents in one transaction rather
+than editing it rule by rule, so no packet is ever evaluated against half a
+ruleset, and removes both tables at shutdown. A table left behind by an earlier
+instance carries the same name and is adopted, then brought to what the
+configuration now asks for, and one in a family the configuration no longer
+covers is removed at startup rather than left translating under rules nothing is
+maintaining.
 
 Nothing here writes iptables. The two are separate registries in the kernel, an
 `iptables-nft` rule is visible here as an ordinary nftables table, and the
@@ -789,7 +739,7 @@ while the node keeps signing with the key it started on. The `babel` block is
 built into the speaker once, apart from the prefixes it originates, which a
 reload does apply. The `kernel` block, including the addresses
 `assign_originated` expands into, is read once at startup, and so is the
-`egress` block: the capability owns the tables it created under the families the
+`cap.egress`: the capability owns the tables it created under the families the
 old block named, and a new one applied here would leave the host holding rules
 from a configuration nothing is running. The rekey and replay settings are
 captured by a session when it is created, so applying them to new sessions alone

@@ -400,70 +400,48 @@ in
               ];
             }
           ];
+          # Written in the capability schema, and in flow style wherever an
+          # optional block is interpolated: nix strips a nested string's own
+          # indentation, so a multi-line block would land back at column zero.
           "ranet-lite/config.yaml".text = ''
-            organization: testorg
-            common_name: client
-            port: 14000
-            endpoints:
-              - serial_number: "2"
-                address_family: ip4
-            private_key: /etc/ranet-lite/key.pem
-            registry: /etc/ranet-lite/registry.json
-            originate:
-              - "${clientTunnel}/128"
-              - "${clientTunnelV4}/32"
-            ${pkgs.lib.optionalString segments "  - \"${clientSID}/128\"\n"}
-            tun: ranet0
-            child_rekey_interval: ${if profile then "0" else "5s"}
-            ike_rekey_interval: ${if profile then "0" else "15s"}
-            rekey_margin: 0
-            rekey_jitter: 0
-            ${
-              if responder then
-                "responder: true"
-              else
-                ''
-                  peers:
-                    - common_name: server
-                      serial_number: "1"
-                ''
-            }
-            ${pkgs.lib.optionalString segments ''
-              segments:
-                source: "${clientTunnel}"
-                local:
-                  - { sid: "${clientSID}", behavior: "End.DT46" }
-                steer:
-                  - from: "${clientTunnel}/128"
-                    to: "${gatewayBehind}/128"
-                    via: ["${gatewaySID}"]
-            ''}
-            ${pkgs.lib.optionalString egress ''
-              egress:
-                enable: true
-                advertise: ["${exitNetV4}", "${exitNetV6}"]
-                interval: 2s
-            ''}
-            ${pkgs.lib.optionalString (kernel || egress) ''
-              kernel:
-                enabled: true
-                table: ${toString kernelTable}
-                protocol: ${toString kernelProtocol}
-                metric: 32
-                prefsrc4: ${clientTunnelV4}
-                reconcile_interval: 2s
-              ${pkgs.lib.optionalString egress
-                # A reply to a translated flow has its destination put back
-                # before the forwarding lookup runs, so the route to the peer
-                # has to be in a table that lookup consults. The mesh's routes
-                # are in a table of the reconciler's own, and a rule is how
-                # anything else reaches them.
-                "  rules:\n    - { to: \"10.99.0.0/24\", table: ${toString kernelTable}, priority: 100 }\n    - { to: \"fd00:99::/64\", table: ${toString kernelTable}, priority: 100 }"
+            node:
+              org: testorg
+              name: client
+            auth:
+              key: /etc/ranet-lite/key.pem
+              trust: /etc/ranet-lite/registry.json
+            link:
+              port: 14000
+              endpoints: [{ serial: "2", family: ip4 }]
+              tun: ranet0
+              ${pkgs.lib.optionalString responder "listen: true"}
+            ${pkgs.lib.optionalString (!responder) ''dial: { to: [{ name: server, serial: "1" }] }''}
+            cap:
+              route:
+                announce: [
+                  "${clientTunnel}/128",
+                  "${clientTunnelV4}/32"${pkgs.lib.optionalString segments '', "${clientSID}/128"''}
+                ]
+              babel: { hello: 500ms, update: 1s }
+              crypto:
+                rekey:
+                  child: ${if profile then "0" else "5s"}
+                  ike: ${if profile then "0" else "15s"}
+                  margin: 0
+                  jitter: 0
+              ${pkgs.lib.optionalString segments ''segment: { source: "${clientTunnel}", local: [{ sid: "${clientSID}", behavior: "End.DT46" }], steer: [{ from: "${clientTunnel}/128", to: "${gatewayBehind}/128", via: ["${gatewaySID}"] }] }''}
+              ${pkgs.lib.optionalString egress ''egress: { advertise: ["${exitNetV4}", "${exitNetV6}"], sweep: 2s }''}
+              ${pkgs.lib.optionalString (kernel || egress)
+                "table: { id: ${toString kernelTable}, proto: ${toString kernelProtocol}, metric: 32, prefsrc4: ${clientTunnelV4}, reconcile: 2s${
+                  # A reply to a translated flow has its destination put back
+                  # before the forwarding lookup runs, so the route to the peer
+                  # has to be in a table that lookup consults. The mesh's routes
+                  # are in a table of the reconciler's own, and a rule is how
+                  # anything else reaches them.
+                  pkgs.lib.optionalString egress
+                    ", rules: [{ to: \"10.99.0.0/24\", table: ${toString kernelTable}, priority: 100 }, { to: \"fd00:99::/64\", table: ${toString kernelTable}, priority: 100 }]"
+                } }"
               }
-            ''}
-            babel:
-              hello_interval: 500ms
-              update_interval: 1s
           '';
         };
 
@@ -474,7 +452,7 @@ in
           after = [ "network-online.target" ];
           serviceConfig = {
             ExecStart =
-              "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug -metrics 127.0.0.1:9669"
+              "${ranetLite}/bin/ranet-lite daemon --config /etc/ranet-lite/config.yaml --log-level debug --metrics 127.0.0.1:9669"
               + pkgs.lib.optionalString profile " -pprof 127.0.0.1:6060";
             TimeoutStopSec = "15s";
             Restart = "on-failure";
@@ -592,7 +570,7 @@ in
         # And the kernel took the header off.
         assert bare_inner(carried), f"the kernel did not decapsulate this tree's header:\n{carried}"
 
-        status = json.loads(client.succeed("ranet-lite status -json"))
+        status = json.loads(client.succeed("ranet-lite status --json"))
         print(json.dumps(status["segment_counters"], indent=2))
         assert status["segment_counters"]["steered"] > 0, "nothing was steered"
         assert status["segment_counters"]["unsteered"] == 0, "a packet could not be steered"
@@ -617,12 +595,12 @@ in
         )
         print(gateway.succeed("ip -6 route show ${clientBehind}/128"))
 
-        before = json.loads(client.succeed("ranet-lite status -json"))["segment_counters"]
+        before = json.loads(client.succeed("ranet-lite status --json"))["segment_counters"]
         gateway.wait_until_succeeds(
             "ping -c 1 -W 2 -I ${gatewayTunnel} ${clientBehind}", timeout=timeout
         )
         gateway.succeed("ping -c 3 -i 0.3 -W 2 -I ${gatewayTunnel} ${clientBehind}")
-        status = json.loads(client.succeed("ranet-lite status -json"))
+        status = json.loads(client.succeed("ranet-lite status --json"))
         after = status["segment_counters"]
         print(json.dumps(after, indent=2))
         assert after["delivered"] > before["delivered"], (

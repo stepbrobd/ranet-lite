@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/schema"
 )
 
 // wireSpeakerPair connects two Speakers via a plain in-memory relay (no
@@ -32,11 +33,11 @@ func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, spe
 	meshA = &netstack.Mesh{Routes: netstack.NewRouteTable()}
 	meshB = &netstack.Mesh{Routes: netstack.NewRouteTable()}
 
-	speakerA, err := New(cfg, meshA)
+	speakerA, err := New(cfg, Routes{}, Runtime{}, meshA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	speakerB, err = New(cfg, meshB)
+	speakerB, err = New(cfg, Routes{}, Runtime{}, meshB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, spe
 }
 
 func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
-	fast := Config{HelloInterval: 50 * time.Millisecond, UpdateInterval: 100 * time.Millisecond}
+	fast := Config{Hello: dur(50 * time.Millisecond), Update: dur(100 * time.Millisecond)}
 	meshA, _, speakerA, speakerB := wireSpeakerPair(t, fast)
 
 	extra := netip.MustParsePrefix("10.66.9.9/32")
@@ -128,7 +129,7 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 	n.reportedCost = 32
 	n.ihuExpiry = time.Now().Add(time.Minute)
 	pkt := buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
-		EncodeRouterID(speakerA.cfg.RouterID), // as if reflected back via another mesh node
+		EncodeRouterID(speakerA.routerID), // as if reflected back via another mesh node
 		EncodeUpdate(Update{AE: AEIPv6, Plen: mine.Bits(), Seqno: 1, Metric: 32, Prefix: net.IP(mine.Addr().AsSlice())}),
 	}))
 	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
@@ -231,7 +232,7 @@ func TestSpeakerSADR(t *testing.T) {
 }
 
 func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
-	fast := Config{HelloInterval: 30 * time.Millisecond, UpdateInterval: 60 * time.Millisecond}
+	fast := Config{Hello: dur(30 * time.Millisecond), Update: dur(60 * time.Millisecond)}
 	meshA, _, speakerA, speakerB := wireSpeakerPair(t, fast)
 
 	extra := netip.MustParsePrefix("10.67.9.9/32")
@@ -269,7 +270,7 @@ func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 
 func TestPeerHandleRemovesExactNeighborAndRoutes(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(Config{}, mesh)
+	speaker, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +302,7 @@ func TestPeerHandleRemovesExactNeighborAndRoutes(t *testing.T) {
 
 func TestWildcardUpdateRetractsEveryRouteFromNeighbor(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(Config{}, mesh)
+	speaker, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +328,7 @@ func TestWildcardUpdateRetractsEveryRouteFromNeighbor(t *testing.T) {
 
 func TestAcknowledgmentUsesUnicastDestination(t *testing.T) {
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(Config{}, mesh)
+	speaker, err := New(Config{}, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,10 +351,20 @@ func TestAcknowledgmentUsesUnicastDestination(t *testing.T) {
 	}
 }
 
-func captureSpeaker(t *testing.T, cfg Config) (*Speaker, *neighborState, *[][]byte) {
+// dur is the file's spelling of an interval, for a test that holds a Go one.
+func dur(d time.Duration) schema.Duration { return schema.Duration(d) }
+
+// captureSpeaker builds one speaker over a recording peer. The runtime is
+// optional, since most tests care about the capability alone and let the
+// router id and the packet size be resolved for them.
+func captureSpeaker(t *testing.T, cfg Config, runtime ...Runtime) (*Speaker, *neighborState, *[][]byte) {
 	t.Helper()
+	var rt Runtime
+	if len(runtime) == 1 {
+		rt = runtime[0]
+	}
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(cfg, mesh)
+	speaker, err := New(cfg, Routes{}, rt, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +419,7 @@ func TestIHUAddressAndRTTOrder(t *testing.T) {
 
 func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 	routerID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	speaker, neighbor, packets := captureSpeaker(t, Config{RouterID: routerID, PacketSize: 64})
+	speaker, neighbor, packets := captureSpeaker(t, Config{}, Runtime{RouterID: routerID, PacketSize: 64})
 	first := netip.MustParsePrefix("10.0.0.1/32")
 	second := netip.MustParsePrefix("2001:db8::1/128")
 	speaker.Originate(first)
@@ -422,8 +433,8 @@ func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 		t.Fatalf("oversized update dump used %d packet(s), want multiple", len(*packets))
 	}
 	for _, packet := range *packets {
-		if got := len(packet) - ipv6HeaderLen - udpHeaderLen; got > speaker.cfg.PacketSize {
-			t.Fatalf("Babel packet is %d bytes, limit %d", got, speaker.cfg.PacketSize)
+		if got := len(packet) - ipv6HeaderLen - udpHeaderLen; got > speaker.packetSize {
+			t.Fatalf("Babel packet is %d bytes, limit %d", got, speaker.packetSize)
 		}
 	}
 
@@ -458,7 +469,7 @@ func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
 // neighbor, and at the default dead timeout each of them declares this node
 // down fourteen seconds later.
 func TestStalledNeighborDoesNotHoldOthers(t *testing.T) {
-	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	speaker, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,10 +536,10 @@ func TestStalledNeighborDoesNotHoldOthers(t *testing.T) {
 // smoothing time constant of RFC 8966 Appendix A.3 and the triggered-update
 // threshold of section 3.7.2, both of which the config decides.
 func TestNewSpeakerCarriesItsConfigurationIntoTheRouteTable(t *testing.T) {
-	cfg := Config{HelloInterval: 4 * time.Second, UpdateInterval: 16 * time.Second}
+	cfg := Config{Hello: dur(4 * time.Second), Update: dur(16 * time.Second)}
 	cfg.Cost = DefaultCostParams()
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := New(cfg, mesh)
+	speaker, err := New(cfg, Routes{}, Runtime{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,12 +558,12 @@ func TestNewSpeakerCarriesItsConfigurationIntoTheRouteTable(t *testing.T) {
 	// which a metric change is worth a triggered update. Zero for either turns
 	// that off: a flapping link would change the selected route on every
 	// update and send one for every change.
-	if want := 3 * cfg.HelloInterval; speaker.routes.tau != want {
+	if want := 3 * cfg.HelloInterval(); speaker.routes.tau != want {
 		t.Errorf("hysteresis time constant is %s, want %s", speaker.routes.tau, want)
 	}
-	if speaker.routes.trigger != cfg.Cost.RxCost {
+	if speaker.routes.trigger != cfg.CostEffective().RxCost {
 		t.Errorf("triggered-update threshold is %d, want one link's base cost, %d",
-			speaker.routes.trigger, cfg.Cost.RxCost)
+			speaker.routes.trigger, cfg.CostEffective().RxCost)
 	}
 }
 
@@ -565,14 +576,13 @@ func TestBabelDefaultsMatchFleet(t *testing.T) {
 	if cost.RxCost != 96 {
 		t.Errorf("default rxcost is %d, want 96", cost.RxCost)
 	}
-	if cost.RTTCost != 1024 || cost.RTTMax != 1024*time.Millisecond {
-		t.Errorf("default rtt costing is %d over %s, want 1024 over 1024ms", cost.RTTCost, cost.RTTMax)
+	if cost.RTT.Weight != 1024 || cost.RTT.Max != dur(1024*time.Millisecond) {
+		t.Errorf("default rtt costing is %d over %s, want 1024 over 1024ms", cost.RTT.Weight, cost.RTT.Max)
 	}
 	var cfg Config
-	cfg.setDefaults()
-	if cfg.HelloInterval != 4*time.Second || cfg.UpdateInterval != 16*time.Second {
+	if cfg.HelloInterval() != 4*time.Second || cfg.UpdateInterval() != 16*time.Second {
 		t.Errorf("default intervals are %s and %s, want the 4s and 16s of RFC 8966 Appendix B",
-			cfg.HelloInterval, cfg.UpdateInterval)
+			cfg.HelloInterval(), cfg.UpdateInterval())
 	}
 }
 
@@ -581,7 +591,7 @@ func TestBabelDefaultsMatchFleet(t *testing.T) {
 // consumed it anyway, the prefix leaves every later dump too and the neighbor
 // black-holes it until its own expiry, which at the defaults is 56 seconds.
 func TestDroppedRetractionIsSentAgain(t *testing.T) {
-	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	speaker, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,7 +724,7 @@ func TestUnscheduledHelloDoesNotFlapANeighbor(t *testing.T) {
 // decided before the update that replaces it can reach the neighbor after it,
 // and the neighbor holds the wrong answer until the next periodic dump.
 func TestEmittersCannotInvertWhatTheyDecided(t *testing.T) {
-	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	speaker, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -829,32 +839,31 @@ func TestDefaultsMatchFleetTheyReplace(t *testing.T) {
 		t.Errorf("default rxcost is %d, want 96: at anything lower a hop through this node looks cheaper than a BIRD hop", cost.RxCost)
 	}
 	// RFC 9616's RTT term, weighted as babeld weights it.
-	if cost.RTTCost != 1024 {
-		t.Errorf("default rtt cost is %d, want 1024", cost.RTTCost)
+	if cost.RTT.Weight != 1024 {
+		t.Errorf("default rtt cost is %d, want 1024", cost.RTT.Weight)
 	}
 	// RFC 9616 section 4.2 RECOMMENDS rtt-min = 10 ms and asks for the mapping
 	// to be "constant around 0". rtt-max stays wider than the 120 ms it
 	// RECOMMENDS because this is a global mesh, where 120 ms saturates every
 	// intercontinental path and the penalty stops ranking them.
-	if cost.RTTMax != 1024*time.Millisecond || cost.RTTMin != 10*time.Millisecond {
-		t.Errorf("default rtt window is %s..%s, want 10ms..1024ms", cost.RTTMin, cost.RTTMax)
+	if cost.RTT.Max != dur(1024*time.Millisecond) || cost.RTT.Min != dur(10*time.Millisecond) {
+		t.Errorf("default rtt window is %s..%s, want 10ms..1024ms", cost.RTT.Min, cost.RTT.Max)
 	}
 
 	var cfg Config
-	cfg.setDefaults()
 	// RFC 8966 Appendix B's hello interval, which sets how long a peer that is
 	// up but silent takes to be declared dead.
-	if cfg.HelloInterval != 4*time.Second {
-		t.Errorf("default hello interval is %s, want 4s", cfg.HelloInterval)
+	if cfg.HelloInterval() != 4*time.Second {
+		t.Errorf("default hello interval is %s, want 4s", cfg.HelloInterval())
 	}
-	if got, want := deadTimeout(cfg.HelloInterval), 14*time.Second; got > want {
+	if got, want := deadTimeout(cfg.HelloInterval()), 14*time.Second; got > want {
 		t.Errorf("a silent peer is declared dead after %s, want no more than %s", got, want)
 	}
 	// Appendix B again: the update interval is four hellos.
-	if cfg.UpdateInterval != 4*cfg.HelloInterval {
-		t.Errorf("default update interval is %s, want four hello intervals", cfg.UpdateInterval)
+	if cfg.UpdateInterval() != 4*cfg.HelloInterval() {
+		t.Errorf("default update interval is %s, want four hello intervals", cfg.UpdateInterval())
 	}
-	if cfg.Cost != cost {
+	if cfg.CostEffective() != cost {
 		t.Error("a config with no costs configured does not get the defaults above")
 	}
 }
@@ -865,16 +874,16 @@ func TestDefaultsMatchFleetTheyReplace(t *testing.T) {
 // exactly, so a flapping challenger takes the route on its first good sample;
 // with the trigger at zero every metric fluctuation earns a triggered update.
 func TestRouteTableTakesHysteresisFromConfig(t *testing.T) {
-	cfg := Config{HelloInterval: 3 * time.Second, Cost: CostParams{RxCost: 77, RTTMax: time.Second}}
-	speaker, err := New(cfg, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	cfg := Config{Hello: dur(3 * time.Second), Cost: CostParams{RxCost: 77, RTT: RTTCost{Max: dur(time.Second)}}}
+	speaker, err := New(cfg, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := 3 * cfg.HelloInterval; speaker.routes.tau != want {
+	if want := 3 * cfg.HelloInterval(); speaker.routes.tau != want {
 		t.Errorf("the smoothing time constant is %s, want %s, three hello intervals", speaker.routes.tau, want)
 	}
-	if speaker.routes.trigger != cfg.Cost.RxCost {
-		t.Errorf("the triggered-update threshold is %d, want one link's base cost %d", speaker.routes.trigger, cfg.Cost.RxCost)
+	if speaker.routes.trigger != cfg.CostEffective().RxCost {
+		t.Errorf("the triggered-update threshold is %d, want one link's base cost %d", speaker.routes.trigger, cfg.CostEffective().RxCost)
 	}
 }
 
@@ -1109,7 +1118,7 @@ func TestLostPacketsDoNotWakeTheLoopPerPacket(t *testing.T) {
 	// One prefix per packet or two, so eight of them lose several packets
 	// rather than one, and a long hello interval so the retry interval the
 	// wake is spaced by is a second rather than a millisecond.
-	speaker, neighbor, _ := captureSpeaker(t, Config{PacketSize: 63, HelloInterval: 4 * time.Second})
+	speaker, neighbor, _ := captureSpeaker(t, Config{Hello: dur(4 * time.Second)}, Runtime{PacketSize: 63})
 	makeNeighborReachable(neighbor)
 	losing := netstack.NewPeerReserved("losing",
 		func(int) (netstack.BatchSealer, error) {
@@ -1179,7 +1188,7 @@ func partialPeer(id string, accept int) *netstack.Peer {
 func TestPartlyRefusedDumpOwesOnlyWhatItLost(t *testing.T) {
 	const prefixes, accept = 8, 1
 	// The smallest packet the speaker takes, so eight prefixes need several.
-	speaker, neighbor, _ := captureSpeaker(t, Config{PacketSize: 63})
+	speaker, neighbor, _ := captureSpeaker(t, Config{}, Runtime{PacketSize: 63})
 	makeNeighborReachable(neighbor)
 	for i := range prefixes {
 		speaker.Originate(netip.MustParsePrefix(fmt.Sprintf("fd00:%x::/64", i)))
@@ -1207,7 +1216,7 @@ func TestPartlyRefusedDumpOwesOnlyWhatItLost(t *testing.T) {
 // already recorded it as asked and nothing rolls that back, so a dropped
 // request is a prefix that stops being asked about at all.
 func TestDumpDoesNotStarveRequestsDecidedWithIt(t *testing.T) {
-	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	speaker, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1334,7 +1343,7 @@ func TestRetractionForUnadvertisedPrefixCostsNothing(t *testing.T) {
 // route through the neighbor, and the only retry is the next hello interval,
 // so it is the one packet of a pass that nothing else can stand in for.
 func TestHelloSurvivesPassThatFillsTheBudget(t *testing.T) {
-	speaker, err := New(Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	speaker, err := New(Config{}, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1817,7 +1826,7 @@ func TestRepeatedRouterIDIsSentOncePerPacket(t *testing.T) {
 // The id in effect does not cross a packet boundary, so a run the assembler
 // splits has to spell it out again at the head of the piece that follows.
 func TestSplitPacketCarriesTheRouterIDAgain(t *testing.T) {
-	speaker, neighbor, packets := captureSpeaker(t, Config{PacketSize: 96})
+	speaker, neighbor, packets := captureSpeaker(t, Config{}, Runtime{PacketSize: 96})
 	makeNeighborReachable(neighbor)
 	var tlvs []RawTLV
 	for i := range 8 {
@@ -2006,7 +2015,7 @@ func TestCongestedPeerDoesNotReopenTheWakePerPacket(t *testing.T) {
 // entries that suppress nothing for as long as a hello interval, which
 // Validate allows to be minutes.
 func TestSuppressionWindowIsADeadlineOfItsOwn(t *testing.T) {
-	speaker, neighbor, _ := captureSpeaker(t, Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute})
+	speaker, neighbor, _ := captureSpeaker(t, Config{Hello: dur(10 * time.Minute), Update: dur(10 * time.Minute)})
 	makeNeighborReachable(neighbor)
 	now := time.Now()
 	speaker.mu.Lock()
@@ -2094,7 +2103,7 @@ func quietPasses(t *testing.T, s *Speaker) uint64 {
 // and counts what the packets cost.
 func TestRefreshingHellosCostTheRunLoopNothing(t *testing.T) {
 	speaker, neighbor, _ := captureSpeaker(t, Config{
-		HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute})
+		Hello: dur(10 * time.Minute), Update: dur(10 * time.Minute)})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); speaker.Run(ctx) }()
@@ -2324,7 +2333,7 @@ func TestPacketWakesALoopThatHasNotRunYet(t *testing.T) {
 // id has to come out of the size the run is packed to, or the assembler splits
 // as if it were still there and the packets stay as many as before.
 func TestSuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
-	speaker, neighbor, packets := captureSpeaker(t, Config{PacketSize: 96})
+	speaker, neighbor, packets := captureSpeaker(t, Config{}, Runtime{PacketSize: 96})
 	makeNeighborReachable(neighbor)
 	var run []RawTLV
 	for i := range 4 {
@@ -2343,8 +2352,8 @@ func TestSuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
 		t.Errorf("four Updates sharing one id left as %d packets, the shape they have with the id repeated", got)
 	}
 	for _, raw := range *packets {
-		if got := len(raw) - ipv6HeaderLen - udpHeaderLen; got > speaker.cfg.PacketSize {
-			t.Errorf("a packet came out %d bytes, past the %d configured", got, speaker.cfg.PacketSize)
+		if got := len(raw) - ipv6HeaderLen - udpHeaderLen; got > speaker.packetSize {
+			t.Errorf("a packet came out %d bytes, past the %d configured", got, speaker.packetSize)
 		}
 	}
 }
@@ -2356,7 +2365,7 @@ func TestSuppressedRouterIDMakesRoomInThePacket(t *testing.T) {
 // congested moment black-holed everything this node originates until the next
 // periodic dump, which is an update interval away.
 func TestRefusedDumpIsStillOwed(t *testing.T) {
-	speaker, _, _ := captureSpeaker(t, Config{HelloInterval: time.Minute, UpdateInterval: time.Minute})
+	speaker, _, _ := captureSpeaker(t, Config{Hello: dur(time.Minute), Update: dur(time.Minute)})
 	speaker.Originate(netip.MustParsePrefix("fd00:1::/64"))
 	speaker.Originate(netip.MustParsePrefix("fd00:2::/64"))
 
@@ -2425,7 +2434,7 @@ func TestRefusedDumpIsStillOwed(t *testing.T) {
 // updateActions branch, so each of those wakes rebuilds and resends the whole
 // dump to the healthy neighbors as well.
 func TestCongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
-	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
+	long := Config{Hello: dur(10 * time.Minute), Update: dur(10 * time.Minute)}
 	speaker, healthy, packets := captureSpeaker(t, long)
 	makeNeighborReachable(healthy)
 	stuck := addPeer(t, speaker, refusingPeer("stuck"))
@@ -2493,7 +2502,7 @@ func TestCongestedPeerDoesNotReopenTheWakeThroughARefusedDump(t *testing.T) {
 // has already given up.
 func TestSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
 	const shortest = 10 * time.Millisecond
-	speaker, _, _ := captureSpeaker(t, Config{HelloInterval: shortest, UpdateInterval: time.Minute})
+	speaker, _, _ := captureSpeaker(t, Config{Hello: dur(shortest), Update: dur(time.Minute)})
 	now := time.Now()
 	speaker.mu.Lock()
 	defer speaker.mu.Unlock()
@@ -2522,7 +2531,7 @@ func TestSendRetryFitsInsideTheDeadTimeout(t *testing.T) {
 // interval Validate accepts is minutes, and the advertised rxcost keeps
 // following a measurement that has already expired.
 func TestStaleRTTHasADeadlineOfItsOwn(t *testing.T) {
-	long := Config{HelloInterval: 10 * time.Minute, UpdateInterval: 10 * time.Minute}
+	long := Config{Hello: dur(10 * time.Minute), Update: dur(10 * time.Minute)}
 	speaker, neighbor, _ := captureSpeaker(t, long)
 	makeNeighborReachable(neighbor)
 	now := time.Now()

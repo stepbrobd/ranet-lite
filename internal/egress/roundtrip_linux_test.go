@@ -28,8 +28,8 @@ func TestNftablesRoundTripInNetworkNamespace(t *testing.T) {
 	}
 	enterThrowawayNamespace(t)
 
-	cfg := Config{
-		Enable: true, Return: true,
+	cfg := Egress{
+		Return:    true,
 		Advertise: prefixes(t, "198.51.100.0/24", "2001:db8:1::/48", "0.0.0.0/0"),
 	}
 	rt := Runtime{
