@@ -87,6 +87,11 @@ type Mesh struct {
 	outboundReaderWG   sync.WaitGroup
 	outboundWorkerWG   sync.WaitGroup
 	writerWG           sync.WaitGroup
+
+	// segmentCounters is the segment routing state, in its own struct so that
+	// everything this file does not touch stays in segments.go with the code
+	// that does.
+	segmentCounters
 }
 
 // outboundBatch owns the TUN buffers from one read until a crypto worker has
@@ -381,6 +386,13 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	m.deliveryWG.Add(1)
 	m.deliveryMu.Unlock()
 	defer m.deliveryWG.Done()
+	// A packet addressed to one of this node's own segments is acted on here
+	// rather than written to the tun, where it would arrive as an
+	// undeliverable packet addressed to an address of ours.
+	raw = m.applySegments(raw)
+	if len(raw) == 0 {
+		return
+	}
 	if len(m.devs) == 1 {
 		for len(raw) != 0 {
 			n := min(len(raw), inboundWriteBatchSize)
