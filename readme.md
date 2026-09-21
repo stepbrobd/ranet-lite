@@ -230,7 +230,7 @@ capability granted to the binary).
 ## Running
 
 ```sh
-sudo ./ranet-lite -config /etc/ranet-lite/config.yaml
+sudo ./ranet-lite daemon --config /etc/ranet-lite/config.yaml
 ```
 
 On startup it logs the TUN device's name (e.g. `ranet0`). Traffic won't flow
@@ -241,11 +241,12 @@ ip addr add 10.66.0.5/32 dev ranet0
 ip route add 10.66.0.0/16 dev ranet0
 ```
 
-The same binary is also the client. A first argument that is not a flag asks a
-running daemon a question over its control socket rather than starting a node,
-so `ranet-lite status` and its siblings work alongside a deployment's own
-`ranet-lite -config ...` with no second binary and no second unit. See
-[Control socket](#control-socket).
+`daemon` is the node; every other subcommand asks a running one a question over
+its control socket, so `ranet-lite status` and its siblings work alongside a
+deployment's own `ranet-lite daemon` with no second binary and no second unit.
+See [Control socket](#control-socket). `ranet-lite completion bash|zsh|fish`
+writes the shell's completion script, generated from the command tree so a
+command added without one is completed anyway.
 
 ## Configuration
 
@@ -501,16 +502,16 @@ over the extension's own channel.
 
 ## Control socket
 
-`-control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
+`--control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
 the default, so a node is askable without having been configured to be.
-`-control ""` turns it off. The socket is mode 0660 and the unit names the group
-that can read it. Nothing on the socket writes, and a reader is bounded by an
-idle timeout and by a limit on the connections open at once across every reader,
-because a client that accumulates them costs the daemon a descriptor apiece and
-a node out of descriptors is one that cannot be asked anything at all. Past that
-limit a connection is closed as it is accepted, so a client holding every place
-is refused at once rather than left waiting, and a shutdown is not held up
-behind it.
+`--control ""` turns it off. The socket is mode 0660 and the unit names the
+group that can read it. Nothing on the socket writes, and a reader is bounded by
+an idle timeout and by a limit on the connections open at once across every
+reader, because a client that accumulates them costs the daemon a descriptor
+apiece and a node out of descriptors is one that cannot be asked anything at
+all. Past that limit a connection is closed as it is accepted, so a client
+holding every place is refused at once rather than left waiting, and a shutdown
+is not held up behind it.
 
 Which process owns the path is settled by an exclusive lock on a sibling file
 rather than by dialing the socket to see whether anything answers, since a live
@@ -523,10 +524,11 @@ having been asked for.
 
 The version a node reports is `version.txt` and the commit the binary was built
 from, because `version.txt` moves once per release and a fleet is converted one
-node at a time in between. `ranet-lite -version` asks the binary the same
-question without a node running.
+node at a time in between. `ranet-lite version` asks the binary the same
+question without a node running, and `ranet-lite version --daemon` asks the
+node, which is how the two are told apart during a conversion.
 
-The subcommands read it and print a table, or the wire form with `-json`:
+The subcommands read it and print a table, or the wire form with `--json`:
 
 ```
 $ ranet-lite status
