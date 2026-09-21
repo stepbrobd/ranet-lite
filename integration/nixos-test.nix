@@ -9,6 +9,11 @@
   # kernel turns on the route reconciler, so the routes babel learns from BIRD
   # have to reach a real kernel table rather than only the in-process trie.
   kernel ? false,
+  # segments steers one destination through a segment routing header that the
+  # gateway's own kernel decapsulates, so this tree's encapsulation is checked
+  # against the implementation it has to interoperate with rather than against
+  # its own decoder.
+  segments ? false,
 }:
 
 let
@@ -18,6 +23,10 @@ let
   kernelTable = 200;
   kernelProtocol = 155;
   clientTunnelV4 = "10.88.0.2";
+  # Inside the /64 BIRD already announces, so the segment is reachable over
+  # the mesh without a second announcement to keep in step with this one.
+  gatewaySID = "fd00:99::6:1";
+  gatewayBehind = "fd00:99::9";
   publicKey = builtins.readFile ./org-pub.pem;
 
   common = {
@@ -36,6 +45,8 @@ in
       "ranet-lite-responder"
     else if kernel then
       "ranet-lite-kernel"
+    else if segments then
+      "ranet-lite-segments"
     else
       "ranet-lite-integration";
 
@@ -46,12 +57,33 @@ in
         imports = [ common ];
 
         boot.kernelModules = [ "xfrm_interface" ];
-        environment.systemPackages = with pkgs; [
-          bird2
-          iperf3
-          iproute2
-          config.services.strongswan-swanctl.package
-        ];
+
+        # The gateway is the peer this tree has to interoperate with, so the
+        # segment it answers for is the kernel's own End behavior rather than
+        # anything from this repository. default covers swan0, which
+        # strongSwan creates once the SA is up and after any boot-time sysctl
+        # would have run.
+        boot.kernel.sysctl = pkgs.lib.mkIf segments {
+          "net.ipv6.conf.all.seg6_enabled" = 1;
+          "net.ipv6.conf.default.seg6_enabled" = 1;
+          # A node answering for a segment is a router for it, and a kernel
+          # with forwarding off drops the packet in ip6_forward and counts
+          # Ip6InAddrErrors, which reads as an address problem rather than as
+          # a policy one. The fleet's own nodes set this too.
+          "net.ipv6.conf.all.forwarding" = 1;
+        };
+
+        environment.systemPackages =
+          with pkgs;
+          [
+            bird2
+            iperf3
+            iproute2
+            config.services.strongswan-swanctl.package
+          ]
+          # A capture is the only thing that tells a packet that never arrived
+          # from one the far end refused.
+          ++ pkgs.lib.optionals segments [ tcpdump ];
 
         environment.etc = {
           "swanctl/private/org-key.pem".source = ./org-key.pem;
@@ -81,7 +113,12 @@ in
                 { Address = "fe80::1/64"; }
                 { Address = "${gatewayTunnel}/64"; }
                 { Address = "${gatewayTunnelV4}/24"; }
-              ];
+              ]
+              # The steered destination goes here rather than on lo, because
+              # the tunnel prefix is a connected /64 on this link: an address
+              # inside it that is not assigned locally is one the gateway
+              # sends straight back to the client.
+              ++ pkgs.lib.optionals segments [ { Address = "${gatewayBehind}/128"; } ];
             };
           };
         };
@@ -224,6 +261,7 @@ in
             curl
             iperf3
             iproute2
+            ranetLite
           ]
           ++ lib.optionals profile [
             pprof
@@ -321,6 +359,14 @@ in
                       serial_number: "1"
                 ''
             }
+            ${pkgs.lib.optionalString segments ''
+              segments:
+                source: "${clientTunnel}"
+                steer:
+                  - from: "${clientTunnel}/128"
+                    to: "${gatewayBehind}/128"
+                    via: ["${gatewaySID}"]
+            ''}
             ${pkgs.lib.optionalString kernel ''
               kernel:
                 enabled: true
@@ -373,6 +419,84 @@ in
 
         start_all()
 
+      '';
+
+      # The gateway's own kernel decapsulates what this tree encapsulated, so
+      # the header is checked against the implementation it interoperates with
+      # rather than against its own decoder.
+      #
+      # The assertion is on the capture rather than on a round trip, because
+      # what is being tested is whether the kernel accepts this tree's header
+      # and takes it off. Where the inner packet goes afterwards is the test
+      # topology's business: End.DT6 looks the decapsulated destination up in
+      # the table it is given, and a local address of the gateway's is not in
+      # main.
+      segmentRouted = ''
+        import json
+
+        gateway.wait_for_unit("systemd-networkd-wait-online.service")
+        gateway.wait_for_unit("strongswan-swanctl.service")
+        gateway.wait_for_unit("bird.service")
+        client.wait_for_unit("ranet-lite.service")
+
+        # The unsteered path first, so a failure below is the segment rather
+        # than the mesh.
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+
+        # The local SID is the kernel's own behavior, added here rather than
+        # in the module so a rejection is a failing command. The device is the
+        # one the packet arrives on: an input lookup landing on a route out of
+        # lo answers ICMP unreachable, which reads exactly like a segment the
+        # kernel never had.
+        gateway.succeed(
+            "ip -6 route replace ${gatewaySID}/128 encap seg6local action End.DT6 table 254 dev swan0"
+        )
+        print(gateway.succeed("ip -6 route show ${gatewaySID}/128"))
+
+        def steer_and_capture(machine, name):
+            """Three steered packets, and what the gateway made of them."""
+            machine.succeed(f"rm -f /tmp/{name}.pcap")
+            machine.execute(f"tcpdump -ni swan0 -w /tmp/{name}.pcap ip6 >/dev/null 2>&1 &")
+            machine.wait_until_succeeds("pgrep -x tcpdump", timeout=timeout)
+            client.execute("ping -c 3 -i 0.3 -W 1 -I ${clientTunnel} ${gatewayBehind}")
+            machine.succeed("pkill -x tcpdump")
+            machine.wait_until_fails("pgrep -x tcpdump", timeout=timeout)
+            return machine.succeed(f"tcpdump -nr /tmp/{name}.pcap 'not port 6696'")
+
+        def bare_inner(capture):
+            """The inner packet on its own, with no routing header left.
+
+            The encapsulated line carries the inner addresses too, since
+            tcpdump prints what is inside, so the routing header is the only
+            thing telling the two apart. The ICMP error the gateway sends when it has no
+            segment runs the other way and matches neither.
+            """
+            return [
+                line for line in capture.splitlines()
+                if "${clientTunnel} > ${gatewayBehind}:" in line and "RT6" not in line
+            ]
+
+        carried = steer_and_capture(gateway, "carried")
+        print(carried)
+        # The encapsulated packet arrived, addressed to the segment.
+        assert "${gatewaySID}" in carried, "the steered packet never reached the gateway"
+        # And the kernel took the header off.
+        assert bare_inner(carried), f"the kernel did not decapsulate this tree's header:\n{carried}"
+
+        status = json.loads(client.succeed("ranet-lite status -json"))
+        print(json.dumps(status["segment_counters"], indent=2))
+        assert status["segment_counters"]["steered"] > 0, "nothing was steered"
+        assert status["segment_counters"]["unsteered"] == 0, "a packet could not be steered"
+        assert status["steering"], "the steering policy is not reported"
+
+        # Taking the segment away leaves the encapsulated packet arriving and
+        # nothing coming out of it, which is the proof that the line above was
+        # the kernel acting on the header rather than anything else.
+        gateway.succeed("ip -6 route del ${gatewaySID}/128")
+        refused = steer_and_capture(gateway, "refused")
+        print(refused)
+        assert "${gatewaySID}" in refused, "the steered packet stopped arriving for another reason"
+        assert not bare_inner(refused), f"something still decapsulated the header:\n{refused}"
       '';
 
       # strongSwan answers, ranet-lite dials: upstream's original exchange.
@@ -537,5 +661,13 @@ in
             print(client.execute("ip -s link show ranet0")[1])
       '';
     in
-    preamble + (if responder then responderScript else initiator);
+    preamble
+    + (
+      if responder then
+        responderScript
+      else if segments then
+        segmentRouted
+      else
+        initiator
+    );
 }

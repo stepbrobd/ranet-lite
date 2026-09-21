@@ -112,6 +112,7 @@
               integration-multicore = integration { cores = 4; };
               responder = integration { responder = true; };
               kernel = integration { kernel = true; };
+              segments = integration { segments = true; };
             };
           };
       }
