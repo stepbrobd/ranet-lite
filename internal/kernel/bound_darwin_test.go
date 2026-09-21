@@ -15,7 +15,7 @@ import (
 
 // What a socket bound with IP_BOUND_IF actually does when the mesh holds a
 // route covering the whole address space, which is the arrangement
-// Config.BoundUnderlay exists for, and what UnderlayDefaults writes to make it
+// Runtime.BoundUnderlay exists for, and what UnderlayDefaults writes to make it
 // work. It is measured rather than assumed, because the claim it rests on,
 // that a bound socket leaves the forwarding table behind, turns out to be
 // false on this kernel and the cost of being wrong is a Mac with no network.

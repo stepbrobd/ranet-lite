@@ -231,6 +231,13 @@ func TestBoundReachProbeAnswersForBothFamilies(t *testing.T) {
 		// something that is not a routing answer.
 		err := reachesWhenBound(index, probe)
 		t.Logf("interface %d to %s: %v", index, probe, err)
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			// A sandbox that forbids the syscall is not the host answering
+			// about a route, so there is nothing here to assert against. The
+			// nix darwin builder refuses a connect to anything off the loopback
+			// even with __darwinAllowLocalNetworking.
+			t.Skipf("this sandbox will not let a socket ask about %s: %v", probe, err)
+		}
 		if err != nil && !errors.Is(err, unix.ENETUNREACH) && !errors.Is(err, unix.EHOSTUNREACH) &&
 			!errors.Is(err, unix.EADDRNOTAVAIL) && !errors.Is(err, unix.ENETDOWN) {
 			t.Errorf("probing %s answered %v, which is not a routing answer", probe, err)
