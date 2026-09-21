@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"slices"
 	"strings"
 
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/registry"
+	"github.com/NickCao/ranet-lite/internal/srv6"
 )
 
 // validateRuntimeConfig refuses a configuration the registry does not support.
@@ -57,6 +59,29 @@ func validateLocalConfig(cfg *config.Config, privateKey ed25519.PrivateKey, reg 
 		localFamilies[endpoint.AddressFamily] = struct{}{}
 	}
 	return localFamilies, nil
+}
+
+// localSegments builds the table this node answers segment routing with, and
+// refuses a configuration it cannot. It is here rather than in internal/srv6
+// because that package takes bytes and returns bytes, and a config file is
+// neither.
+func localSegments(cfg *config.Config) (*srv6.LocalTable, error) {
+	if len(cfg.Segments.Local) == 0 {
+		return nil, nil
+	}
+	segments := make([]srv6.Segment, 0, len(cfg.Segments.Local))
+	for _, local := range cfg.Segments.Local {
+		sid, err := netip.ParseAddr(local.SID)
+		if err != nil {
+			return nil, fmt.Errorf("config: segments.local sid %q: %w", local.SID, err)
+		}
+		behavior, err := srv6.ParseBehavior(local.Behavior)
+		if err != nil {
+			return nil, fmt.Errorf("config: segments.local %s: %w", local.SID, err)
+		}
+		segments = append(segments, srv6.Segment{SID: sid, Behavior: behavior})
+	}
+	return srv6.NewLocalTable(segments)
 }
 
 // effectivePeers is who this node dials: the configured list, or every node

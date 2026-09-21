@@ -195,6 +195,11 @@ func reloadable(old, next *config.Config) error {
 		// of reporting a reload that did nothing. Originate is the exception:
 		// SetOriginated applies it, and it is the field an exit changes.
 		return fmt.Errorf("config: babel settings changed, restart to apply")
+	case !reflect.DeepEqual(normalizeSegments(old.Segments), normalizeSegments(next.Segments)):
+		// The table is built once, before the tun exists, and the inbound
+		// path reads it without asking whether it changed. Applying a new one
+		// here would leave packets already in flight acted on under the old.
+		return fmt.Errorf("config: segments changed, restart to apply")
 	case !sameKernelSettings(old.Kernel, next.Kernel) || !sameKernelAddresses(old, next):
 		// The reconciler is configured once in main, including the addresses
 		// assign_originated expands into, so none of this block can be applied
@@ -215,6 +220,15 @@ func reloadable(old, next *config.Config) error {
 // interval and one written out as its own default; comparing them as written
 // refuses a reload that changes nothing, which writing "reconcile_interval:
 // 30s" into the file would have been enough to cause.
+// normalizeSegments compares the block by what it was given rather than by how
+// the file was written, so an omitted list and an empty one are the same.
+func normalizeSegments(segments config.Segments) config.Segments {
+	if len(segments.Local) == 0 {
+		segments.Local = nil
+	}
+	return segments
+}
+
 func sameKernelSettings(old, next config.Kernel) bool {
 	normalize := func(k *config.Kernel) {
 		if len(k.Addresses) == 0 {

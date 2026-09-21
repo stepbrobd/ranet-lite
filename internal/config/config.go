@@ -77,9 +77,10 @@ type Config struct {
 	// deployment already owns. Pick a mark nothing else on the host uses.
 	FWMark uint32 `yaml:"fwmark"`
 
-	Peers  []Peer `yaml:"peers"`
-	Babel  Babel  `yaml:"babel"`
-	Kernel Kernel `yaml:"kernel"`
+	Peers    []Peer   `yaml:"peers"`
+	Babel    Babel    `yaml:"babel"`
+	Kernel   Kernel   `yaml:"kernel"`
+	Segments Segments `yaml:"segments"`
 	// Experimental is ranet's block, carried so its config parses here.
 	Experimental Experimental `yaml:"experimental"`
 }
@@ -133,6 +134,29 @@ type Kernel struct {
 	// ReconcileInterval is the periodic sweep that corrects drift nothing
 	// announced. Omitted uses the package default.
 	ReconcileInterval *Duration `yaml:"reconcile_interval"`
+}
+
+// Segments configures segment routing, RFC 8986, which this tree performs in
+// the dataplane rather than in a kernel. That makes it the one piece of the
+// fleet's steering that works the same on every platform: darwin has no
+// segment routing and a mobile tunnel provider has no forwarding table at all,
+// and neither needs one when the process carrying the packet is the one acting
+// on the header.
+type Segments struct {
+	// Local is the segments this node answers for. The fleet spells them as
+	// seg6local routes under its own /60, `<base>6::1` for End.DT46 and
+	// `<base>6::2` for End, and the same two addresses go here unchanged.
+	Local []LocalSegment `yaml:"local"`
+}
+
+// LocalSegment is one address this node answers for and what it does with a
+// packet that arrives on it.
+type LocalSegment struct {
+	SID string `yaml:"sid"`
+	// Behavior is spelled as RFC 8986 spells it and as
+	// `ip route ... encap seg6local action` takes it, so a converted
+	// configuration reads the same: End for a waypoint, End.DT46 for an exit.
+	Behavior string `yaml:"behavior"`
 }
 
 // Rule is one policy rule as the file spells it. The strings are parsed where

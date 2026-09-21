@@ -123,10 +123,17 @@ func New(cfg *config.Config) (_ *Client, err error) {
 		return nil, err
 	}
 	warnUnforwardableTransit(cfg)
+	// Before the tun exists, so a segment this node could not answer for
+	// refuses the startup without a device to clean up.
+	segments, err := localSegments(cfg)
+	if err != nil {
+		return nil, err
+	}
 	mesh, err := netstack.NewNamed(0, cfg.TUN)
 	if err != nil {
 		return nil, err
 	}
+	mesh.SetSegments(segments)
 	defer func() {
 		if err != nil {
 			mesh.Close()
