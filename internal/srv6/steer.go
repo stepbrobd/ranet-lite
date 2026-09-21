@@ -97,13 +97,6 @@ func NewSteerTable(entries []Steer) (*SteerTable, error) {
 				return nil, fmt.Errorf("srv6: steering entry selector %s is a v4-mapped prefix, which no packet is looked up under", prefix)
 			}
 		}
-		selector := [2]netip.Prefix{entry.From, entry.To}
-		if seen[selector] {
-			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(*entry))
-		}
-		seen[selector] = true
-		entry.name = steerName(*entry)
-		out.overhead = max(out.overhead, entry.Policy.Overhead())
 		// The trie is keyed by destination first and has no entry for "any
 		// destination", so an entry that names only a source takes the
 		// zero-length prefix of the family its source is in. An invalid
@@ -113,6 +106,18 @@ func NewSteerTable(entries []Steer) (*SteerTable, error) {
 		if !destination.IsValid() {
 			destination = anyDestination(entry.From)
 		}
+		// Keyed on what the trie is keyed on rather than on what was written,
+		// because those differ: an omitted destination and one written out as
+		// the zero-length prefix are two spellings the trie stores under one
+		// key, so keying on the spelling lets the second entry overwrite the
+		// first while a diagnostic goes on reporting both.
+		selector := [2]netip.Prefix{entry.From, destination}
+		if seen[selector] {
+			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(*entry))
+		}
+		seen[selector] = true
+		entry.name = steerName(*entry)
+		out.overhead = max(out.overhead, entry.Policy.Overhead())
 		out.table.Set(entry.From, destination, &entry.Policy)
 	}
 	return out, nil

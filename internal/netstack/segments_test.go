@@ -426,3 +426,25 @@ func TestTwoSegmentsOfThisNodeInOneListAreBothActedOn(t *testing.T) {
 		t.Errorf("a list naming two of this node's segments counted %+v", counters)
 	}
 }
+
+// The report interval is measured on the monotonic clock, which needs a start.
+// time.Since of a zero time saturates, so a counter set that was never started
+// would report once and suppress everything after it for 292 years, which is
+// the failure a rate limit is supposed to prevent rather than cause.
+func TestDropReportsSurviveACounterSetThatWasNeverStarted(t *testing.T) {
+	primed := &Mesh{Routes: NewRouteTable()}
+	primed.startSegmentReports()
+	primed.reportSegmentDrop("first")
+	if got := primed.segmentReported.Load(); got < 0 {
+		t.Error("a started set did not record its first report")
+	}
+
+	// A Mesh nothing started still reports rather than going quiet.
+	var unstarted Mesh
+	for range 3 {
+		unstarted.reportSegmentDrop("still speaking")
+	}
+	if !unstarted.segmentsStarted.IsZero() {
+		t.Fatal("the unstarted case is no longer reachable, so this test is not testing it")
+	}
+}

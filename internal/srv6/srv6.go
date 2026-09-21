@@ -99,8 +99,9 @@ var (
 	ErrNotSegmentRouted = errors.New("srv6: packet carries no segment routing header")
 	// ErrExhausted is an End reached with no segment left to move to. RFC 8986
 	// section 4.1 S03 hands the packet to whatever the next header names; this
-	// drops it, as get_and_validate_srh does, because a waypoint SID is not
-	// an address this node terminates traffic on.
+	// drops it, as linux does by passing IP6_FH_F_SKIP_RH and then finding no
+	// header left to act on, because a waypoint SID is not an address this
+	// node terminates traffic on.
 	ErrExhausted = errors.New("srv6: End reached the last segment and there is nowhere to forward to")
 	// ErrHopLimit and ErrHeaderInvalid name the two refusals RFC 8986 section
 	// 4.1 answers with an ICMP message rather than with silence, S06 and S10.
@@ -276,23 +277,27 @@ func Usable(address netip.Addr) bool {
 // the inner header.
 func writeOuter(out, inner []byte, source netip.Addr, path []netip.Addr) {
 	innerNext, _ := innerNextHeader(inner)
-	// __seg6_do_srh_encap copies the traffic class and the hop limit out of an
-	// IPv6 inner packet and leaves the flow label at zero, the default the
-	// seg6_flowlabel sysctl asks for. Matching it keeps a packet
-	// this node steers and one a kernel headend steers the same bytes, and
-	// stops an encapsulation handing a packet a hop budget its own header had
-	// already spent.
-	traffic, hopLimit := uint8(0), uint8(DefaultHopLimit)
+	// __seg6_do_srh_encap copies the traffic class, the flow label and the hop
+	// limit out of an IPv6 inner packet, the behavior seg6_flowlabel 0 names
+	// and its default. Matching it keeps a packet this node steers and
+	// one a kernel headend steers the same bytes, and stops an encapsulation
+	// handing a packet a hop budget its own header had already spent.
+	hopLimit := uint8(DefaultHopLimit)
 	if innerNext == NextHeaderIPv6 {
-		traffic, hopLimit = inner[0]<<4|inner[1]>>4, inner[7]
+		hopLimit = inner[7]
 	}
 	segments := reversed(path)
 	last := uint8(len(segments) - 1)
 	srhLen := srhFixedLen + addrLen*len(segments)
 
-	out[0] = 0x60 | traffic>>4
-	out[1] = traffic << 4
-	binary.BigEndian.PutUint16(out[2:], 0) // flow label, see above
+	if innerNext == NextHeaderIPv6 {
+		// Version, traffic class and flow label together, since the inner
+		// packet's version nibble is already 6.
+		copy(out[:4], inner[:4])
+	} else {
+		out[0], out[1] = 0x60, 0
+		binary.BigEndian.PutUint16(out[2:], 0)
+	}
 	binary.BigEndian.PutUint16(out[4:], uint16(srhLen+len(inner)))
 	out[6] = nextHeaderRouting
 	out[7] = hopLimit

@@ -230,8 +230,12 @@ func (m *Mesh) forwardSegments(segments []forwardedSegment) {
 	if len(segments) == 0 {
 		return
 	}
-	counts := make(map[*Peer]int, len(segments))
-	order := make([]*Peer, 0, len(segments))
+	// Sized for the peers a batch names rather than for its packets: one
+	// inbound batch is up to 128 packets and names one peer in the ordinary
+	// case, so hinting the packet count is several kilobytes of garbage per
+	// batch that nothing reads.
+	counts := make(map[*Peer]int)
+	order := make([]*Peer, 0, 4)
 	for i := range segments {
 		segment := &segments[i]
 		src, dst, nextHeader, ok := addrsOf(segment.raw)
@@ -347,6 +351,14 @@ func (m *Mesh) takeICMPToken() bool {
 // so a peer sending a stream of refused headers costs a counter rather than a
 // log. The counter is the record; the line is there to say what kind.
 func (m *Mesh) reportSegmentDrop(message string, args ...any) {
+	if m.segmentsStarted.IsZero() {
+		// time.Since of a zero time saturates, so an unstarted counter set
+		// would report once and then suppress everything for 292 years. A
+		// Mesh built without startSegmentReports only exists in a test, and
+		// reporting is the answer that cannot hide anything.
+		slog.Warn(message, append([]any{"interface", m.Name}, args...)...)
+		return
+	}
 	now := int64(time.Since(m.segmentsStarted))
 	previous := m.segmentReported.Load()
 	if now-previous < int64(segmentDropInterval) || !m.segmentReported.CompareAndSwap(previous, now) {

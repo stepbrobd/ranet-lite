@@ -374,25 +374,37 @@ func TestExitDeliversAnEncapsulationWithNoRoutingHeader(t *testing.T) {
 	}
 }
 
-// H.Encaps copies the traffic class and the hop limit off an IPv6 inner packet
-// the way __seg6_do_srh_encap does, and leaves the flow label at zero, which
-// the default seg6_flowlabel asks for. A fixed outer hop limit would
-// launder a packet past the budget its own header had already spent.
+// H.Encaps copies the traffic class, the flow label and the hop limit off an
+// IPv6 inner packet the way __seg6_do_srh_encap does under the seg6_flowlabel
+// default. Every class is swept, because reading one back with the inverse of
+// the expression that wrote it cannot see a nibble in the wrong place. A fixed
+// outer hop limit would launder a packet past the budget its own header had
+// already spent.
 func TestEncapsulationCopiesTheInnerTrafficClassAndHopLimit(t *testing.T) {
-	inner := innerV6Hops("payload", 7)
-	inner[0], inner[1] = 0x6a, 0xbc // traffic class 0xab, flow label 0xc0000
-	out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), []netip.Addr{addr("2a0c:b641:69c:98d6::1")})
+	exit := []netip.Addr{addr("2a0c:b641:69c:98d6::1")}
+	for class := range 256 {
+		inner := innerV6Hops("payload", 7)
+		inner[0] = 0x60 | byte(class)>>4
+		inner[1] = byte(class)<<4 | 0x0c
+		inner[2], inner[3] = 0xde, 0xf0 // the rest of the flow label
+		out, err := Encapsulate(inner, addr("2a0c:b641:69c:8c0::1"), exit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(out[:4], inner[:4]) {
+			t.Fatalf("class %#x: the outer first word is %x, want the inner %x", class, out[:4], inner[:4])
+		}
+		if out[7] != 7 {
+			t.Fatalf("class %#x: the outer hop limit is %d, want the inner 7", class, out[7])
+		}
+	}
+	// An IPv4 inner has no class or label to copy, so the outer gets neither.
+	out, err := Encapsulate(innerV4("payload"), addr("2a0c:b641:69c:8c0::1"), exit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := out[0]<<4 | out[1]>>4; got != 0xab {
-		t.Errorf("the outer traffic class is %#x, want the inner 0xab", got)
-	}
-	if out[7] != 7 {
-		t.Errorf("the outer hop limit is %d, want the inner 7", out[7])
-	}
-	if out[1]&0x0f != 0 || out[2] != 0 || out[3] != 0 {
-		t.Errorf("the outer flow label is %#x %#x %#x", out[1]&0x0f, out[2], out[3])
+	if out[0] != 0x60 || out[1] != 0 || out[2] != 0 || out[3] != 0 || out[7] != DefaultHopLimit {
+		t.Errorf("an encapsulated v4 packet got outer %x hop limit %d", out[:4], out[7])
 	}
 }
 

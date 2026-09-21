@@ -86,12 +86,25 @@ func TestSteeringRefusesWhatWouldClaimItsOwnEncapsulation(t *testing.T) {
 func TestSteeringRefusesTwoEntriesWithOneSelector(t *testing.T) {
 	first := policy("2a0c:b641:69c:8c0::1", "2a0c:b641:69c:98d6::1")
 	second := policy("2a0c:b641:69c:8c0::1", "2a0c:b641:69c:6c46::1")
-	_, err := NewSteerTable([]Steer{
-		{From: prefix("2001:db8::/32"), Policy: first},
-		{From: prefix("2001:db8::/32"), Policy: second},
-	})
-	if err == nil {
-		t.Error("two entries selecting the same packets were accepted")
+	for name, entries := range map[string][]Steer{
+		"written the same way": {
+			{From: prefix("2001:db8::/32"), Policy: first},
+			{From: prefix("2001:db8::/32"), Policy: second},
+		},
+		// An omitted destination and one written out as the zero-length
+		// prefix are two spellings of one trie key, so keying the check on
+		// what was written rather than on what the trie stores lets the
+		// second entry quietly replace the first.
+		"an omitted destination against an explicit one": {
+			{From: prefix("2001:db8::/32"), Policy: first},
+			{From: prefix("2001:db8::/32"), To: prefix("::/0"), Policy: second},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewSteerTable(entries); err == nil {
+				t.Error("two entries selecting the same packets were accepted")
+			}
+		})
 	}
 }
 
