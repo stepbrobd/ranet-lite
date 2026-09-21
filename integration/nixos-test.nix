@@ -627,7 +627,6 @@ in
             # node pulls in, so it never becomes active here however configured
             # the link is. This arm needs the far side answering instead, so it
             # waits for the addresses themselves.
-            print(behind.execute("systemctl list-units --all 'systemd-networkd*'")[1])
             for address in ["${behindV4}", "${behindV6}"]:
                 behind.wait_until_succeeds(f"ip addr show dev eth1 | grep -qF {address}", timeout=timeout)
             client.wait_for_unit("ranet-lite.service")
