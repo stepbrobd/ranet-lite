@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -119,7 +120,7 @@ func egressLine(e EgressStatus) string {
 	line := fmt.Sprintf("%s, %d rules, %d flows", e.Where, e.Installed, e.Flows)
 	withheld := make([]string, 0, len(e.Advertise))
 	for _, prefix := range e.Advertise {
-		if !containsPrefix(e.Announced, prefix) {
+		if !slices.Contains(e.Announced, prefix) {
 			withheld = append(withheld, prefix.String())
 		}
 	}
@@ -148,15 +149,6 @@ func egressLine(e EgressStatus) string {
 		line += ", " + e.Err
 	}
 	return line
-}
-
-func containsPrefix(prefixes []netip.Prefix, want netip.Prefix) bool {
-	for _, prefix := range prefixes {
-		if prefix == want {
-			return true
-		}
-	}
-	return false
 }
 
 func prefixText(prefixes []netip.Prefix) string {

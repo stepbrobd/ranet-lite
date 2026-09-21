@@ -240,7 +240,7 @@ func TestUnchangedRulesAreNotRewritten(t *testing.T) {
 	if be.applied != 1 {
 		t.Errorf("wrote the ruleset %d times, want once", be.applied)
 	}
-	if got := tr.Stats().Packets; got != 11 {
+	if got := tr.Stats().Flows; got != 11 {
 		t.Errorf("reported %d flows, want the counter the host holds", got)
 	}
 }

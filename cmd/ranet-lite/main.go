@@ -490,7 +490,7 @@ func egressStatus(translator *egress.Translator) control.EgressStatus {
 		Announced: stats.Announced,
 		PassAt:    stats.At,
 		Installed: stats.Installed,
-		Flows:     stats.Packets,
+		Flows:     stats.Flows,
 		Bytes:     stats.Bytes,
 		Conflicts: stats.Conflicts,
 		Err:       stats.Err,

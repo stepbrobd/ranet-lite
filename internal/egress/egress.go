@@ -347,7 +347,10 @@ type Stats struct {
 	At        time.Time
 	Desired   int
 	Installed int
-	Packets   uint64
+	// Flows counts the connections the rules have translated, and Bytes the
+	// first packet of each. A nat chain is consulted once per connection and
+	// never again, so neither is a packet count.
+	Flows     uint64
 	Bytes     uint64
 	Announced []netip.Prefix
 	Conflicts []string
@@ -589,14 +592,14 @@ func (t *Translator) reconcile() error {
 	}
 	t.publish(announced)
 
-	var packets, bytes uint64
+	var flows, bytes uint64
 	for _, rule := range held {
-		packets += rule.Packets
+		flows += rule.Packets
 		bytes += rule.Bytes
 	}
 	stats := Stats{
 		At: time.Now(), Desired: len(desired), Installed: len(held),
-		Packets: packets, Bytes: bytes,
+		Flows: flows, Bytes: bytes,
 		Announced: announced, Conflicts: conflicts,
 	}
 	if err != nil {
