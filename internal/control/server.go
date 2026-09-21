@@ -218,22 +218,33 @@ func newServer(src Source) *http.Server {
 	}
 }
 
-// boundedListener hands out at most cap(places) connections at a time. Past
-// that the accept waits, so a client queues in the kernel backlog rather than
-// costing the daemon anything, and the idle timeout keeps the queue moving.
+// boundedListener hands out at most cap(places) connections at a time and
+// closes the rest as it accepts them.
+//
+// Closing rather than waiting for a place keeps the accept loop answering
+// its own listener: waiting for one would park this goroutine on a
+// channel that closing the listener does not wake, so a client holding every
+// place would hold up the shutdown for as long as the idle timeout. It is also
+// the better answer to give, since a diagnostic that is refused says so at
+// once where one that waits looks like a node that has stopped responding.
 type boundedListener struct {
 	net.Listener
 	places chan struct{}
 }
 
 func (l *boundedListener) Accept() (net.Conn, error) {
-	l.places <- struct{}{}
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		<-l.places
-		return nil, err
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.places <- struct{}{}:
+			return &boundedConn{Conn: conn, places: l.places}, nil
+		default:
+			conn.Close()
+		}
 	}
-	return &boundedConn{Conn: conn, places: l.places}, nil
 }
 
 type boundedConn struct {

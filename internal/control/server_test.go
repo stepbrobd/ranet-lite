@@ -326,3 +326,85 @@ func (p *onePipe) Accept() (net.Conn, error) {
 }
 func (p *onePipe) Close() error   { return nil }
 func (p *onePipe) Addr() net.Addr { return p.daemon.LocalAddr() }
+
+// A client that accumulates connections costs the daemon a goroutine and a
+// descriptor apiece, and a node out of descriptors cannot be asked anything,
+// which is the one thing this socket exists to prevent. Past the bound a
+// connection is closed as it is accepted rather than queued, so a client
+// holding every place cannot hold up the accept loop or a shutdown either.
+func TestConnectionsPastTheBoundAreRefusedRatherThanQueued(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	listener, err := Listen(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- Serve(listener, fakeSource{}) }()
+
+	// One request each, then held open, the state the idle timeout would
+	// otherwise be the only bound on.
+	held := make([]net.Conn, 0, maxConnections)
+	defer func() {
+		for _, conn := range held {
+			conn.Close()
+		}
+	}()
+	for len(held) < maxConnections {
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatalf("connection %d of %d was refused: %v", len(held)+1, maxConnections, err)
+		}
+		if _, err := conn.Write([]byte("GET " + PathStatus + " HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			t.Fatalf("connection %d was not answered: %v", len(held)+1, err)
+		}
+		held = append(held, conn)
+	}
+
+	// The next one is accepted and closed rather than left waiting.
+	over, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("a connection past the bound was refused at dial: %v", err)
+	}
+	defer over.Close()
+	over.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadAll(over); err != nil {
+		t.Errorf("a connection past the bound was left open: %v", err)
+	}
+
+	// And the listener still answers its own close while every place is held.
+	listener.Close()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("an ordinary close reported %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Serve did not return while the bound was full")
+	}
+}
+
+// A duration inside a sentence is written out, and the unit is chosen after
+// rounding: a pass 59.5 seconds ago is a minute, not sixty seconds. A
+// timestamp ahead of this clock is said rather than rendered as a negative.
+func TestKernelLineWritesItsDurationOut(t *testing.T) {
+	for name, test := range map[string]struct {
+		since time.Duration
+		want  string
+	}{
+		"one second":          {time.Second, "last pass 1 second ago"},
+		"under a minute":      {45 * time.Second, "last pass 45 seconds ago"},
+		"rounding to one":     {59500 * time.Millisecond, "last pass 1 minute ago"},
+		"rounding to an hour": {3599 * time.Second, "last pass 1 hour ago"},
+		"a clock ahead":       {-3 * time.Second, "last pass timestamped ahead of this clock"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			line := kernelLine(KernelStatus{Enabled: true, PassAt: time.Now().Add(-test.since)})
+			if !strings.Contains(line, test.want) {
+				t.Errorf("the line reads %q, want it to carry %q", line, test.want)
+			}
+		})
+	}
+}

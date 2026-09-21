@@ -488,9 +488,12 @@ over the extension's own channel.
 the default, so a node is askable without having been configured to be.
 `-control ""` turns it off. The socket is mode 0660 and the unit names the group
 that can read it. Nothing on the socket writes, and a reader is bounded by an
-idle timeout and by a limit on how many connections one may hold at once,
+idle timeout and by a limit on the connections open at once across every reader,
 because a client that accumulates them costs the daemon a descriptor apiece and
-a node out of descriptors is one that cannot be asked anything at all.
+a node out of descriptors is one that cannot be asked anything at all. Past that
+limit a connection is closed as it is accepted, so a client holding every place
+is refused at once rather than left waiting, and a shutdown is not held up
+behind it.
 
 Which process owns the path is settled by an exclusive lock on a sibling file
 rather than by dialing the socket to see whether anything answers, since a live
