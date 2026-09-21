@@ -204,3 +204,73 @@ func TestPacketsBeforeAndAfterASegmentKeepTheirOrder(t *testing.T) {
 		}
 	}
 }
+
+// A packet a policy claims leaves encapsulated and is routed by its first
+// segment rather than by the address it was addressed to, which is the whole
+// point of steering it and the thing a route lookup done first would undo.
+func TestSteeredPacketIsRoutedByItsFirstSegment(t *testing.T) {
+	exit := segAddr("2a0c:b641:69c:98d6::1")
+	table, err := srv6.NewSteerTable([]srv6.Steer{{
+		From:   segPrefix("2602:f590::17/128"),
+		Policy: srv6.Policy{Source: segAddr("2a0c:b641:69c:8c0::1"), Path: []netip.Addr{exit}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mesh := &Mesh{Routes: NewRouteTable()}
+	mesh.SetSteering(table)
+
+	buf := make([]byte, tunOffset+2048)
+	inner := plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
+	copy(buf[tunOffset:], inner)
+
+	size, steered := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
+	if !steered {
+		t.Fatal("a packet the policy names was not steered")
+	}
+	if size != len(inner)+srv6.Overhead(1) {
+		t.Fatalf("the steered packet is %d bytes, want %d", size, len(inner)+srv6.Overhead(1))
+	}
+	if got := netip.AddrFrom16([16]byte(buf[tunOffset+24 : tunOffset+40])); got != exit {
+		t.Errorf("the steered packet is addressed to %s, want the first segment %s", got, exit)
+	}
+	if counters := mesh.SegmentCounters(); counters.Steered != 1 || counters.Unsteered != 0 {
+		t.Errorf("steering counted %+v", counters)
+	}
+
+	// A packet from another address is left exactly as it was.
+	other := len(inner)
+	if size, steered := mesh.steer(buf, other, segAddr("2602:f590::18"), segAddr("2001:4860:4860::8888")); steered || size != other {
+		t.Errorf("a packet no policy names was steered, size %d", size)
+	}
+}
+
+// A packet a policy claims and cannot encapsulate goes out as it was rather
+// than being dropped, which is the more conservative of the two failures, and
+// the counter says it happened.
+func TestPacketThatCannotBeSteeredGoesOutUnchanged(t *testing.T) {
+	table, err := srv6.NewSteerTable([]srv6.Steer{{
+		From:   segPrefix("2602:f590::17/128"),
+		Policy: srv6.Policy{Source: segAddr("2a0c:b641:69c:8c0::1"), Path: []netip.Addr{segAddr("2a0c:b641:69c:98d6::1")}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mesh := &Mesh{Routes: NewRouteTable()}
+	mesh.SetSteering(table)
+
+	inner := plainV6(segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"), "payload")
+	// A buffer with no room for the header at all.
+	buf := make([]byte, tunOffset+len(inner))
+	copy(buf[tunOffset:], inner)
+	size, steered := mesh.steer(buf, len(inner), segAddr("2602:f590::17"), segAddr("2001:4860:4860::8888"))
+	if steered || size != len(inner) {
+		t.Fatalf("a packet that could not be encapsulated reported steered=%v size=%d", steered, size)
+	}
+	if !bytes.Equal(buf[tunOffset:], inner) {
+		t.Error("a packet that could not be steered was changed anyway")
+	}
+	if counters := mesh.SegmentCounters(); counters.Unsteered != 1 || counters.Steered != 0 {
+		t.Errorf("a refused encapsulation counted %+v", counters)
+	}
+}

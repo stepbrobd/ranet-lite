@@ -29,6 +29,42 @@ var errNotIP = errors.New("netstack: a forwarded segment is not an IP packet")
 // log line per packet.
 const segmentDropInterval = 30 * time.Second
 
+// SetSteering installs the table deciding which of this node's own packets go
+// through a segment list, or nil for none. Like SetSegments it is called
+// before the device carries anything and read on the hot path, so the pointer
+// is swapped rather than the table mutated.
+func (m *Mesh) SetSteering(table *srv6.SteerTable) { m.steerTable.Store(table) }
+
+// Steering is the table currently installed, for a diagnostic to report.
+func (m *Mesh) Steering() *srv6.SteerTable { return m.steerTable.Load() }
+
+// steer encapsulates one outbound packet when a policy claims it, in the
+// buffer the tun reader already owns, and reports whether it did.
+//
+// A packet no policy claims costs one trie lookup, which is the same lookup
+// the forwarding table is about to do anyway. One that cannot be encapsulated
+// is left alone rather than dropped: it then takes the route it would have
+// taken unsteered, which is the more conservative of the two failures, and the
+// counter says it happened.
+func (m *Mesh) steer(buf []byte, size int, source, destination netip.Addr) (int, bool) {
+	table := m.steerTable.Load()
+	if table == nil {
+		return size, false
+	}
+	policy := table.Lookup(source, destination)
+	if policy == nil {
+		return size, false
+	}
+	encapsulated, err := srv6.EncapsulateInPlace(buf, tunOffset, size, policy.Source, policy.Path, 0)
+	if err != nil {
+		m.segmentsUnsteered.Add(1)
+		m.reportSegmentDrop("a packet could not be steered and went unencapsulated", "policy", policy, "err", err)
+		return size, false
+	}
+	m.segmentsSteered.Add(1)
+	return encapsulated, true
+}
+
 // SetSegments installs the segments this node answers for, or nil for none.
 // It is called before any session exists and read on the inbound path, so the
 // pointer is swapped rather than the table mutated.
@@ -43,6 +79,11 @@ type SegmentCounters struct {
 	Forwarded uint64
 	Delivered uint64
 	Dropped   uint64
+	// Steered counts this node's own packets that a policy encapsulated, and
+	// Unsteered the ones a policy claimed and could not, which went out as
+	// they were.
+	Steered   uint64
+	Unsteered uint64
 }
 
 func (m *Mesh) SegmentCounters() SegmentCounters {
@@ -50,6 +91,8 @@ func (m *Mesh) SegmentCounters() SegmentCounters {
 		Forwarded: m.segmentsForwarded.Load(),
 		Delivered: m.segmentsDelivered.Load(),
 		Dropped:   m.segmentsDropped.Load(),
+		Steered:   m.segmentsSteered.Load(),
+		Unsteered: m.segmentsUnsteered.Load(),
 	}
 }
 
@@ -161,6 +204,9 @@ type segmentCounters struct {
 	segmentsForwarded atomic.Uint64
 	segmentsDelivered atomic.Uint64
 	segmentsDropped   atomic.Uint64
+	steerTable        atomic.Pointer[srv6.SteerTable]
+	segmentsSteered   atomic.Uint64
+	segmentsUnsteered atomic.Uint64
 	// segmentReported is the last report in unix nanoseconds, zero for never.
 	segmentReported atomic.Int64
 }

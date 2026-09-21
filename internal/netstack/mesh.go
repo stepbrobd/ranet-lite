@@ -259,14 +259,25 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 		b.n = n
 		for i := 0; i < n; i++ {
 			raw := b.bufs[i][tunOffset : tunOffset+b.sizes[i]]
-			if src, dst, nh, ok := addrsOf(raw); ok {
-				if peer, ok := m.Routes.Lookup(src, dst); ok {
-					b.peers[i], b.headers[i] = peer, nh
-					if b.counts[peer] == 0 {
-						b.peerOrder = append(b.peerOrder, peer)
-					}
-					b.counts[peer]++
+			src, dst, nh, ok := addrsOf(raw)
+			if !ok {
+				continue
+			}
+			// Steering happens before the route lookup, because a steered
+			// packet is routed by the segment it is going to rather than by
+			// the address it was addressed to.
+			if size, steered := m.steer(b.bufs[i], b.sizes[i], src, dst); steered {
+				b.sizes[i] = size
+				if src, dst, nh, ok = addrsOf(b.bufs[i][tunOffset : tunOffset+size]); !ok {
+					continue
 				}
+			}
+			if peer, ok := m.Routes.Lookup(src, dst); ok {
+				b.peers[i], b.headers[i] = peer, nh
+				if b.counts[peer] == 0 {
+					b.peerOrder = append(b.peerOrder, peer)
+				}
+				b.counts[peer]++
 			}
 		}
 		if len(b.peerOrder) == 0 {
