@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -343,8 +344,20 @@ func TestShutdownSaysNothingAboutReconnecting(t *testing.T) {
 	log.SetOutput(written)
 	t.Cleanup(func() { log.SetOutput(previous) })
 	stopAlpha()
-	if got := written.count("reconnecting in"); got != 0 {
-		t.Errorf("shutdown wrote %d reconnect lines, want none", got)
+	// Only alpha is stopping, and both nodes write to the one logger this
+	// captures, so the lines that count are the ones naming alpha's own peer.
+	// bravo stays up, loses the node it was dialing and says it will retry,
+	// which is the correct thing for a node whose peer went away: counting its
+	// line as well failed this test in about one run in thirty.
+	dialingBravo := fmt.Sprintf("peer %s/%s", alpha.cfg.Organization, bravo.name)
+	var got []string
+	for _, line := range written.lines("reconnecting in") {
+		if strings.Contains(line, dialingBravo) {
+			got = append(got, line)
+		}
+	}
+	if len(got) != 0 {
+		t.Errorf("shutdown wrote %d reconnect lines, want none: %s", len(got), strings.Join(got, " | "))
 	}
 }
 

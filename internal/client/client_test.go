@@ -298,8 +298,7 @@ func TestReloadKeepsThePathsTheCommandLineSupplied(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
-	speaker, err := babel.New(babel.Config{}, mesh)
+	speaker, err := babel.New(babel.Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1537,7 +1536,8 @@ func TestMetricsLabelsUseOnlyTheEscapesTheFormatDefines(t *testing.T) {
 
 	// And the rendered line carries it, so nothing above the helper reaches
 	// for %q again.
-	speaker, err := babel.New(babel.Config{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := babel.New(babel.Config{}, mesh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1703,6 +1703,20 @@ func (b *syncBuffer) count(phrase string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return bytes.Count(b.buf.Bytes(), []byte(phrase))
+}
+
+// lines returns the lines carrying a phrase, so an assertion that counts them
+// can say which ones it found rather than only how many.
+func (b *syncBuffer) lines(phrase string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var found []string
+	for _, line := range strings.Split(b.buf.String(), "\n") {
+		if strings.Contains(line, phrase) {
+			found = append(found, line)
+		}
+	}
+	return found
 }
 
 // The registry is the trust root a handshake is checked against, so a node
