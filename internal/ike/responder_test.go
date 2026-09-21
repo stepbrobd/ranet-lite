@@ -45,12 +45,12 @@ func newResponderHarness(t *testing.T, lookup func(Identity) (ed25519.PublicKey,
 	if err != nil {
 		t.Fatal(err)
 	}
-	responderHub, err := transport.NewHub(":0", 0)
+	responderHub, err := transport.NewHub(":0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { responderHub.Close() })
-	initiatorHub, err := transport.NewHub(":0", 0)
+	initiatorHub, err := transport.NewHub(":0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -833,7 +833,7 @@ func TestAnsweredExchangeRefreshesLivenessClock(t *testing.T) {
 
 func listenHub(t *testing.T) *transport.Hub {
 	t.Helper()
-	hub, err := transport.NewHub("127.0.0.1:0", 0)
+	hub, err := transport.NewHub("127.0.0.1:0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -884,7 +884,7 @@ func observedEndpointFrom(t *testing.T, hub *transport.Hub, spi uint64, source n
 // it an off-path source can make the responder allocate for an address it
 // never has to receive at.
 func TestResponderDemandsCookieUnderPressure(t *testing.T) {
-	hub, err := transport.NewHub("127.0.0.1:0", 0)
+	hub, err := transport.NewHub("127.0.0.1:0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -915,7 +915,7 @@ func TestResponderDemandsCookieUnderPressure(t *testing.T) {
 }
 
 func TestResponderRefusesCookieItDidNotIssue(t *testing.T) {
-	hub, err := transport.NewHub("127.0.0.1:0", 0)
+	hub, err := transport.NewHub("127.0.0.1:0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1176,7 +1176,7 @@ func TestHalfOpenShareIsPerAddressNotPerFlow(t *testing.T) {
 	}
 	// A second hub on the same machine is the same address and a different
 	// source port, which is all an attacker has to vary.
-	other, err := transport.NewHub("127.0.0.1:0", 0)
+	other, err := transport.NewHub("127.0.0.1:0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1237,7 +1237,7 @@ func TestResponderRefusesOfferItCannotAuthenticate(t *testing.T) {
 // threshold, at sixteen packets every thirty seconds, and the victim is then
 // refused in silence for as long as the attacker keeps it up.
 func TestOneAddressCannotSpendItsShareWithoutCookie(t *testing.T) {
-	hub, err := transport.NewHub("127.0.0.1:0", 0)
+	hub, err := transport.NewHub("127.0.0.1:0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1285,7 +1285,7 @@ func TestOneAddressCannotSpendItsShareWithoutCookie(t *testing.T) {
 // makes "under pressure" the ordinary state for any address holding two
 // half-open exchanges, so the rotation is no longer a load condition.
 func TestCookieSurvivesRotationThatFollowsIt(t *testing.T) {
-	hub, err := transport.NewHub("127.0.0.1:0", 0)
+	hub, err := transport.NewHub("127.0.0.1:0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1432,12 +1432,12 @@ func TestResponderChecksTheNonceAgainstTheNegotiatedPRF(t *testing.T) {
 // changes state (RFC 7296 section 2.21, RFC 7815 section 2.1); the deadline is
 // what ends the wait.
 func TestUndecryptableDatagramDoesNotEndTheHandshake(t *testing.T) {
-	hub, err := transport.NewHub(":0", 0)
+	hub, err := transport.NewHub(":0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer hub.Close()
-	peerHub, err := transport.NewHub(":0", 0)
+	peerHub, err := transport.NewHub(":0", transport.Underlay{}, transport.Runtime{})
 	if err != nil {
 		t.Fatal(err)
 	}

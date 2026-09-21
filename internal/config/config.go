@@ -31,6 +31,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/srv6"
+	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
 type Config struct {
@@ -69,16 +70,20 @@ type Link struct {
 	// TUN names an existing device to attach to, or the device to create when
 	// it does not exist. Empty creates an automatically named one.
 	TUN string `yaml:"tun,omitempty" json:"tun,omitempty" toml:"tun,omitempty"`
-	// Mark is set with SO_MARK on the one UDP socket carrying IKE and ESP,
-	// linux only, so a policy rule can keep the underlay in a table of the
-	// operator's choosing. Needed on a node whose mesh address is the only
-	// global address of its family: the kernel then sources this socket from
-	// it, a "from <mesh address>" rule sends it to the mesh table, and an
-	// exit-announced default there routes the underlay into the tun carrying
-	// it. Pair it with a rule under cap.table, such as
-	// { fwmark = 0x726c, table = "main", priority = 40, family = "both" }.
-	// Pick a mark nothing else on the host uses.
-	Mark uint32 `yaml:"mark,omitempty" json:"mark,omitempty" toml:"mark,omitempty"`
+	// Underlay keeps the one UDP socket carrying IKE and ESP out of the reach
+	// of the routes the mesh installs, which lets an exit-announced default be
+	// a real default rather than one no ordinary socket can see.
+	// Needed on a node whose mesh address is the only global address of its
+	// family: the kernel then sources this socket from it, a "from <mesh
+	// address>" rule sends it to the mesh table, and an exit-announced default
+	// there routes the underlay into the tun carrying it.
+	//
+	// One block for both platforms because it is one idea, spelled two ways;
+	// the type in internal/transport says which field each of them reads, and
+	// each is refused by name on the platform that has no meaning for it. That
+	// refusal is at startup rather than at load, as cap.table's rules and VRF
+	// are, so one file can carry a fleet's settings and a laptop's.
+	Underlay transport.Underlay `yaml:"underlay,omitempty" json:"underlay,omitempty" toml:"underlay,omitempty"`
 }
 
 // Endpoint is one local socket identity. Address selection is global: the

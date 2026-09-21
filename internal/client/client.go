@@ -33,7 +33,11 @@ type Client struct {
 	privateKey ed25519.PrivateKey
 	speaker    *babel.Speaker
 	hub        *transport.Hub
-	sessions   *sessionSet
+	// closeUnderlay releases whatever the transport's underlay setting had to
+	// open, which on darwin is the route socket the binding follows. Nil on a
+	// Client built by hand in a test.
+	closeUnderlay func()
+	sessions      *sessionSet
 	workers    int
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -179,7 +183,16 @@ func steeredMTU(steering *srv6.SteerTable) (int, error) {
 // newClient is New with the loading done, so a test can stand up a client
 // around a mesh it built itself rather than a privileged TUN.
 func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.Registry, mesh *netstack.Mesh) (_ *Client, err error) {
-	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Link.Port), cfg.Link.Mark)
+	underlay, closeUnderlay, err := underlayRuntime(cfg.Link.Underlay)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			closeUnderlay()
+		}
+	}()
+	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Link.Port), cfg.Link.Underlay, underlay)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +210,8 @@ func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.R
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		Mesh: mesh, privateKey: privateKey,
-		speaker: speaker, hub: hub, sessions: newSessionSet(),
+		speaker: speaker, hub: hub, closeUnderlay: closeUnderlay,
+		sessions: newSessionSet(),
 		workers: max(1, runtime.GOMAXPROCS(0)),
 		ctx:     ctx, cancel: cancel,
 		dialers: make(map[string]*dialer),
@@ -248,7 +262,28 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) Close() {
 	c.cancel()
 	_ = c.hub.Close()
+	if c.closeUnderlay != nil {
+		c.closeUnderlay()
+	}
 	c.Mesh.Close()
+}
+
+// LiveSessions is how many of this node's sessions have recently proved their
+// peer is there. The route reconciler reads it before it hands this machine's
+// own traffic to the mesh, so the answer is deliberately the narrow one: a
+// session that is merely installed proves nothing, and a peer that rebooted
+// leaves one looking established for over a minute.
+//
+// A node whose underlay socket is not where its configuration says it should
+// be reports none, whatever its sessions are doing. On darwin the socket is
+// bound to the interface the host's own default leaves by, and a default route
+// out of the tun over an unbound socket is the tunnel inside itself that the
+// binding exists to prevent.
+func (c *Client) LiveSessions() int {
+	if !c.hub.UnderlayReady() {
+		return 0
+	}
+	return c.sessions.liveCount()
 }
 
 // dialer is one running peer loop. It is a pointer so an entry has an identity

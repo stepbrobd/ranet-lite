@@ -1,9 +1,8 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package transport
 
 import (
-	"errors"
 	"net/netip"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -32,16 +31,15 @@ func (b *portableBind) Send(packets [][]byte, endpoint Endpoint) error {
 	return b.Bind.Send(packets, endpoint.(*portableEndpoint).Endpoint)
 }
 
-func openPacketBind(port uint16, fwmark uint32) (packetBind, []receiveFunc, uint16, error) {
-	if fwmark != 0 {
-		// Refused rather than ignored: a mark this platform cannot set is a
-		// rule somewhere that will never match, and the configuration that
-		// asked for it was written to keep the underlay out of the overlay.
-		// darwin reaches the same end through interface scope on the routes
-		// the reconciler installs, which scopeRoute in internal/kernel
-		// decides.
-		return nil, nil, 0, errors.New("fwmark is a linux facility and is set on no other platform")
-	}
+// This platform has neither facility, so Underlay.refuse turns down every
+// configuration that asks for one by name rather than opening a socket that
+// quietly does nothing about the underlay.
+const (
+	marksSockets = false
+	bindsSockets = false
+)
+
+func openPacketBind(port uint16, underlay Underlay, index int) (packetBind, []receiveFunc, uint16, error) {
 	b := &portableBind{conn.NewStdNetBind()}
 	fns, port, err := b.Open(port)
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/internal/srv6"
+	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
 // The node a test starts from, in both spellings. Everything below adds one
@@ -186,7 +187,7 @@ func TestRenderedCapabilitiesParseBackToThemselves(t *testing.T) {
 				Port:      13000,
 				Listen:    true,
 				TUN:       "ranet0",
-				Mark:      0x726c,
+				Underlay:  transport.Underlay{Mark: 0x726c},
 				Endpoints: []Endpoint{{Serial: "0", Family: "ip4"}},
 			},
 			Dial: Dial{All: true, To: []Peer{{Org: "example", Name: "gateway", Serial: "1"}}},

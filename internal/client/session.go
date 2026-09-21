@@ -333,6 +333,24 @@ func (s *sessionSet) holds(path string) bool {
 	return live != nil && s.active(live.session)
 }
 
+// liveCount is how many paths a session that has recently proved its peer is
+// there serves, which is the same test holds applies to one path. A Client
+// built by hand in a test carries no set and reports none.
+func (s *sessionSet) liveCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, live := range s.live {
+		if s.active(live.session) {
+			count++
+		}
+	}
+	return count
+}
+
 // revoke closes every live session whose peer the registry no longer
 // authenticates, and reports which paths went. A reload is the only moment
 // this node learns that a node has been taken out of the mesh, and until it

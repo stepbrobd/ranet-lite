@@ -39,14 +39,26 @@ endpoints = [{ serial = "0", family = "ip4" }]
 # automatically named ranet%d on linux, or the next free utun on darwin.
 # tun = "ranet0"
 
-# Mark the one UDP socket carrying IKE and ESP, linux only, so a policy rule
-# can keep the underlay in a table of your choosing. Set it on a node whose
-# mesh address is the only global address of its family: the kernel sources
-# this socket from that address, a "from <mesh address>" rule sends it to the
-# mesh table, and an exit-announced default there routes the underlay into the
-# tun carrying it. The reconciler writes the matching rule itself, see
-# cap.table.rules below.
+# Keep the one UDP socket carrying IKE and ESP out of the reach of the routes
+# the mesh installs. One block for both platforms, because it is one idea: a
+# node holding an address an exit announces ends up with a route out of its own
+# tun covering the peers it reaches that tun through, and an underlay following
+# it is a tunnel running inside itself. Set one of the two on any node that
+# takes an exit-announced default; each is refused by name on the platform that
+# has no meaning for it.
+#
+# mark is SO_MARK on the socket, linux only. The reconciler writes the matching
+# rule itself, see cap.table.rules below.
+#
+# bind is IP_BOUND_IF and IPV6_BOUND_IF on the interface the host's own default
+# route leaves by, darwin only. It also gives that interface a default of its
+# own scoped to it, follows both when the machine moves between wifi, ethernet
+# and a dock, and tells the reconciler to install an announced default as a
+# real default rather than scoping it out of every socket's reach, without
+# which this machine cannot use a mesh exit at all.
+# [link.underlay]
 # mark = 0x726c
+# bind = true
 
 [dial]
 # Dial every node the trust document names, the N-to-N reconciliation ranet
@@ -109,6 +121,7 @@ announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
 # addresses = ["10.66.0.5/32"]     # assigned to the device, removed at exit
 # assign_announced = false         # also assign what cap.route announces
 # reconcile = "30s"
+# capture_grace = "10s"            # how long an announced default outlives the last live session
 
 # Enslave the device to a VRF, and make that device when nothing of the name
 # exists. linux only: the other platforms have one forwarding table and refuse
