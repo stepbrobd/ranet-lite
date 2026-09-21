@@ -93,17 +93,23 @@ func localSegments(cfg *config.Config) (*srv6.LocalTable, error) {
 // before the tun sees it, so every packet to that address would be refused as
 // carrying no routing header, and the address would go dark with nothing but a
 // rate-limited warning to say why. On linux the two coexist because the SID is
-// a route rather than an address; here they cannot.
+// a route rather than an address. Here they cannot.
+//
+// The set covers everything the reconciler assigns rather than
+// kernel.addresses alone, since assign_originated puts every originated
+// prefix on the device too.
 func refuseSegmentOnOwnAddress(cfg *config.Config, segments []srv6.Segment) error {
-	carried := make(map[netip.Addr]bool, len(cfg.Kernel.Addresses))
-	for _, raw := range cfg.Kernel.Addresses {
-		if prefix, err := netip.ParsePrefix(raw); err == nil {
-			carried[prefix.Addr()] = true
-		}
+	assigned, err := cfg.KernelAddresses()
+	if err != nil {
+		return err
+	}
+	carried := make(map[netip.Addr]bool, len(assigned))
+	for _, prefix := range assigned {
+		carried[prefix.Addr()] = true
 	}
 	for _, segment := range segments {
 		if carried[segment.SID] {
-			return fmt.Errorf("config: segments.local %s is also a kernel.addresses entry, so every packet to it would be taken as a segment", segment.SID)
+			return fmt.Errorf("config: segments.local %s is an address this node assigns to its own device, so every packet to it would be taken as a segment", segment.SID)
 		}
 	}
 	return nil

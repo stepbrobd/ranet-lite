@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/srv6"
 	"gopkg.in/yaml.v3"
 )
 
@@ -841,8 +842,16 @@ func (c *Config) validate() error {
 		return err
 	}
 	if c.Segments.Source != "" {
-		if _, err := netip.ParseAddr(c.Segments.Source); err != nil {
+		// Checked against what an encapsulation will accept rather than only
+		// for parseability, because nothing else reads this field until a
+		// steer entry needs it, and a node that steers nothing yet would
+		// otherwise carry a source it can never send from.
+		source, err := netip.ParseAddr(c.Segments.Source)
+		if err != nil {
 			return fmt.Errorf("config: segments.source %q: %w", c.Segments.Source, err)
+		}
+		if !srv6.Usable(source) {
+			return fmt.Errorf("config: segments.source %s cannot address a segment routed packet", source)
 		}
 	}
 	for _, raw := range c.Kernel.Addresses {
