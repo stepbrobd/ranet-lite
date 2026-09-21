@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,13 +38,29 @@ func (stubSource) Peers() []control.Peer {
 // serveStub starts a control socket for one test and returns its path.
 func serveStub(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 	listener, err := control.Listen(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { listener.Close() })
 	go control.Serve(listener, stubSource{})
+	return path
+}
+
+// socketPath names a socket short enough to bind. See the same helper in
+// internal/control/server_test.go for what t.TempDir() costs on darwin.
+func socketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "control.sock")
+	if len(path) > control.MaxSocketPath {
+		t.Fatalf("this TMPDIR leaves no room for a socket: %s is %d bytes", path, len(path))
+	}
 	return path
 }
 
@@ -123,7 +140,10 @@ func TestCommandsRefuseWhatTheyCannotActOn(t *testing.T) {
 	}{
 		"an unknown command": {command: "neighbours", want: "unknown command"},
 		"a stray argument":   {command: "status", args: []string{"-control", socket, "extra"}, want: "takes no arguments"},
-		"no daemon":          {command: "status", args: []string{"-control", filepath.Join(t.TempDir(), "gone.sock")}, want: "daemon"},
+		"no daemon":          {command: "status", args: []string{"-control", filepath.Join(filepath.Dir(socketPath(t)), "gone.sock")}, want: "daemon"},
+		// A reader given a path the kernel will not take is told the same
+		// thing the daemon is told, rather than "connect: invalid argument".
+		"a path over the limit": {command: "status", args: []string{"-control", filepath.Join(t.TempDir(), strings.Repeat("d", control.MaxSocketPath), "control.sock")}, want: "unix socket holds"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var out, usage strings.Builder

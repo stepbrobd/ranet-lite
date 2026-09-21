@@ -94,8 +94,29 @@ func TestHandlerRefusesWrites(t *testing.T) {
 // A socket an instance left behind is removed and a socket a live daemon is
 // listening on is not, because taking the second away would leave the running
 // node unreachable while reporting a clean start.
+// socketPath names a socket short enough to bind. t.TempDir() writes the test
+// name and a random suffix under TMPDIR, which comes to 110 bytes in the
+// darwin nix sandbox and up to 129 under a default macOS TMPDIR, over the
+// limit Listen refuses at: a test of what happens under that limit cannot be
+// written over it. cmd/ranet-lite/cli_test.go keeps the same helper, because
+// the length of a path is a property of the platform rather than of either
+// package.
+func socketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "control.sock")
+	if len(path) > MaxSocketPath {
+		t.Fatalf("this TMPDIR leaves no room for a socket: %s is %d bytes", path, len(path))
+	}
+	return path
+}
+
 func TestListenClearsStaleSocketAndRefusesLiveOne(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 
 	stale, err := net.Listen("unix", path)
 	if err != nil {
@@ -130,7 +151,7 @@ func TestListenClearsStaleSocketAndRefusesLiveOne(t *testing.T) {
 // Anything at the path that is not a socket belongs to somebody else, so it is
 // named rather than unlinked.
 func TestListenRefusesPathThatIsNotSocket(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +168,7 @@ func TestListenRefusesPathThatIsNotSocket(t *testing.T) {
 // sun_path is 104 bytes on darwin and 108 on linux, and a bind over either
 // fails as "invalid argument", which names neither the path nor the limit.
 func TestListenRefusesOverlongPath(t *testing.T) {
-	path := "/tmp/" + strings.Repeat("d", maxSocketPath) + "/control.sock"
+	path := "/tmp/" + strings.Repeat("d", MaxSocketPath) + "/control.sock"
 	_, err := Listen(path)
 	if err == nil {
 		t.Fatal("an overlong socket path was accepted")
@@ -164,7 +185,7 @@ func TestListenRefusesOverlongPath(t *testing.T) {
 // check that the client and the handler agree about field names as well as
 // about paths.
 func TestClientRoundTripsEveryRead(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 	listener, err := Listen(path)
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +245,7 @@ func TestClientRoundTripsEveryRead(t *testing.T) {
 // "connect: no such file or directory" names neither the daemon nor the flag
 // that would have created the socket.
 func TestClientExplainsMissingDaemon(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 	_, err := Dial(path).Status()
 	if err == nil {
 		t.Fatal("reading a socket that does not exist succeeded")
@@ -262,7 +283,7 @@ func TestDurationRoundTripsAsText(t *testing.T) {
 // one whose backlog is full and one whose socket this user cannot open all
 // fail that way.
 func TestListenRefusesALiveSocketItCannotDial(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 	listener, err := Listen(path)
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +354,7 @@ func (p *onePipe) Addr() net.Addr { return p.daemon.LocalAddr() }
 // closed as it is accepted rather than queued, so a client holding every place
 // cannot hold up the accept loop or a shutdown either.
 func TestConnectionsPastTheBoundAreRefusedRatherThanQueued(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := socketPath(t)
 	listener, err := Listen(path)
 	if err != nil {
 		t.Fatal(err)

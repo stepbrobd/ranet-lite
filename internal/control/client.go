@@ -81,6 +81,11 @@ func read[T any](c *Client, path string) (T, error) {
 // daemon nor the flag that would have created it.
 func (c *Client) explain(err error) error {
 	switch {
+	case len(c.path) > MaxSocketPath:
+		// The kernel answers a bind and a connect over the limit the same
+		// way, as "invalid argument", so the reader is told what the daemon
+		// would have been told rather than left with an errno.
+		return fmt.Errorf("control: socket path is %d bytes, over the %d a unix socket holds: %s", len(c.path), MaxSocketPath, c.path)
 	case errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("control: no socket at %s: the daemon creates it unless it was started with -control \"\"", c.path)
 	case errors.Is(err, syscall.ECONNREFUSED):

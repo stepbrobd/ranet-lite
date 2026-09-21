@@ -14,11 +14,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// maxSocketPath is the shortest of the platform limits this tree builds for:
+// MaxSocketPath is the shortest of the platform limits this tree builds for:
 // linux allows 108 bytes in sun_path and darwin 104, both including the
 // terminator. Binding a longer one fails as "invalid argument", which names
 // neither the path nor the limit, so the check is here instead.
-const maxSocketPath = 103
+const MaxSocketPath = 103
 
 // socketMode is the permission the socket is left at. Group readable rather
 // than owner only, so an operator in the daemon's group runs the subcommands
@@ -50,8 +50,8 @@ const lockSuffix = ".lock"
 // A path that is not a socket is refused by name rather than removed: it is
 // not this daemon's to take away from whoever put it there.
 func Listen(path string) (net.Listener, error) {
-	if len(path) > maxSocketPath {
-		return nil, fmt.Errorf("control: socket path is %d bytes, over the %d a unix socket holds: %s", len(path), maxSocketPath, path)
+	if len(path) > MaxSocketPath {
+		return nil, fmt.Errorf("control: socket path is %d bytes, over the %d a unix socket holds: %s", len(path), MaxSocketPath, path)
 	}
 	if err := makeParent(filepath.Dir(path)); err != nil {
 		return nil, err
