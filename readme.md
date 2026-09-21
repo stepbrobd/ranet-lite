@@ -490,8 +490,11 @@ flow that took it.
 Both interfaces are matched, never one. A packet that arrives on the TUN and
 leaves by it again is mesh transit, and rewriting its source would put this
 node's address on a packet it is only relaying. A packet this host generated
-itself has no arrival interface at all, which nftables breaks out of a rule
-over, so neither direction ever reaches one.
+itself has no arrival interface at all, which recent kernels report as the empty
+name rather than as a failure to read, so the inbound direction tests the
+interface index against zero as well: without it, this node's own mesh traffic
+would go out under the return source, which on an exit is an address belonging
+to somebody else.
 
 `source4` and `source6` say what the source becomes. Omitted, or written as
 `auto`, the host's own routes decide it per packet, which is the only answer
