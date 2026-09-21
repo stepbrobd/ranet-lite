@@ -249,9 +249,9 @@ func (c *Config) setDefaults() {
 }
 
 // Validate checks what this node says about itself, then asks each capability
-// to check itself, then makes the two checks that span capabilities. The split
-// is deliberate: a rule about what a rule may say belongs with the reconciler
-// that installs it, and repeating it here is how the two come to disagree.
+// to check itself, then makes the checks that span two capabilities. The split
+// is deliberate: what a policy rule may say belongs with the reconciler that
+// installs it, and repeating it here is how the two come to disagree.
 func (c *Config) Validate() error {
 	if err := c.validateNode(); err != nil {
 		return err
