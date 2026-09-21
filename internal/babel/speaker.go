@@ -759,10 +759,25 @@ func (s *Speaker) sweepRequestsLocked(now time.Time) {
 // neighbors` reports, plus the packets this node's own dataplane could not
 // hand to that peer, which BIRD has no equivalent of.
 type NeighborStat struct {
-	Peer   string
-	Alive  bool
-	Cost   uint16
-	Routes int
+	Peer string
+	// Addr is the neighbor's link-local address inside the tunnel, which is
+	// the address BIRD prints in its first column.
+	Addr  netip.Addr
+	Alive bool
+	Cost  uint16
+	// ReportedCost is the rxcost the neighbor last sent back in an IHU, and
+	// HaveReportedCost is false until one has arrived. Cost is this node's
+	// view of the link and this is the neighbor's, so a link that carries in
+	// one direction only can be told from one that carries in neither.
+	ReportedCost     uint16
+	HaveReportedCost bool
+	// RTT is the round trip RFC 9616 measured, valid only when HaveRTT is.
+	RTT     time.Duration
+	HaveRTT bool
+	// Expires is how long the neighbor has left before its Hello deadline
+	// passes, zero once it already has.
+	Expires time.Duration
+	Routes  int
 	// Dropped counts the packets the dataplane refused to queue for this
 	// neighbor, both its control traffic and whatever the mesh was forwarding
 	// through it.
@@ -777,8 +792,12 @@ type NeighborStat struct {
 // takes the same lock the protocol runs under, so it is a point in time rather
 // than a set of independently sampled counters.
 type Stats struct {
-	Neighbors  []NeighborStat
-	Selected   int
+	Neighbors []NeighborStat
+	Selected  int
+	// Prefixes is every key this speaker holds, learned and originated
+	// together, so a node whose routes are all retracted can be told from one
+	// that has heard nothing at all.
+	Prefixes   int
 	Originated int
 }
 
@@ -799,16 +818,136 @@ func (s *Speaker) Stats() Stats {
 			received[neighbor]++
 		}
 	}
+	// adoptOriginatedLocked deletes an originated prefix's entry, so the two
+	// maps are disjoint in the steady state and the sum is the key count. The
+	// membership test covers the window where a neighbor has re-advertised a
+	// prefix this node originates and the entry is back.
+	stats.Prefixes = len(s.routes.entries)
+	for key := range s.originate {
+		if _, present := s.routes.entries[key]; !present {
+			stats.Prefixes++
+		}
+	}
 	for _, neighbor := range s.neighbors {
 		stats.Neighbors = append(stats.Neighbors, NeighborStat{
-			Peer:       neighbor.peer.ID,
-			Alive:      neighbor.isAlive(now),
-			Cost:       neighbor.linkCost(now, s.cfg.Cost),
-			Routes:     received[neighbor],
-			Dropped:    neighbor.peer.Dropped(),
-			SendFailed: neighbor.peer.SendFailed(),
+			Peer:             neighbor.peer.ID,
+			Addr:             neighbor.addr,
+			Alive:            neighbor.isAlive(now),
+			Cost:             neighbor.linkCost(now, s.cfg.Cost),
+			ReportedCost:     neighbor.reportedCost,
+			HaveReportedCost: neighbor.haveReportedCost,
+			RTT:              neighbor.measuredRTT,
+			HaveRTT:          neighbor.haveRTT,
+			Expires:          remaining(now, neighbor.helloExpiry()),
+			Routes:           received[neighbor],
+			Dropped:          neighbor.peer.Dropped(),
+			SendFailed:       neighbor.peer.SendFailed(),
 		})
 	}
 	sort.Slice(stats.Neighbors, func(i, j int) bool { return stats.Neighbors[i].Peer < stats.Neighbors[j].Peer })
 	return stats
+}
+
+// remaining is how long is left until deadline, and zero once it has passed or
+// was never set. A negative duration in an operator's "expires" column reads
+// as a bug in the column rather than as a neighbor that is already late.
+func remaining(now, deadline time.Time) time.Duration {
+	if deadline.IsZero() || !now.Before(deadline) {
+		return 0
+	}
+	return deadline.Sub(now)
+}
+
+// Originated is every prefix this node announces itself, as configured and as
+// the speaker holds it. A caller comparing it against the config file is
+// comparing what took effect against what was asked for.
+func (s *Speaker) Originated() []OriginatedRoute {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]OriginatedRoute, 0, len(s.originate))
+	for key := range s.originate {
+		out = append(out, OriginatedRoute{Destination: key.dest, Source: key.source})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Destination != out[j].Destination {
+			return out[i].Destination.String() < out[j].Destination.String()
+		}
+		return out[i].Source.String() < out[j].Source.String()
+	})
+	return out
+}
+
+// RouteStat is one prefix of the Babel route table as an operator reads it:
+// the selected route, where it points, and how many neighbors offered one.
+// Via is empty for a prefix held unreachable, which a retraction leaves behind
+// so a packet does not follow a shorter prefix instead.
+type RouteStat struct {
+	Destination netip.Prefix
+	// Source is invalid on an ordinary route and set on a source-specific one,
+	// where the pair is the key rather than the destination alone.
+	Source     netip.Prefix
+	Via        string
+	Metric     uint16
+	RouterID   [8]byte
+	Seqno      uint16
+	Candidates int
+	Originated bool
+}
+
+// RouteDump is every prefix this speaker holds, taken under the same lock the
+// protocol runs under so the table is a moment rather than a walk across
+// several. It is the diagnostic BIRD answered with `show route`, and it is
+// deliberately the route table rather than the forwarding table: a prefix with
+// no usable route still appears, which is the case an operator is looking for.
+func (s *Speaker) RouteDump() []RouteStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Both maps, the way advertisableKeys reads both: adoptOriginatedLocked
+	// deletes a prefix's entry when this node takes it over, so a walk of the
+	// route table alone omits everything this node announces, which is the
+	// half an operator checks first.
+	out := make([]RouteStat, 0, len(s.originate)+len(s.routes.entries))
+	seen := make(map[routeKey]struct{}, len(s.originate)+len(s.routes.entries))
+	add := func(key routeKey) {
+		if _, done := seen[key]; done {
+			return
+		}
+		seen[key] = struct{}{}
+		_, originated := s.originate[key]
+		stat := RouteStat{
+			Destination: key.dest,
+			Source:      key.source,
+			Metric:      MetricInfinity,
+			Originated:  originated,
+		}
+		if originated {
+			// A prefix this node originates is advertised at metric zero and
+			// points at nowhere else, whatever a neighbor is still saying
+			// about it.
+			stat.Metric = 0
+		}
+		if entry := s.routes.entries[key]; entry != nil {
+			stat.Candidates = len(entry.routes)
+			if !originated && entry.selected.neighbor != nil {
+				stat.Via = entry.selected.neighbor.peer.ID
+				stat.Metric = entry.selected.cost
+				stat.RouterID = entry.selected.routerID
+				stat.Seqno = entry.selected.seqno
+			}
+		}
+		out = append(out, stat)
+	}
+	for key := range s.originate {
+		add(key)
+	}
+	for key := range s.routes.entries {
+		add(key)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Destination != out[j].Destination {
+			return out[i].Destination.String() < out[j].Destination.String()
+		}
+		return out[i].Source.String() < out[j].Source.String()
+	})
+	return out
 }
