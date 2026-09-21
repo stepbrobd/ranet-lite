@@ -114,6 +114,7 @@ func segmentCounters(counters netstack.SegmentCounters) control.SegmentCounters 
 		Dropped:   counters.Dropped,
 		Steered:   counters.Steered,
 		Unsteered: counters.Unsteered,
+		Unrouted:  counters.Unrouted,
 		Answered:  counters.Answered,
 	}
 }

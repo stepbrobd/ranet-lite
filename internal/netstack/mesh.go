@@ -282,9 +282,13 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 			if !ok {
 				// A steered packet whose first segment the mesh cannot reach
 				// is gone at this point, so it is counted here: without this
-				// the steered counter climbs while the traffic disappears.
+				// the steered counter climbs while the traffic disappears. It
+				// is counted apart from Dropped, which holds the packets this
+				// node refused to act on for a peer: an operator who
+				// configures steering and no local segment would otherwise
+				// see the loss on a line reporting a table they do not have.
 				if steered {
-					m.segmentsDropped.Add(1)
+					m.segmentsUnrouted.Add(1)
 					m.reportSegmentDrop("no route to the first segment of a steered packet", "segment", dst)
 				}
 				continue

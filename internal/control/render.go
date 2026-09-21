@@ -121,7 +121,10 @@ func steeringLine(s Status) string {
 	line := strings.Join(s.Steering, "; ")
 	line += fmt.Sprintf(" (%d steered", s.SegmentCounters.Steered)
 	if s.SegmentCounters.Unsteered > 0 {
-		line += fmt.Sprintf(", %d could not be", s.SegmentCounters.Unsteered)
+		line += fmt.Sprintf(", %d too large to encapsulate", s.SegmentCounters.Unsteered)
+	}
+	if s.SegmentCounters.Unrouted > 0 {
+		line += fmt.Sprintf(", %d with no route to their first segment", s.SegmentCounters.Unrouted)
 	}
 	return line + ")"
 }

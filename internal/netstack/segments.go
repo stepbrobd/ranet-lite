@@ -108,11 +108,16 @@ type SegmentCounters struct {
 	Forwarded uint64
 	Delivered uint64
 	Dropped   uint64
-	// Steered counts this node's own packets that a policy encapsulated, and
-	// Unsteered the ones a policy claimed and this node could not, which are
-	// dropped rather than sent by a route the policy exists to override.
+	// Steered counts this node's own packets that a policy encapsulated,
+	// Unsteered the ones a policy claimed and this node could not, and
+	// Unrouted the ones it encapsulated and the mesh had no route to the
+	// first segment of. Both failures drop the packet rather than send it by
+	// the route the policy exists to override, and both are this node's own
+	// steering rather than anything a peer did, so neither is counted in
+	// Dropped.
 	Steered   uint64
 	Unsteered uint64
+	Unrouted  uint64
 	// Answered counts the ICMP errors sent for refused packets, which is the
 	// half of Dropped a sender was told about.
 	Answered uint64
@@ -125,6 +130,7 @@ func (m *Mesh) SegmentCounters() SegmentCounters {
 		Dropped:   m.segmentsDropped.Load(),
 		Steered:   m.segmentsSteered.Load(),
 		Unsteered: m.segmentsUnsteered.Load(),
+		Unrouted:  m.segmentsUnrouted.Load(),
 		Answered:  m.segmentsAnswered.Load(),
 	}
 }
@@ -376,6 +382,7 @@ type segmentCounters struct {
 	steerTable        atomic.Pointer[srv6.SteerTable]
 	segmentsSteered   atomic.Uint64
 	segmentsUnsteered atomic.Uint64
+	segmentsUnrouted  atomic.Uint64
 	segmentsAnswered  atomic.Uint64
 	// icmpTokens and icmpFilled are the bucket answerRefused draws from, in
 	// tokens and in nanoseconds since segmentsStarted.

@@ -127,11 +127,15 @@ type SegmentCounters struct {
 	Forwarded uint64 `json:"forwarded"`
 	Delivered uint64 `json:"delivered"`
 	Dropped   uint64 `json:"dropped"`
-	// Steered counts this node's own packets a policy encapsulated, and
-	// Unsteered the ones a policy claimed and could not, which went out
-	// unencapsulated and took the route they would have taken anyway.
+	// Steered counts this node's own packets a policy encapsulated, Unsteered
+	// the ones a policy claimed and could not, and Unrouted the ones it
+	// encapsulated toward a first segment the mesh had no route to. Both
+	// failures drop the packet, because a policy here selects an exit and the
+	// route it overrides puts the packet out of another node under a source
+	// that node does not announce.
 	Steered   uint64 `json:"steered"`
 	Unsteered uint64 `json:"unsteered"`
+	Unrouted  uint64 `json:"unrouted"`
 	// Answered counts the ICMP errors sent for refused packets, which is the
 	// half of Dropped whose sender was told why.
 	Answered uint64 `json:"answered"`

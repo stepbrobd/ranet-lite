@@ -106,9 +106,15 @@ func TestSteeredPacketWithNoRouteIsCounted(t *testing.T) {
 	dev.reads <- plainV6(segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888"), "payload")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if counters := m.SegmentCounters(); counters.Dropped > 0 {
+		// Unrouted rather than Dropped: this is a packet of this node's own
+		// that its steering could not deliver, not one a peer addressed to a
+		// segment here, and status reports the two on different lines.
+		if counters := m.SegmentCounters(); counters.Unrouted > 0 {
 			if counters.Steered != 1 {
 				t.Errorf("the packet was counted steered %d times", counters.Steered)
+			}
+			if counters.Dropped != 0 {
+				t.Errorf("this node's own steering was counted against its segment table %d times", counters.Dropped)
 			}
 			return
 		}
