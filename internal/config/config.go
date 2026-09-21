@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/srv6"
 	"gopkg.in/yaml.v3"
 )
@@ -82,6 +83,11 @@ type Config struct {
 	Babel    Babel    `yaml:"babel"`
 	Kernel   Kernel   `yaml:"kernel"`
 	Segments Segments `yaml:"segments"`
+	// Egress is the capability that makes this node an exit node or a subnet
+	// router. Its type belongs to internal/egress rather than being mirrored
+	// here, so the package that acts on a field is the one that says what it
+	// means and the one that validates it.
+	Egress egress.Config `yaml:"egress"`
 	// Experimental is ranet's block, carried so its config parses here.
 	Experimental Experimental `yaml:"experimental"`
 }
@@ -839,6 +845,13 @@ func (c *Config) validate() error {
 		}
 	}
 	if err := c.Kernel.refuseWhatDisablingIgnores(); err != nil {
+		return err
+	}
+	// Validated by the package that owns the capability rather than here. This
+	// file decides nothing about what an egress block may say, so that a
+	// generated or control-plane-supplied capability is judged by the same
+	// rules a written one is.
+	if err := c.Egress.Validate(); err != nil {
 		return err
 	}
 	if c.Segments.Source != "" {

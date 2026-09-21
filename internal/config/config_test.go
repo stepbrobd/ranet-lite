@@ -112,6 +112,13 @@ func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 		// read rather than when the first steer entry needs it.
 		"a v4 segment source":        "segments:\n  source: \"10.0.0.1\"\n",
 		"a multicast segment source": "segments:\n  source: \"ff02::1\"\n",
+		// The egress capability judges itself, in the package that installs
+		// it, so these reach Load through one call and not through a mirrored
+		// copy of its fields.
+		"an exit that advertises nothing":      "egress:\n  enable: true\n",
+		"an advertised prefix with host bits":  "egress:\n  enable: true\n  advertise: [\"198.51.100.7/24\"]\n",
+		"an egress source of the other family": "egress:\n  enable: true\n  advertise: [\"0.0.0.0/0\"]\n  source4: \"2001:db8::1\"\n",
+		"an egress block left switched off":    "egress:\n  advertise: [\"0.0.0.0/0\"]\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yaml")
