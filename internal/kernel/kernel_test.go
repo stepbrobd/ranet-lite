@@ -43,6 +43,7 @@ type fakeKernel struct {
 	vrfs     map[string]uint32
 	ruleAdds int
 	ruleDels int
+	vrfErr   error
 
 	failAdd     map[Route]error
 	failDel     map[Route]error
@@ -603,10 +604,15 @@ func TestRunWithdrawsOnCancel(t *testing.T) {
 	}
 }
 
+// A rule pass deletes every rule carrying this reconciler's protocol that the
+// configuration does not name, so claiming RTPROT_STATIC would delete every
+// static rule on the host, since systemd-networkd stamps it on its own.
 func TestNewRejectsReservedProtocol(t *testing.T) {
-	_, err := New(Config{Interface: "ranet0", Protocol: 2}, netstack.NewRouteTable())
-	if err == nil || !strings.Contains(err.Error(), "is reserved") {
-		t.Fatalf("RTPROT_KERNEL was refused with %v, want it named as reserved", err)
+	for _, protocol := range []uint8{2, protocolStatic} {
+		_, err := New(Config{Interface: "ranet0", Protocol: protocol}, netstack.NewRouteTable())
+		if err == nil || !strings.Contains(err.Error(), "is reserved") {
+			t.Errorf("protocol %d was refused with %v, want it named as reserved", protocol, err)
+		}
 	}
 }
 
@@ -1038,6 +1044,9 @@ func (f *fakeKernel) DelRule(rule Rule) error {
 func (f *fakeKernel) EnsureVRF(name string, table uint32) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.vrfErr != nil {
+		return false, f.vrfErr
+	}
 	if _, exists := f.vrfs[name]; exists {
 		return false, nil
 	}
@@ -1084,6 +1093,16 @@ func TestPlatformWithoutRulesRefusesThemByName(t *testing.T) {
 	}
 	if err := refuseWhatThePlatformLacks(Config{CreateVRF: true, VRF: "gravity"}, plat); err == nil {
 		t.Fatal("vrf creation was accepted on a platform with no VRFs")
+	}
+	// Naming a VRF without asking for one to be created still needs the link
+	// enslaved to it, which the same platforms cannot do.
+	if err := refuseWhatThePlatformLacks(Config{VRF: "gravity"}, plat); err == nil {
+		t.Fatal("a vrf was accepted on a platform with no VRFs")
+	}
+	// Asking for a device with no name to create is a configuration that
+	// cannot mean anything.
+	if err := refuseWhatThePlatformLacks(Config{CreateVRF: true}, newFakeKernel(t)); err == nil {
+		t.Fatal("vrf_create with no vrf was accepted")
 	}
 	// The same configuration on a platform that has both is accepted.
 	if err := refuseWhatThePlatformLacks(Config{Rules: []Rule{rule}, CreateVRF: true, VRF: "gravity"}, newFakeKernel(t)); err != nil {
@@ -1190,5 +1209,65 @@ func TestVRFThatWasAlreadyThereIsLeftAlone(t *testing.T) {
 	}
 	if table, ok := fake.vrfs["gravity"]; !ok || table != 42 {
 		t.Errorf("shutdown removed a vrf it did not create: %v %d", ok, table)
+	}
+}
+
+// Two spellings the kernel stores as one rule have to reach the diff as one
+// rule. A mark with no mask is stored and reported back with a mask of all
+// ones, and a prefix of length zero is reported back as no prefix at all, so a
+// configuration holding either spelling never matches its own readback: every
+// pass deletes the rule and installs it again, with a window each time in
+// which the traffic it steers is unsteered.
+func TestRulesAreCanonicalizedToWhatTheKernelReportsBack(t *testing.T) {
+	masked := Rule{Family: FamilyIPv4, FWMark: 0x726c, FWMask: ^uint32(0), Table: 254, Priority: 40}
+	if got := masked.canonical(); got.FWMask != 0 {
+		t.Errorf("an all-ones mask survived canonicalization as %#x", got.FWMask)
+	}
+	wide := Rule{Family: FamilyIPv6, To: prefix("::/0"), FWMark: 1, Table: 200, Priority: 100}
+	if got := wide.canonical(); got.To.IsValid() {
+		t.Errorf("a zero-length prefix survived canonicalization as %s", got.To)
+	}
+
+	// The reconciler holds the canonical form, so the diff compares the dump
+	// against what the kernel would report rather than against the spelling.
+	reconciler, _, fake := harness(t, Config{Rules: []Rule{masked}})
+	if got := reconciler.cfg.Rules[0].FWMask; got != 0 {
+		t.Fatalf("the reconciler kept mask %#x", got)
+	}
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	adds, dels := fake.ruleAdds, fake.ruleDels
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.ruleAdds != adds || fake.ruleDels != dels {
+		t.Errorf("a second pass moved %d adds and %d deletes", fake.ruleAdds-adds, fake.ruleDels-dels)
+	}
+
+	// Dropping a zero-length prefix leaves a rule selecting nothing, which is
+	// refused by name rather than installed as a rule matching everything.
+	everything := Rule{Family: FamilyIPv6, To: prefix("::/0"), Table: 200, Priority: 100}
+	if err := everything.canonical().validate(); err == nil {
+		t.Error("a rule selecting every address was accepted")
+	}
+}
+
+// A pass that fails anywhere has to say so where an operator reads it. Only
+// applyRoutes counts, so a node whose rules or VRF fail on every pass would
+// otherwise report a clean route count and no error at all.
+func TestStatsCarryTheWholePassError(t *testing.T) {
+	reconciler, _, fake := harness(t, Config{VRF: "gravity", CreateVRF: true})
+	fake.vrfErr = errors.New("no permission to create a vrf")
+
+	if err := reconciler.reconcile(); err == nil {
+		t.Fatal("a failing vrf did not fail the pass")
+	}
+	stats := reconciler.Stats()
+	if stats.Err == "" {
+		t.Error("the pass failed and Stats reported no error")
+	}
+	if stats.At.IsZero() {
+		t.Error("a failing pass left no timestamp, so a stale one reads as current")
 	}
 }

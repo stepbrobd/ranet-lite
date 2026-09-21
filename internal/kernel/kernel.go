@@ -89,6 +89,11 @@ const (
 	// darwin too.
 	reservedTable = 253
 	lastByteTable = 255
+	// protocolStatic is RTPROT_STATIC, which systemd-networkd stamps on every
+	// route and rule it installs. It is the highest protocol number this
+	// reconciler must not claim, and it is named here for the same reason the
+	// tables above are.
+	protocolStatic = 4
 	// defaultIPv6Metric is IP6_RT_PRIO_USER, what the kernel stamps on an
 	// IPv6 route that arrives without RTA_PRIORITY. The reconciler sends it
 	// explicitly instead, so a dump reports back exactly what it installed.
@@ -320,6 +325,30 @@ func (r Rule) String() string {
 	return strings.Join(append(parts, fmt.Sprintf("lookup %d", r.Table)), " ")
 }
 
+// canonical is the rule as the kernel reports it back. Two spellings can reach
+// the kernel as one rule while only one of them survives a dump, and a diff
+// holding the other deletes and reinstalls that rule on every pass, with a
+// window each time in which it is not there.
+//
+// A mark with no mask matches every bit, which the kernel stores and reports
+// as a mask of all ones: `ip rule add fwmark X` and `ip rule add fwmark
+// X/0xffffffff` answer EEXIST to each other. A prefix of length zero selects
+// every address, so the kernel emits no FRA_DST or FRA_SRC for it and a rule
+// carrying nothing else is one that matches everything, which validate then
+// refuses by name rather than installing.
+func (r Rule) canonical() Rule {
+	if r.FWMask == ^uint32(0) {
+		r.FWMask = 0
+	}
+	if r.To.Bits() == 0 {
+		r.To = netip.Prefix{}
+	}
+	if r.From.Bits() == 0 {
+		r.From = netip.Prefix{}
+	}
+	return r
+}
+
 // validate refuses a rule the kernel would accept and an operator would not
 // recognize afterwards. It runs at startup, so a mistake costs a refusal to
 // start rather than a rule installed against a live fleet.
@@ -408,6 +437,10 @@ type Reconciler struct {
 	// reconcile goroutine publishes a whole value and a reader takes one, so
 	// this needs no lock and a reader can never see half a pass.
 	stats atomic.Pointer[Stats]
+	// routePass holds the counts applyRoutes took, between that step and the
+	// record reconcile makes of the whole pass. Only the reconcile goroutine
+	// touches it.
+	routePass Stats
 }
 
 // Stats is one finished route pass. Installed counts the routes the kernel
@@ -450,11 +483,14 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 	if cfg.Protocol == 0 {
 		cfg.Protocol = DefaultProtocol
 	}
-	if cfg.Protocol < 4 {
+	if cfg.Protocol <= protocolStatic {
 		// rtnetlink reserves 0 through 3 for unspec, redirect, kernel and
-		// boot; claiming one of those would make the reconciler's routes
-		// indistinguishable from the kernel's own.
-		return nil, fmt.Errorf("kernel: protocol %d is reserved, use 4 through 255", cfg.Protocol)
+		// boot, and 4 is the static protocol systemd-networkd stamps on the
+		// rules it installs. Claiming any of them makes this reconciler's
+		// routes indistinguishable from somebody else's, and since a rule
+		// pass deletes every rule carrying this protocol that the config does
+		// not name, claiming 4 deletes every static rule on the host.
+		return nil, fmt.Errorf("kernel: protocol %d is reserved for the kernel and for networkd, use 5 through 255", cfg.Protocol)
 	}
 	if cfg.Table >= reservedTable && cfg.Table <= lastByteTable {
 		// rtnetlink reserves 253, 254 and 255 for default, main and local, and
@@ -487,14 +523,13 @@ func New(cfg Config, src RouteSource) (*Reconciler, error) {
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = DefaultReconcileInterval
 	}
+	cfg.Rules = canonicalRules(cfg.Rules)
 	for i, rule := range cfg.Rules {
 		if err := rule.validate(); err != nil {
 			return nil, err
 		}
-		for _, earlier := range cfg.Rules[:i] {
-			if earlier == rule {
-				return nil, fmt.Errorf("kernel: rule %s is configured twice", rule)
-			}
+		if slices.Contains(cfg.Rules[:i], rule) {
+			return nil, fmt.Errorf("kernel: rule %s is configured twice", rule)
 		}
 	}
 	plat, err := newPlatform(cfg)
@@ -521,8 +556,11 @@ func refuseWhatThePlatformLacks(cfg Config, plat platform) error {
 	if _, ok := plat.(ruler); !ok && len(cfg.Rules) > 0 {
 		return fmt.Errorf("kernel: %d policy rules are configured and this platform has no policy routing: %s", len(cfg.Rules), rulesUnavailable)
 	}
-	if _, ok := plat.(vrfMaker); !ok && cfg.CreateVRF {
-		return errors.New("kernel: vrf_create is set and this platform has no VRFs: there is one forwarding table here and the reconciler already writes it")
+	if _, ok := plat.(vrfMaker); !ok && (cfg.CreateVRF || cfg.VRF != "") {
+		return errors.New("kernel: vrf or vrf_create is set and this platform has no VRFs: there is one forwarding table here and the reconciler already writes it")
+	}
+	if cfg.CreateVRF && cfg.VRF == "" {
+		return errors.New("kernel: vrf_create is set and vrf names no device, so there is nothing to create")
 	}
 	return nil
 }
@@ -531,7 +569,20 @@ func refuseWhatThePlatformLacks(cfg Config, plat platform) error {
 // refusal answers the next question as well as the current one.
 const rulesUnavailable = "an announced default and a source-specific route are installed scoped to the tun instead, which keeps both off every unbound socket, and the underlay stays out of the mesh without needing a mark"
 
+// canonicalRules is the configured rules in the spelling the kernel reports
+// back, in a copy: New is handed the caller's slice and a reload compares one
+// Config against another, so rewriting in place would change what that
+// comparison reads. See Rule.canonical.
+func canonicalRules(rules []Rule) []Rule {
+	out := slices.Clone(rules)
+	for i := range out {
+		out[i] = out[i].canonical()
+	}
+	return out
+}
+
 func newReconciler(cfg Config, src RouteSource, plat platform) *Reconciler {
+	cfg.Rules = canonicalRules(cfg.Rules)
 	r := &Reconciler{
 		cfg: cfg, src: src, plat: plat,
 		owned:       make(map[netip.Prefix]bool),
@@ -646,13 +697,34 @@ func stopTimer(t *time.Timer) {
 	}
 }
 
-// reconcile brings the kernel to one snapshot. The three steps are
-// independent and every error is collected, so a VRF that cannot be joined
-// does not stop routes from being installed.
+// reconcile brings the kernel to one snapshot. The five steps are independent
+// and every error is collected, so a VRF that cannot be joined does not stop
+// routes from being installed.
+//
+// The pass is recorded here rather than inside applyRoutes, so that what a
+// diagnostic reports is the error Run logged rather than one fifth of it: a
+// node whose rules or VRF fail on every pass would otherwise answer `ranet-lite
+// status` with a clean route count and no error at all, which is the outage
+// that reads as a routing problem for a day.
 func (r *Reconciler) reconcile() error {
 	// The VRF first, because applyMaster enslaves the link to it and a master
 	// that does not exist yet is a master the link cannot join.
-	return errors.Join(r.applyVRF(), r.applyMaster(), r.applyAddresses(), r.applyRoutes(), r.applyRules())
+	err := errors.Join(r.applyVRF(), r.applyMaster(), r.applyAddresses(), r.applyRoutes(), r.applyRules())
+	r.recordPass(err)
+	return err
+}
+
+// recordPass publishes the pass applyRoutes counted, with the whole pass's
+// error rather than the route half's. A pass that failed before applyRoutes
+// could count anything still records the attempt, so a stale PassAt cannot
+// read as a reconciler that is keeping up.
+func (r *Reconciler) recordPass(err error) {
+	stats := r.routePass
+	stats.At = time.Now()
+	if err != nil {
+		stats.Err = err.Error()
+	}
+	r.stats.Store(&stats)
 }
 
 // applyVRF creates the master device when the configuration asked for one and
@@ -763,23 +835,18 @@ func (r *Reconciler) applyRoutes() error {
 	if added > 0 || removed > 0 {
 		slog.Info("kernel routes reconciled", "added", added, "removed", removed)
 	}
-	err = errors.Join(errs...)
 	// Installed is counted rather than re-listed: the kernel held len(actual)
 	// when the pass started and every add and delete below was confirmed, so
-	// the sum is exact and costs no second dump.
-	stats := Stats{
-		At:        time.Now(),
+	// the sum is exact and costs no second dump. reconcile publishes it, with
+	// the error of the whole pass rather than this step's.
+	r.routePass = Stats{
 		Desired:   len(desired),
 		Installed: len(actual) - removed + added,
 		Skipped:   skipped,
 		Added:     added,
 		Removed:   removed,
 	}
-	if err != nil {
-		stats.Err = err.Error()
-	}
-	r.stats.Store(&stats)
-	return err
+	return errors.Join(errs...)
 }
 
 // desired projects one forwarding table snapshot onto the routes the kernel
