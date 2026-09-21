@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
-	"io"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -104,38 +102,32 @@ func TestFirstSignalShutsDownAndTheSecondGivesUp(t *testing.T) {
 	}
 }
 
-// `ranet-lite config.yaml`, one missing dash, otherwise starts against the
-// default path and reports nothing: the node comes up with a configuration
-// nobody asked for. An unreadable -log-level is the same shape.
-func TestCommandLineRefusesWhatItCannotActOn(t *testing.T) {
+// `ranet-lite daemon config.yaml`, one missing dash, otherwise starts against
+// the default path and reports nothing: the node comes up with a
+// configuration nobody asked for. An unreadable --log-level is the same shape.
+func TestDaemonRefusesWhatItCannotActOn(t *testing.T) {
 	for name, args := range map[string][]string{
-		"a positional argument": {"config.yaml"},
-		"one after a flag":      {"-config", "/etc/x.yaml", "extra"},
-		"an unreadable level":   {"-log-level", "chatty"},
+		"a positional argument": {"daemon", "config.yaml"},
+		"one after a flag":      {"daemon", "--config", "/etc/x.yaml", "extra"},
+		"an unreadable level":   {"daemon", "--log-level", "chatty"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := parseOptions(args, io.Discard); err == nil {
-				t.Errorf("parseOptions(%q) was accepted", args)
+			if _, err := execute(t, args...); err == nil {
+				t.Errorf("%q was accepted", args)
 			}
 		})
 	}
-	opts, err := parseOptions([]string{"-config", "/etc/x.yaml", "-log-level", "debug"}, io.Discard)
-	if err != nil {
-		t.Fatalf("a well-formed command line was refused: %v", err)
-	}
-	if opts.configPath != "/etc/x.yaml" || opts.level != slog.LevelDebug {
-		t.Errorf("parsed %+v, want the config path and level given", opts)
-	}
 
-	// -h is a request the flag package has already answered by writing the
-	// usage. Reported as a failure it prints "flag: help requested" under the
-	// usage and exits 1.
-	usage := &strings.Builder{}
-	if _, err := parseOptions([]string{"-h"}, usage); !errors.Is(err, flag.ErrHelp) {
-		t.Errorf("asking for help returned %v, want flag.ErrHelp so run can tell it from a refusal", err)
+	// --help is a request cobra answers by writing the usage. Reported as a
+	// failure it exits nonzero on a question that was answered.
+	usage, err := execute(t, "daemon", "--help")
+	if err != nil {
+		t.Errorf("asking for help failed: %v", err)
 	}
-	if !strings.Contains(usage.String(), "-config") {
-		t.Errorf("the usage does not name the flags: %q", usage.String())
+	for _, want := range []string{"--config", "--log-level", "--metrics"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("the usage does not name %s: %q", want, usage)
+		}
 	}
 }
 
@@ -148,11 +140,11 @@ func TestStartupRefusalsAvoidTheStandardLogger(t *testing.T) {
 		t.Fatal(err)
 	}
 	if bytes.Contains(body, []byte("log.Fatal")) {
-		t.Error("main.go still exits through log.Fatal, which writes at INFO and vanishes at -log-level warn")
+		t.Error("main.go still exits through log.Fatal, which writes at INFO and vanishes at --log-level warn")
 	}
 }
 
-// The same rule from the other side: a refusal at -log-level error is written.
+// The same rule from the other side: a refusal at --log-level error is written.
 // See refuseToStart.
 func TestStartupRefusalsSurviveAProductionLogLevel(t *testing.T) {
 	var written strings.Builder
@@ -164,6 +156,6 @@ func TestStartupRefusalsSurviveAProductionLogLevel(t *testing.T) {
 		t.Error("a refusal reported success")
 	}
 	if !strings.Contains(written.String(), "/nonexistent.yaml") {
-		t.Errorf("a refusal at -log-level error wrote %q", written.String())
+		t.Errorf("a refusal at --log-level error wrote %q", written.String())
 	}
 }

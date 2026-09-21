@@ -87,7 +87,7 @@ func (c *Client) explain(err error) error {
 		// would have been told rather than left with an errno.
 		return fmt.Errorf("control: socket path is %d bytes, over the %d a unix socket holds: %s", len(c.path), MaxSocketPath, c.path)
 	case errors.Is(err, os.ErrNotExist):
-		return fmt.Errorf("control: no socket at %s: the daemon creates it unless it was started with -control \"\"", c.path)
+		return fmt.Errorf("control: no socket at %s: the daemon creates it unless it was started with --control \"\"", c.path)
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("control: nothing is listening at %s, so the daemon is not running", c.path)
 	case errors.Is(err, os.ErrPermission):

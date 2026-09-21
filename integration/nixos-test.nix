@@ -408,7 +408,7 @@ in
           after = [ "network-online.target" ];
           serviceConfig = {
             ExecStart =
-              "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug -metrics 127.0.0.1:9669"
+              "${ranetLite}/bin/ranet-lite daemon --config /etc/ranet-lite/config.yaml --log-level debug --metrics 127.0.0.1:9669"
               + pkgs.lib.optionalString profile " -pprof 127.0.0.1:6060";
             TimeoutStopSec = "15s";
             Restart = "on-failure";
@@ -502,7 +502,7 @@ in
         # And the kernel took the header off.
         assert bare_inner(carried), f"the kernel did not decapsulate this tree's header:\n{carried}"
 
-        status = json.loads(client.succeed("ranet-lite status -json"))
+        status = json.loads(client.succeed("ranet-lite status --json"))
         print(json.dumps(status["segment_counters"], indent=2))
         assert status["segment_counters"]["steered"] > 0, "nothing was steered"
         assert status["segment_counters"]["unsteered"] == 0, "a packet could not be steered"
@@ -527,12 +527,12 @@ in
         )
         print(gateway.succeed("ip -6 route show ${clientBehind}/128"))
 
-        before = json.loads(client.succeed("ranet-lite status -json"))["segment_counters"]
+        before = json.loads(client.succeed("ranet-lite status --json"))["segment_counters"]
         gateway.wait_until_succeeds(
             "ping -c 1 -W 2 -I ${gatewayTunnel} ${clientBehind}", timeout=timeout
         )
         gateway.succeed("ping -c 3 -i 0.3 -W 2 -I ${gatewayTunnel} ${clientBehind}")
-        status = json.loads(client.succeed("ranet-lite status -json"))
+        status = json.loads(client.succeed("ranet-lite status --json"))
         after = status["segment_counters"]
         print(json.dumps(after, indent=2))
         assert after["delivered"] > before["delivered"], (

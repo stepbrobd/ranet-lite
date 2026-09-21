@@ -642,11 +642,12 @@ babel:
 """)
         peer_command = [
             str(args.client),
-            "-config",
+            "daemon",
+            "--config",
             peer_conf,
-            "-pprof",
+            "--pprof",
             peer_pprof,
-            "-metrics",
+            "--metrics",
             peer_metrics,
         ]
         if args.peer_affinity:
@@ -694,12 +695,13 @@ babel:
 """)
     client_command = [
         str(args.client),
-        "-config",
+        "daemon",
+        "--config",
         client_conf,
-        "-pprof",
+        "--pprof",
         client_pprof,
     ]
-    client_command += ["-metrics", client_metrics]
+    client_command += ["--metrics", client_metrics]
     if args.affinity:
         client_command = ["taskset", "-c", args.affinity] + client_command
     start(client_command, "client", env=dict(os.environ, GOMAXPROCS=str(args.cores)))

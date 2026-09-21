@@ -2,14 +2,15 @@
 // userspace IKEv2/ESP and an embedded Babel speaker. Babel exchanges control
 // packets inside ESP. Address and kernel route configuration are external
 // unless the kernel block in the config file turns the reconciler on.
+//
+// `ranet-lite daemon` is the node. Every other subcommand reads a running
+// one's control socket; see cli.go.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -24,16 +25,36 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/NickCao/ranet-lite/internal/client"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/kernel"
-	"github.com/NickCao/ranet-lite/internal/version"
 )
 
-func main() { os.Exit(run()) }
+// main runs the command tree and turns what it returns into a process status.
+// A daemon that refused to start has already said why through the handler an
+// operator's log level selects, so its status comes back as an exitCode and is
+// not written a second time.
+func main() {
+	if err := newRoot().Execute(); err != nil {
+		var code exitCode
+		if errors.As(err, &code) {
+			os.Exit(int(code))
+		}
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-// options is the command line after parsing.
+// exitCode carries a process status out through cobra's error return, which is
+// the only way back to main from a command body.
+type exitCode int
+
+func (e exitCode) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+
+// options is the daemon's command line after parsing.
 type options struct {
 	configPath         string
 	registryPath       string
@@ -42,93 +63,64 @@ type options struct {
 	pprofAddr          string
 	metricsAddr        string
 	controlPath        string
-	version            bool
 	contentionProfiles bool
 	level              slog.Level
 }
 
-// parseOptions reads the command line and refuses what it cannot act on. It
-// takes the arguments rather than reading them from the process, and returns
-// an error rather than exiting, so that every refusal is reachable from a
-// test and so that -h can be told from a mistake.
-func parseOptions(args []string, usage io.Writer) (options, error) {
-	fs := flag.NewFlagSet("ranet-lite", flag.ContinueOnError)
-	fs.SetOutput(usage)
+// daemonCommand is the node itself. Its flags are its own rather than the
+// root's: a reader's --control names a socket to read and this one names a
+// socket to bind, and the two would share a description that fits neither.
+func daemonCommand() *cobra.Command {
 	var o options
-	fs.StringVar(&o.configPath, "config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
-	fs.StringVar(&o.registryPath, "registry", "", "path to registry.json, overriding the config file; ranet spells it this way and its own config carries no such field")
-	fs.StringVar(&o.privateKeyPath, "key", "", "path to the PKCS8 PEM Ed25519 private key, overriding the config file; ranet spells it this way and its own config carries no such field")
-	fs.BoolVar(&o.fullMesh, "full-mesh", false, "dial every node the registry names, as ranet does; its own config file has no field to ask for this")
-	fs.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
-	fs.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
-	fs.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
-	fs.StringVar(&o.controlPath, "control", control.DefaultSocket, "unix socket serving the read-only control surface the subcommands read; empty disables it")
-	fs.BoolVar(&o.version, "version", false, "print the version this binary was built from and exit")
-	logLevel := fs.String("log-level", "info", "minimum log level: debug, info, warn, or error")
-	if err := fs.Parse(args); err != nil {
-		return options{}, err
+	var logLevel string
+	cmd := &cobra.Command{
+		Use:   "daemon",
+		Short: "run this node: IKEv2, ESP, the babel speaker and the optional route reconciler",
+		Args:  noArguments,
+		RunE: func(*cobra.Command, []string) error {
+			if err := o.level.UnmarshalText([]byte(logLevel)); err != nil {
+				return fmt.Errorf("invalid --log-level %q: %w", logLevel, err)
+			}
+			if code := runDaemon(o); code != 0 {
+				return exitCode(code)
+			}
+			return nil
+		},
 	}
-	if fs.NArg() != 0 {
-		// A missing dash is the way this happens: `ranet-lite config.yaml`
-		// otherwise starts silently against the default path. A first
-		// argument is dispatched as a subcommand before this, so anything
-		// reaching here followed a flag and names neither.
-		return options{}, fmt.Errorf("unexpected argument %q: the config path is given with -config, and a subcommand comes first (%s)",
-			fs.Arg(0), strings.Join(commandNames(), ", "))
-	}
-	if err := o.level.UnmarshalText([]byte(*logLevel)); err != nil {
-		return options{}, fmt.Errorf("invalid -log-level %q: %w", *logLevel, err)
-	}
-	return o, nil
+	f := cmd.Flags()
+	f.StringVarP(&o.configPath, "config", "c", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
+	f.StringVar(&o.registryPath, "registry", "", "path to registry.json, overriding the config file; ranet spells it this way and its own config carries no such field")
+	f.StringVar(&o.privateKeyPath, "key", "", "path to the PKCS8 PEM Ed25519 private key, overriding the config file; ranet spells it this way and its own config carries no such field")
+	f.BoolVar(&o.fullMesh, "full-mesh", false, "dial every node the registry names, as ranet does; its own config file has no field to ask for this")
+	f.StringVar(&o.pprofAddr, "pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling, CPU at /debug/pprof/profile and flamegraph at go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
+	f.BoolVar(&o.contentionProfiles, "contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
+	f.StringVar(&o.metricsAddr, "metrics", "", "if set, serve Prometheus metrics on this address (e.g. 127.0.0.1:9669) at /metrics")
+	f.StringVar(&o.controlPath, "control", control.DefaultSocket, "unix socket serving the read-only control surface the other subcommands read; empty disables it")
+	f.StringVar(&logLevel, "log-level", "info", "minimum log level: debug, info, warn, or error")
+	return cmd
 }
 
 // refuseToStart reports a startup this node will not attempt, at the level an
-// operator filters for. The standard logger writes through slog at INFO, which
-// -log-level warn and above drop, so every refusal below was a process that
-// exited 1 having written nothing at all.
+// operator filters for. The standard logger writes through slog at INFO,
+// which --log-level warn and above drop, so every refusal below was a process
+// that exited 1 having written nothing at all.
 func refuseToStart(err error) int {
 	slog.Error("ranet-lite is not starting", "err", err)
 	return 1
 }
 
-// run is main's body so that every deferred close runs before the process
-// exits with a status. A failure reported only in the log and then exited zero
-// tells a supervisor the node stopped cleanly when it did not, and the route
-// withdrawal at shutdown is one of the things that reports this way.
-func run() int {
-	// A first argument that is not a flag asks for the client half rather than
-	// the daemon, so `ranet-lite -config ...` still starts a node and a
-	// deployment needs no change. See cli.go.
-	if name, rest, ok := subcommand(os.Args[1:]); ok {
-		return runCommand(name, rest, os.Stdout, os.Stderr)
-	}
-
-	// Before slog.SetDefault below, so this one refusal reaches stderr through
-	// the standard logger's own writer rather than through a handler that has
-	// not been installed. Every later one goes through refuseToStart.
-	opts, err := parseOptions(os.Args[1:], os.Stderr)
-	if errors.Is(err, flag.ErrHelp) {
-		// The flag package has already written the usage that was asked for.
-		// Reporting the sentinel as a failure prints "flag: help requested"
-		// under it and exits 1 on a request that was answered.
-		return 0
-	}
-	if err != nil {
-		log.Print(err)
-		return 1
-	}
-	if opts.version {
-		// Asked of the binary rather than of a node, because the question
-		// comes up before a node is running and on a host where one will not.
-		fmt.Fprintln(os.Stdout, version.String())
-		return 0
-	}
+// runDaemon is the node's body, in a function of its own so that every
+// deferred close runs before the process exits with a status. A failure
+// reported only in the log and then exited zero tells a supervisor the node
+// stopped cleanly when it did not, and the route withdrawal at shutdown is one
+// of the things that reports this way.
+func runDaemon(opts options) int {
 	configPath, pprofAddr := &opts.configPath, &opts.pprofAddr
 	metricsAddr, contentionProfiles := &opts.metricsAddr, &opts.contentionProfiles
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: opts.level})))
 
-	// Set by anything that fails on a goroutine or after run has committed to
-	// a clean shutdown. run returns nonzero if any of them did.
+	// Set by anything that fails on a goroutine or after runDaemon has
+	// committed to a clean shutdown. It returns nonzero if any of them did.
 	var failed atomic.Bool
 
 	if *pprofAddr != "" {
@@ -251,7 +243,7 @@ func run() int {
 	// leaving a node nobody has a way to ask anything. The default path is the
 	// one case that warns and carries on: it is on without being asked for, so
 	// a node whose unit cannot reach /var/run would otherwise stop starting on
-	// upgrade over a diagnostic it never requested. -control "" is the opt-out.
+	// upgrade over a diagnostic it never requested. --control "" is the opt-out.
 	if opts.controlPath != "" {
 		listener, err := control.Listen(opts.controlPath)
 		if err != nil && opts.controlPath == control.DefaultSocket {
