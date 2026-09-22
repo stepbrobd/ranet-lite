@@ -59,6 +59,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 )
 
 const (
@@ -154,8 +155,8 @@ type Header struct {
 // header carries every segment but the first, so its path starts one hop in.
 func (h Header) Path() []netip.Addr {
 	path := make([]netip.Addr, 0, len(h.Segments))
-	for i := len(h.Segments) - 1; i >= 0; i-- {
-		path = append(path, h.Segments[i])
+	for _, segment := range slices.Backward(h.Segments) {
+		path = append(path, segment)
 	}
 	return path
 }
