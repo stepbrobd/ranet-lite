@@ -585,3 +585,62 @@ func TestPrepareMovesOntoAnInterfaceItCannotCover(t *testing.T) {
 		})
 	}
 }
+
+// The reconciler asks Ready once a pass, so it is the only thing repairing
+// this routing while the daemon runs: Prepare fires on a link change and
+// nothing else drives ensure. The three answers it owes are asked here
+// against the recorded table the rest of this file uses, because the
+// CaptureRoutes contract is guarded through a fake in capture_test.go and the
+// one implementation behind it was guarded by the dumps another test happened
+// to break.
+func TestReadyRepairsTheUnderlayAndAnswersPerFamily(t *testing.T) {
+	links := &fakeDefaults{
+		v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")},
+		v6: hostDefault{index: dockIndex, gateway: addr("2001:db8::1")},
+	}
+	var held []dumpEntry
+	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, held...) })
+
+	// A socket on no interface has nothing scoped to it, and that is a refusal
+	// rather than an answer: "not covered" with no error reads as a host that
+	// reaches nothing, where this is a socket the transport has not bound yet
+	// and a reconciler that should say why it is holding a capture back.
+	switch covered, err := underlay.Ready(); {
+	case err == nil:
+		t.Error("an underlay on no interface answered rather than saying it is on none")
+	case covered.V4 || covered.V6:
+		t.Errorf("an underlay on no interface reports %+v", covered)
+	}
+
+	// Bound to the uplink, which carries the host's IPv4 and not its IPv6.
+	if err := underlay.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	held = append(held, ourScoped(uplinkIndex, addr("192.168.0.1")))
+	written := len(sent(t, sock))
+	covered, err := underlay.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !covered.V4 || covered.V6 {
+		t.Errorf("a socket whose host reaches IPv4 here and IPv6 elsewhere reports %+v, want IPv4 alone", covered)
+	}
+	if got := sent(t, sock); len(got) != written {
+		t.Errorf("a route already in the table was written again: %+v", got[written:])
+	}
+
+	// The kernel drops it, which clearing IFF_UP does and bringing the
+	// interface back up does not undo. The pass that finds it gone is this
+	// one, not a Prepare, because nothing has changed on the link.
+	held = nil
+	if covered, err = underlay.Ready(); err != nil {
+		t.Fatal(err)
+	}
+	got := sent(t, sock)
+	if len(got) != written+1 || got[written].kind != unix.RTM_ADD || !got[written].scoped {
+		t.Fatalf("the route the kernel dropped was not put back: %+v", got[written:])
+	}
+	if !covered.V4 {
+		t.Errorf("the family it had just repaired reports %+v", covered)
+	}
+}
