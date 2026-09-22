@@ -1,6 +1,7 @@
 package srv6
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 
@@ -29,14 +30,25 @@ type Segments struct {
 }
 
 // Normalized is the capability as the dataplane runs it: an omitted list and
-// an empty one the same, and every steering entry carrying the outer source it
-// will be sent from, the block's own where the entry named none. Two
-// configurations are compared through this rather than as they were written,
-// so a source repeated on the entry that inherits it is not a change and does
-// not cost a restart.
+// an empty one the same, both lists in one order, and every steering entry
+// carrying the outer source it will be sent from, the block's own where the
+// entry named none. Two configurations are compared through this rather than
+// as they were written, so neither a source repeated on the entry that
+// inherits it nor the order the entries were listed in is a change, and
+// neither costs a restart.
+//
+// Both lists are read as sets: the local segments become a map keyed by SID
+// and the steering entries a trie keyed by their selector, and a duplicate key
+// in either is refused rather than resolved by position. The segments inside
+// one steering entry are the exception and are left alone, because Via is the
+// order a packet visits its waypoints.
 func (s Segments) Normalized() Segments {
 	if len(s.Local) == 0 {
 		s.Local = nil
+	} else {
+		s.Local = slices.SortedFunc(slices.Values(s.Local), func(a, b Segment) int {
+			return cmp.Or(schema.CompareAddr(a.SID, b.SID), cmp.Compare(a.Behavior, b.Behavior))
+		})
 	}
 	if len(s.Steer) == 0 {
 		s.Steer = nil
@@ -53,6 +65,14 @@ func (s Segments) Normalized() Segments {
 			s.Steer[i].Source = s.Source
 		}
 	}
+	slices.SortFunc(s.Steer, func(a, b Steer) int {
+		return cmp.Or(
+			schema.ComparePrefix(a.From, b.From),
+			schema.ComparePrefix(a.To, b.To),
+			schema.CompareAddr(a.Source, b.Source),
+			slices.CompareFunc(a.Via, b.Via, schema.CompareAddr),
+		)
+	})
 	return s
 }
 

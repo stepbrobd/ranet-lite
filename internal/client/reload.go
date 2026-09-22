@@ -1,6 +1,7 @@
 package client
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"fmt"
@@ -179,9 +180,14 @@ func reloadable(old, next *config.Config) error {
 		// acceptPeers is started once by Run, so turning the listener on or
 		// off here would report success and change nothing.
 		return fmt.Errorf("config: link.listen changed, restart to apply")
-	case !slices.Equal(old.Link.Endpoints, next.Link.Endpoints):
+	case !slices.Equal(sortedEndpoints(old.Link.Endpoints), sortedEndpoints(next.Link.Endpoints)):
 		// The listener answers to one identity per local endpoint and builds
-		// that set once, and each endpoint runs its own dialers.
+		// that set once, and each endpoint runs its own dialers. Compared as a
+		// set, since every reader of the list builds one: an identity set, a
+		// family set, and one dialer per endpoint and peer. Comparing them in
+		// the order they were written refuses a reload over two lines swapped,
+		// and every capability beside this one is compared as the subsystem
+		// reads it rather than as the file spells it.
 		return fmt.Errorf("config: link.endpoints changed, restart to apply")
 	case old.Babel().Effective() != next.Babel().Effective():
 		// The speaker is built once, so a changed interval or cost would be
@@ -273,6 +279,15 @@ func sameTable(old, next *config.Config) bool {
 	return slices.Equal(
 		sortedPrefixes(old.Cap.Table.Assigned(old.Routes().Announced())),
 		sortedPrefixes(next.Cap.Table.Assigned(next.Routes().Announced())))
+}
+
+// sortedEndpoints puts the local endpoints in one order, for the same reason
+// sortedPrefixes does. The serial alone decides it, since two endpoints
+// sharing one are refused where the file is read.
+func sortedEndpoints(endpoints []config.Endpoint) []config.Endpoint {
+	out := slices.Clone(endpoints)
+	slices.SortFunc(out, func(a, b config.Endpoint) int { return cmp.Compare(a.Serial, b.Serial) })
+	return out
 }
 
 // sortedPrefixes puts an address set in one order, so two of them compare as

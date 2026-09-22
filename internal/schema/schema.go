@@ -16,6 +16,7 @@
 package schema
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -111,6 +112,21 @@ func (p Prefix) MarshalYAML() (any, error) {
 	}
 	return string(text), nil
 }
+
+// ComparePrefix orders two prefixes, by address and then by length. It is a
+// total order over every value the type takes, the zero one included, since
+// netip orders an invalid address before every valid one.
+//
+// It is here rather than in each capability because a capability needs it for
+// one reason only: to put a list whose order the subsystem does not read into
+// one order, so that two files writing the same set compare equal and a reload
+// is not refused over the order somebody happened to write them in.
+func ComparePrefix(a, b Prefix) int {
+	return cmp.Or(a.Addr().Compare(b.Addr()), cmp.Compare(a.Bits(), b.Bits()))
+}
+
+// CompareAddr orders two addresses, and is there for the same reason.
+func CompareAddr(a, b Addr) int { return a.Addr.Compare(b.Addr) }
 
 // Addr is one address, with no prefix length and no zone.
 type Addr struct{ netip.Addr }

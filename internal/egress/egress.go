@@ -134,14 +134,21 @@ type Runtime struct {
 }
 
 // Normalized is the capability as the translator runs it: the sweep the file
-// left out filled in, an omitted list and an empty one the same, and a source
-// naming no address written as the auto it means. Two configurations are
-// compared through this rather than as they were written, so "source4 = auto",
-// the spelling examples/config.toml documents, is not a change and does not
-// cost a restart.
+// left out filled in, an omitted list and an empty one the same, the
+// advertised prefixes in one order, and a source naming no address written as
+// the auto it means. Two configurations are compared through this rather than
+// as they were written, so neither "source4 = auto", the spelling
+// examples/config.toml documents, nor the order the prefixes were listed in is
+// a change, and neither costs a restart.
+//
+// The order is not meaningful: the list decides which families are translated
+// and which prefixes are announced, and both are sets. A rule is installed per
+// family rather than per entry, so nothing here is positional.
 func (e Egress) Normalized() Egress {
 	if len(e.Advertise) == 0 {
 		e.Advertise = nil
+	} else {
+		e.Advertise = slices.SortedFunc(slices.Values(e.Advertise), schema.ComparePrefix)
 	}
 	if e.Sweep == 0 {
 		e.Sweep = schema.Duration(DefaultSweep)

@@ -638,9 +638,9 @@ func (r Rule) String() string {
 // the mark and still leaves the socket on the routes the mesh installed, which
 // is the state it was set to get out of.
 func (t Table) ReadsMark(mark uint32) bool {
-	mesh := t.Normalized().ID
-	for _, rule := range t.Rules {
-		if rule.selectsMark(mark) && rule.Table != mesh {
+	normalized := t.Normalized()
+	for _, rule := range normalized.Rules {
+		if rule.selectsMark(mark) && rule.Table != normalized.ID {
 			return true
 		}
 	}
@@ -843,10 +843,6 @@ func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
 		// an assigned address keeps its host bits; only a route key is masked.
 		addresses = append(addresses, netip.PrefixFrom(prefix.Addr().WithZone(""), prefix.Bits()))
 	}
-	rules, err := expandRules(t.Rules)
-	if err != nil {
-		return nil, err
-	}
 	plat, err := newPlatform(t, rt)
 	if err != nil {
 		return nil, err
@@ -855,16 +851,27 @@ func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
 		plat.Close()
 		return nil, err
 	}
-	return newReconciler(t, rt, canonicalRules(rules), addresses, src, plat), nil
+	// The rules as Normalized left them: expanded, canonical and in one order,
+	// which is the form the reconciler installs and diffs against the kernel.
+	return newReconciler(t, rt, t.Rules, addresses, src, plat), nil
 }
 
 // Normalized is the capability as the reconciler runs it: every field the file
-// left out filled in with the default it stands for, every rule in the
-// spelling the kernel reports back, and an omitted list and an empty one the
-// same. New resolves a capability through this, and a reload compares two
-// through it rather than as they were written, so writing a field out as its
-// own default is not a change. Leaving a defaulted field out of here refuses a
-// reload over nothing, and a restart drops every SA on the node.
+// left out filled in with the default it stands for, every rule expanded to
+// the one family it installs under and spelled the way the kernel reports it
+// back, and every list the reconciler reads as a set in one order. New
+// resolves a capability through this and hands the rules straight on, and a
+// reload compares two through it rather than as they were written, so neither
+// a field written out as its own default nor a second spelling of one ruleset
+// is a change. Leaving either out refuses a reload over nothing, and a restart
+// drops every SA on the node.
+//
+// Both lists here are read as sets. applyRules diffs what the kernel holds
+// against the rules by value, and the kernel orders them by the priority each
+// one carries rather than by the order they arrived in; the addresses are
+// assigned to one device. So "family = both" and the same rule written once
+// per family describe one reconciler, as do two files listing the same
+// addresses in different orders.
 func (t Table) Normalized() Table {
 	if t.ID == 0 {
 		t.ID = DefaultTable
@@ -883,13 +890,41 @@ func (t Table) Normalized() Table {
 	}
 	if len(t.Addresses) == 0 {
 		t.Addresses = nil
-	}
-	if len(t.Rules) == 0 {
-		t.Rules = nil
 	} else {
+		t.Addresses = slices.SortedFunc(slices.Values(t.Addresses), schema.ComparePrefix)
+	}
+	switch expanded, err := expandRules(t.Rules); {
+	case len(t.Rules) == 0:
+		t.Rules = nil
+	case err != nil:
+		// A rule expansion refuses is one Validate refuses, and New runs
+		// Validate first, so this answers a caller comparing two capabilities
+		// neither of which will ever run. Left as written, such a rule still
+		// compares equal to itself.
 		t.Rules = canonicalRules(t.Rules)
+	default:
+		t.Rules = sortedRules(canonicalRules(expanded))
 	}
 	return t
+}
+
+// sortedRules puts a rule set in one order, in place, over the copy
+// canonicalRules already made. The order is the whole rule rather than the
+// priority alone, so two rules sharing a priority still sort the same way
+// every time.
+func sortedRules(rules []Rule) []Rule {
+	slices.SortFunc(rules, func(a, b Rule) int {
+		return cmp.Or(
+			cmp.Compare(a.Priority, b.Priority),
+			cmp.Compare(a.Family, b.Family),
+			cmp.Compare(a.Table, b.Table),
+			cmp.Compare(a.FWMark, b.FWMark),
+			cmp.Compare(a.FWMask, b.FWMask),
+			schema.ComparePrefix(a.From, b.From),
+			schema.ComparePrefix(a.To, b.To),
+		)
+	})
+	return rules
 }
 
 // refuseWhatThePlatformLacks stops a startup that asked for a facility this

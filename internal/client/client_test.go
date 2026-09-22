@@ -1112,9 +1112,16 @@ func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 	marked := kernel.Rule{FWMark: 0x726c, Table: schema.TableMain, Priority: 40, Family: kernel.FamilyBoth}
 	masked := marked
 	masked.FWMask = ^uint32(0)
+	markedIPv4, markedIPv6 := marked, marked
+	markedIPv4.Family, markedIPv6.Family = kernel.FamilyIPv4, kernel.FamilyIPv6
 	exit := []schema.Prefix{schema.MustPrefix("0.0.0.0/0")}
+	first, second := schema.MustPrefix("10.0.0.1/32"), schema.MustPrefix("10.0.0.2/32")
 	source := schema.MustAddr("3fff:1:69c:8c0::1")
-	steered := srv6.Steer{From: schema.MustPrefix("3fff:a::1/128"), Via: []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")}}
+	here := srv6.Segment{SID: schema.MustAddr("3fff:1:69c:8c6::1"), Behavior: srv6.BehaviorEnd}
+	there := srv6.Segment{SID: schema.MustAddr("3fff:1:69c:8c6::2"), Behavior: srv6.BehaviorEndDT46}
+	steered := srv6.Steer{From: schema.MustPrefix("3fff:a::1/128"), Via: []schema.Addr{
+		schema.MustAddr("3fff:1:69c:98d6::1"), schema.MustAddr("3fff:1:69c:6c46::1")}}
+	elsewhere := srv6.Steer{From: schema.MustPrefix("3fff:a::2/128"), Via: []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")}}
 	// Spelled out in full as an operator would, one pointer per field, so the
 	// comparison has to resolve them rather than read the block as written.
 	params := base.Babel().CostEffective()
@@ -1172,14 +1179,70 @@ func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 			{Table: &kernel.Table{Rules: []kernel.Rule{marked}}},
 			{Table: &kernel.Table{Rules: []kernel.Rule{masked}}},
 		},
+		// One rule written for both families against the same rule written
+		// once per family. The reconciler expands the first into the second
+		// before it installs anything, so the two files run one ruleset.
+		"a family written once against the same rule written twice": {
+			{Table: &kernel.Table{Rules: []kernel.Rule{marked}}},
+			{Table: &kernel.Table{Rules: []kernel.Rule{markedIPv4, markedIPv6}}},
+		},
+		"the same two rules in the other order": {
+			{Table: &kernel.Table{Rules: []kernel.Rule{markedIPv4, markedIPv6}}},
+			{Table: &kernel.Table{Rules: []kernel.Rule{markedIPv6, markedIPv4}}},
+		},
+		"the same addresses in the other order": {
+			{Table: &kernel.Table{Addresses: []schema.Prefix{first, second}}},
+			{Table: &kernel.Table{Addresses: []schema.Prefix{second, first}}},
+		},
+		"the same advertised prefixes in the other order": {
+			{Egress: &egress.Egress{Advertise: []schema.Prefix{first, second}}},
+			{Egress: &egress.Egress{Advertise: []schema.Prefix{second, first}}},
+		},
+		"the same local segments in the other order": {
+			{Segment: &srv6.Segments{Local: []srv6.Segment{here, there}}},
+			{Segment: &srv6.Segments{Local: []srv6.Segment{there, here}}},
+		},
+		"the same steering entries in the other order": {
+			{Segment: &srv6.Segments{Source: source, Steer: []srv6.Steer{steered, elsewhere}}},
+			{Segment: &srv6.Segments{Source: source, Steer: []srv6.Steer{elsewhere, steered}}},
+		},
+		"the same endpoints in the other order": {},
 	} {
 		t.Run(name, func(t *testing.T) {
 			before, after := *base, *base
 			before.Cap, after.Cap = pair[0], pair[1]
+			if name == "the same endpoints in the other order" {
+				// The one list outside cap, and the same defect: every reader
+				// of it builds a set.
+				before.Link.Endpoints = []config.Endpoint{{Serial: "0", Family: "ip4"}, {Serial: "1", Family: "ip6"}}
+				after.Link.Endpoints = []config.Endpoint{{Serial: "1", Family: "ip6"}, {Serial: "0", Family: "ip4"}}
+			}
 			if err := reloadable(&before, &after); err != nil {
 				t.Errorf("writing a default out in full was refused: %v", err)
 			}
 		})
+	}
+
+	// Order carries meaning inside one steering entry, since via is the order
+	// a packet visits its waypoints, so two entries that differ only there are
+	// two configurations and the comparison has to say so.
+	viaBack := steered
+	viaBack.Via = []schema.Addr{steered.Via[1], steered.Via[0]}
+	reordered, viaSwapped := *base, *base
+	reordered.Cap = config.Caps{Segment: &srv6.Segments{Source: source, Steer: []srv6.Steer{steered}}}
+	viaSwapped.Cap = config.Caps{Segment: &srv6.Segments{Source: source, Steer: []srv6.Steer{viaBack}}}
+	if err := reloadable(&reordered, &viaSwapped); err == nil {
+		t.Error("a segment list visited in the other order was taken as the same steering")
+	}
+
+	// And two rules that differ in more than their order are still two rules.
+	elsewhereRule := marked
+	elsewhereRule.Table = 201
+	differs, differsToo := *base, *base
+	differs.Cap = config.Caps{Table: &kernel.Table{Rules: []kernel.Rule{marked}}}
+	differsToo.Cap = config.Caps{Table: &kernel.Table{Rules: []kernel.Rule{elsewhereRule}}}
+	if err := reloadable(&differs, &differsToo); err == nil {
+		t.Error("two rules looking up different tables compared as one")
 	}
 
 	// A real change is still refused, or the comparison would be useless.
