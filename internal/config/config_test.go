@@ -588,12 +588,59 @@ func TestConfigurationEndingInASeparatorIsTaken(t *testing.T) {
 			}
 		})
 	}
-	// A second document is not. A file half pasted below a stray separator
-	// would otherwise start on the first half alone and validate cleanly, so
-	// the node comes up with the listener off or the wrong peer set and
-	// nothing says so.
-	if _, err := loadYAML(t, nodeYAML+"---\nlink:\n  listen: false\n"); err == nil {
-		t.Error("a second document was accepted")
+	// A second document is not, however many empty ones stand between it and
+	// the first. A file half pasted below a stray separator would otherwise
+	// start on the first half alone and validate cleanly, so the node comes up
+	// with the listener off or the wrong peer set and nothing says so, and
+	// reading exactly one document past the first let an empty one hide the
+	// half behind it: cat of two configurations, which is the case this
+	// refuses, is where that empty document comes from.
+	for name, between := range map[string]string{
+		"a separator":                      "---\n",
+		"an empty document between them":   "---\n---\n",
+		"two empty documents between them": "---\n---\n---\n",
+		"an end marker and a separator":    "...\n---\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadYAML(t, nodeYAML+between+"link:\n  listen: false\n"); err == nil {
+				t.Error("a second document was accepted")
+			}
+		})
+	}
+}
+
+// A key whose spelling differs from the tag in case alone is refused by name,
+// under the decoder that would otherwise fold it. BurntSushi matches a field
+// case-insensitively when the exact spelling misses and records the key as
+// decoded, so Undecoded reports nothing: "ANNOUNCE" loaded as "announce", and
+// a document carrying both spellings took whichever one a map walk reached
+// last, 176 times out of 200 the typo. The other decoder refuses it, and
+// Load's own doc says both run strict so that a typo cannot silently do
+// something.
+func TestTOMLRefusesAKeyThatDiffersOnlyInCase(t *testing.T) {
+	for name, body := range map[string]string{
+		"a capability's field":          "[cap.route]\nANNOUNCE = [\"10.66.0.5/32\"]\n",
+		"a nested block":                "[cap.table.VRF]\nname = \"mesh\"\n",
+		"a field inside a list":         "[cap.table]\nrules = [{ FWMARK = 0x726c, table = \"main\", priority = 40, family = \"both\" }]\n",
+		"a field in an array of tables": "[[cap.table.rules]]\nFWMARK = 0x726c\ntable = \"main\"\npriority = 40\nfamily = \"both\"\n",
+		// Both spellings in one document, where the folded one used to win or
+		// lose depending on the run.
+		"one written twice": "[cap.route]\nannounce = [\"10.66.0.5/32\"]\nANNOUNCE = [\"10.66.0.6/32\"]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadTOML(t, nodeTOML+body)
+			if err == nil {
+				t.Fatalf("toml folded the case of %q", body)
+			}
+			if !strings.Contains(err.Error(), "unknown field") {
+				t.Errorf("the refusal reads %q and does not name the key", err)
+			}
+		})
+	}
+	// The same keys spelled right are still taken, so the check refuses the
+	// case rather than the key.
+	if _, err := loadTOML(t, nodeTOML+"[cap.table]\nrules = [{ fwmark = 0x726c, table = \"main\", priority = 40, family = \"both\" }]\n[cap.table.vrf]\nname = \"mesh\"\n"); err != nil {
+		t.Errorf("the keys as the tags spell them were refused: %v", err)
 	}
 }
 

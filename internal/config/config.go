@@ -16,13 +16,16 @@
 package config
 
 import (
+	"encoding"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -215,7 +218,106 @@ func decodeTOML(body []byte, c *Config) error {
 	if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
 		return fmt.Errorf("unknown field %q", undecoded[0].String())
 	}
+	var written map[string]any
+	if _, err := toml.Decode(string(body), &written); err != nil {
+		return err
+	}
+	return exactKeys(written, reflect.TypeOf(*c), "")
+}
+
+// exactKeys refuses a key whose spelling differs from the field's tag in case
+// alone. The TOML decoder falls back to a case-insensitive match when the
+// exact spelling misses, and records the key as decoded, so Undecoded says
+// nothing about it: "ANNOUNCE" loads as "announce", and a document carrying
+// both spellings takes whichever one a map walk reached last, which is a
+// different node on different runs of the same file. The other decoder refuses
+// it outright, and a typo that silently does something is worse than one that
+// silently does nothing.
+func exactKeys(written map[string]any, structure reflect.Type, path string) error {
+	for _, key := range slices.Sorted(maps.Keys(written)) {
+		field, exact := tomlField(structure, key)
+		if !exact {
+			// Undecoded has already reported a key matching no field at all,
+			// so what is left here differs in case alone.
+			return fmt.Errorf("unknown field %q", path+key)
+		}
+		if err := exactKeysIn(written[key], field.Type, path+key+"."); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// exactKeysIn walks whatever stands under one key. A type that decodes itself
+// is left to its own walk, which refuses an unknown key the same way.
+func exactKeysIn(written any, field reflect.Type, path string) error {
+	if decodesItselfTOML(field) {
+		return nil
+	}
+	if field.Kind() == reflect.Pointer {
+		field = field.Elem()
+	}
+	switch value := written.(type) {
+	case map[string]any:
+		if field.Kind() != reflect.Struct {
+			return nil
+		}
+		return exactKeys(value, field, path)
+	case []map[string]any:
+		// An array of tables, which is how the decoder hands over
+		// [[cap.table.rules]].
+		if field.Kind() != reflect.Slice {
+			return nil
+		}
+		for _, element := range value {
+			if err := exactKeysIn(element, field.Elem(), path); err != nil {
+				return err
+			}
+		}
+	case []any:
+		if field.Kind() != reflect.Slice {
+			return nil
+		}
+		for _, element := range value {
+			if err := exactKeysIn(element, field.Elem(), path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// tomlField finds the field a written key names and reports whether the
+// spelling matched the tag exactly.
+func tomlField(structure reflect.Type, key string) (reflect.StructField, bool) {
+	if structure.Kind() != reflect.Struct {
+		return reflect.StructField{}, false
+	}
+	for i := range structure.NumField() {
+		field := structure.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("toml"), ",")
+		if name == "" {
+			name = field.Name
+		}
+		if name == key {
+			return field, true
+		}
+	}
+	return reflect.StructField{}, false
+}
+
+// decodesItselfTOML reports a type that reads its own toml, by either of the
+// two interfaces that decoder consults. Each of them refuses an unknown key on
+// its own, so the walk above stops there.
+func decodesItselfTOML(t reflect.Type) bool {
+	if t.Kind() != reflect.Pointer {
+		t = reflect.PointerTo(t)
+	}
+	return t.Implements(reflect.TypeFor[toml.Unmarshaler]()) ||
+		t.Implements(reflect.TypeFor[encoding.TextUnmarshaler]())
 }
 
 func decodeYAML(body []byte, c *Config) error {
@@ -230,15 +332,23 @@ func decodeYAML(body []byte, c *Config) error {
 	// validates cleanly, so a node comes up with the listener off or the wrong
 	// peer set and nothing says so. registry.Load refuses the identical case
 	// in JSON.
-	var trailing yaml.Node
-	switch err := decoder.Decode(&trailing); {
-	case errors.Is(err, io.EOF):
-	case err != nil:
-		return err
-	case !emptyDocument(&trailing):
-		return errors.New("a second document follows the first")
+	//
+	// Read to the end rather than one document further. A file whose first
+	// half ends in a separator decodes to an empty document between the two,
+	// and stopping at the first empty one took the second half with it: cat of
+	// two configurations, which is the case this refuses, is exactly where
+	// that separator comes from.
+	for {
+		var trailing yaml.Node
+		switch err := decoder.Decode(&trailing); {
+		case errors.Is(err, io.EOF):
+			return blocksWritten(body, c)
+		case err != nil:
+			return err
+		case !emptyDocument(&trailing):
+			return errors.New("a second document follows the first")
+		}
 	}
-	return blocksWritten(body, c)
 }
 
 // blocksWritten turns a capability block an operator wrote into the capability
