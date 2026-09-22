@@ -90,6 +90,7 @@ func newRoot() *cobra.Command {
 		licensesCommand(),
 		completionCommand(root),
 	)
+	root.AddCommand(r.queryCommands()...)
 	root.AddCommand(r.writeCommands()...)
 	return root
 }

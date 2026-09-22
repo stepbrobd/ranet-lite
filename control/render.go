@@ -284,6 +284,94 @@ func RenderRoutes(w io.Writer, routes []Route) {
 	table(w, []string{"destination", "from", "via", "metric", "router-id", "seqno", "paths"}, rows)
 }
 
+// RenderWhois writes where an address goes: the sentence naming the prefix
+// that covers it and the peer this node reaches it through, then every
+// covering prefix so a reader sees what it would fall back to.
+//
+// It names the peer rather than the originating node, because Babel carries a
+// router id and no name, and the id is random per process. The next hop is the
+// origin only where the origin is a neighbor, so the column is called via and
+// the router id is printed as it arrives.
+func RenderWhois(w io.Writer, address netip.Addr, covering []Route) {
+	if len(covering) == 0 {
+		fmt.Fprintf(w, "%s is in no prefix this mesh carries\n", address)
+		return
+	}
+	best := covering[0]
+	switch {
+	case best.Originated:
+		fmt.Fprintf(w, "%s is in %s, which this node originates\n", address, best.Destination)
+	case best.Via == "":
+		fmt.Fprintf(w, "%s is in %s, which is held unreachable\n", address, best.Destination)
+	default:
+		fmt.Fprintf(w, "%s is in %s, reached through %s\n", address, best.Destination, best.Via)
+	}
+	fmt.Fprintln(w)
+	RenderRoutes(w, covering)
+}
+
+// RenderExitNodes writes the defaults the mesh offers and which of them this
+// node would use, which is `tailscale exit-node list` over the route table.
+//
+// One row per prefix and source, because that pair is the route table's key
+// and an exit announces its default from its own transit prefix. The state
+// column is the answer a reader came for: a default with a next hop is one
+// this node's traffic can take, and one without is an exit that has withdrawn.
+func RenderExitNodes(w io.Writer, defaults []Route) {
+	if len(defaults) == 0 {
+		fmt.Fprintln(w, "no node in this mesh advertises a default, so there is no exit to take")
+		return
+	}
+	rows := make([][]string, 0, len(defaults))
+	for _, route := range defaults {
+		from := ""
+		if route.From.IsValid() {
+			from = route.From.String()
+		}
+		rows = append(rows, []string{
+			route.Destination.String(),
+			from,
+			exitVia(route),
+			cost(route.Metric),
+			route.RouterID,
+			fmt.Sprint(route.Candidates),
+			exitState(route),
+		})
+	}
+	table(w, []string{"destination", "from", "via", "metric", "router-id", "paths", "state"}, rows)
+}
+
+func exitVia(route Route) string {
+	switch {
+	case route.Originated:
+		return "this node"
+	case route.Via == "":
+		return "unreachable"
+	}
+	return route.Via
+}
+
+// exitState says which default this node would actually take. An originated
+// one is this node's own advertisement rather than a choice it made, so it is
+// named as that instead of as a selection.
+func exitState(route Route) string {
+	switch {
+	case route.Originated:
+		return "advertised by this node"
+	case route.Via == "":
+		return "withdrawn"
+	}
+	return "selected"
+}
+
+// RenderAddresses writes this node's mesh addresses, one per line and nothing
+// else, so the output goes into a shell variable without being cut up first.
+func RenderAddresses(w io.Writer, addresses []netip.Addr) {
+	for _, address := range addresses {
+		fmt.Fprintln(w, address)
+	}
+}
+
 // RenderSessions writes the live IKE SAs, which `swanctl --list-sas` answered
 // while strongSwan carried them.
 func RenderSessions(w io.Writer, sessions []Session) {
