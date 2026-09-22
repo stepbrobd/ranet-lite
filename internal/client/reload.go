@@ -12,10 +12,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/egress"
-	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/registry"
-	"github.com/NickCao/ranet-lite/internal/schema"
-	"github.com/NickCao/ranet-lite/internal/srv6"
 )
 
 // peerPath names one dialer, and is the same name the session it establishes is
@@ -199,7 +196,7 @@ func reloadable(old, next *config.Config) error {
 		// SetRoutes applies them. Whether this node relays is read while a
 		// packet is being built and is fixed for the speaker's life.
 		return fmt.Errorf("config: cap.route transit changed, restart to apply")
-	case !reflect.DeepEqual(normalize(old.Segments()), normalize(next.Segments())):
+	case !reflect.DeepEqual(old.Segments().Normalized(), next.Segments().Normalized()):
 		// The table is built once, before the tun exists, and the inbound
 		// path reads it without asking whether it changed. Applying a new one
 		// here would leave packets already in flight acted on under the old.
@@ -225,22 +222,16 @@ func reloadable(old, next *config.Config) error {
 }
 
 // sameEgress compares the capability by what it was given rather than by how
-// the file was written, as sameTable does: an omitted list and an empty one
-// ask for the same thing, and so do an omitted sweep and one written out as
-// its own default.
+// the file was written, as sameTable does. The capability itself says what
+// that means, so a field that grows a default does not also have to be
+// remembered here.
 func sameEgress(old, next *config.Config) bool {
 	normalize := func(e *egress.Egress) *egress.Egress {
 		if e == nil {
 			return nil
 		}
-		copied := *e
-		if len(copied.Advertise) == 0 {
-			copied.Advertise = nil
-		}
-		if copied.Sweep == 0 {
-			copied.Sweep = schema.Duration(egress.DefaultSweep)
-		}
-		return &copied
+		normalized := e.Normalized()
+		return &normalized
 	}
 	return reflect.DeepEqual(normalize(old.Egress()), normalize(next.Egress()))
 }
@@ -260,13 +251,15 @@ func sameCrypto(old, next *config.Config) bool {
 }
 
 // sameTable compares the reconciler's capability, which is read once at
-// startup, by what it was given rather than by how the file was written. An
-// omitted list and an empty one mean the same thing, and so do an omitted
-// interval and one written out as its own default. Comparing them as written
-// refuses a reload that changes nothing, which writing "reconcile = 30s" into
-// the file would have been enough to cause. The addresses are compared as the
-// reconciler resolves them, since assign_announced expands cap.route into
-// them.
+// startup, by what it was given rather than by how the file was written:
+// kernel.Table.Normalized is the capability as New resolves it, so a field
+// spelled out as its own default is not a change. Comparing them as written
+// refuses a reload that changes nothing, which writing "id = 200" or
+// "capture_grace = 10s" into the file, the values already running and the
+// lines examples/config.toml documents, would have been enough to cause, and
+// the restart that answer asks for drops every SA on the node. The addresses
+// are compared as the reconciler resolves them, since assign_announced expands
+// cap.route into them.
 func sameTable(old, next *config.Config) bool {
 	if (old.Cap.Table == nil) != (next.Cap.Table == nil) {
 		return false
@@ -274,10 +267,7 @@ func sameTable(old, next *config.Config) bool {
 	if old.Cap.Table == nil {
 		return true
 	}
-	before, after := *old.Cap.Table, *next.Cap.Table
-	normalizeTable(&before)
-	normalizeTable(&after)
-	if !reflect.DeepEqual(before, after) {
+	if !reflect.DeepEqual(old.Cap.Table.Normalized(), next.Cap.Table.Normalized()) {
 		return false
 	}
 	return slices.Equal(
@@ -296,41 +286,6 @@ func sortedPrefixes(prefixes []netip.Prefix) []netip.Prefix {
 		return a.Bits() - b.Bits()
 	})
 	return out
-}
-
-func normalizeTable(t *kernel.Table) {
-	if len(t.Addresses) == 0 {
-		t.Addresses = nil
-	}
-	if len(t.Rules) == 0 {
-		t.Rules = nil
-	}
-	if t.Reconcile == 0 {
-		t.Reconcile = schema.Duration(kernel.DefaultReconcileInterval)
-	}
-}
-
-// normalize compares the segment capability by what it was given rather than
-// by how the file was written, so an omitted list and an empty one are the
-// same.
-func normalize(segments srv6.Segments) srv6.Segments {
-	if len(segments.Local) == 0 {
-		segments.Local = nil
-	}
-	// Cloned before the entries are touched: the struct is a shallow copy, so
-	// normalizing in place would reach through the shared backing array and
-	// edit the configuration this comparison is only supposed to read.
-	if len(segments.Steer) == 0 {
-		segments.Steer = nil
-	} else {
-		segments.Steer = slices.Clone(segments.Steer)
-		for i := range segments.Steer {
-			if len(segments.Steer[i].Via) == 0 {
-				segments.Steer[i].Via = nil
-			}
-		}
-	}
-	return segments
 }
 
 // announced is every prefix this node is putting into the mesh right now: the

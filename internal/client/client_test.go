@@ -1109,12 +1109,23 @@ func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 		// what turns it on and adding one is a change by itself.
 		Cap: config.Caps{Table: &kernel.Table{}},
 	}
+	marked := kernel.Rule{FWMark: 0x726c, Table: schema.TableMain, Priority: 40, Family: kernel.FamilyBoth}
+	masked := marked
+	masked.FWMask = ^uint32(0)
+	exit := []schema.Prefix{schema.MustPrefix("0.0.0.0/0")}
+	source := schema.MustAddr("3fff:1:69c:8c0::1")
+	steered := srv6.Steer{From: schema.MustPrefix("3fff:a::1/128"), Via: []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")}}
 	// Spelled out in full as an operator would, one pointer per field, so the
 	// comparison has to resolve them rather than read the block as written.
 	params := base.Babel().CostEffective()
 	defaults := babel.CostOptions{Rx: &params.RxCost, RTT: babel.RTTOptions{
 		Weight: &params.RTT.Weight, Min: &params.RTT.Min, Max: &params.RTT.Max}}
 
+	// Every block the reconciler is configured with once at startup, with each
+	// defaulted field written out as the value already running. These are the
+	// lines examples/config.toml documents, and refusing any of them answers
+	// "restart to apply" to a file that changed nothing, where the restart
+	// drops every SA on the node.
 	for name, write := range map[string]func(*config.Config){
 		"babel costs": func(c *config.Config) {
 			c.Cap.Babel = &babel.Config{Cost: defaults}
@@ -1122,11 +1133,50 @@ func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 		"the reconcile interval": func(c *config.Config) {
 			c.Cap.Table = &kernel.Table{Reconcile: schema.Duration(kernel.DefaultReconcileInterval)}
 		},
+		"the table id": func(c *config.Config) {
+			c.Cap.Table = &kernel.Table{ID: kernel.DefaultTable}
+		},
+		"the route protocol": func(c *config.Config) {
+			c.Cap.Table = &kernel.Table{Proto: kernel.DefaultProtocol}
+		},
+		"the capture grace": func(c *config.Config) {
+			c.Cap.Table = &kernel.Table{CaptureGrace: schema.Duration(kernel.DefaultCaptureGrace)}
+		},
+		"an empty address list": func(c *config.Config) {
+			c.Cap.Table = &kernel.Table{Addresses: []schema.Prefix{}, Rules: []kernel.Rule{}}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			next := *base
 			write(&next)
 			if err := reloadable(base, &next); err != nil {
+				t.Errorf("writing a default out in full was refused: %v", err)
+			}
+		})
+	}
+
+	// The same, one capability at a time, for the two blocks whose defaults
+	// live outside cap.table.
+	for name, pair := range map[string][2]config.Caps{
+		"an egress source written as the auto it means": {
+			{Egress: &egress.Egress{Advertise: exit}},
+			{Egress: &egress.Egress{Advertise: exit, Source4: egress.Source{Auto: true},
+				Source6: egress.Source{Auto: true}, Sweep: schema.Duration(egress.DefaultSweep)}},
+		},
+		"a steering source repeated on the entry that inherits it": {
+			{Segment: &srv6.Segments{Source: source, Steer: []srv6.Steer{steered}}},
+			{Segment: &srv6.Segments{Source: source, Steer: []srv6.Steer{
+				{From: steered.From, Source: source, Via: steered.Via}}}},
+		},
+		"a mark mask the kernel reports as none": {
+			{Table: &kernel.Table{Rules: []kernel.Rule{marked}}},
+			{Table: &kernel.Table{Rules: []kernel.Rule{masked}}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before, after := *base, *base
+			before.Cap, after.Cap = pair[0], pair[1]
+			if err := reloadable(&before, &after); err != nil {
 				t.Errorf("writing a default out in full was refused: %v", err)
 			}
 		})

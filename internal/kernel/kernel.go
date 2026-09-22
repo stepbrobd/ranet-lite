@@ -771,21 +771,7 @@ func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
 	if err := t.Validate(); err != nil {
 		return nil, err
 	}
-	if t.ID == 0 {
-		t.ID = DefaultTable
-	}
-	if t.Proto == 0 {
-		t.Proto = DefaultProtocol
-	}
-	if t.PrefSrc4.IsValid() {
-		t.PrefSrc4 = schema.AddrFrom(t.PrefSrc4.Unmap().WithZone(""))
-	}
-	if t.Reconcile <= 0 {
-		t.Reconcile = schema.Duration(DefaultReconcileInterval)
-	}
-	if t.CaptureGrace <= 0 {
-		t.CaptureGrace = schema.Duration(DefaultCaptureGrace)
-	}
+	t = t.Normalized()
 	if rt.BoundUnderlay && rt.Sessions == nil {
 		// The two halves of one arrangement. A bound underlay lets this
 		// backend install an announced default where every socket can see
@@ -817,6 +803,40 @@ func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
 		return nil, err
 	}
 	return newReconciler(t, rt, canonicalRules(rules), addresses, src, plat), nil
+}
+
+// Normalized is the capability as the reconciler runs it: every field the file
+// left out filled in with the default it stands for, every rule in the
+// spelling the kernel reports back, and an omitted list and an empty one the
+// same. New resolves a capability through this, and a reload compares two
+// through it rather than as they were written, so writing a field out as its
+// own default is not a change. Leaving a defaulted field out of here refuses a
+// reload over nothing, and a restart drops every SA on the node.
+func (t Table) Normalized() Table {
+	if t.ID == 0 {
+		t.ID = DefaultTable
+	}
+	if t.Proto == 0 {
+		t.Proto = DefaultProtocol
+	}
+	if t.PrefSrc4.IsValid() {
+		t.PrefSrc4 = schema.AddrFrom(t.PrefSrc4.Unmap().WithZone(""))
+	}
+	if t.Reconcile <= 0 {
+		t.Reconcile = schema.Duration(DefaultReconcileInterval)
+	}
+	if t.CaptureGrace <= 0 {
+		t.CaptureGrace = schema.Duration(DefaultCaptureGrace)
+	}
+	if len(t.Addresses) == 0 {
+		t.Addresses = nil
+	}
+	if len(t.Rules) == 0 {
+		t.Rules = nil
+	} else {
+		t.Rules = canonicalRules(t.Rules)
+	}
+	return t
 }
 
 // refuseWhatThePlatformLacks stops a startup that asked for a facility this

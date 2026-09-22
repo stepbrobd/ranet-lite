@@ -35,6 +35,15 @@ type Source struct {
 // trip rather than coming back as an empty string.
 func (s Source) IsZero() bool { return !s.Auto && !s.Addr.IsValid() }
 
+// normalized is the source the translator reads: one naming no address is
+// auto, whether the file left the field out or wrote the word.
+func (s Source) normalized() Source {
+	if !s.Addr.IsValid() {
+		return Source{Auto: true}
+	}
+	return s
+}
+
 func (s Source) String() string {
 	if s.Addr.IsValid() {
 		return s.Addr.String()

@@ -133,6 +133,23 @@ type Runtime struct {
 	Announce func([]netip.Prefix)
 }
 
+// Normalized is the capability as the translator runs it: the sweep the file
+// left out filled in, an omitted list and an empty one the same, and a source
+// naming no address written as the auto it means. Two configurations are
+// compared through this rather than as they were written, so "source4 = auto",
+// the spelling examples/config.toml documents, is not a change and does not
+// cost a restart.
+func (e Egress) Normalized() Egress {
+	if len(e.Advertise) == 0 {
+		e.Advertise = nil
+	}
+	if e.Sweep == 0 {
+		e.Sweep = schema.Duration(DefaultSweep)
+	}
+	e.Source4, e.Source6 = e.Source4.normalized(), e.Source6.normalized()
+	return e
+}
+
 // Validate refuses a capability that cannot mean anything, in the package that
 // knows what its fields mean. It runs at load, so a mistake costs a refusal to
 // start rather than an exit that advertises and drops.

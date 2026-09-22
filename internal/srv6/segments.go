@@ -2,6 +2,7 @@ package srv6
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/NickCao/ranet-lite/internal/schema"
 	"gopkg.in/yaml.v3"
@@ -25,6 +26,34 @@ type Segments struct {
 	// list: the traffic sourced from this node's announced address, through
 	// the waypoints and out at a chosen exit.
 	Steer []Steer `yaml:"steer,omitempty" json:"steer,omitempty" toml:"steer,omitempty"`
+}
+
+// Normalized is the capability as the dataplane runs it: an omitted list and
+// an empty one the same, and every steering entry carrying the outer source it
+// will be sent from, the block's own where the entry named none. Two
+// configurations are compared through this rather than as they were written,
+// so a source repeated on the entry that inherits it is not a change and does
+// not cost a restart.
+func (s Segments) Normalized() Segments {
+	if len(s.Local) == 0 {
+		s.Local = nil
+	}
+	if len(s.Steer) == 0 {
+		s.Steer = nil
+		return s
+	}
+	// Cloned before the entries are touched: the struct is a shallow copy, so
+	// writing through it would reach the configuration this only reads.
+	s.Steer = slices.Clone(s.Steer)
+	for i := range s.Steer {
+		if len(s.Steer[i].Via) == 0 {
+			s.Steer[i].Via = nil
+		}
+		if !s.Steer[i].Source.IsValid() {
+			s.Steer[i].Source = s.Source
+		}
+	}
+	return s
 }
 
 // Validate refuses a capability this node could not act on, by building the
