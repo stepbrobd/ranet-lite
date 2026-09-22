@@ -258,7 +258,7 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 			return
 		}
 		b.n = n
-		for i := 0; i < n; i++ {
+		for i := range n {
 			raw := b.bufs[i][tunOffset : tunOffset+b.sizes[i]]
 			src, dst, nh, ok := addrsOf(raw)
 			if !ok {
@@ -461,9 +461,7 @@ func (m *Mesh) startInboundWriters() {
 	for lane := range m.devs {
 		queue := make(chan inboundWriteBatch, inboundWriteQueueSize)
 		m.inboundWriters[lane] = queue
-		m.writerWG.Add(1)
-		go func() {
-			defer m.writerWG.Done()
+		m.writerWG.Go(func() {
 			pending := make([][]byte, 0, 2*inboundWriteBatchSize)
 			for {
 				var first inboundWriteBatch
@@ -485,7 +483,7 @@ func (m *Mesh) startInboundWriters() {
 				clear(pending)
 				pending = pending[:0]
 			}
-		}()
+		})
 	}
 }
 

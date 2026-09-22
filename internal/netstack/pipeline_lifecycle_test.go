@@ -129,8 +129,7 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 			n: 2, bufs: [][]byte{framed(1), framed(2)}, sizes: []int{1, 1}, headers: []byte{0, 0}, peers: peers,
 			peerOrder: append([]*Peer(nil), peers...), counts: map[*Peer]int{a: 1, b: 1}, batches: make(map[*Peer]*peerBatch),
 		}
-		m.outboundReaderWG.Add(1)
-		go func() { defer m.outboundReaderWG.Done(); m.dispatchOutbound(batch) }()
+		m.outboundReaderWG.Go(func() { m.dispatchOutbound(batch) })
 	}
 	dispatch([]*Peer{a, b})
 	<-firstReserved
@@ -168,14 +167,12 @@ func TestMeshCloseDrainsQueuedTickets(t *testing.T) {
 	m := &Mesh{closed: make(chan struct{}), outboundJobs: make(chan *outboundBatch, 4), outboundFree: make(chan *outboundBatch, 4)}
 	m.outboundWorkerWG.Add(1)
 	go m.outboundWorker()
-	m.outboundReaderWG.Add(1)
-	go func() {
-		defer m.outboundReaderWG.Done()
+	m.outboundReaderWG.Go(func() {
 		m.dispatchOutbound(&outboundBatch{
 			n: 1, bufs: [][]byte{framed(1)}, sizes: []int{1}, headers: []byte{0}, peers: []*Peer{peer},
 			peerOrder: []*Peer{peer}, counts: map[*Peer]int{peer: 1}, batches: make(map[*Peer]*peerBatch),
 		})
-	}()
+	})
 	done := make(chan struct{})
 	go func() { m.Close(); close(done) }()
 	select {

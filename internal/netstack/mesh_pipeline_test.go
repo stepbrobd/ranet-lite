@@ -111,7 +111,7 @@ func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T
 		m.outboundJobs <- b
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-started:
 		case <-time.After(time.Second):
@@ -319,8 +319,8 @@ func TestDeliverInboundBatchUsesFlowAffineQueues(t *testing.T) {
 
 	packets := make([][]byte, 0, 32)
 	want := make([][][]byte, queueCount)
-	for stream := 0; stream < 16; stream++ {
-		for sequence := 0; sequence < 2; sequence++ {
+	for stream := range 16 {
+		for sequence := range 2 {
 			packet := ipv6TCPPacket(uint16(40000+stream), 5201, byte(sequence))
 			packets = append(packets, packet)
 			lane := int(innerFlowHash(packet) % queueCount)

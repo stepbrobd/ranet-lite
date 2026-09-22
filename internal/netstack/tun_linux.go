@@ -44,7 +44,7 @@ func createTUNQueues(name string, mtu, queueCount int) ([]tun.Device, string, er
 	}
 
 	actualName := name
-	for i := 0; i < queueCount; i++ {
+	for i := range queueCount {
 		fd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 		if err != nil {
 			closeDevices()
