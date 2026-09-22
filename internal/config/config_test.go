@@ -989,3 +989,93 @@ func TestZeroRekeyIntervalDisablesIt(t *testing.T) {
 		t.Errorf("a margin beside a disabled rekey was refused: %v", err)
 	}
 }
+
+// A key written with nothing under it turns a block on and leaves a scalar
+// alone, and fillBlocks is where the two rules meet: it allocates the first
+// and must not touch the second. Every pointer-to-scalar field in this schema
+// spells an omitted field as nil and reads a written zero as written, so
+// filling one in turns a bare "replay:" into anti-replay disabled and a bare
+// "transit:" into a node that refuses to carry the mesh, in each case the
+// opposite of what leaving the key out means. Neither has a second spelling to
+// agree with either, because toml cannot write a key with no value at all.
+//
+// The fields are found by reflection rather than listed, so one added later is
+// covered without anybody remembering to, and the two whose zero is a safety
+// property are asked again below in the terms their subsystem reads them in.
+func TestBareScalarKeyIsNotAWrittenZero(t *testing.T) {
+	for _, path := range pointerScalars(reflect.TypeFor[Config](), "") {
+		t.Run(path, func(t *testing.T) {
+			body := nodeYAML
+			for depth, key := range strings.Split(path, ".") {
+				body += strings.Repeat("  ", depth) + key + ":\n"
+			}
+			cfg, err := loadYAML(t, body)
+			if err != nil {
+				// Refused is an answer an operator can see. Silently taking
+				// the zero is the one that is not.
+				return
+			}
+			field := reflect.ValueOf(cfg).Elem()
+			for _, key := range strings.Split(path, ".") {
+				if field.Kind() == reflect.Pointer {
+					field = field.Elem()
+				}
+				field = fieldByKey(field, key)
+			}
+			if !field.IsNil() {
+				t.Errorf("%s written with nothing under it reads as %v, want the default it stands for",
+					path, field.Elem())
+			}
+		})
+	}
+
+	// The same two facts as their subsystems ask them, because a nil pointer
+	// is only interesting for what it means downstream.
+	cfg, err := loadYAML(t, nodeYAML+"cap:\n  crypto:\n    replay:\n")
+	if err != nil {
+		t.Fatalf("a bare replay key was refused: %v", err)
+	}
+	if got := cfg.Crypto().ReplayWindow(); got != ike.DefaultReplayWindow {
+		t.Errorf("a bare replay key runs a %d packet window, want %d: zero is anti-replay off",
+			got, ike.DefaultReplayWindow)
+	}
+	cfg, err = loadYAML(t, nodeYAML+"cap:\n  route:\n    transit:\n")
+	if err != nil {
+		t.Fatalf("a bare transit key was refused: %v", err)
+	}
+	if !cfg.Routes().Transits() {
+		t.Error("a bare transit key stops this node carrying the mesh, the meaning of writing false")
+	}
+}
+
+// pointerScalars names every field under ty that spells absence as a nil
+// pointer to something other than a block, in the yaml path a file writes. A
+// field reached through a list is skipped: an empty list has no element for a
+// key to sit under.
+func pointerScalars(ty reflect.Type, prefix string) []string {
+	if ty.Kind() != reflect.Struct {
+		return nil
+	}
+	var out []string
+	for i := range ty.NumField() {
+		field := ty.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		key, _, _ := strings.Cut(field.Tag.Get("yaml"), ",")
+		if key == "" {
+			key = strings.ToLower(field.Name)
+		}
+		path := strings.TrimPrefix(prefix+"."+key, ".")
+		under := field.Type
+		if under.Kind() == reflect.Pointer {
+			if under.Elem().Kind() != reflect.Struct {
+				out = append(out, path)
+				continue
+			}
+			under = under.Elem()
+		}
+		out = append(out, pointerScalars(under, path)...)
+	}
+	return out
+}
