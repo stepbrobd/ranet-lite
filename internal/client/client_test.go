@@ -34,7 +34,7 @@ import (
 	"github.com/NickCao/ranet-lite/schema"
 	"github.com/NickCao/ranet-lite/srv6"
 	"github.com/NickCao/ranet-lite/transport"
-	yaml "gopkg.in/yaml.v3"
+	yaml "go.yaml.in/yaml/v3"
 )
 
 func TestInboundBatchOrderMergesConsecutiveCompletedBatches(t *testing.T) {

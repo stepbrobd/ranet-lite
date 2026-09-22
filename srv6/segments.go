@@ -6,7 +6,7 @@ import (
 	"slices"
 
 	"github.com/NickCao/ranet-lite/schema"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Segments is the cap.segment capability, parsed straight out of the file: the

@@ -16,7 +16,14 @@
 // how two files writing the same set compare equal across a reload.
 //
 // This package imports nothing else in this repository, so a capability
-// package takes it without taking the daemon.
+// package takes it without taking the daemon. It does import one thing
+// outside it that a caller inherits: [Scalar] takes a [yaml.Node], and each
+// scalar here answers [yaml.Unmarshaler], so a package defining a capability
+// of its own takes go.yaml.in/yaml/v3 along with this one. That is a
+// commitment rather than an accident. Changing decoders changes Scalar's
+// signature, so the choice is made here once and every capability in the tree
+// spells a malformed value the same way, with the line number and the shape
+// the file actually held.
 //
 // # Adding a scalar
 //
@@ -56,7 +63,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Duration is an interval as Go spells one, "4s" or "1h30m". A bare zero is

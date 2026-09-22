@@ -63,7 +63,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/sadr"
 	"github.com/NickCao/ranet-lite/schema"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const (

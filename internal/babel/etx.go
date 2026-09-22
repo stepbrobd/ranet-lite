@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/NickCao/ranet-lite/schema"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Hello history and the link-quality estimators of RFC 8966 Appendix A.
