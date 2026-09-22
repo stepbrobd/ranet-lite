@@ -453,7 +453,7 @@ in
           serviceConfig = {
             ExecStart =
               "${ranetLite}/bin/ranet-lite daemon --config /etc/ranet-lite/config.yaml --log-level debug --metrics 127.0.0.1:9669"
-              + pkgs.lib.optionalString profile " -pprof 127.0.0.1:6060";
+              + pkgs.lib.optionalString profile " --pprof 127.0.0.1:6060";
             TimeoutStopSec = "15s";
             Restart = "on-failure";
             AmbientCapabilities = [ "CAP_NET_ADMIN" ];
