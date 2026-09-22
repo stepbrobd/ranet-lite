@@ -16,8 +16,8 @@
 package schema
 
 import (
+	"encoding/json"
 	"fmt"
-	"maps"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -100,7 +100,17 @@ func (p *Prefix) UnmarshalYAML(value *yaml.Node) error {
 	return Scalar(value, "a prefix such as 2001:db8::/48", p)
 }
 
-func (p Prefix) MarshalYAML() (any, error) { return p.String(), nil }
+// MarshalYAML makes the refusal MarshalText makes, rather than writing the
+// "invalid Prefix" that String answers for a prefix carrying no address: that
+// literal renders without complaint and no decoder reads it back, so a
+// rendered configuration would be one nothing can load.
+func (p Prefix) MarshalYAML() (any, error) {
+	text, err := p.MarshalText()
+	if err != nil {
+		return nil, err
+	}
+	return string(text), nil
+}
 
 // Addr is one address, with no prefix length and no zone.
 type Addr struct{ netip.Addr }
@@ -142,7 +152,15 @@ func (a *Addr) UnmarshalYAML(value *yaml.Node) error {
 	return Scalar(value, "an address such as 2001:db8::1", a)
 }
 
-func (a Addr) MarshalYAML() (any, error) { return a.String(), nil }
+// MarshalYAML is Prefix.MarshalYAML for an address, and is there for the same
+// reason.
+func (a Addr) MarshalYAML() (any, error) {
+	text, err := a.MarshalText()
+	if err != nil {
+		return nil, err
+	}
+	return string(text), nil
+}
 
 // TableID is a routing table, as a number or as one of the names the kernel
 // reserves, so a rule sending the underlay to the main table reads as
@@ -209,7 +227,7 @@ func (t TableID) MarshalYAML() (any, error) { return t.String(), nil }
 // protocol carrying them.
 type Announce struct {
 	Prefix Prefix `yaml:"prefix" json:"prefix" toml:"prefix"`
-	From   Prefix `yaml:"from,omitempty" json:"from,omitempty" toml:"from,omitempty"`
+	From   Prefix `yaml:"from,omitempty" json:"from,omitempty,omitzero" toml:"from,omitempty"`
 }
 
 func (a Announce) String() string {
@@ -251,21 +269,45 @@ func (a *Announce) UnmarshalYAML(value *yaml.Node) error {
 // hands over the value it decoded rather than a node. A type implementing this
 // is told nothing about unknown keys either, so the walk below refuses them the
 // way the yaml walk does.
-func (a *Announce) UnmarshalTOML(data any) error {
+func (a *Announce) UnmarshalTOML(data any) error { return a.decoded(data, "table") }
+
+// UnmarshalJSON takes the two spellings under encoding/json, which is how the
+// control plane reads an announcement. Without it json takes the bare form
+// through UnmarshalText and refuses the mapping outright, so the file and the
+// wire form would be two schemas rather than one. The decoded value is the
+// same pair of shapes the toml decoder hands over, so the walk is shared.
+func (a *Announce) UnmarshalJSON(data []byte) error {
+	var written any
+	if err := json.Unmarshal(data, &written); err != nil {
+		return err
+	}
+	return a.decoded(written, "object")
+}
+
+// decoded walks the mapping form for a decoder that hands over a value rather
+// than a node. shape names a mapping the way that decoder's own documentation
+// does, so a refusal names the thing the operator was writing.
+func (a *Announce) decoded(data any, shape string) error {
 	switch value := data.(type) {
 	case string:
 		return a.UnmarshalText([]byte(value))
 	case map[string]any:
-		// Sorted, so an entry whose prefix and from are both wrong names the
-		// same one on every load.
-		for _, key := range slices.Sorted(maps.Keys(value)) {
+		// prefix first, which is the order the yaml walk takes and the order
+		// Routes.Validate checks in, so an entry whose prefix and from are
+		// both wrong names the same half whichever decoder read it. The rest
+		// is sorted, so an entry with two typos names the same one every time.
+		for _, key := range append([]string{"prefix", "from"}, otherKeys(value)...) {
+			written, present := value[key]
+			if !present {
+				continue
+			}
 			target, err := a.field(key)
 			if err != nil {
 				return err
 			}
-			text, ok := value[key].(string)
+			text, ok := written.(string)
 			if !ok {
-				return fmt.Errorf("announce %s is %T, and a prefix is written as a string", key, value[key])
+				return fmt.Errorf("announce %s is %T, and a prefix is written as a string", key, written)
 			}
 			if err := target.UnmarshalText([]byte(text)); err != nil {
 				return err
@@ -273,7 +315,19 @@ func (a *Announce) UnmarshalTOML(data any) error {
 		}
 		return a.complete()
 	}
-	return fmt.Errorf("an announcement is a prefix or a prefix and from table, not %T", data)
+	return fmt.Errorf("an announcement is a prefix or a prefix and from %s, not %T", shape, data)
+}
+
+// otherKeys is every key an announcement does not name, in one order.
+func otherKeys(value map[string]any) []string {
+	out := make([]string, 0, len(value))
+	for key := range value {
+		if key != "prefix" && key != "from" {
+			out = append(out, key)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func (a *Announce) field(name string) (*Prefix, error) {

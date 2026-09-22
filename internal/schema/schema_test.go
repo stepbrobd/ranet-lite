@@ -1,6 +1,9 @@
 package schema
 
 import (
+	"encoding"
+	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -224,6 +227,99 @@ func TestTableNamesSurviveARoundTrip(t *testing.T) {
 			t.Errorf("table %d was written as %q and read back as %d", table, text, got)
 		}
 	}
+}
+
+// A value with no spelling is refused by every marshaller, not only by the
+// text one. MarshalYAML used to answer the "invalid Prefix" String gives for a
+// zero prefix, which renders without complaint and which no decoder reads
+// back, so a rendered configuration would be one nothing can load.
+func TestEveryMarshallerRefusesAValueWithNoSpelling(t *testing.T) {
+	for name, empty := range map[string]any{
+		"a prefix carrying no address": Prefix{},
+		"an address carrying no value": Addr{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rendered, err := yaml.Marshal(empty)
+			if err == nil {
+				t.Errorf("yaml wrote %q, which nothing reads back", strings.TrimSpace(string(rendered)))
+			}
+			if _, err := empty.(encoding.TextMarshaler).MarshalText(); err == nil {
+				t.Error("the text half wrote it too")
+			}
+		})
+	}
+}
+
+// encoding/json is the control plane's decoder, and rule 5 of the capability
+// plan says the file and the wire form are one schema. Without UnmarshalJSON
+// the bare spelling went through the text half and the mapping one was refused
+// outright, so an exit's announcement could be written in a file and not sent
+// over the wire.
+func TestJSONReadsBothAnnouncementSpellings(t *testing.T) {
+	want := []Announce{
+		{Prefix: MustPrefix("10.66.0.5/32")},
+		{Prefix: MustPrefix("::/0"), From: MustPrefix("2001:db8::/48")},
+	}
+	var got []Announce
+	if err := json.Unmarshal([]byte(`["10.66.0.5/32", {"prefix": "::/0", "from": "2001:db8::/48"}]`), &got); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("json read %v, want %v", got, want)
+	}
+	// And it reads back what it rendered, so a capability sent to a daemon and
+	// one written in a file describe the same node.
+	rendered, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	if err := json.Unmarshal(rendered, &got); err != nil {
+		t.Fatalf("parse %s: %v", rendered, err)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("the json round trip gave %v from %s", got, rendered)
+	}
+	// The same refusals the other two decoders make. A nested decoder is told
+	// nothing about unknown keys, so the walk has to refuse them itself.
+	for name, body := range map[string]string{
+		"an unknown field":              `[{"prefix": "::/0", "form": "2001:db8::/48"}]`,
+		"no prefix":                     `[{"from": "2001:db8::/48"}]`,
+		"a prefix that is not a string": `[{"prefix": 5}]`,
+		"neither spelling":              `[["10.66.0.5/32"]]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var refused []Announce
+			if err := json.Unmarshal([]byte(body), &refused); err == nil {
+				t.Errorf("json took %s as %v", body, refused)
+			}
+		})
+	}
+}
+
+// An entry whose prefix and from are both wrong names the same half under
+// every decoder. The toml walk sorted its keys, which puts from first, while
+// the yaml walk and Routes.Validate both take prefix first, so the three
+// disagreed about which half to name.
+func TestEveryDecoderNamesTheSameHalfOfABadAnnouncement(t *testing.T) {
+	// Each half is spelled wrong differently, so the refusal says which one it
+	// reached rather than only that something was wrong.
+	const badPrefix, badFrom = "xn--prefix", "xn--from"
+	named := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("an announcement with two bad halves was taken")
+		}
+		if !strings.Contains(err.Error(), badPrefix) {
+			t.Errorf("the refusal reads %q, and prefix is the half the yaml walk and Routes.Validate name first", err)
+		}
+	}
+	var fromYAML Announce
+	named(t, yaml.Unmarshal([]byte("{ prefix: "+badPrefix+", from: "+badFrom+" }"), &fromYAML))
+	var fromTOML Announce
+	named(t, fromTOML.UnmarshalTOML(map[string]any{"prefix": badPrefix, "from": badFrom}))
+	var fromJSON Announce
+	named(t, json.Unmarshal([]byte(`{"prefix": "`+badPrefix+`", "from": "`+badFrom+`"}`), &fromJSON))
 }
 
 func equal(a, b holder) bool {

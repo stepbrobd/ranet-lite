@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"maps"
 	"os"
 	"path/filepath"
@@ -285,6 +286,24 @@ func TestRenderedCapabilitiesParseBackToThemselves(t *testing.T) {
 				if !reflect.DeepEqual(*got, want) {
 					t.Errorf("%s round trip gave\n%+v\nfrom\n%s", rendered.extension, *got, body)
 				}
+			}
+			// And the control plane's own decoder, which is encoding/json
+			// rather than the yaml one a .json file goes to. Rule 5 of the
+			// capability plan makes the file and the wire form one schema, so
+			// a capability a file spells has to survive the wire too. It did
+			// not: a prefix nobody wrote went out through MarshalText, which
+			// refuses one carrying no address, so rendering any capability
+			// with an optional selector failed outright.
+			wire, err := json.Marshal(&want)
+			if err != nil {
+				t.Fatalf("render as json: %v", err)
+			}
+			var overWire Config
+			if err := json.Unmarshal(wire, &overWire); err != nil {
+				t.Fatalf("parse %s: %v", wire, err)
+			}
+			if !reflect.DeepEqual(overWire, want) {
+				t.Errorf("the json round trip gave\n%+v\nfrom\n%s", overWire, wire)
 			}
 		})
 	}
