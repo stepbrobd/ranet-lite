@@ -175,23 +175,11 @@ func New(cfg *config.Config) (_ *Client, err error) {
 
 // steeredMTU is the device MTU once the largest configured segment list has
 // been taken off it, and zero for a node that steers nothing, which leaves the
-// device's own default.
-//
-// A list long enough to take the MTU under the IPv6 minimum is refused rather
-// than installed: the device would come up unable to carry a packet the
-// protocol says every link must, and the failure would show up as unreachable
-// hosts rather than as a configuration this node would not run.
+// device's own default. The arithmetic and the refusal are the capability's
+// own, and config.Validate makes the same call with the same device, so a file
+// the loader took is a file this will start on.
 func steeredMTU(steering *srv6.SteerTable) (int, error) {
-	overhead := steering.Overhead()
-	if overhead == 0 {
-		return 0, nil
-	}
-	mtu := netstack.DefaultMTU - overhead
-	if mtu < srv6.MinimumIPv6MTU {
-		return 0, fmt.Errorf("config: the longest segment list takes %d bytes, leaving a %d byte device under the %d byte minimum IPv6 requires",
-			overhead, mtu, srv6.MinimumIPv6MTU)
-	}
-	return mtu, nil
+	return steering.CheckMTU(netstack.DefaultMTU)
 }
 
 // newClient is New with the loading done, so a test can stand up a client

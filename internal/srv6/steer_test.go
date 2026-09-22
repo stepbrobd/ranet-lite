@@ -96,6 +96,16 @@ func TestSteeringRefusesWhatWouldClaimItsOwnEncapsulation(t *testing.T) {
 		// A selector carrying bits below its length steers a whole prefix
 		// where one address was meant, and says nothing.
 		"host bits under a length": steering("2001:db8::1/32", "", source, exit),
+		// A zero-length selector claims every address of its family, so the
+		// entry steers every packet this node sends of that family, babel's
+		// own included. The "no selector" case above tests whether a selector
+		// was written rather than what it covers, so these walked past it and
+		// the table then claimed every packet probed. kernel.Rule.validate
+		// refuses the identical typo.
+		"a zero-length source":      steering("::/0", "", source, exit),
+		"a zero-length destination": steering("2001:db8::/32", "::/0", source, exit),
+		"a zero-length v4 source":   steering("0.0.0.0/0", "", source, exit),
+		"two zero-length halves":    steering("::/0", "::/0", source, exit),
 		// Neither the entry nor the block names an outer source, so there is
 		// nothing to send the encapsulation from.
 		"no source at all": {From: sprefix("2001:db8::/32"), Via: []schema.Addr{saddr(exit)}},
@@ -131,13 +141,12 @@ func TestSteeringRefusesTwoEntriesWithOneSelector(t *testing.T) {
 	second := steering("2001:db8::/32", "", source, "3fff:1:69c:6c46::1")
 	for name, entries := range map[string][]Steer{
 		"written the same way": {first, second},
-		// An omitted destination and one written out as the zero-length
-		// prefix are two spellings of one trie key, so keying the check on
-		// what was written rather than on what the trie stores lets the
-		// second entry quietly replace the first.
-		"an omitted destination against an explicit one": {
+		// The check is keyed on what the trie stores rather than on what was
+		// written, so a second entry can never replace a first while a
+		// diagnostic reports both.
+		"one carrying a source of its own": {
 			first,
-			steering("2001:db8::/32", "::/0", source, "3fff:1:69c:6c46::1"),
+			Steer{From: sprefix("2001:db8::/32"), Source: saddr(source), Via: []schema.Addr{saddr("3fff:1:69c:6c46::1")}},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

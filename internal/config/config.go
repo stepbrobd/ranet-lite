@@ -35,6 +35,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
@@ -475,11 +476,20 @@ func (c *Config) Validate() error {
 	// package that refused and the block an operator can find in their own
 	// file, and wrapping it in a second "config:" would say neither twice.
 	for _, capability := range []interface{ Validate() error }{
-		c.Routes(), c.Babel(), c.Segments(), c.Crypto(),
+		c.Routes(), c.Babel(), c.Crypto(),
 	} {
 		if err := capability.Validate(); err != nil {
 			return err
 		}
+	}
+	// cap.segment is asked with the device it steers from, since one of its
+	// refusals is about a segment list the device cannot carry. The MTU is a
+	// node fact rather than part of the block, and passing it here makes a file
+	// this accepts a file the daemon will run: the same refusal used to live
+	// where the tun is made, so a configuration check reported a file good that
+	// the daemon then would not start on.
+	if err := c.Segments().Validate(netstack.DefaultMTU); err != nil {
+		return err
 	}
 	// Table and Egress are asked only where the block was written, because
 	// neither has a zero value worth checking: an absent table writes no

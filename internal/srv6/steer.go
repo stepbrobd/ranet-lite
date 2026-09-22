@@ -119,19 +119,36 @@ func NewSteerTable(entries []Steer, source schema.Addr) (*SteerTable, error) {
 		if from.IsValid() && to.IsValid() && from.Addr().Is4() != to.Addr().Is4() {
 			return nil, fmt.Errorf("srv6: steering entry from %s to %s names two address families", from, to)
 		}
-		for _, prefix := range [2]netip.Prefix{from, to} {
+		for _, named := range [2]struct {
+			field  string
+			prefix netip.Prefix
+		}{{"from", from}, {"to", to}} {
+			prefix := named.prefix
 			if !prefix.IsValid() {
 				continue
 			}
 			if prefix.Addr().Is4In6() {
-				return nil, fmt.Errorf("srv6: steering entry selector %s is a v4-mapped prefix, which no packet is looked up under", prefix)
+				return nil, fmt.Errorf("srv6: cap.segment steer %s %s is a v4-mapped prefix, which no packet is looked up under", named.field, prefix)
 			}
 			// Refused rather than masked, as kernel.Rule.validate refuses the
 			// same typo. Masking a host address written with the wrong length
 			// steers a whole prefix where one address was meant, and says
 			// nothing.
 			if prefix.Masked() != prefix {
-				return nil, fmt.Errorf("srv6: steering entry selector %s has bits set below its prefix length", prefix)
+				return nil, fmt.Errorf("srv6: cap.segment steer %s %s has bits set below its prefix length", named.field, prefix)
+			}
+			// A zero-length selector claims every address of its family, so an
+			// entry carrying one steers every packet this node sends of that
+			// family, the babel traffic carrying the mesh's own routing
+			// included. The check above it tests whether a selector was
+			// written rather than what it covers, so "from: ::/0" walked past
+			// it. It is also the spelling an omitted field already has, and
+			// the trie stores the two under one key, so a second entry
+			// replaced the first while Entries, which the control socket
+			// serves, went on reporting both. kernel.Rule.validate refuses the
+			// identical typo.
+			if prefix.Bits() == 0 {
+				return nil, fmt.Errorf("srv6: cap.segment steer %s %s selects every address of its family, the same as leaving %s out: name the prefix this entry steers", named.field, prefix, named.field)
 			}
 		}
 		// The trie is keyed by destination first and has no entry for "any
@@ -144,10 +161,8 @@ func NewSteerTable(entries []Steer, source schema.Addr) (*SteerTable, error) {
 			destination = anyDestination(from)
 		}
 		// Keyed on what the trie is keyed on rather than on what was written,
-		// because those differ: an omitted destination and one written out as
-		// the zero-length prefix are two spellings the trie stores under one
-		// key, so keying on the spelling lets the second entry overwrite the
-		// first while a diagnostic goes on reporting both.
+		// so a second entry can never quietly overwrite a first while a
+		// diagnostic goes on reporting both.
 		selector := [2]netip.Prefix{from, destination}
 		if seen[selector] {
 			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(entry, &policy))
@@ -210,6 +225,32 @@ func (t *SteerTable) Overhead() int {
 		return 0
 	}
 	return t.overhead
+}
+
+// CheckMTU is the MTU a device of this size runs at once the longest segment
+// list has been taken off it, and zero for a table that steers nothing, which
+// leaves the device's own default. Taking the list off the MTU is ordinary
+// tunnel behavior; the alternative is a packet arriving that cannot be
+// encapsulated and going out unsteered, a hole in the steering rather than a
+// smaller MSS.
+//
+// A list long enough to take the device under the minimum IPv6 requires is
+// refused rather than installed: the device would come up unable to carry a
+// packet the protocol says every link must, and the failure reads as
+// unreachable hosts rather than as a configuration this node would not run.
+// One piece of arithmetic, called both where the file is read and where the
+// device is made, so the two cannot disagree about which file loads.
+func (t *SteerTable) CheckMTU(device int) (int, error) {
+	overhead := t.Overhead()
+	if overhead == 0 {
+		return 0, nil
+	}
+	mtu := device - overhead
+	if mtu < MinimumIPv6MTU {
+		return 0, fmt.Errorf("srv6: cap.segment steer: the longest segment list takes %d bytes, leaving a %d byte device under the %d byte minimum IPv6 requires",
+			overhead, mtu, MinimumIPv6MTU)
+	}
+	return mtu, nil
 }
 
 // Entries is the table as it was configured, for a diagnostic to print.

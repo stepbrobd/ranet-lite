@@ -78,11 +78,11 @@ func TestSteerSelectorWithHostBitsIsRefused(t *testing.T) {
 			Via:  []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")},
 		}},
 	}
-	if err := segments.Validate(); err == nil {
+	if err := segments.Validate(netstack.DefaultMTU); err == nil {
 		t.Error("a selector with bits below its prefix length was accepted")
 	}
 	segments.Steer[0].From = schema.MustPrefix("3fff:a::198:18:104:117/128")
-	if err := segments.Validate(); err != nil {
+	if err := segments.Validate(netstack.DefaultMTU); err != nil {
 		t.Errorf("a host selector was refused: %v", err)
 	}
 }

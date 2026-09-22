@@ -435,6 +435,19 @@ func TestBothDecodersRefuseTheSameConfigurations(t *testing.T) {
 			asYAML: "cap:\n  egress:\n    advertise: [\"0.0.0.0/0\"]\n    source4: \"2001:db8::1\"\n",
 			asTOML: "[cap.egress]\nadvertise = [\"0.0.0.0/0\"]\nsource4 = \"2001:db8::1\"\n",
 		},
+		// The device comes down by the longest segment list, and a list long
+		// enough to take it under the 1280 RFC 8200 requires of every link is
+		// one the daemon refuses at startup. Refusing it here too makes a
+		// configuration check and the daemon agree: lists of five and more
+		// loaded clean and then would not start.
+		"a segment list the device cannot carry": {
+			asYAML: "cap:\n  segment:\n    source: \"3fff:1:69c:8c0::1\"\n    steer:\n      - from: \"3fff:a::1/128\"\n        via: [\"3fff:1:69c::1\", \"3fff:1:69c::2\", \"3fff:1:69c::3\", \"3fff:1:69c::4\", \"3fff:1:69c::5\"]\n",
+			asTOML: "[cap.segment]\nsource = \"3fff:1:69c:8c0::1\"\nsteer = [{ from = \"3fff:a::1/128\", via = [\"3fff:1:69c::1\", \"3fff:1:69c::2\", \"3fff:1:69c::3\", \"3fff:1:69c::4\", \"3fff:1:69c::5\"] }]\n",
+		},
+		"a steering selector that claims every address": {
+			asYAML: "cap:\n  segment:\n    source: \"3fff:1:69c:8c0::1\"\n    steer: [{ from: \"::/0\", via: [\"3fff:1:69c::1\"] }]\n",
+			asTOML: "[cap.segment]\nsource = \"3fff:1:69c:8c0::1\"\nsteer = [{ from = \"::/0\", via = [\"3fff:1:69c::1\"] }]\n",
+		},
 		"an egress source nothing can reply to": {
 			asYAML: "cap:\n  egress:\n    advertise: [\"0.0.0.0/0\"]\n    source4: 127.0.0.1\n",
 			asTOML: "[cap.egress]\nadvertise = [\"0.0.0.0/0\"]\nsource4 = \"127.0.0.1\"\n",

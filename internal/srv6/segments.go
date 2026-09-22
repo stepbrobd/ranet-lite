@@ -59,14 +59,27 @@ func (s Segments) Normalized() Segments {
 // Validate refuses a capability this node could not act on, by building the
 // two tables and throwing them away. Everything it can say is said by the
 // constructors, so there is one set of rules rather than two.
-func (s Segments) Validate() error {
+//
+// deviceMTU is the device the steering runs on, a node fact rather than part
+// of the block, and zero asks for no device check. A caller that has one
+// passes it: a segment list long enough to take that device under the 1280
+// RFC 8200 requires of every link is refused here rather than at startup, so
+// a file this accepts is a file the daemon will run.
+func (s Segments) Validate(deviceMTU int) error {
 	if s.Source.IsValid() && !Usable(s.Source.Addr) {
 		// Checked here rather than where the first steering entry needs it,
 		// because nothing else reads the field and a node that steers nothing
 		// yet would otherwise carry a source it can never send from.
 		return fmt.Errorf("srv6: cap.segment source %s cannot address a segment routed packet", s.Source)
 	}
-	_, _, err := s.Tables()
+	_, steering, err := s.Tables()
+	if err != nil {
+		return err
+	}
+	if deviceMTU == 0 {
+		return nil
+	}
+	_, err = steering.CheckMTU(deviceMTU)
 	return err
 }
 
