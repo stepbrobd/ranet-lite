@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 func tunnelChild(id uint32) esp.ChildSA {

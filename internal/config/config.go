@@ -37,7 +37,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/srv6"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 type Config struct {
@@ -85,7 +85,7 @@ type Link struct {
 	// there routes the underlay into the tun carrying it.
 	//
 	// One block for both platforms because it is one idea, spelled two ways;
-	// the type in internal/transport says which field each of them reads, and
+	// the type in transport says which field each of them reads, and
 	// each is refused by name on the platform that has no meaning for it. That
 	// refusal is at startup rather than at load, as cap.table's rules and VRF
 	// are, so one file can carry a fleet's settings and a laptop's.

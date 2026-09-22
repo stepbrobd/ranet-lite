@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 func TestChildNegotiationUsesRequestIKEKeys(t *testing.T) {

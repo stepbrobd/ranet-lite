@@ -14,7 +14,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/netstack"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 // countingWriter counts writes rather than keeping them, the unit a report

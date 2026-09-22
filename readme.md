@@ -890,16 +890,18 @@ does too, so the import graph fixes the order in which anything else follows.
 - `control` is the read-only control socket, its wire types, and the client the
   subcommands read it with. It is the surface a control plane or a third-party
   monitor talks to, and it imports nothing else in this repository.
+- `transport` is the shared UDP socket mux, separating IKE from ESP framing, and
+  the one setting that keeps that socket off the routes the mesh installs. It
+  imports nothing else in this repository.
 - `esp` is userspace ESP AEAD encap and decap with anti-replay.
 - `sadr` is the immutable source and destination routing trie, with snapshot
   iteration.
 
 The rest is this program's own assembly, or is held inside by one import:
 
-- `internal/ike` is the IKEv2 initiator and responder.
+- `internal/ike` is the IKEv2 initiator and responder. It is held inside by
+  `internal/schema`, which its rekey intervals are spelled in.
 - `internal/client` owns the runtime, peer reconnection, and the ESP pipeline.
-- `internal/transport` is the shared UDP socket mux, separating IKE from ESP
-  framing.
 - `internal/netstack` owns the TUN device and the `(source, destination)` route
   table.
 - `internal/babel` is the embedded Babel speaker.
@@ -913,7 +915,9 @@ The rest is this program's own assembly, or is held inside by one import:
   the decoder pair each one needs.
 - `internal/config` is ranet-lite's own config format.
 - `internal/srv6` is segment routing: the header, the encapsulation, and the two
-  behaviors this mesh uses, all in this process rather than in a kernel.
+  behaviors this mesh uses, all in this process rather than in a kernel. It too
+  is held inside by `internal/schema`, which its segments and steering entries
+  are spelled in.
 - `internal/egress` is the exit node and subnet router capability: the source
   translation, the nftables table it owns, and the advertisement it withholds
   while that table does not hold the rules the configuration asks for.
@@ -926,6 +930,14 @@ The rest is this program's own assembly, or is held inside by one import:
   regenerates the third-party notice file, and the standalone interop and
   smoke-test binaries used during development (IKE, ESP, babel tests). They are
   under `internal` so that nothing outside this repository can install them.
+
+`internal/ike` and `internal/srv6` are the two worth promoting next, a minimal
+IKEv2 initiator and responder and an RFC 8754 and RFC 8986 implementation that
+acts on a segment routing header in userspace. Both are blocked on
+`internal/schema` alone, which they carry in exported signatures, so either one
+moves when the configuration vocabulary is a public commitment or when those
+signatures stop naming it. `internal/babel` and `internal/kernel` are blocked on
+`internal/netstack`, the daemon's dataplane, which is a wider move.
 
 ## Testing
 

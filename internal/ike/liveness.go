@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 const (

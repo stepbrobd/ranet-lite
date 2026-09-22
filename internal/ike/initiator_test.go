@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 // muxLoopback is the mux's own address with an explicit loopback host. The

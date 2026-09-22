@@ -20,7 +20,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 	"github.com/NickCao/ranet-lite/internal/srv6"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 type Client struct {

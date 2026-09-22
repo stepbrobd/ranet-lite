@@ -1,6 +1,40 @@
 // Package transport shares one UDP socket between IKE control messages and
-// UDP-encapsulated ESP packets. IKE packets carry a four-byte non-ESP marker;
-// ESP packets are bare and begin with their nonzero inbound SPI.
+// UDP-encapsulated ESP packets. IKE packets carry a four-byte non-ESP marker,
+// ESP packets are bare and begin with their nonzero inbound SPI. That rule is
+// RFC 3948 section 2.2, and it carries IKE and its own ESP traffic across a
+// NAT on one port.
+//
+// # What a caller uses
+//
+// [NewHub] binds the port and owns the socket. Each peer then gets a [Mux]
+// from [Hub.NewMux] or [Hub.NewMuxTo], which is that peer's logical channel:
+// the caller registers the inbound SPIs it has negotiated with
+// [Mux.RegisterIKE] and [Mux.RegisterESP], and from then on [Mux.SendIKE] and
+// [Mux.RecvIKE] carry control messages while [Mux.SendESP], [Mux.RecvESP] and
+// their batch forms carry the data. An IKE datagram whose SPI no Mux has
+// registered arrives on [Hub.Listen] as an [Unclaimed], which is how a peer
+// that has never dialed this node opens an IKE_SA_INIT. [Dial] is the one-peer
+// shorthand: a hub and a single mux, closed together.
+//
+// A peer that moves keeps working because a received datagram carries the
+// [Endpoint] it came from. [Mux.AdoptEndpoint] repoints the channel at it once
+// IKE has authenticated the move, so this package never decides on its own
+// that a peer's address changed.
+//
+// # Keeping the socket out of its own tunnel
+//
+// [Underlay] and [Runtime] are the one setting that keeps this socket off the
+// routes a mesh running over it installs, a mark on linux and an interface
+// binding on darwin. [Underlay] is a plain value a config file or a control
+// plane can produce whole, and [Runtime] carries what the caller has to
+// resolve at startup, so a caller that wants neither passes both zero.
+//
+// # What it does not do
+//
+// Nothing here encrypts, authenticates or parses a payload: an IKE message
+// leaves and arrives as bytes, and an ESP packet is opaque. Nothing here
+// writes a policy rule either, including the one that has to match
+// [Underlay.Mark].
 package transport
 
 import (

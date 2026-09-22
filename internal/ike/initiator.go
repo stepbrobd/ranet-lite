@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 // PeerConfig describes everything needed to establish one IKEv2 SA with a

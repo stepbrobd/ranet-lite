@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 // Identity is one ASN1_DN name, the only identity type this profile uses.

@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/NickCao/ranet-lite/esp"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 type inboundDecrypted = esp.AuthenticatedPacket

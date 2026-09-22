@@ -7,7 +7,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/kernel"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 // underlayStatePath is where the record of the routes this process wrote

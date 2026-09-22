@@ -33,7 +33,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/registry"
 	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/internal/srv6"
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 	yaml "gopkg.in/yaml.v3"
 )
 

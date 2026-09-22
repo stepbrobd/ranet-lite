@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/transport"
+	"github.com/NickCao/ranet-lite/transport"
 )
 
 func TestSessionRunStopsOnContextCancellation(t *testing.T) {

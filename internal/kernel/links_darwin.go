@@ -16,7 +16,7 @@ import (
 
 // Links answers which interface the host's own traffic leaves by, and says
 // when that changes. It is the read side of the same PF_ROUTE socket the
-// reconciler writes, and it exists for internal/transport: on darwin the
+// reconciler writes, and it exists for transport: on darwin the
 // underlay socket is kept out of the mesh's routing by being bound to that
 // interface, and nothing but the routing table knows which one it is.
 //

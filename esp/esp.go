@@ -3,8 +3,8 @@
 // package ike: AES-GCM or ChaCha20-Poly1305, no ESN, one SA per direction.
 // Peer-initiated Child SA rekeys replace these instances in the production
 // data plane. Packets are carried UDP-encapsulated (RFC 3948) since ranet's
-// strongSwan deployments force that unconditionally; see
-// internal/transport.Mux for the shared socket.
+// strongSwan deployments force that unconditionally. See the Mux in package
+// transport for the shared socket.
 package esp
 
 import (
