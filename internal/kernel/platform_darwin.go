@@ -101,6 +101,17 @@ type routePlatform struct {
 	// installed scoped under one answer and deleted under another leaves the
 	// kernel holding a key nothing will name again.
 	underlay []netip.Addr
+	// assigned is this interface's own addresses as of the current pass, and
+	// assignedAt says whether that answer has been taken yet.
+	//
+	// It is cached for the same reason underlay is, and to stop paying for it
+	// repeatedly: AddRoute asks sourceIsOurs about every source-specific route
+	// it is offered, a route it skips stays in the diff and is offered again
+	// on the next pass, so a node hearing sixty-four of them paid for
+	// sixty-four whole-interface dumps per pass, forever. Taken once and
+	// shared, the pass pays for one.
+	assigned   []netip.Prefix
+	assignedAt bool
 }
 
 func newPlatform(t Table, rt Runtime) (platform, error) {
@@ -166,7 +177,7 @@ func (p *routePlatform) open() error {
 	if p.control6, err = controlSocket(unix.AF_INET6); err != nil {
 		return err
 	}
-	p.monitor, err = newRouteMonitor(p.index)
+	p.monitor, err = newRouteMonitor(p.index, 0, false)
 	return err
 }
 
@@ -251,6 +262,10 @@ func (p *routePlatform) ownedRoutes(rib []byte) ([]Route, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kernel: parse the route dump: %w", err)
 	}
+	// A pass starts once its dump has parsed, so this is where the answers
+	// held for one pass are dropped: the same point rotateWarnings uses, and
+	// for the same reason.
+	p.assigned, p.assignedAt = nil, false
 	// After the parse, not before it: a dump the kernel returns and this
 	// library cannot read is a pass that will not reach any AddRoute either,
 	// and rotating for it would empty the record two passes later. See
@@ -425,7 +440,7 @@ func (p *routePlatform) decodeRoute(message route.Message) (Route, bool) {
 // interface, which interface scope can stand in for. Anything else is
 // a prefix belonging to some other node and cannot be expressed here.
 func (p *routePlatform) sourceIsOurs(source netip.Prefix) (bool, error) {
-	assigned, err := p.Addrs()
+	assigned, err := p.passAddrs()
 	if err != nil {
 		// Distinguished from "not ours" on purpose. Reporting a dump failure
 		// as a source we cannot express would skip the route, report success,
@@ -593,7 +608,18 @@ func (p *routePlatform) scopeRoute(r Route) bool {
 	// TestDarwinBoundSocketNeedsAScopedDefault for the one thing the binding
 	// does not do by itself.
 	if p.rt.BoundUnderlay {
-		return false
+		// Not capturesTheMachine: a bound socket with a default scoped to its
+		// own interface is not stranded by one, and hiding it from every
+		// unbound socket leaves this Mac unable to use a mesh exit at all.
+		//
+		// coversAny stays either way. It is a different question: a prefix
+		// holding a peer's own endpoint, 2000::/3 or a provider aggregate,
+		// sends this node's ESP into the tunnel carrying it however the
+		// socket is bound, because the peer is reached through the tun rather
+		// than past it. Dropping this arm with the other one was a hole the
+		// gate does not cover, since such a prefix is neither half the space
+		// nor a route containing the family's zero address.
+		return coversAny(r.Destination, p.underlay)
 	}
 	return capturesTheMachine(r) || coversAny(r.Destination, p.underlay)
 }
@@ -693,6 +719,21 @@ func (p *routePlatform) skipRoute(r Route, why string) error {
 // expressed at all.
 func (p *routePlatform) skipSourceSpecific(r Route) error {
 	return p.skipRoute(r, "the darwin FIB holds one source per destination")
+}
+
+// passAddrs is Addrs for one reconcile pass, read once however many routes
+// ask. A failure is not cached, so the next asker retries it, which is how a
+// transient dump failure recovers.
+func (p *routePlatform) passAddrs() ([]netip.Prefix, error) {
+	if p.assignedAt {
+		return p.assigned, nil
+	}
+	assigned, err := p.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	p.assigned, p.assignedAt = assigned, true
+	return assigned, nil
 }
 
 func (p *routePlatform) Addrs() ([]netip.Prefix, error) {

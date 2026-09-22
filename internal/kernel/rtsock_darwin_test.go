@@ -332,3 +332,59 @@ func drain(signal <-chan struct{}) {
 		}
 	}
 }
+
+// The link watcher must not wake on the mesh's own route churn. applyRoutes
+// writes one RTM_ADD per route and the kernel broadcasts every one, so an
+// unfiltered watcher wakes once per route this node installs, each wake
+// costing a route lookup and a fresh socket. Measured at about 34 microseconds
+// and 46 allocations per wake, which at a full table is hundreds of
+// milliseconds of a core per convergence, driven by whatever a peer announces.
+func TestLinkWatcherIgnoresTheMeshAndOurOwnWrites(t *testing.T) {
+	const meshIndex = 42
+	const otherIndex = 16
+	self := uintptr(os.Getpid())
+	for name, test := range map[string]struct {
+		monitor *routeMonitor
+		index   int
+		pid     uintptr
+		wakes   bool
+	}{
+		"the link watcher on another interface's change": {
+			&routeMonitor{index: 0, skip: meshIndex, quiet: true, self: self}, otherIndex, 1, true,
+		},
+		"the link watcher on the mesh's own churn": {
+			&routeMonitor{index: 0, skip: meshIndex, quiet: true, self: self}, meshIndex, self, false,
+		},
+		"the link watcher on this process's own write elsewhere": {
+			&routeMonitor{index: 0, skip: meshIndex, quiet: true, self: self}, otherIndex, self, false,
+		},
+		// The reconciler's own monitor keeps waking on its own successful
+		// writes, which is how it converges on what it just installed.
+		"the reconciler's monitor on its own write": {
+			&routeMonitor{index: meshIndex, self: self}, meshIndex, self, true,
+		},
+		"the reconciler's monitor on another interface": {
+			&routeMonitor{index: meshIndex, self: self}, otherIndex, 1, false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			message := routeMessageBytes(t, unix.RTM_ADD, test.index, test.pid, 0)
+			if got := test.monitor.wakesOn(message); got != test.wakes {
+				t.Errorf("woke %v, want %v", got, test.wakes)
+			}
+		})
+	}
+}
+
+// routeMessageBytes is the fixed header of one routing message, which is all
+// the monitor decodes.
+func routeMessageBytes(t *testing.T, kind, index int, pid uintptr, errno uint32) []byte {
+	t.Helper()
+	message := make([]byte, rtmDecodedLen)
+	binary.NativeEndian.PutUint16(message[:2], uint16(rtmDecodedLen))
+	message[rtmTypeOffset] = byte(kind)
+	binary.NativeEndian.PutUint16(message[rtmIndexOffset:], uint16(index))
+	binary.NativeEndian.PutUint32(message[rtmPIDOffset:], uint32(pid))
+	binary.NativeEndian.PutUint32(message[rtmErrnoOffset:], errno)
+	return message
+}

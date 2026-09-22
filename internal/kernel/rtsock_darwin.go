@@ -245,8 +245,20 @@ func ioctlRequest(fd int, request uintptr, argument []byte) error {
 // reconciler. Its own writes still wake it once; the settle window in Run
 // absorbs the burst and the following pass finds nothing to do.
 type routeMonitor struct {
-	file  *os.File
+	file *os.File
+	// index is the interface whose changes wake this monitor, or zero for
+	// every interface, and skip is the one interface that never does. A
+	// watcher for the host's own default takes the second shape: the route it
+	// follows moves between wifi, ethernet and a dock, so it cannot name one
+	// interface, but the mesh tun's own churn is the one thing it must not
+	// wake on, and that churn is one broadcast per route this process writes.
 	index int
+	skip  int
+	// quiet drops this process's own writes, successful ones included. The
+	// reconciler wants them, because its own install landing is a change it
+	// should converge on; a watcher for the host's routing does not, because
+	// every route the mesh installs would wake it.
+	quiet bool
 	// self is this process, which stamps every route message it writes. XNU
 	// broadcasts the result of a route_output to every PF_ROUTE listener,
 	// including the writer's own monitor, and SO_USELOOPBACK is off only on
@@ -260,7 +272,10 @@ type routeMonitor struct {
 // newRouteMonitor watches one interface, or every interface when index is
 // zero, as a watcher for the host's own default route needs: the
 // route it follows moves between interfaces and is never on the mesh tun.
-func newRouteMonitor(index int) (*routeMonitor, error) {
+// newRouteMonitor watches one interface, or every interface when index is
+// zero, minus the one skip names, and optionally ignores this process's own
+// writes. See routeMonitor for which caller wants which.
+func newRouteMonitor(index int, skip int, quiet bool) (*routeMonitor, error) {
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: open route monitor socket: %w", err)
@@ -279,6 +294,8 @@ func newRouteMonitor(index int) (*routeMonitor, error) {
 	monitor := &routeMonitor{
 		file:   os.NewFile(uintptr(fd), "pf-route-monitor"),
 		index:  index,
+		skip:   skip,
+		quiet:  quiet,
 		self:   uintptr(os.Getpid()),
 		signal: make(chan struct{}, 1),
 		done:   make(chan struct{}),
@@ -361,10 +378,19 @@ func (m *routeMonitor) wakesOn(message []byte) bool {
 	default:
 		return false
 	}
-	if m.index != 0 && int(binary.NativeEndian.Uint16(message[rtmIndexOffset:])) != m.index {
+	index := int(binary.NativeEndian.Uint16(message[rtmIndexOffset:]))
+	if m.index != 0 && index != m.index {
+		return false
+	}
+	if m.skip != 0 && index == m.skip {
+		// The mesh's own churn, which is one broadcast per route this
+		// reconciler writes and is never a change in the host's own routing.
 		return false
 	}
 	ours := uintptr(binary.NativeEndian.Uint32(message[rtmPIDOffset:])) == m.self
+	if ours && m.quiet {
+		return false
+	}
 	refused := binary.NativeEndian.Uint32(message[rtmErrnoOffset:]) != 0
 	return !ours || !refused
 }

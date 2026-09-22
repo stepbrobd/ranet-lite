@@ -1504,3 +1504,37 @@ func TestDarwinScopesADefaultWhileTheUnderlayIsUnbound(t *testing.T) {
 		t.Error("an announced default installed plain with the underlay still on the forwarding table")
 	}
 }
+
+// A source-specific route the backend skips never enters a dump, so it stays
+// in the diff and is offered again on the next pass. Asking the kernel for
+// this interface's addresses once per offer meant a node hearing sixty-four of
+// them paid for sixty-four whole-interface dumps per pass, forever. One pass,
+// one dump.
+func TestDarwinReadsItsAddressesOncePerPass(t *testing.T) {
+	plat, _ := testPlatform(t, Table{}, Runtime{})
+	dumps := 0
+	plat.addrs = func() ([]netip.Prefix, error) {
+		dumps++
+		// None of ours, so every source-specific route below is skipped and
+		// offered again on the pass after this one.
+		return nil, nil
+	}
+	skipped := []Route{
+		{Destination: prefix("2001:db8:1::/48"), Source: prefix("2001:db8:a::/48")},
+		{Destination: prefix("2001:db8:2::/48"), Source: prefix("2001:db8:b::/48")},
+		{Destination: prefix("2001:db8:3::/48"), Source: prefix("2001:db8:c::/48")},
+	}
+	for range 2 {
+		if _, err := plat.ownedRoutes(dumpRIB(t)); err != nil {
+			t.Fatal(err)
+		}
+		for _, route := range skipped {
+			if err := plat.AddRoute(route); !errors.Is(err, errRouteSkipped) {
+				t.Fatalf("AddRoute reported %v rather than skipping the route", err)
+			}
+		}
+	}
+	if dumps != 2 {
+		t.Errorf("two passes over %d skipped routes read the addresses %d times, want 2", len(skipped), dumps)
+	}
+}

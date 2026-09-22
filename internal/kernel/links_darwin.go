@@ -40,8 +40,12 @@ type Links struct {
 func WatchLinks(mesh int) (*Links, error) {
 	// Index zero, so a change on any interface wakes it: the route being
 	// followed moves between wifi, ethernet, a dock and a VPN of the user's
-	// own, and it is never on the mesh tun the reconciler watches.
-	monitor, err := newRouteMonitor(0)
+	// own, so no one interface can be named. The mesh tun is skipped and this
+	// process's own writes are dropped, which together are the whole of the
+	// churn a peer can drive: applyRoutes writes one RTM_ADD per route and the
+	// kernel broadcasts every one, so an unfiltered watcher wakes once per
+	// route installed, each wake costing a route lookup and a socket.
+	monitor, err := newRouteMonitor(0, mesh, true)
 	if err != nil {
 		return nil, err
 	}
