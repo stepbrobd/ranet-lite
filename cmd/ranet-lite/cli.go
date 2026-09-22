@@ -13,15 +13,15 @@ import (
 )
 
 // This file is the command tree. `ranet-lite daemon` is the node itself and
-// every other command reads a running one's control socket and prints it. They
-// are subcommands of one binary rather than two programs because a fleet
-// deploys one file, and because the wire types and the renderer are then
-// shared with the daemon by the compiler rather than by hand.
+// every other command speaks to a running one's control socket. They are
+// subcommands of one binary rather than two programs because a fleet deploys
+// one file, and because the wire types and the renderer are then shared with
+// the daemon by the compiler rather than by hand.
 //
-// Every command but daemon is read-only. There is no subcommand that changes
-// the node's configuration, because the configuration's entry points are its
-// file and SIGHUP, and a socket that could write would need an authorization
-// story to replace the one the file's permissions already are.
+// The commands here read. The four that act on a node are in write.go, and
+// none of them changes its configuration: the configuration's entry points
+// stay its file and SIGHUP, so the socket needs no authorization story to
+// replace the one the file's permissions already are.
 
 // reader holds the two flags every read takes. One value is shared by all of
 // them because cobra parses the flags of the one command that runs.
@@ -89,6 +89,7 @@ func newRoot() *cobra.Command {
 		licensesCommand(),
 		completionCommand(root),
 	)
+	root.AddCommand(r.writeCommands()...)
 	return root
 }
 
