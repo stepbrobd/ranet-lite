@@ -1175,7 +1175,10 @@ func TestPlatformWithoutRulesRefusesThemByName(t *testing.T) {
 // on a live node.
 func TestRuleValidationRefusesWhatReadsWrong(t *testing.T) {
 	for name, rule := range map[string]Rule{
-		"no family":           {To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 100},
+		// On a mark, so nothing else in validate answers for it: an address
+		// rule with no family is refused by the family-of-the-address check
+		// below instead, and the case would pass with this one deleted.
+		"no family":           {FWMark: 0x726c, Table: 200, Priority: 100},
 		"the wrong family":    {Family: FamilyIPv6, To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 100},
 		"host bits":           {Family: FamilyIPv4, To: schema.MustPrefix("10.1.2.3/8"), Table: 200, Priority: 100},
 		"no selector":         {Family: FamilyIPv4, Table: 200, Priority: 100},
