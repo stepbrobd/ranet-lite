@@ -1427,12 +1427,27 @@ func TestStoppedReconcilerWithdrawsAndStartsAgain(t *testing.T) {
 	if reconciler.Enabled() {
 		t.Error("the reconciler reports itself as writing to the kernel after being stopped")
 	}
-	waitFor(t, func() bool { return len(fake.snapshot()) == 0 })
-	fake.mu.Lock()
-	addresses := len(fake.addrs)
-	fake.mu.Unlock()
-	if addresses != 0 {
-		t.Errorf("%d addresses survived the stop", addresses)
+	// Both halves, in one condition. withdraw deletes every route and only
+	// then every address, which is the order the kernel needs, so a wait on
+	// the routes alone returns in the middle of the withdrawal and reads the
+	// addresses before they have been touched.
+	withdrawn := func() bool {
+		if len(fake.snapshot()) != 0 {
+			return false
+		}
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return len(fake.addrs) == 0
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !withdrawn() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !withdrawn() {
+		fake.mu.Lock()
+		addresses := len(fake.addrs)
+		fake.mu.Unlock()
+		t.Fatalf("the stop left %d routes and %d addresses behind", len(fake.snapshot()), addresses)
 	}
 	// The pass recorded after a withdrawal reads zero installed, so a
 	// diagnostic does not go on reporting the routes of the last pass that ran.
