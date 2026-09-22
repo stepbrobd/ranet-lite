@@ -36,7 +36,7 @@ func newRoot() *cobra.Command {
 	r := &reader{}
 	root := &cobra.Command{
 		Use:     "ranet-lite",
-		Short:   "A ranet mesh node, and the commands that read one",
+		Short:   "A ranet mesh node, and the commands that read and act on one",
 		Version: version.String(),
 		// main prints the one error and the usage is on --help, so neither is
 		// written twice.

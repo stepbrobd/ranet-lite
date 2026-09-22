@@ -359,12 +359,16 @@ ip addr add 10.66.0.5/32 dev ranet0
 ip route add 10.66.0.0/16 dev ranet0
 ```
 
-`daemon` is the node; every other subcommand asks a running one a question over
-its control socket, so `ranet-lite status` and its siblings work alongside a
+`daemon` is the node; every other subcommand speaks to a running one over its
+control socket, so `ranet-lite status` and its siblings work alongside a
 deployment's own `ranet-lite daemon` with no second binary and no second unit.
-See [Control socket](#control-socket). `ranet-lite completion bash|zsh|fish`
-writes the shell's completion script, generated from the command tree so a
-command added without one is completed anyway.
+Most of them ask a question; `disable`, `enable`, `redial`, `rekey` and `reload`
+act on one. See [Control socket](#control-socket).
+`ranet-lite completion
+bash|zsh|fish` writes the shell's completion script,
+generated from the command tree so a command added without one is completed
+anyway, and a peer or a subsystem an argument takes is completed from the
+running node.
 
 ## Configuration
 
@@ -660,13 +664,14 @@ extension's own channel.
 `--control /var/run/ranet-lite/control.sock` is where the daemon answers, and is
 the default, so a node is askable without having been configured to be.
 `--control ""` turns it off. The socket is mode 0660 and the unit names the
-group that can read it. Nothing on the socket writes, and a reader is bounded by
-an idle timeout and by a limit on the connections open at once across every
-reader, because a client that accumulates them costs the daemon a descriptor
-apiece and a node out of descriptors is one that cannot be asked anything at
-all. Past that limit a connection is closed as it is accepted, so a client
-holding every place is refused at once rather than left waiting, and a shutdown
-is not held up behind it.
+group that can reach it, and that mode is the whole authorization story; see
+[the verbs](#acting-on-a-running-node) for the line that keeps it sufficient. A
+caller is bounded by an idle timeout and by a limit on the connections open at
+once across every caller, because a client that accumulates them costs the
+daemon a descriptor apiece and a node out of descriptors is one that cannot be
+asked anything at all. Past that limit a connection is closed as it is accepted,
+so a client holding every place is refused at once rather than left waiting, and
+a shutdown is not held up behind it.
 
 Which process owns the path is settled by an exclusive lock on a sibling file
 rather than by dialing the socket to see whether anything answers, since a live
@@ -725,12 +730,62 @@ is still a row, which is the case an operator is looking for. `sessions` answers
 `swanctl --list-sas`. `peers` lists who this node dials, from the config file or
 from the trust document under `dial.all`, and whether it got there.
 
-No subcommand changes anything. A node's configuration is its file, a reload is
-SIGHUP, and a socket that could write would need an authorization story to
-replace the one the file's permissions already are. That is also why this is not
-the daemon and client split tailscale has: there is no login flow here, identity
-being a static key and a registry entry that nix and sops put in place before
-the process starts.
+Four more answer questions rather than printing one subsystem. `whois <address>`
+is a longest prefix match over that route table: it says which prefix covers an
+address and which peer this node reaches it through, then what the address would
+fall back to. It names the peer and not the originating node, because Babel
+carries a router id and no name and this tree gives each speaker a random one,
+so an origin is nameable only where it is a neighbor. `ip` prints this node's
+own mesh addresses, one per line, taken from the host prefixes it announces.
+`exit-node list` is the defaults the mesh advertises and which of them this node
+would take, with a withdrawn one told from one that is carrying traffic.
+`bugreport` is every subsystem in one JSON object, and a read that did not
+answer leaves its own line in it rather than replacing the report, so a node
+that is half up still produces one.
+
+`metrics` prints the same scrape the metrics listener serves, read over the
+control socket, so a node's counters are readable without it binding a port a
+fleet then has to firewall.
+
+### Acting on a running node
+
+Five subcommands change what a node is doing right now: `disable` and `enable` a
+subsystem, which is `reconciler`, `steering` or `responder`; `redial <peer>`;
+`rekey <peer>` or `rekey --all`; and `reload`, which does what SIGHUP does so a
+supervisor is not the only way to ask.
+
+None of them changes the configuration. A node's configuration is its file, and
+that stays its only entry point. What these act on is operational state the file
+already decides: `cap.table`, `cap.segment`'s steering, `link.listen`, the peers
+list and the file itself. Whoever may edit that file could already ask for every
+one of them, by editing and restarting if not by editing and sending SIGHUP, so
+the socket's mode grants nothing the file's permissions did not, and a verb that
+reached past what the file can express would break that and is refused on those
+grounds. The subsystem names are a closed set for the same reason. The two
+halves are told apart by method rather than by path: a read answers GET and
+nothing else, and a verb answers POST alone.
+
+The state lives in the process. A restart starts everything the file names, and
+a reload leaves a stopped subsystem stopped, because the trust document is
+rewritten every time any node joins the mesh and a reload that started one again
+would undo a decision an operator took minutes earlier on a schedule nobody
+chose. A node running less than its file says reports it on the `disabled` line
+of `ranet-lite status`, which is the only place that difference shows.
+
+`disable reconciler` withdraws every route, address and rule the reconciler
+installed, as `birdc disable` did to a kernel protocol, rather than freezing a
+table nobody is maintaining. `disable steering` leaves the policies loaded and
+stops acting on them, so a diagnostic still reports what was stopped.
+`disable responder` refuses the next handshake and leaves the sessions this node
+already holds alone. `redial` is the answer to the finding from the butte
+cutover: a peer that dials this node and cannot be dialed back does not retry on
+its own, and one of them carried a dead session for sixteen minutes. It drops
+what this node holds for that peer and sets its dialers going at once rather
+than after the reconnect delay.
+
+This is still not the daemon and client split tailscale has: there is no login
+flow here, identity being a static key and a registry entry that nix and sops
+put in place before the process starts.
 
 ## Sharing a host with other networking
 
@@ -887,9 +942,10 @@ package doc that says what a caller calls. The rule that decides membership is
 mechanical: a package can only sit outside `internal` if everything it imports
 does too, so the import graph fixes the order in which anything else follows.
 
-- `control` is the read-only control socket, its wire types, and the client the
-  subcommands read it with. It is the surface a control plane or a third-party
-  monitor talks to, and it imports nothing else in this repository.
+- `control` is the control socket: its wire types, the reads, the five verbs
+  that act on a running node, and the client the subcommands speak it with. It
+  is the surface a control plane or a third-party monitor talks to, and it
+  imports nothing else in this repository.
 - `transport` is the shared UDP socket mux, separating IKE from ESP framing, and
   the one setting that keeps that socket off the routes the mesh installs. It
   imports nothing else in this repository.
