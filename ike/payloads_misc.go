@@ -201,7 +201,7 @@ func DecodeTS(body []byte) ([]TrafficSelector, error) {
 	count := int(body[0])
 	rest := body[4:]
 	var out []TrafficSelector
-	for i := 0; i < count; i++ {
+	for range count {
 		if len(rest) < 8 {
 			return nil, fmt.Errorf("ike: truncated traffic selector")
 		}

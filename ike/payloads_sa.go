@@ -138,7 +138,7 @@ func decodeProposal(b []byte) (Proposal, bool, []byte, error) {
 	}
 	p.SPI = append([]byte{}, rest[:spiSize]...)
 	rest = rest[spiSize:]
-	for i := 0; i < numTrans; i++ {
+	for i := range numTrans {
 		t, more, next, err := decodeTransform(rest)
 		if err != nil {
 			return Proposal{}, false, nil, err

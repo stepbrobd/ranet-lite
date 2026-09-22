@@ -65,7 +65,7 @@ func sendRecvWithin(mux *transport.Mux, req []byte, attempts int, accept func([]
 	if err := mux.RegisterIKE(reqHdr.SPIInitiator); err != nil {
 		return nil, err
 	}
-	for attempt := 0; attempt < attempts; attempt++ {
+	for attempt := range attempts {
 		if err := mux.SendIKE(req); err != nil {
 			return nil, err
 		}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -797,14 +798,7 @@ func suiteFromProposal(p Proposal) (SASuite, error) {
 		if _, duplicate := selected[transform.Type]; duplicate {
 			return SASuite{}, fmt.Errorf("ike: duplicate selected transform type %d", transform.Type)
 		}
-		matched := false
-		for _, candidate := range offered {
-			if transform == candidate {
-				matched = true
-				break
-			}
-		}
-		if !matched {
+		if !slices.Contains(offered, transform) {
 			return SASuite{}, fmt.Errorf("ike: responder selected unoffered transform %d/%d", transform.Type, transform.ID)
 		}
 		selected[transform.Type] = transform

@@ -126,8 +126,7 @@ func (s *Session) negotiateChild(old *ChildSA) error {
 		// A rejection is the one answer that installs nothing at the peer, and
 		// rekeyChild reads it to recover from CHILD_SA_NOT_FOUND, so it passes
 		// through whole.
-		var rejected *childNegotiationRejectedError
-		if errors.As(err, &rejected) {
+		if _, ok := errors.AsType[*childNegotiationRejectedError](err); ok {
 			return err
 		}
 		return orphaned(err)
@@ -271,8 +270,7 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	}
 	selected, err := selectChildRequestProposal(payloads.sa.Body, expected, group)
 	if err != nil {
-		var invalidKE *invalidKEError
-		if errors.As(err, &invalidKE) {
+		if invalidKE, ok := errors.AsType[*invalidKEError](err); ok {
 			return s.responseNotifyData(ctx, msgID, CREATE_CHILD_SA, N_INVALID_KE_PAYLOAD,
 				invalidKENotifyData(invalidKE.group))
 		}

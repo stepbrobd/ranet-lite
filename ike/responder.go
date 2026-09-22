@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -331,8 +332,7 @@ func (r *Responder) handshake(ctx context.Context, datagram transport.Unclaimed)
 	}
 	proposal, suite, err := selectIKEProposal(saPayload.Body, peerGroup)
 	if err != nil {
-		var wrongGroup *invalidKEError
-		if errors.As(err, &wrongGroup) {
+		if wrongGroup, ok := errors.AsType[*invalidKEError](err); ok {
 			r.sendStatelessNotify(datagram, spiI, N_INVALID_KE_PAYLOAD, invalidKENotifyData(wrongGroup.group))
 			return nil, Accepted{}, err
 		}
@@ -542,8 +542,7 @@ func (s *Session) completeResponderAuth(r *Responder, realMessage1, realMessage2
 	if err != nil {
 		notify := N_NO_PROPOSAL_CHOSEN
 		var data []byte
-		var wrongGroup *invalidKEError
-		if errors.As(err, &wrongGroup) {
+		if wrongGroup, ok := errors.AsType[*invalidKEError](err); ok {
 			// RFC 7296 section 1.3 gives INVALID_KE_PAYLOAD "two octets of
 			// data associated with this notification: the accepted
 			// Diffie-Hellman group number in big endian order", and has the
@@ -1012,10 +1011,8 @@ func selectIKEProposal(body []byte, keGroup uint16) (Proposal, SASuite, error) {
 				if candidate.Type != want {
 					continue
 				}
-				for _, transform := range proposal.Transforms {
-					if transform == candidate {
-						return candidate, true
-					}
+				if slices.Contains(proposal.Transforms, candidate) {
+					return candidate, true
 				}
 			}
 			return Transform{}, false

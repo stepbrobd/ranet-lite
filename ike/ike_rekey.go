@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"slices"
 )
 
 // RekeyIKE replaces the IKE SA while retaining the current Child SAs. Run
@@ -45,7 +46,7 @@ func (s *Session) RekeyIKE() error {
 		response []RawPayload
 		err      error
 	)
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		dh, err = GenerateDH(group)
 		if err != nil {
 			return fmt.Errorf("ike: generate IKE SA rekey DH key: %w", err)
@@ -134,14 +135,7 @@ func (s *Session) RekeyIKE() error {
 		return fmt.Errorf("ike: IKE SA rekey nonce length %d is short for the negotiated PRF", len(nonce.Body))
 	}
 	for _, selected := range props[0].Transforms {
-		matched := false
-		for _, offered := range proposal.Transforms {
-			if selected == offered {
-				matched = true
-				break
-			}
-		}
-		if !matched {
+		if !slices.Contains(proposal.Transforms, selected) {
 			return fmt.Errorf("ike: IKE SA rekey chose unsupported transform %d/%d", selected.Type, selected.ID)
 		}
 	}
