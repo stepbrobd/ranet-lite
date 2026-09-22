@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding"
 	"encoding/json"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/NickCao/ranet-lite/ike"
 	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/schema"
 	"github.com/NickCao/ranet-lite/srv6"
@@ -1129,4 +1132,320 @@ func pointerScalars(ty reflect.Type, prefix string) []string {
 		out = append(out, pointerScalars(under, path)...)
 	}
 	return out
+}
+
+// fullConfig writes every capability block and sets every field of every one
+// of them to a value of its own, so a field that arrives holding its
+// neighbour's value reads back wrong rather than equal. The values satisfy
+// every check Load makes, since the round trip below goes through the loader
+// rather than through a decoder alone.
+func fullConfig() Config {
+	transit := false
+	rxcost, weight := uint16(96), uint16(1024)
+	rttMin, rttMax := schema.Duration(10*time.Millisecond), schema.Duration(1024*time.Millisecond)
+	replay := uint32(2048)
+	child, rekeyIKE := schema.Duration(90*time.Minute), schema.Duration(150*time.Minute)
+	margin, jitter := schema.Duration(3*time.Minute), schema.Duration(30*time.Second)
+	retryFirst, retryMax := schema.Duration(7*time.Second), schema.Duration(11*time.Minute)
+	return Config{
+		Node: Node{Org: "example", Name: "laptop"},
+		Auth: Auth{Key: "key.pem", Trust: "trust.json"},
+		Link: Link{
+			Port:      13000,
+			Endpoints: []Endpoint{{Serial: "0", Family: "ip4"}},
+			Listen:    true,
+			TUN:       "ranet0",
+			Underlay:  transport.Underlay{Mark: 0x726c, Bind: true},
+		},
+		Dial: Dial{All: true, To: []Peer{{Org: "example", Name: "gateway", Serial: "1"}}},
+		Cap: Caps{
+			Route: &babel.Routes{
+				Announce: []schema.Announce{
+					{Prefix: schema.MustPrefix("10.66.0.5/32")},
+					{Prefix: schema.MustPrefix("::/0"), From: schema.MustPrefix("2001:db8:1::/48")},
+				},
+				Transit: &transit,
+			},
+			Babel: &babel.Config{
+				Hello:   schema.Duration(4 * time.Second),
+				Update:  schema.Duration(16 * time.Second),
+				Quality: babel.LinkQualityNone,
+				Cost: babel.CostOptions{Rx: &rxcost, RTT: babel.RTTOptions{
+					Weight: &weight,
+					Min:    &rttMin,
+					Max:    &rttMax,
+				}},
+			},
+			Table: &kernel.Table{
+				ID:              200,
+				Proto:           155,
+				Metric:          64,
+				PrefSrc4:        schema.MustAddr("10.66.0.5"),
+				Addresses:       []schema.Prefix{schema.MustPrefix("10.66.0.5/32")},
+				AssignAnnounced: true,
+				VRF:             &kernel.VRF{Name: "mesh", Create: true},
+				Reconcile:       schema.Duration(30 * time.Second),
+				CaptureGrace:    schema.Duration(10 * time.Second),
+				// Two rules, because a rule naming an address is refused for
+				// also naming the family that address already says, so no one
+				// rule can carry every field the type has.
+				Rules: []kernel.Rule{{
+					To:       schema.MustPrefix("3fff:1:69c::/48"),
+					From:     schema.MustPrefix("3fff:a::/32"),
+					FWMark:   0x726c,
+					FWMask:   0xffff,
+					Table:    schema.TableMain,
+					Priority: 40,
+				}, {
+					FWMark:   0x726c,
+					FWMask:   0xffff,
+					Table:    schema.TableMain,
+					Priority: 41,
+					Family:   kernel.FamilyIPv6,
+				}},
+			},
+			Segment: &srv6.Segments{
+				Source: schema.MustAddr("3fff:1:69c:8c0::1"),
+				Local:  []srv6.Segment{{SID: schema.MustAddr("3fff:1:69c:8c6::1"), Behavior: srv6.BehaviorEndDT46}},
+				Steer: []srv6.Steer{{
+					From:   schema.MustPrefix("3fff:a::198:18:104:117/128"),
+					To:     schema.MustPrefix("3fff:1:69c:8c9::/64"),
+					Source: schema.MustAddr("3fff:1:69c:8c0::2"),
+					Via: []schema.Addr{
+						schema.MustAddr("3fff:1:69c:98d6::1"),
+						schema.MustAddr("3fff:1:69c:98d6::2"),
+					},
+				}},
+			},
+			Crypto: &ike.Crypto{
+				Replay: &replay,
+				Rekey: ike.Rekey{
+					Child:  &child,
+					IKE:    &rekeyIKE,
+					Margin: &margin,
+					Jitter: &jitter,
+					Retry:  ike.Retry{First: &retryFirst, Max: &retryMax},
+				},
+			},
+			Egress: &egress.Egress{
+				Advertise: []schema.Prefix{schema.MustPrefix("0.0.0.0/0"), schema.MustPrefix("::/0")},
+				// One of each spelling a source takes, so the address form and
+				// the word both cross every encoder in this one case.
+				Source4: egress.Source{Addr: netip.MustParseAddr("198.51.100.7")},
+				Source6: egress.Source{Auto: true},
+				Return:  true,
+				Sweep:   schema.Duration(45 * time.Second),
+			},
+		},
+	}
+}
+
+// A file an operator wrote reaches the daemon whole, whichever of the three
+// encoders carried it. Each decides an absent field on its own terms, so each
+// is asked the same question separately rather than one standing for the
+// others: a field dropped on the way out is a setting the node never applies
+// and nothing reports.
+//
+// The case is checked against the schema before it is rendered, so a
+// capability that grows a field fails here until fullConfig writes one, rather
+// than passing a round trip that never carried it.
+func TestEveryWrittenFieldSurvivesEachEncoder(t *testing.T) {
+	want := fullConfig()
+	if missing := unwritten(reflect.ValueOf(want), ""); len(missing) > 0 {
+		t.Fatalf("fullConfig leaves %d field(s) at zero, so no encoder below is asked to carry them: %s",
+			len(missing), strings.Join(missing, ", "))
+	}
+	for _, rendered := range []struct {
+		extension string
+		render    func(any) ([]byte, error)
+	}{
+		{".yaml", yaml.Marshal},
+		{".toml", renderTOML},
+	} {
+		body, err := rendered.render(&want)
+		if err != nil {
+			t.Fatalf("render %s: %v", rendered.extension, err)
+		}
+		got, err := load(t, rendered.extension, string(body))
+		if err != nil {
+			t.Fatalf("parse %s:\n%s\n%v", rendered.extension, body, err)
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Errorf("%s round trip gave\n%+v\nfrom\n%s", rendered.extension, *got, body)
+		}
+	}
+	// The control plane's own decoder, which is encoding/json rather than the
+	// yaml one a .json file goes to. Rule 5 of the capability plan makes the
+	// file and the wire form one schema, so a field a file spells has to
+	// survive the wire too.
+	wire, err := json.Marshal(&want)
+	if err != nil {
+		t.Fatalf("render as json: %v", err)
+	}
+	var overWire Config
+	if err := json.Unmarshal(wire, &overWire); err != nil {
+		t.Fatalf("parse %s: %v", wire, err)
+	}
+	if !reflect.DeepEqual(overWire, want) {
+		t.Errorf("the json round trip gave\n%+v\nfrom\n%s", overWire, wire)
+	}
+}
+
+// unwritten names every field left at its zero value, in the yaml path a file
+// writes it under. The walk stops at a type spelling itself as one scalar,
+// since what stands behind that spelling is the type's own business, and a
+// net/netip value exports no field to look at in any case.
+//
+// A pointer to a scalar counts as written the moment it is not nil, because
+// that is the whole reason those fields are pointers: cap.route transit and
+// cap.crypto replay both take an explicit zero, which asks for something other
+// than the default an absent field takes.
+func unwritten(value reflect.Value, path string) []string {
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return []string{path}
+		}
+		if value.Type().Elem().Kind() != reflect.Struct {
+			return nil
+		}
+		return unwritten(value.Elem(), path)
+	}
+	if value.Kind() == reflect.Slice && value.Len() == 0 {
+		return []string{path}
+	}
+	if value.IsZero() {
+		return []string{path}
+	}
+	if spellsItself(value.Type()) {
+		return nil
+	}
+	var out []string
+	switch value.Kind() {
+	case reflect.Struct:
+		structure := value.Type()
+		for i := range structure.NumField() {
+			field := structure.Field(i)
+			if !field.IsExported() {
+				continue
+			}
+			key, _, _ := strings.Cut(field.Tag.Get("yaml"), ",")
+			if key == "" {
+				key = strings.ToLower(field.Name)
+			}
+			out = append(out, unwritten(value.Field(i), strings.TrimPrefix(path+"."+key, "."))...)
+		}
+	case reflect.Slice:
+		// A list carries a set of entries rather than one entry holding one of
+		// every field, so a field any entry writes is a field this case
+		// covers. cap.table rules is why: a rule naming an address may not
+		// also name a family, and demanding both of one entry would demand a
+		// rule the loader refuses.
+		missing := unwritten(value.Index(0), path)
+		for i := 1; i < value.Len() && len(missing) > 0; i++ {
+			missing = alsoMissing(missing, unwritten(value.Index(i), path))
+		}
+		out = append(out, missing...)
+	}
+	return out
+}
+
+// alsoMissing is the paths left unwritten by both entries.
+func alsoMissing(first, second []string) []string {
+	return slices.DeleteFunc(first, func(path string) bool { return !slices.Contains(second, path) })
+}
+
+// spellsItself reports a type writing itself as one value rather than as the
+// fields behind it, by either of the two marshalers this tree's encoders
+// consult.
+func spellsItself(ty reflect.Type) bool {
+	if ty.Kind() != reflect.Pointer {
+		ty = reflect.PointerTo(ty)
+	}
+	return ty.Implements(reflect.TypeFor[yaml.Marshaler]()) ||
+		ty.Implements(reflect.TypeFor[encoding.TextMarshaler]())
+}
+
+// A block holding one written field and nothing else still reaches the
+// daemon. That shape finds what a full configuration hides: yaml.v3 decides
+// omitempty for a struct by asking for IsZero and otherwise walking the
+// exported fields, so a block whose one written field the walk cannot see is
+// dropped with the operator's value in it, while a fully populated block
+// always has some other field for the walk to find.
+//
+// Each case below is one nested block the omitempty finding names, rendered
+// and read back at its own type so no validation stands between the two.
+func TestOneWrittenFieldKeepsItsBlock(t *testing.T) {
+	oneEndpoint := func() Link { return Link{Endpoints: []Endpoint{{Serial: "0", Family: "ip4"}}} }
+	withUnderlay := func(underlay transport.Underlay) Link {
+		link := oneEndpoint()
+		link.Underlay = underlay
+		return link
+	}
+	rx := uint16(96)
+	rttMin := schema.Duration(10 * time.Millisecond)
+	replay := uint32(2048)
+	child, retryFirst := schema.Duration(90*time.Minute), schema.Duration(7*time.Second)
+	for name, want := range map[string]any{
+		"cap.crypto rekey":       ike.Crypto{Rekey: ike.Rekey{Child: &child}},
+		"cap.crypto rekey retry": ike.Rekey{Retry: ike.Retry{First: &retryFirst}},
+		"cap.babel cost":         babel.Config{Cost: babel.CostOptions{Rx: &rx}},
+		"cap.babel cost rtt":     babel.CostOptions{RTT: babel.RTTOptions{Min: &rttMin}},
+		// The three cases standing on a whole Config write the one endpoint
+		// the schema requires as well, since an endpoint list is the one
+		// required field here that is a list: yaml writes a nil one as an
+		// empty sequence and reads that back as an empty list rather than as
+		// nothing, which would read as a difference the block never caused.
+		"dial":          Config{Link: oneEndpoint(), Dial: Dial{All: true}},
+		"cap":           Config{Link: oneEndpoint(), Cap: Caps{Crypto: &ike.Crypto{Replay: &replay}}},
+		"link underlay": Config{Link: withUnderlay(transport.Underlay{Mark: 0x726c})},
+		"cap.route announce from": babel.Routes{Announce: []schema.Announce{
+			{Prefix: schema.MustPrefix("::/0"), From: schema.MustPrefix("2001:db8:1::/48")},
+		}},
+		"cap.segment source": srv6.Segments{Source: schema.MustAddr("3fff:1:69c:8c0::1")},
+		"cap.segment steer": srv6.Segments{Steer: []srv6.Steer{{
+			From:   schema.MustPrefix("3fff:a::198:18:104:117/128"),
+			To:     schema.MustPrefix("3fff:1:69c:8c9::/64"),
+			Source: schema.MustAddr("3fff:1:69c:8c0::2"),
+			Via:    []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")},
+		}}},
+		"cap.egress source": egress.Egress{
+			Source4: egress.Source{Addr: netip.MustParseAddr("198.51.100.7")},
+			Source6: egress.Source{Auto: true},
+		},
+		"cap.table prefsrc4": kernel.Table{PrefSrc4: schema.MustAddr("10.66.0.5")},
+		"cap.table rule selectors": kernel.Table{Rules: []kernel.Rule{{
+			To:       schema.MustPrefix("3fff:1:69c::/48"),
+			From:     schema.MustPrefix("3fff:a::/32"),
+			Table:    schema.TableMain,
+			Priority: 40,
+		}}},
+		"cap.table vrf": kernel.Table{VRF: &kernel.VRF{Name: "mesh"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, encoder := range []struct {
+				name   string
+				render func(any) ([]byte, error)
+				parse  func([]byte, any) error
+			}{
+				{"yaml", yaml.Marshal, yaml.Unmarshal},
+				{"json", json.Marshal, json.Unmarshal},
+				{"toml", renderTOML, func(body []byte, target any) error {
+					_, err := toml.Decode(string(body), target)
+					return err
+				}},
+			} {
+				body, err := encoder.render(want)
+				if err != nil {
+					t.Fatalf("render as %s: %v", encoder.name, err)
+				}
+				got := reflect.New(reflect.TypeOf(want))
+				if err := encoder.parse(body, got.Interface()); err != nil {
+					t.Fatalf("parse the %s\n%s\n%v", encoder.name, body, err)
+				}
+				if !reflect.DeepEqual(got.Elem().Interface(), want) {
+					t.Errorf("%s dropped it: wrote\n%s\nand read back %+v", encoder.name, body, got.Elem().Interface())
+				}
+			}
+		})
+	}
 }
