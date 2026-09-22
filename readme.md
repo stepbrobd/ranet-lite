@@ -101,15 +101,36 @@ primary.
 
 ranet-lite writes it, and it is the only route this tree puts out of an
 interface it does not own, so the rules around it are narrower than the tun's.
-It goes in before the first capturing route and comes out after the last one, so
-`cap.table.capture_grace` withdraws the pair together. It follows the host's own
-default: the interface it is going to is written before the socket moves onto it
-and the one it left is cleared after that, which leaves no moment with no usable
-route. Only a route this tool recorded writing is ever withdrawn, only after a
-readback finds it still carrying `RTF_IFSCOPE`, the recorded interface and the
-recorded next hop, and a delete that is not interface-scoped cannot be encoded
-at all. An add that answers `EEXIST` is success and not ownership, so a route
-macOS wrote for a secondary interface is used and never removed.
+
+It is written whenever the socket is bound rather than only when the mesh looks
+like it is capturing. Writing it under a condition meant every set that slipped
+past the condition took the machine off the network with nothing to fall back
+on, and three ordinary announcements are such a set. It duplicates the host's
+own default on the interface that already carries it, so it costs nothing when
+nothing needs it.
+
+The reconciler asks before it installs a route that would carry this machine's
+own traffic, and installs none when the answer is no. That is an invariant
+rather than a sequence: a capture is never in the kernel while the underlay is
+uncovered, whether the cover could not be written, the family has no default of
+its own, or the host reaches it through another interface.
+
+It is reconciled rather than remembered. The kernel drops this route on its own,
+clearing `IFF_UP` purges it and bringing the interface back up does not restore
+it, so every pass reads the table back and writes what is missing; a record
+saying it was written says nothing about whether it is there. The record is the
+claim to delete it and nothing else.
+
+It follows the host's own default: the interface it is going to is written
+before the socket moves onto it and the one it left is cleared after that, which
+leaves no moment with no usable route. Only a route this tool recorded writing
+is ever withdrawn, only after a readback finds it still carrying `RTF_IFSCOPE`,
+the recorded interface and the recorded next hop, and a delete that is not
+interface-scoped cannot be encoded at all. An add that answers `EEXIST` is
+success and not ownership, so a route macOS wrote for a secondary interface is
+used and never removed. Nothing is withdrawn while a capture is still in the
+kernel, so a withdrawal that failed upstream cannot take the fallback away from
+under one.
 
 The record outlives the process. It is written to
 `/var/run/ranet-lite/underlay.json`, beside the control socket's lock, before
@@ -123,10 +144,13 @@ host's own unscoped default. The last clause separates our route from the
 system's, because macOS writes a scoped default for every interface except the
 one holding the unscoped default;
 `TestNoOtherProgramScopesADefaultToThePrimaryInterface` asserts that on whatever
-machine the suite runs on rather than taking it on trust. Any record failing any
-clause is kept and reported rather than acted on, and a state file that is
-missing, truncated or not JSON is reported and treated as empty: a node that
-will not start is worse than a route left behind.
+machine the suite runs on rather than taking it on trust. A record failing any
+clause is kept where nothing in the process can delete it, so the clauses are
+not undone by the next ordinary withdrawal, and the next start weighs them
+again. The file is locked before it is read, so a second daemon starting beside
+a running one reclaims nothing and overwrites nothing; a state file that is
+missing, truncated or not JSON is reported and treated as empty, because a node
+that will not start is worse than a route left behind.
 
 The edge that leaves is worth knowing. The last clause is a snapshot, so a host
 that makes another interface primary while our route is in place, and later
@@ -137,11 +161,16 @@ which macOS answers by rewriting it.
 Either way, a route that would carry this machine's own traffic is held back
 until at least one session is live, withdrawn once none has been live for
 `cap.table.capture_grace` (10s by default) and restored on the next live
-session. A session counts as live only while it is still proving its peer is
-there and only while the underlay socket is where `link.underlay` says it should
-be. Without that rule a laptop whose mesh has gone loses every network it has
-rather than only the mesh, and it cannot recover on its own, because reaching
-the peers needs the network the default just took.
+session. Such a route is one covering half a family's address space or more, or
+one covering that family's unspecified address however small, which is the
+kernel's own trigger rather than a rule of thumb: measured, `0.0.0.0/24` out of
+the tun costs a bound socket as much as `0.0.0.0/1` does, and a set with no
+member larger than a quarter took this machine off the network. A session counts
+as live only while it is still proving its peer is there and only while the
+underlay socket is where `link.underlay` says it should be. Without that rule a
+laptop whose mesh has gone loses every network it has rather than only the mesh,
+and it cannot recover on its own, because reaching the peers needs the network
+the default just took.
 
 The capture itself has to be the pair of halves rather than a real default.
 darwin has no route replace, so `0.0.0.0/0` out of the tun collides with the
