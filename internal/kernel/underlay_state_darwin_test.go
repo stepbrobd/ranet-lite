@@ -4,6 +4,7 @@ package kernel
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ func reclaimFrom(t *testing.T, rib []byte, records []writtenDefault, lookup func
 	}
 	sock := &fakeRouteSocket{t: t}
 	u := &UnderlayDefaults{
-		sock: sock, links: &fakeDefaults{}, statePath: state,
+		sock: sock, links: &fakeDefaults{}, host: namedDevices{}, statePath: state,
 		written:      make(map[writtenDefault]bool),
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),
@@ -221,7 +222,7 @@ func loadInto(t *testing.T, body string) ([]writtenDefault, error) {
 	records, err := loadUnderlayState(state)
 	sock := &fakeRouteSocket{t: t}
 	u := &UnderlayDefaults{
-		sock: sock, links: &fakeDefaults{}, statePath: state,
+		sock: sock, links: &fakeDefaults{}, host: namedDevices{}, statePath: state,
 		written:      make(map[writtenDefault]bool),
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),
@@ -237,8 +238,11 @@ func loadInto(t *testing.T, body string) ([]writtenDefault, error) {
 }
 
 // goodRecord is ourRecord as the file spells it, the one every case below
-// pairs its bad record with.
-const goodRecord = `{"destination":"0.0.0.0/0","index":16,"interface":"en0","gateway":"192.168.0.1"}`
+// pairs its bad record with. Built from the same constant rather than written
+// out: a literal index here and uplinkIndex there can drift apart, and the
+// comparison below would then report that drift as a decoding fault.
+var goodRecord = fmt.Sprintf(
+	`{"destination":"0.0.0.0/0","index":%d,"interface":"en0","gateway":"192.168.0.1"}`, uplinkIndex)
 
 // A state file this tool cannot read must not stop a node starting, and must
 // not be turned into a delete. A daemon that will not come up is worse than a
@@ -372,7 +376,7 @@ func TestReclaimKeepsItsRecordsWhenTheTableWillNotReadBack(t *testing.T) {
 			}
 			sock := &fakeRouteSocket{t: t}
 			u := &UnderlayDefaults{
-				sock: sock, links: &fakeDefaults{}, statePath: state,
+				sock: sock, links: &fakeDefaults{}, host: namedDevices{}, statePath: state,
 				written:      make(map[writtenDefault]bool),
 				refused:      make(map[writtenDefault]bool),
 				covered:      make(map[netip.Prefix]bool),
@@ -587,7 +591,7 @@ func TestRefusedRecordsAreNotReachableByAWithdrawal(t *testing.T) {
 	}
 	sock := &fakeRouteSocket{t: t}
 	u := &UnderlayDefaults{
-		sock: sock, links: &fakeDefaults{}, statePath: state,
+		sock: sock, links: &fakeDefaults{}, host: namedDevices{}, statePath: state,
 		written:      make(map[writtenDefault]bool),
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),

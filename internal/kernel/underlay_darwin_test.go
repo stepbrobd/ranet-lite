@@ -13,9 +13,15 @@ import (
 )
 
 // The two interfaces every test here moves between, and the next hops on them.
+//
+// The values are past any index a machine hands out, so a test that builds an
+// UnderlayDefaults without namedDevices fails everywhere rather than only
+// where the number happens to be free. 16 and 19 named real interfaces on the
+// author's laptop and named nothing on a CI runner, so the one literal that
+// forgot the fake passed every local run and failed only there.
 const (
-	uplinkIndex = 16
-	dockIndex   = 19
+	uplinkIndex = 916
+	dockIndex   = 919
 )
 
 var (
@@ -568,7 +574,7 @@ func TestCloseLeavesTheRouteWhileACaptureIsStillInstalled(t *testing.T) {
 	var held []dumpEntry
 	sock := &fakeRouteSocket{t: t}
 	underlay := &UnderlayDefaults{
-		sock: sock, links: links, mesh: meshIndex,
+		sock: sock, links: links, mesh: meshIndex, host: namedDevices{},
 		written:      make(map[writtenDefault]bool),
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),
