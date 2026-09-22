@@ -49,11 +49,11 @@ func TestReplayWindowMatchesReference(t *testing.T) {
 	for _, window := range []uint32{1, 2, 3, 32, 63, 64, 65, 100, 128, 4096} {
 		t.Run(fmt.Sprint(window), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(uint64(window), 7))
-			for seed := 0; seed < 50; seed++ {
+			for seed := range 50 {
 				w := newReplayWindow(window)
 				ref := &referenceWindow{window: window, seen: map[uint32]bool{}}
 				var highest uint32
-				for step := 0; step < 400; step++ {
+				for step := range 400 {
 					var seq uint32
 					switch rng.IntN(5) {
 					case 0: // in order
@@ -115,7 +115,7 @@ func BenchmarkReplayCommitJumpDistances(b *testing.B) {
 // get wrong.
 func TestClearRangeClearsExactlyItsBits(t *testing.T) {
 	for _, window := range []uint32{1, 2, 7, 64, 65, 130} {
-		for start := uint32(0); start < window; start++ {
+		for start := range window {
 			for n := uint32(0); n <= window; n++ {
 				got := newReplayWindow(window)
 				want := newReplayWindow(window)

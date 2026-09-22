@@ -523,7 +523,7 @@ func TestSealConcurrentUniqueSeq(t *testing.T) {
 	const n = 200
 	pkts := make([][]byte, n)
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -631,14 +631,12 @@ func TestOpenConcurrentReplayRejected(t *testing.T) {
 	const n = 50
 	var wg sync.WaitGroup
 	var successes atomic.Int32
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			if _, _, err := in.Open(pkt); err == nil {
 				successes.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if got := successes.Load(); got != 1 {
