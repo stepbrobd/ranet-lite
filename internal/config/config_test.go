@@ -390,6 +390,19 @@ func TestBothDecodersRefuseTheSameConfigurations(t *testing.T) {
 			asYAML: "cap:\n  table:\n    rules:\n      - { to: \"10.0.0.0/8\", table: 200, priority: 40 }\n      - { to: \"10.0.0.0/8\", table: 200, priority: 40 }\n",
 			asTOML: "[cap.table]\nrules = [{ to = \"10.0.0.0/8\", table = 200, priority = 40 }, { to = \"10.0.0.0/8\", table = 200, priority = 40 }]\n",
 		},
+		// The kernel reads an all-ones mask and an absent one alike, so these
+		// two entries install one rule. Compared as written they looked
+		// different, and every pass reported EEXIST on the second and retried.
+		"two rules one mask apart": {
+			asYAML: "cap:\n  table:\n    rules:\n      - { fwmark: 0x726c, table: main, priority: 40, family: both }\n      - { fwmark: 0x726c, fwmask: 0xffffffff, table: main, priority: 40, family: both }\n",
+			asTOML: "[cap.table]\nrules = [{ fwmark = 0x726c, table = \"main\", priority = 40, family = \"both\" }, { fwmark = 0x726c, fwmask = 0xffffffff, table = \"main\", priority = 40, family = \"both\" }]\n",
+		},
+		// And one entry written for both families expanded into two that are
+		// one rule each, which the comparison also has to see.
+		"one family written twice": {
+			asYAML: "cap:\n  table:\n    rules:\n      - { fwmark: 0x726c, table: main, priority: 40, family: both }\n      - { fwmark: 0x726c, table: main, priority: 40, family: ipv6 }\n",
+			asTOML: "[cap.table]\nrules = [{ fwmark = 0x726c, table = \"main\", priority = 40, family = \"both\" }, { fwmark = 0x726c, table = \"main\", priority = 40, family = \"ipv6\" }]\n",
+		},
 		"a negative rekey interval": {
 			asYAML: "cap:\n  crypto:\n    rekey: { child: -1s }\n",
 			asTOML: "[cap.crypto.rekey]\nchild = \"-1s\"\n",

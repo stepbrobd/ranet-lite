@@ -335,10 +335,22 @@ func (t Table) Validate() error {
 			return err
 		}
 	}
-	for i, rule := range expanded {
-		if slices.Contains(expanded[:i], rule) {
-			return fmt.Errorf("kernel: rule %s is configured twice", rule)
+	// Canonicalized before the comparison, because that is the spelling the
+	// kernel holds: an all-ones mask and a bare mark are one rule to it, which
+	// an earlier round settled against a real one. Two entries spelled those
+	// two ways install the same rule, AddRule sends NLM_F_EXCL, and every pass
+	// reports EEXIST on the second and retries over a rule already there.
+	//
+	// Through a set rather than a scan over what came before: one entry
+	// written "family = both" expands to two, so the list grows with the
+	// fleet's, and the scan cost 1.5 seconds at sixteen thousand rules.
+	seen := make(map[Rule]struct{}, len(expanded))
+	for _, rule := range expanded {
+		rule = rule.canonical()
+		if _, twice := seen[rule]; twice {
+			return fmt.Errorf("kernel: cap.table rules %s is configured twice", rule)
 		}
+		seen[rule] = struct{}{}
 	}
 	return nil
 }
