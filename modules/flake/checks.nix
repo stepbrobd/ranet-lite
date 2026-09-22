@@ -72,8 +72,11 @@
         test = go "test" [ ] "go test -race ./...";
         vet = go "vet" [ ] "go vet ./...";
         # platform_unsupported.go and tun_name_other.go sit behind build
-        # tags no configured system matches
-        cross = go "cross" [ ] "GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build ./...";
+        # tags no configured system matches. vet rather than build, because
+        # go build drops _test.go files, and freebsd has no arm that runs
+        # them, so a test file that stopped compiling off this platform
+        # would reach a release unmentioned
+        cross = go "cross" [ ] "GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go vet ./...";
         # the formatter rewrites markdown, nix and toml, so without these
         # only its go half is ever checked
         format =
