@@ -126,7 +126,7 @@ update = "16s"
 # addresses = ["10.66.0.5/32"]     # assigned to the device, removed at exit
 # assign_announced = false         # also assign what cap.route announces
 # reconcile = "30s"
-# capture_grace = "10s"            # how long an announced default outlives the last live session
+# capture_grace = "10s"            # how long an announced default outlives the last live session, 1s floor
 
 # Enslave the device to a VRF, and make that device when nothing of the name
 # exists. linux only: the other platforms have one forwarding table and refuse

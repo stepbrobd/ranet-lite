@@ -74,7 +74,7 @@ cap:
   #   addresses: ["10.66.0.5/32"]
   #   assign_announced: false
   #   reconcile: 30s
-  #   capture_grace: 10s
+  #   capture_grace: 10s          # how long an announced default outlives the last live session, 1s floor
   #   vrf: { name: mesh, create: true }
   #   rules:
   #     - { fwmark: 0x726c, table: main, priority: 40, family: both }

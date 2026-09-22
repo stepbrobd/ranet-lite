@@ -114,11 +114,13 @@ on, and three ordinary announcements are such a set. It duplicates the host's
 own default on the interface that already carries it, so it costs nothing when
 nothing needs it.
 
-The reconciler asks before it installs a route that would carry this machine's
-own traffic, and installs none when the answer is no. That is an invariant
-rather than a sequence: a capture is never in the kernel while the underlay is
-uncovered, whether the cover could not be written, the family has no default of
-its own, or the host reaches it through another interface.
+The reconciler asks once a pass, and drops from that pass every capturing route
+whose own family the underlay cannot fall back on, so such a route is neither
+installed nor left behind: the host's default moving to another interface
+withdraws one that is already in the kernel. The answer is per family, because
+the fallback is: a bound socket resolves the unspecified address of the
+destination's own family, so a covered IPv4 does nothing for a `::/0` capture.
+That is an invariant rather than a sequence, on both edges.
 
 It is reconciled rather than remembered. The kernel drops this route on its own,
 clearing `IFF_UP` purges it and bringing the interface back up does not restore
@@ -168,14 +170,18 @@ until at least one session is live, withdrawn once none has been live for
 `cap.table.capture_grace` (10s by default) and restored on the next live
 session. Such a route is one covering half a family's address space or more, or
 one covering that family's unspecified address however small, which is the
-kernel's own trigger rather than a rule of thumb: measured, `0.0.0.0/24` out of
-the tun costs a bound socket as much as `0.0.0.0/1` does, and a set with no
-member larger than a quarter took this machine off the network. A session counts
-as live only while it is still proving its peer is there and only while the
-underlay socket is where `link.underlay` says it should be. Without that rule a
-laptop whose mesh has gone loses every network it has rather than only the mesh,
-and it cannot recover on its own, because reaching the peers needs the network
-the default just took.
+kernel's own trigger rather than a rule of thumb: measured for both families,
+`0.0.0.0/24` out of the tun costs a bound socket as much as `0.0.0.0/1` does and
+`::/64` costs it as much as `::/1`, while a set with no member larger than a
+quarter took this machine off the network. `capture_grace` has a floor of one
+second, refused by name below it: the gate is sampled once a pass and a pass
+reads the routing table, so a shorter grace only sets how often that happens,
+and the wake it asks for is armed only while a capturing route is actually in
+play. A session counts as live only while it is still proving its peer is there
+and only while the underlay socket is where `link.underlay` says it should be.
+Without that rule a laptop whose mesh has gone loses every network it has rather
+than only the mesh, and it cannot recover on its own, because reaching the peers
+needs the network the default just took.
 
 The capture itself has to be the pair of halves rather than a real default.
 darwin has no route replace, so `0.0.0.0/0` out of the tun collides with the
