@@ -176,9 +176,25 @@ func TestUnderlayStaysUnboundUntilTheHostHasADefaultRoute(t *testing.T) {
 
 	links.move(index, nil)
 	waitFor(t, bind, index)
-	if !hub.UnderlayReady() {
+	// Polled rather than read once: the socket carries the option before the
+	// hub records where it is, because the reachability probe runs between
+	// the two, and that probe is two connect calls rather than nothing.
+	if !waitReady(t, hub) {
 		t.Error("the underlay bound and still reports that it is not where it should be")
 	}
+}
+
+// waitReady polls until the hub says its underlay is where it should be.
+func waitReady(t *testing.T, hub *Hub) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hub.UnderlayReady() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
 }
 
 // A default route that disappears leaves the binding where it is. Unbinding
@@ -392,3 +408,79 @@ func (r *refusingRoutes) Prepare(int) error {
 }
 
 func (r *refusingRoutes) Settle(int) error { return nil }
+
+// failingRoutes fails Settle on demand, which is the path that used to leave
+// both sockets open on the port for the life of the process.
+type failingRoutes struct{ settle atomic.Bool }
+
+func (r *failingRoutes) Prepare(int) error { return nil }
+func (r *failingRoutes) Settle(int) error {
+	if r.settle.Load() {
+		return errors.New("the record could not be settled")
+	}
+	return nil
+}
+
+// A hub that fails on the way up has to leave nothing behind. Settle runs
+// after the sockets are open, so returning without closing them held the port
+// until the process exited and the next attempt on it answered EADDRINUSE.
+func TestFailedSettleLeavesNoSocketOnThePort(t *testing.T) {
+	index, _ := twoInterfaces(t)
+	// A fixed port, so the second attempt asks for the one the first would
+	// have leaked rather than for whatever is free.
+	probe, err := NewHub(":0", Underlay{}, Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.LocalAddr().(*net.UDPAddr).Port
+	_ = probe.Close()
+
+	routes := &failingRoutes{}
+	routes.settle.Store(true)
+	address := fmt.Sprintf(":%d", port)
+	if _, err := NewHub(address, Underlay{Bind: true},
+		Runtime{Links: newFakeLinks(index), Routes: routes}); err == nil {
+		t.Fatal("a hub whose settle failed was returned anyway")
+	}
+	// The port has to be free again, which it is only if both sockets closed.
+	again, err := NewHub(address, Underlay{}, Runtime{})
+	if err != nil {
+		t.Fatalf("the port is still held after a failed settle: %v", err)
+	}
+	_ = again.Close()
+}
+
+// A move that fails partway puts both families back where they were. One on
+// each interface reaches half this node's peers, and recording the index it
+// did not reach makes UnderlayReady answer from a value nothing holds.
+func TestPartialRebindLeavesBothFamiliesWhereTheyWere(t *testing.T) {
+	first, _ := twoInterfaces(t)
+	hub, err := NewHub(":0", Underlay{Bind: true}, Runtime{Links: newFakeLinks(first)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+	bind := hub.bind.(*darwinBind)
+	if got := boundInterface(t, bind.v4); got != first {
+		t.Fatalf("the hub opened on interface %d, want %d", got, first)
+	}
+
+	// The v6 half refuses while the v4 half has already moved, which is the
+	// half-finished move. It is injected because the kernel will not produce
+	// one: every index it refuses, it refuses for both families, measured.
+	_, second := twoInterfaces(t)
+	bind.v6.bindOption = func(int) error { return errors.New("the option was refused") }
+	t.Cleanup(func() { bind.v6.bindOption = nil })
+	if err := hub.BindUnderlay(second); err == nil {
+		t.Fatal("a move whose second family refused reported success")
+	}
+	if got := boundInterface(t, bind.v4); got != first {
+		t.Errorf("the udp4 socket was left on %d after a failed move, want %d", got, first)
+	}
+	if got := boundInterface(t, bind.v6); got != first {
+		t.Errorf("the udp6 socket was left on %d after a failed move, want %d", got, first)
+	}
+	if hub.UnderlayReady() {
+		t.Error("a hub that could not complete a move reports its underlay ready")
+	}
+}

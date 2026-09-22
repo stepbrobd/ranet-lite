@@ -220,6 +220,10 @@ func NewHub(localAddr string, underlay Underlay, rt Runtime) (*Hub, error) {
 	}
 	if index != 0 && rt.Routes != nil {
 		if err := rt.Routes.Settle(index); err != nil {
+			// The sockets are already open at this point, so returning
+			// without closing them leaves both bound to the port for the life
+			// of the process and the next attempt on it fails with EADDRINUSE.
+			_ = bind.Close()
 			return nil, fmt.Errorf("transport: settle on interface %d: %w", index, err)
 		}
 	}

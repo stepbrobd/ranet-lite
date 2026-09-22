@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // Underlay is how this node keeps the one UDP socket carrying IKE and ESP out
@@ -145,6 +146,12 @@ func bindUnderlay(underlay Underlay, rt Runtime) (int, error) {
 	return index, nil
 }
 
+// linkSettle absorbs the rest of a burst of routing changes before the socket
+// is moved, the way the reconciler's own settle window does. A link coming up
+// is several messages, and answering the first of them costs a route lookup
+// and a rebind that the last of them would only redo.
+const linkSettle = 250 * time.Millisecond
+
 // follow rebinds the socket whenever the host's default route moves to another
 // interface. It runs for the life of the hub.
 func (h *Hub) follow(links LinkSource, routes UnderlayRoutes) {
@@ -154,6 +161,9 @@ func (h *Hub) follow(links LinkSource, routes UnderlayRoutes) {
 		case <-h.done:
 			return
 		case <-changed:
+		}
+		if !h.settleLinks(changed) {
+			return
 		}
 		index, err := links.DefaultInterface()
 		if err != nil {
@@ -170,6 +180,22 @@ func (h *Hub) follow(links LinkSource, routes UnderlayRoutes) {
 	}
 }
 
+// settleLinks waits out a fixed window, discarding further wake-ups, and
+// reports whether the hub is still open.
+func (h *Hub) settleLinks(changed <-chan struct{}) bool {
+	timer := time.NewTimer(linkSettle)
+	defer timer.Stop()
+	for {
+		select {
+		case <-h.done:
+			return false
+		case <-changed:
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
 // moveUnderlay puts the socket on one interface in the order that leaves it
 // usable throughout: the interface it is going to is made ready first, then
 // the socket moves, then whatever the interface it left needed comes down. A
@@ -177,6 +203,10 @@ func (h *Hub) follow(links LinkSource, routes UnderlayRoutes) {
 // not ready is the outage this sequence exists to avoid.
 func (h *Hub) moveUnderlay(index int, routes UnderlayRoutes) error {
 	if routes != nil {
+		// Unconditionally, even where the index has not changed. The kernel
+		// drops the route this depends on when an interface goes down and
+		// does not restore it when the interface comes back, so a wake that
+		// finds the same index is exactly the case that needs the repair.
 		if err := routes.Prepare(index); err != nil {
 			return fmt.Errorf("transport: prepare interface %d: %w", index, err)
 		}
@@ -215,6 +245,13 @@ func (h *Hub) bindUnderlayTo(index int, routed bool) error {
 		return nil
 	}
 	if err := binder.bindInterface(index, routed); err != nil {
+		// A move that failed partway leaves the socket on no one interface,
+		// so the binding is recorded as unknown rather than as the index it
+		// did not reach. UnderlayReady then answers false, which stops a
+		// capture being installed over half a move.
+		h.mu.Lock()
+		h.boundTo = 0
+		h.mu.Unlock()
 		return err
 	}
 	h.mu.Lock()

@@ -57,6 +57,11 @@ type darwinSocket struct {
 	conn *net.UDPConn
 	raw  syscall.RawConn
 	ipv6 bool
+	// bindOption is the setsockopt this socket moves with, a field so a test
+	// can fail one family and not the other. Every index the kernel refuses
+	// it refuses for both, so a half-finished move cannot be produced from
+	// outside and the rollback would otherwise go unmeasured.
+	bindOption func(index int) error
 }
 
 // boundInterfaceOption is the level and option name that binds this family's
@@ -69,6 +74,13 @@ func (s *darwinSocket) boundInterfaceOption() (level, option int) {
 }
 
 func (s *darwinSocket) setBoundInterface(index int) error {
+	if s.bindOption != nil {
+		return s.bindOption(index)
+	}
+	return s.setBoundInterfaceOption(index)
+}
+
+func (s *darwinSocket) setBoundInterfaceOption(index int) error {
 	level, option := s.boundInterfaceOption()
 	var setErr error
 	if err := s.raw.Control(func(fd uintptr) {
@@ -82,8 +94,10 @@ func (s *darwinSocket) setBoundInterface(index int) error {
 // darwinBind holds the one socket per family every session shares.
 type darwinBind struct {
 	// rebind serializes a move from one interface to the other, so the two
-	// families cannot end up on different ones.
+	// families cannot end up on different ones, and bound is the interface
+	// both are on, which a half-finished move puts them back onto.
 	rebind sync.Mutex
+	bound  int
 	v4, v6 *darwinSocket
 }
 
@@ -111,18 +125,27 @@ func (b *darwinBind) Close() error {
 func (b *darwinBind) bindInterface(index int, routed bool) error {
 	b.rebind.Lock()
 	defer b.rebind.Unlock()
-	var errs []error
+	var moved []*darwinSocket
 	for _, socket := range []*darwinSocket{b.v4, b.v6} {
 		if socket == nil {
 			continue
 		}
 		if err := socket.setBoundInterface(index); err != nil {
-			errs = append(errs, fmt.Errorf("transport: bind the underlay socket to interface %d: %w", index, err))
+			// Put back whatever already moved, so a half-finished move leaves
+			// both families where they were rather than one on each
+			// interface. b.bound holds where they were, from this process's
+			// own record rather than from a guess.
+			errs := []error{fmt.Errorf("transport: bind the underlay socket to interface %d: %w", index, err)}
+			for _, done := range moved {
+				if back := done.setBoundInterface(b.bound); back != nil {
+					errs = append(errs, fmt.Errorf("transport: put the underlay socket back on interface %d: %w", b.bound, back))
+				}
+			}
+			return errors.Join(errs...)
 		}
+		moved = append(moved, socket)
 	}
-	if err := errors.Join(errs...); err != nil {
-		return err
-	}
+	b.bound = index
 	reportBoundReach(index, routed)
 	return nil
 }
@@ -330,5 +353,10 @@ func listenPacketBind(port uint16, index int) (packetBind, []receiveFunc, uint16
 	if len(receivers) == 0 {
 		return nil, nil, 0, unix.EAFNOSUPPORT
 	}
+	// The first binding happens in the listen hook above rather than through
+	// bindInterface, so this is where the bind learns where its sockets are.
+	// A rollback reads it, and without it a half-finished first move would put
+	// the family that had already moved onto no interface at all.
+	b.bound = index
 	return b, receivers, port, nil
 }
