@@ -50,6 +50,13 @@ func RenderStatus(w io.Writer, s Status) {
 		{"steering", steeringLine(s)},
 		{"esp", fmt.Sprintf("%d in, %d dropped, %d refused", s.ESP.InboundPackets, s.ESP.InboundDropped, s.ESP.ReceiveRefused)},
 	}
+	// Only where something is off. Every other row above answers a question a
+	// healthy node has an answer to, and this one would read "none" on all of
+	// them; it is here so that a node running less than its file says carries
+	// the difference where somebody will see it.
+	if len(s.Disabled) > 0 {
+		rows = append(rows, []string{"disabled", disabledLine(s.Disabled)})
+	}
 	out := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, row := range rows {
 		fmt.Fprintf(out, "%s\t%s\n", row[0], row[1])
@@ -149,6 +156,31 @@ func egressLine(e EgressStatus) string {
 		line += ", " + e.Err
 	}
 	return line
+}
+
+// disabledLine names the stopped subsystems and says the state goes away by
+// itself, because whoever reads this row is often not whoever wrote it and the
+// first question is whether a restart is needed to undo it.
+func disabledLine(subsystems []Subsystem) string {
+	names := make([]string, 0, len(subsystems))
+	for _, name := range subsystems {
+		names = append(names, string(name))
+	}
+	return strings.Join(names, ", ") + ", stopped on the control socket and started again by an enable or a restart"
+}
+
+// RenderResult writes the answer to a write. The entries are listed under the
+// sentence only where the verb reached more than one, so a redial that covered
+// four paths names them and a disable does not repeat the subsystem it just
+// said.
+func RenderResult(w io.Writer, result Result) {
+	fmt.Fprintln(w, result.Detail)
+	if len(result.Acted) < 2 {
+		return
+	}
+	for _, entry := range result.Acted {
+		fmt.Fprintf(w, "  %s\n", entry)
+	}
 }
 
 func prefixText(prefixes []netip.Prefix) string {

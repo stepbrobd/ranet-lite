@@ -1,8 +1,8 @@
-// Package control is the wire format of a running node's read-only view, the
-// client that reads it and the server that answers. The daemon serves JSON
-// over a unix socket and the same binary's subcommands render it, which is the
-// answer to `birdc show babel neighbors` and `birdc show route` once Babel has
-// moved out of BIRD.
+// Package control is the wire format of a running node's live view and of the
+// few verbs that act on it, the client that speaks it and the server that
+// answers. The daemon serves JSON over a unix socket and the same binary's
+// subcommands render it, which is the answer to `birdc show babel neighbors`
+// and `birdc show route` once Babel has moved out of BIRD.
 //
 // # What a caller uses
 //
@@ -14,19 +14,43 @@
 // such program and takes no privileged path of its own. The Render functions
 // write the same values as the text the subcommands print.
 //
+// A Source that also implements [Sink] serves the four operational verbs as
+// well, and one that does not serves the reads alone and refuses every write
+// by name rather than by a missing route.
+//
 // Nothing outside this package is needed to speak the protocol: the types are
 // plain structs over [net/netip] addresses and a [Duration] that marshals as a
 // Go duration string, and the paths are named constants. This package imports
 // nothing else in this repository, so a caller takes it without taking the
 // daemon.
 //
-// # Read-only
+// # What the socket grants
 //
-// Nothing here writes. A node's configuration comes from its file and a reload
-// is SIGHUP, so the socket needs no authorization story beyond its mode: a
-// reader learns the mesh's topology and this node's counters, and can change
-// nothing. The handler refuses every method but GET for that reason, rather
-// than leaving the rule implied by the absence of a route that would write.
+// The reads carry the mesh's topology and this node's counters and change
+// nothing at all. The writes in [Sink] stop and start a subsystem, drop the
+// sessions this node holds for one peer so its dialer opens them again,
+// replace a Child SA, and re-read the configuration file. None of them holds
+// state of its own past the process, and none of them touches the
+// configuration: the file stays its only entry point.
+//
+// A node's configuration comes from its file, so the socket's mode is the
+// whole authorization story, and every verb here stays inside it. Each one
+// acts on something the file already decides -- cap.table, cap.segment's
+// steering, link.listen, the peers list, and the file itself -- so whoever
+// may edit the file could already ask for it, by editing and restarting if
+// not by editing and sending SIGHUP. The socket grants nothing the file's
+// permissions did not.
+//
+// That is the line a verb has to stay inside. One that changed something the
+// file cannot express, a new peer or a key or an address, would put a grant
+// on the socket the file's permissions do not carry, and it is refused on
+// those grounds rather than admitted with an authorization check of its own.
+// [Subsystem] is a closed set for the same reason.
+//
+// The two halves are told apart by method rather than by path. A read answers
+// GET and HEAD and nothing else, so a caller that reaches a write path with a
+// GET is refused rather than acted on; a write answers POST alone, because a
+// second rekey is a second exchange rather than the same one repeated.
 //
 // # Versioning
 //
@@ -45,12 +69,20 @@ import (
 )
 
 // Paths the handler serves, named so the client and the server cannot drift.
+// The first five answer a GET and the rest a POST; see the package doc for
+// why the method rather than the prefix separates them.
 const (
 	PathStatus    = "/v0/status"
 	PathNeighbors = "/v0/neighbors"
 	PathRoutes    = "/v0/routes"
 	PathSessions  = "/v0/sessions"
 	PathPeers     = "/v0/peers"
+
+	PathDisable = "/v0/disable"
+	PathEnable  = "/v0/enable"
+	PathRedial  = "/v0/redial"
+	PathRekey   = "/v0/rekey"
+	PathReload  = "/v0/reload"
 )
 
 // DefaultSocket is where the daemon listens and where the client looks. It is
@@ -67,6 +99,88 @@ type Source interface {
 	Routes() []Route
 	Sessions() []Session
 	Peers() []Peer
+}
+
+// Subsystem names one part of a node that can be stopped and started again.
+// The set is closed and stays closed: each of the three is a block of the
+// configuration file, so stopping one asks for nothing the file could not say,
+// and a name outside the set is refused rather than reaching for whatever a
+// later runtime happens to call itself.
+type Subsystem string
+
+const (
+	// SubsystemReconciler is the cap.table route reconciler. Stopping it
+	// withdraws every route, address and rule it installed, the same as
+	// `birdc disable` on a kernel protocol while Babel lived in BIRD.
+	SubsystemReconciler Subsystem = "reconciler"
+	// SubsystemSteering is cap.segment's steer policies, the decision to send
+	// this node's own packets through a segment list. Stopping it sends them
+	// by the route table instead, which is the node without the policies.
+	SubsystemSteering Subsystem = "steering"
+	// SubsystemResponder is link.listen, answering peers that dial in.
+	// Stopping it leaves the sessions this node already holds alone, dialed
+	// and answered alike, and refuses the next handshake.
+	SubsystemResponder Subsystem = "responder"
+)
+
+// Subsystems is the closed set, in the order a usage line names them.
+var Subsystems = []Subsystem{SubsystemReconciler, SubsystemSteering, SubsystemResponder}
+
+// SubsystemNames is the same set as plain strings, for a usage line and for
+// shell completion.
+func SubsystemNames() []string {
+	out := make([]string, 0, len(Subsystems))
+	for _, name := range Subsystems {
+		out = append(out, string(name))
+	}
+	return out
+}
+
+// Request is the body of a write. One shape serves every verb, and each verb
+// reads the fields it needs: a field another verb fills is ignored rather than
+// refused, so a client and a daemon built from different revisions still
+// speak. An empty body decodes as the zero value, and reload is asked with one.
+type Request struct {
+	Subsystem Subsystem `json:"subsystem,omitempty"`
+	Peer      string    `json:"peer,omitempty"`
+	All       bool      `json:"all,omitempty"`
+}
+
+// Result is the answer to a write. Acted names what the verb reached, one
+// entry per subsystem or per path, so a script sees the same list the sentence
+// summarizes. Detail is that sentence, written once here rather than once in
+// the daemon's log and again in the subcommand.
+type Result struct {
+	Acted  []string `json:"acted,omitempty"`
+	Detail string   `json:"detail"`
+}
+
+// Sink is the write path, and is optional: [Handler] serves these verbs for a
+// [Source] that implements it and refuses them by name for one that does not.
+//
+// Every method reports what it reached, or an error naming what this node does
+// not run. A verb that found nothing is an error rather than a quiet success,
+// because an operator told "steering is off" by a node that never steered has
+// been told nothing.
+type Sink interface {
+	// SetSubsystem stops or starts one subsystem. The state lives in the
+	// process, so a restart returns to whatever the file says and a reload
+	// leaves it as an operator set it: a registry rewrite arrives on every
+	// node that joins the mesh, and re-enabling on one would undo a decision
+	// made minutes earlier.
+	SetSubsystem(name Subsystem, on bool) (Result, error)
+	// Redial drops the sessions this node holds for one peer and sets its
+	// dialers going again at once rather than after the reconnect delay. It is
+	// the answer to a peer that holds a session this node no longer has, on
+	// the side that can act.
+	Redial(peer string) (Result, error)
+	// Rekey asks one peer's sessions, or every session, to replace their Child
+	// SA. The exchange runs on its own and the new SPIs appear under
+	// [Client.Sessions]; the answer says how many were asked.
+	Rekey(peer string, all bool) (Result, error)
+	// Reload re-reads the configuration file and the trust document it names,
+	// as SIGHUP does, so a supervisor is not the only way to ask.
+	Reload() (Result, error)
 }
 
 // Duration is a time.Duration that reads as "4s" in JSON rather than as a
@@ -135,6 +249,12 @@ type Status struct {
 	// routing at all, and those are the two states a reader is trying to tell
 	// apart.
 	SegmentCounters SegmentCounters `json:"segment_counters"`
+	// Disabled names the subsystems somebody stopped over the control socket,
+	// and is absent where none is. A node whose file says it reconciles routes
+	// and which is not reconciling them says so here and nowhere else, so this
+	// is the field that keeps a disable from being invisible to whoever comes
+	// after.
+	Disabled []Subsystem `json:"disabled,omitempty"`
 }
 
 // SegmentCounters is this node's segment routing, counted since startup.

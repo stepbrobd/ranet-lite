@@ -72,10 +72,12 @@ func TestHandlerServesEveryReadAsJSON(t *testing.T) {
 	}
 }
 
-// The socket is read-only, and the rule is enforced rather than left implied
-// by there being no route that writes: a POST falling through to a reader
-// answers 200 and reads as a write that took effect.
-func TestHandlerRefusesWrites(t *testing.T) {
+// A read path takes no write, and the rule is enforced rather than left
+// implied by there being nothing on that path to write: a POST falling through
+// to a reader answers 200 and reads as a write that took effect. It matters
+// more since the verbs arrived, because a POST is now a method this surface
+// answers somewhere.
+func TestReadPathsRefuseAWrite(t *testing.T) {
 	server := httptest.NewServer(Handler(fakeSource{}))
 	defer server.Close()
 	response, err := http.Post(server.URL+PathStatus, "application/json", strings.NewReader("{}"))

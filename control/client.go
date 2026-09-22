@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,26 @@ func (c *Client) Sessions() ([]Session, error) { return read[[]Session](c, PathS
 
 func (c *Client) Peers() ([]Peer, error) { return read[[]Peer](c, PathPeers) }
 
+// Disable and Enable stop and start one subsystem. Redial, Rekey and Reload
+// are the other three verbs, written out for the same reason the reads are.
+func (c *Client) Disable(subsystem Subsystem) (Result, error) {
+	return c.call(PathDisable, Request{Subsystem: subsystem})
+}
+
+func (c *Client) Enable(subsystem Subsystem) (Result, error) {
+	return c.call(PathEnable, Request{Subsystem: subsystem})
+}
+
+func (c *Client) Redial(peer string) (Result, error) {
+	return c.call(PathRedial, Request{Peer: peer})
+}
+
+func (c *Client) Rekey(peer string, all bool) (Result, error) {
+	return c.call(PathRekey, Request{Peer: peer, All: all})
+}
+
+func (c *Client) Reload() (Result, error) { return c.call(PathReload, Request{}) }
+
 // read fetches and decodes one path. A body is bounded, because a client
 // reading a daemon it cannot verify still should not be made to allocate
 // without limit.
@@ -61,6 +82,28 @@ func read[T any](c *Client, path string) (T, error) {
 	if err != nil {
 		return out, c.explain(err)
 	}
+	return decode[T](path, response)
+}
+
+// call posts one write and decodes its answer. The body is JSON rather than a
+// form, so the daemon parses one shape whether the caller is this client or
+// anything else that can open the socket.
+func (c *Client) call(path string, request Request) (Result, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return Result{}, err
+	}
+	response, err := c.http.Post("http://control"+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return Result{}, c.explain(err)
+	}
+	return decode[Result](path, response)
+}
+
+// decode reads one answer, bounded and with its status checked, which is the
+// same treatment a read and a write both need.
+func decode[T any](path string, response *http.Response) (T, error) {
+	var out T
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<20))
 	if err != nil {

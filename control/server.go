@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -156,9 +157,13 @@ func (l *ownedListener) Close() error {
 	return errors.Join(l.Listener.Close(), l.lock.Close())
 }
 
-// Handler serves src. Every route is a GET returning JSON, and the answer is
-// built and encoded outside whatever lock src took, because a slow reader must
-// not be able to hold the dataplane's lock open.
+// Handler serves src. Every answer is JSON, built and encoded outside whatever
+// lock src took, because a slow reader must not be able to hold the
+// dataplane's lock open.
+//
+// The reads are always served. The writes are served when src also implements
+// [Sink], and refused by name when it does not, rather than answering 404 on a
+// path this build does have.
 func Handler(src Source) http.Handler {
 	mux := http.NewServeMux()
 	answer(mux, PathStatus, func() any { return src.Status() })
@@ -166,17 +171,23 @@ func Handler(src Source) http.Handler {
 	answer(mux, PathRoutes, func() any { return src.Routes() })
 	answer(mux, PathSessions, func() any { return src.Sessions() })
 	answer(mux, PathPeers, func() any { return src.Peers() })
+	sink, _ := src.(Sink)
+	act(mux, PathDisable, sink, func(s Sink, r Request) (Result, error) { return s.SetSubsystem(r.Subsystem, false) })
+	act(mux, PathEnable, sink, func(s Sink, r Request) (Result, error) { return s.SetSubsystem(r.Subsystem, true) })
+	act(mux, PathRedial, sink, func(s Sink, r Request) (Result, error) { return s.Redial(r.Peer) })
+	act(mux, PathRekey, sink, func(s Sink, r Request) (Result, error) { return s.Rekey(r.Peer, r.All) })
+	act(mux, PathReload, sink, func(s Sink, r Request) (Result, error) { return s.Reload() })
 	return mux
 }
 
 // answer registers one read. The method check is explicit rather than implied
-// by there being nothing to write: a POST that falls through to a reader looks
-// like a write that succeeded.
+// by there being nothing on this path to write: a POST that falls through to a
+// reader looks like a write that succeeded.
 func answer(mux *http.ServeMux, path string, read func() any) {
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "the control socket is read-only", http.StatusMethodNotAllowed)
+			http.Error(w, "this is a read, so it takes a GET", http.StatusMethodNotAllowed)
 			return
 		}
 		body, err := json.Marshal(read())
@@ -186,6 +197,66 @@ func answer(mux *http.ServeMux, path string, read func() any) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(append(body, '\n'))
+	})
+}
+
+// maxRequest bounds a write's body. A [Request] is four short fields, so
+// anything near this is a client that has lost track of what it is sending and
+// should be told rather than allocated for.
+const maxRequest = 64 << 10
+
+// act registers one write.
+//
+// POST rather than GET, and the method carries the whole separation between
+// the two halves of this surface: a reader that reaches one of these paths
+// with a GET is refused instead of acting, and none of the reads answers
+// anything but GET and HEAD. POST rather than PUT because none of the verbs is
+// idempotent, a second rekey being a second exchange rather than the same one
+// restated.
+//
+// The authorization story is the socket's mode and stays that way: nothing
+// here inspects a credential, because every verb acts on state the node's own
+// file already decides. See the package doc for the line that keeps a verb
+// from needing one.
+func act(mux *http.ServeMux, path string, sink Sink, run func(Sink, Request) (Result, error)) {
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "this is a write, so it takes a POST", http.StatusMethodNotAllowed)
+			return
+		}
+		if sink == nil {
+			http.Error(w, "this node serves the reads only, so there is nothing here to ask", http.StatusNotImplemented)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequest))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var request Request
+		// An empty body is the zero request rather than a decode failure, so
+		// reload, which reads no field, is asked with nothing at all.
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &request); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		result, err := run(sink, request)
+		if err != nil {
+			// The caller named something this node does not run, which is a
+			// request to correct rather than a failure on this side.
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		answered, err := json.Marshal(result)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(append(answered, '\n'))
 	})
 }
 
