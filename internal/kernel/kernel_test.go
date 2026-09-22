@@ -1178,11 +1178,14 @@ func TestRuleValidationRefusesWhatReadsWrong(t *testing.T) {
 		// On a mark, so nothing else in validate answers for it: an address
 		// rule with no family is refused by the family-of-the-address check
 		// below instead, and the case would pass with this one deleted.
-		"no family":           {FWMark: 0x726c, Table: 200, Priority: 100},
-		"the wrong family":    {Family: FamilyIPv6, To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 100},
-		"host bits":           {Family: FamilyIPv4, To: schema.MustPrefix("10.1.2.3/8"), Table: 200, Priority: 100},
-		"no selector":         {Family: FamilyIPv4, Table: 200, Priority: 100},
-		"a mask with no mark": {Family: FamilyIPv4, FWMask: 0xffff, Table: 200, Priority: 100},
+		"no family":        {FWMark: 0x726c, Table: 200, Priority: 100},
+		"the wrong family": {Family: FamilyIPv6, To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 100},
+		"host bits":        {Family: FamilyIPv4, To: schema.MustPrefix("10.1.2.3/8"), Table: 200, Priority: 100},
+		"no selector":      {Family: FamilyIPv4, Table: 200, Priority: 100},
+		// With a selector of its own, so the check for a rule selecting
+		// nothing does not answer for this one: without the destination the
+		// case passes with the mark-mask check deleted.
+		"a mask with no mark": {Family: FamilyIPv4, FWMask: 0xffff, To: schema.MustPrefix("10.0.0.0/8"), Table: 200, Priority: 100},
 		"the local priority":  {Family: FamilyIPv4, To: schema.MustPrefix("10.0.0.0/8"), Table: 200},
 		"no table":            {Family: FamilyIPv4, To: schema.MustPrefix("10.0.0.0/8"), Priority: 100},
 	} {
