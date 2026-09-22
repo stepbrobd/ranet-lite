@@ -40,7 +40,7 @@ func testSendESPBatch(t *testing.T, network, addr string) {
 	// pending-batch handling as well as the ordinary batched send path.
 	const n = 200
 	batch := make([][]byte, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		batch[i] = []byte{byte(i), byte(i >> 8)}
 	}
 	if err := m.SendESPBatch(batch); err != nil {
@@ -50,7 +50,7 @@ func testSendESPBatch(t *testing.T, network, addr string) {
 	got := map[int]bool{}
 	buf := make([]byte, 64)
 	peer.SetReadDeadline(time.Now().Add(5 * time.Second))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		rn, _, err := peer.ReadFromUDP(buf)
 		if err != nil {
 			t.Fatalf("read %d/%d: %v", i, n, err)
@@ -299,7 +299,7 @@ func testRecvESPBatch(t *testing.T, network, addr string) {
 	// has a real chance to pick up more than one of these in a single
 	// call — this is the actual code path under test.
 	const n = 200
-	for i := 0; i < n; i++ {
+	for i := range n {
 		pkt := []byte{0xaa, 0xbb, 0xcc, 0xdd, byte(i), byte(i >> 8), 0, 1}
 		if _, err := server.WriteToUDP(pkt, dst); err != nil {
 			t.Fatalf("write %d: %v", i, err)
@@ -307,7 +307,7 @@ func testRecvESPBatch(t *testing.T, network, addr string) {
 	}
 
 	got := map[int]bool{}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		pkt, err := m.RecvESP()
 		if err != nil {
 			t.Fatalf("RecvESP %d/%d: %v", i, n, err)

@@ -405,7 +405,7 @@ func (h *Hub) receiveLoop(fn receiveFunc) {
 		unclaimed = unclaimed[:0]
 		unwanted := 0
 		h.mu.Lock()
-		for i := 0; i < n; i++ {
+		for i := range n {
 			raw := bufs[i][:sizes[i]]
 			// Every arm that reaches no Mux is counted. The SPI is cleartext,
 			// so anyone who can reach the port can send these, which is the
