@@ -141,8 +141,14 @@ func sent(t *testing.T, sock *fakeRouteSocket) []sentRoute {
 // deleted the physical default route.
 func TestUnderlayDefaultsNeverDeletesAnUnscopedDefault(t *testing.T) {
 	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
-	scoped := []dumpEntry{ourScoped(uplinkIndex, addr("192.168.0.1"))}
-	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, scoped...) })
+	// The table reads back what this process wrote, so the sequence installs
+	// and withdraws for real. Started from a table already holding our own
+	// scoped default, every key is satisfied on the first pass and the whole
+	// sequence sends nothing: measured at zero adds and zero deletes, which
+	// left every assertion below on an empty loop.
+	var sock *fakeRouteSocket
+	underlay, opened := testUnderlay(t, links, func() []byte { return hostRIB(t, kernelHolds(t, sock)...) })
+	sock = opened
 
 	for _, step := range []struct {
 		name string
@@ -151,7 +157,10 @@ func TestUnderlayDefaultsNeverDeletesAnUnscopedDefault(t *testing.T) {
 		{"prepare", func() error { return underlay.Prepare(uplinkIndex) }},
 		{"cover", func() error { _, err := underlay.Ready(); return err }},
 		{"settle", func() error { return underlay.Settle(uplinkIndex) }},
-		{"move to the dock", func() error { return underlay.Prepare(dockIndex) }},
+		{"the host's default moves to the dock", func() error {
+			links.v4 = hostDefault{index: dockIndex, gateway: addr("10.0.0.1")}
+			return underlay.Prepare(dockIndex)
+		}},
 		{"settle on the dock", func() error { return underlay.Settle(dockIndex) }},
 		{"close", underlay.Close},
 	} {
@@ -160,10 +169,15 @@ func TestUnderlayDefaultsNeverDeletesAnUnscopedDefault(t *testing.T) {
 		}
 	}
 
+	var adds, deletes int
 	for _, message := range sent(t, sock) {
+		if message.kind == unix.RTM_ADD {
+			adds++
+		}
 		if message.kind != unix.RTM_DELETE {
 			continue
 		}
+		deletes++
 		// Every one of the three, because the unscoped default differs from
 		// ours only in the flag and in nothing else the kernel keys on.
 		if !message.scoped {
@@ -176,6 +190,31 @@ func TestUnderlayDefaultsNeverDeletesAnUnscopedDefault(t *testing.T) {
 			t.Errorf("a delete was sent naming no next hop: %+v", message)
 		}
 	}
+	// The positive control, because every assertion above is on a loop over
+	// the deletes: a sequence that wrote and withdrew nothing passes them all.
+	if adds == 0 || deletes == 0 {
+		t.Fatalf("the sequence sent %d adds and %d deletes, so nothing above was weighed", adds, deletes)
+	}
+}
+
+// kernelHolds is the table as this process left it, rebuilt from the messages
+// it sent, so a pass that reads the table back sees its own writes. Without it
+// a fake table is a snapshot the reconciler can never move.
+func kernelHolds(t *testing.T, sock *fakeRouteSocket) []dumpEntry {
+	t.Helper()
+	var held []dumpEntry
+	for _, message := range sent(t, sock) {
+		entry := ourScoped(message.index, message.gateway)
+		switch message.kind {
+		case unix.RTM_ADD:
+			held = append(held, entry)
+		case unix.RTM_DELETE:
+			held = slices.DeleteFunc(held, func(other dumpEntry) bool {
+				return other.index == entry.index && other.dst == entry.dst
+			})
+		}
+	}
+	return held
 }
 
 // A process that crashed left its scoped default behind. The next one records

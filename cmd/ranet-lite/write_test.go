@@ -41,6 +41,14 @@ func (s *writingStub) Rekey(peer string, all bool) (control.Result, error) {
 
 func (s *writingStub) Reload() (control.Result, error) { return s.record("reload") }
 
+// Sessions names a peer the peers list does not. The completion unions the
+// two, and a peer that only dials this node has no entry in the peers list and
+// is the peer a redial is for, so spelling both halves the same way would let
+// either be deleted unseen.
+func (*writingStub) Sessions() []control.Session {
+	return []control.Session{{Path: "example/inbound/0@0", Peer: "example/inbound", Active: true}}
+}
+
 func (s *writingStub) record(call string) (control.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -120,11 +128,16 @@ func TestVerbsRefuseWhatTheyCannotActOn(t *testing.T) {
 		args []string
 		want string
 	}{
-		"disable with no subsystem": {args: []string{"disable"}, want: "arg"},
-		"disable with two":          {args: []string{"disable", "steering", "responder"}, want: "arg"},
-		"rekey with neither":        {args: []string{"rekey"}, want: "arg"},
-		"rekey with both":           {args: []string{"rekey", "example/gateway", "--all"}, want: "takes no arguments"},
-		"reload with an argument":   {args: []string{"reload", "now"}, want: "takes no arguments"},
+		// The whole message rather than a substring every cobra argument
+		// error carries: with "arg" alone any of these five refusals
+		// satisfies any of the five expectations.
+		"disable with no subsystem": {args: []string{"disable"}, want: "accepts 1 arg(s), received 0"},
+		"disable with two":          {args: []string{"disable", "steering", "responder"}, want: "accepts 1 arg(s), received 2"},
+		// The same sentence as the first, from the other validator: rekey
+		// decides on --all where disable takes a fixed count.
+		"rekey with neither":      {args: []string{"rekey"}, want: "accepts 1 arg(s), received 0"},
+		"rekey with both":         {args: []string{"rekey", "example/gateway", "--all"}, want: `ranet-lite rekey takes no arguments, got "example/gateway"`},
+		"reload with an argument": {args: []string{"reload", "now"}, want: `ranet-lite reload takes no arguments, got "now"`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out, err := execute(t, append(test.args, "--control", socket)...)
@@ -160,9 +173,12 @@ func TestVerbArgumentsAreCompleted(t *testing.T) {
 		command string
 		want    string
 	}{
-		"a subsystem": {command: "disable", want: "steering"},
-		"a peer":      {command: "redial", want: "example/gateway"},
-		"a session":   {command: "rekey", want: "example/gateway"},
+		"a subsystem":                      {command: "disable", want: "steering"},
+		"a peer this node dials":           {command: "redial", want: "example/gateway"},
+		"a peer that only dials this node": {command: "redial", want: "example/inbound"},
+		// rekey takes the same completion, so this holds the wiring rather
+		// than the function the case above already drives.
+		"the same peers under rekey": {command: "rekey", want: "example/inbound"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out, err := execute(t, cobra.ShellCompRequestCmd, test.command, "--control", socket, "")
