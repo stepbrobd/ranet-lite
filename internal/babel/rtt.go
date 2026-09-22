@@ -32,7 +32,7 @@ func microDelta(b, a uint32) time.Duration {
 // one at a time.
 type CostOptions struct {
 	Rx  *uint16    `yaml:"rx,omitempty" json:"rx,omitempty" toml:"rx,omitempty"`
-	RTT RTTOptions `yaml:"rtt,omitempty" json:"rtt,omitempty" toml:"rtt,omitempty"`
+	RTT RTTOptions `yaml:"rtt,omitempty" json:"rtt,omitzero" toml:"rtt,omitempty"`
 }
 
 // RTTOptions is the round-trip half of the block, as a file writes it.

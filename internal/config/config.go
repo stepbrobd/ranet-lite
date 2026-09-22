@@ -44,8 +44,8 @@ type Config struct {
 	Node Node `yaml:"node" json:"node" toml:"node"`
 	Auth Auth `yaml:"auth" json:"auth" toml:"auth"`
 	Link Link `yaml:"link" json:"link" toml:"link"`
-	Dial Dial `yaml:"dial,omitempty" json:"dial,omitempty" toml:"dial,omitempty"`
-	Cap  Caps `yaml:"cap,omitempty" json:"cap,omitempty" toml:"cap,omitempty"`
+	Dial Dial `yaml:"dial,omitempty" json:"dial,omitzero" toml:"dial,omitempty"`
+	Cap  Caps `yaml:"cap,omitempty" json:"cap,omitzero" toml:"cap,omitempty"`
 }
 
 // Node is who this is. Both halves have to match an entry in the document
@@ -89,7 +89,7 @@ type Link struct {
 	// each is refused by name on the platform that has no meaning for it. That
 	// refusal is at startup rather than at load, as cap.table's rules and VRF
 	// are, so one file can carry a fleet's settings and a laptop's.
-	Underlay transport.Underlay `yaml:"underlay,omitempty" json:"underlay,omitempty" toml:"underlay,omitempty"`
+	Underlay transport.Underlay `yaml:"underlay,omitempty" json:"underlay,omitzero" toml:"underlay,omitempty"`
 }
 
 // Endpoint is one local socket identity. Address selection is global: the

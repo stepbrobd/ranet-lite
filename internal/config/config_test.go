@@ -1354,6 +1354,20 @@ func alsoMissing(first, second []string) []string {
 	return slices.DeleteFunc(first, func(path string) bool { return !slices.Contains(second, path) })
 }
 
+// oneEndpoint is a link writing the one endpoint the schema requires and
+// nothing else, which the two checks below start from: an endpoint list is the
+// only required field here that is a list, and yaml writes a nil one as an
+// empty sequence and reads that back as an empty list, so a case leaving it out
+// reports a difference no block it was probing had caused.
+func oneEndpoint() Link { return Link{Endpoints: []Endpoint{{Serial: "0", Family: "ip4"}}} }
+
+// withUnderlay is oneEndpoint carrying an underlay setting.
+func withUnderlay(underlay transport.Underlay) Link {
+	link := oneEndpoint()
+	link.Underlay = underlay
+	return link
+}
+
 // spellsItself reports a type writing itself as one value rather than as the
 // fields behind it, by either of the two marshalers this tree's encoders
 // consult.
@@ -1375,12 +1389,6 @@ func spellsItself(ty reflect.Type) bool {
 // Each case below is one nested block the omitempty finding names, rendered
 // and read back at its own type so no validation stands between the two.
 func TestOneWrittenFieldKeepsItsBlock(t *testing.T) {
-	oneEndpoint := func() Link { return Link{Endpoints: []Endpoint{{Serial: "0", Family: "ip4"}}} }
-	withUnderlay := func(underlay transport.Underlay) Link {
-		link := oneEndpoint()
-		link.Underlay = underlay
-		return link
-	}
 	rx := uint16(96)
 	rttMin := schema.Duration(10 * time.Millisecond)
 	replay := uint32(2048)
@@ -1444,6 +1452,69 @@ func TestOneWrittenFieldKeepsItsBlock(t *testing.T) {
 				}
 				if !reflect.DeepEqual(got.Elem().Interface(), want) {
 					t.Errorf("%s dropped it: wrote\n%s\nand read back %+v", encoder.name, body, got.Elem().Interface())
+				}
+			}
+		})
+	}
+}
+
+// A block nobody wrote leaves no key behind and reads back as the zero value
+// the capability documents. The two halves belong together: writing a block
+// turns that capability on, so a block rendered as an empty mapping writes down
+// a decision the file never made, and a block dropped on the way out that does
+// not read back zero loses the defaults it stood for.
+//
+// yaml decides this by walking a struct's exported fields and json by asking
+// for omitzero, so each is asked separately here. The toml encoder has no
+// third spelling and writes the empty table, which costs nothing as long as it
+// reads back zero, so it is asked for the round trip alone.
+func TestUnwrittenBlockLeavesNoKey(t *testing.T) {
+	for name, probe := range map[string]struct {
+		value  any
+		absent []string
+	}{
+		"cap.crypto": {ike.Crypto{}, []string{"rekey", "retry"}},
+		"cap.babel":  {babel.Config{}, []string{"cost", "rtt"}},
+		"cap.table":  {kernel.Table{}, []string{"vrf", "rules"}},
+		// The two standing on a whole Link write the endpoint the schema
+		// requires and nothing else, since an endpoint list is the one
+		// required field that is a list: yaml writes a nil one as an empty
+		// sequence and reads that back as an empty list, which would read as a
+		// difference no optional block caused.
+		"link":           {oneEndpoint(), []string{"underlay"}},
+		"a whole config": {Config{Link: oneEndpoint()}, []string{"dial", "cap", "underlay"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, encoder := range []struct {
+				name   string
+				render func(any) ([]byte, error)
+				parse  func([]byte, any) error
+				names  bool
+			}{
+				{"yaml", yaml.Marshal, yaml.Unmarshal, true},
+				{"json", json.Marshal, json.Unmarshal, true},
+				{"toml", renderTOML, func(body []byte, target any) error {
+					_, err := toml.Decode(string(body), target)
+					return err
+				}, false},
+			} {
+				body, err := encoder.render(probe.value)
+				if err != nil {
+					t.Fatalf("render as %s: %v", encoder.name, err)
+				}
+				if encoder.names {
+					for _, key := range probe.absent {
+						if strings.Contains(string(body), key) {
+							t.Errorf("%s writes %q for a block nobody wrote:\n%s", encoder.name, key, body)
+						}
+					}
+				}
+				got := reflect.New(reflect.TypeOf(probe.value))
+				if err := encoder.parse(body, got.Interface()); err != nil {
+					t.Fatalf("parse the %s\n%s\n%v", encoder.name, body, err)
+				}
+				if !reflect.DeepEqual(got.Elem().Interface(), probe.value) {
+					t.Errorf("%s read %s back as %+v rather than as the zero it was written from", encoder.name, body, got.Elem().Interface())
 				}
 			}
 		})

@@ -22,7 +22,7 @@ type Crypto struct {
 	// reorders bursts by more than 32 before they reach userspace. An explicit
 	// 0 turns replay checking off.
 	Replay *uint32 `yaml:"replay,omitempty" json:"replay,omitempty" toml:"replay,omitempty"`
-	Rekey  Rekey   `yaml:"rekey,omitempty" json:"rekey,omitempty" toml:"rekey,omitempty"`
+	Rekey  Rekey   `yaml:"rekey,omitempty" json:"rekey,omitzero" toml:"rekey,omitempty"`
 }
 
 // Rekey is when a key is replaced. A rekey runs before its interval expires:
@@ -33,7 +33,7 @@ type Rekey struct {
 	IKE    *schema.Duration `yaml:"ike,omitempty" json:"ike,omitempty" toml:"ike,omitempty"`
 	Margin *schema.Duration `yaml:"margin,omitempty" json:"margin,omitempty" toml:"margin,omitempty"`
 	Jitter *schema.Duration `yaml:"jitter,omitempty" json:"jitter,omitempty" toml:"jitter,omitempty"`
-	Retry  Retry            `yaml:"retry,omitempty" json:"retry,omitempty" toml:"retry,omitempty"`
+	Retry  Retry            `yaml:"retry,omitempty" json:"retry,omitzero" toml:"retry,omitempty"`
 }
 
 // Retry is the capped exponential backoff after a scheduled rekey fails.

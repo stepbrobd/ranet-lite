@@ -25,7 +25,7 @@ type Config struct {
 	// mirrors: a fixed rx cost plus up to rtt.weight scaled linearly between
 	// rtt.min and rtt.max. Each of the four keeps the speaker's default on its
 	// own, so writing one of them leaves the other three alone.
-	Cost CostOptions `yaml:"cost,omitempty" json:"cost,omitempty" toml:"cost,omitempty"`
+	Cost CostOptions `yaml:"cost,omitempty" json:"cost,omitzero" toml:"cost,omitempty"`
 }
 
 // Runtime is the half the speaker is handed rather than told: the router id
