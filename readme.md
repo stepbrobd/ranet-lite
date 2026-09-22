@@ -952,7 +952,59 @@ over [autopilot](https://github.com/stepbrobd/autopilot), which loads `lib/` and
 - `pkgs/` holds one directory per package, imported into `overlays.default` by
   `lib.importPackagesTree`. `pkgs.ranet-lite` is the daemon and
   `pkgs.iperf3-benchmark` is the patched iperf the namespace benchmark needs.
+- `modules/nixos/` and `modules/darwin/` are the deployment modules, exported as
+  `nixosModules.default` and `darwinModules.default`. See
+  [Running it as a service](#running-it-as-a-service).
 - `integration/` holds the NixOS VM tests and the namespace benchmark.
+
+## Running it as a service
+
+The nixos module runs the daemon from this flake's package, writes the config
+file from `services.ranet-lite.settings`, and gives the control socket a
+`RuntimeDirectory` and a group:
+
+```nix
+{
+  imports = [ inputs.ranet-lite.nixosModules.default ];
+
+  services.ranet-lite = {
+    enable = true;
+    group = "ranet-lite";
+    settings = {
+      node = {
+        org = "example";
+        name = "gateway";
+      };
+      auth = {
+        key = "/var/lib/ranet-lite/key.pem";
+        trust = "/var/lib/ranet-lite/trust.json";
+      };
+      link = {
+        port = 13000;
+        endpoints = [
+          {
+            serial = "0";
+            family = "ip4";
+          }
+        ];
+      };
+    };
+  };
+}
+```
+
+`settings` is written to the store and is world readable there, so the key and
+the trust document are named by path rather than carried inline. A config file
+that must stay out of the store entirely is named by `configFile` instead.
+`systemctl reload ranet-lite` sends SIGHUP, which reconciles against a rewritten
+trust document without dropping an SA. A restart drops every one.
+
+The nix-darwin module is the same options over `launchd.daemons`, with the log
+file taking the place of the journal and `admin` as the default group, because
+that is a group macOS already has and nothing here creates one. It was evaluated
+by hand against nix-darwin, which produced the expected plist, and it has never
+been loaded on a Mac. No check covers it: verifying it in CI would mean taking
+nix-darwin as an input of this flake, which nothing else here needs.
 
 ## Testing
 
@@ -997,7 +1049,10 @@ nix build .#checks.x86_64-linux.egress -L
 
 `responder` inverts the exchange: strongSwan dials and ranet-lite answers, which
 upstream could not do at all, and the check asserts that ranet-lite never dials.
-`kernel` exercises the route reconciler against a real table.
+`kernel` exercises the route reconciler against a real table. `nixos-module`
+boots nothing: it evaluates the nixos module into the unit systemd would run and
+reads back the binary, the runtime directory and the group, since otherwise a
+wrong option name in it is found by the first machine that imports it.
 
 `egress` makes the client an exit node and boots a third machine behind it,
 holding prefixes the gateway can reach through the mesh and no other way. It

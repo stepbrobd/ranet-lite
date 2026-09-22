@@ -1,4 +1,4 @@
-{ lib, ... }:
+{ inputs, lib, ... }:
 
 {
   perSystem =
@@ -44,6 +44,26 @@
         '';
       });
 
+      # the nixos module evaluated into the unit it generates. A machine that
+      # imports it is the only other way to learn that an option name or a
+      # type is wrong, since the vm arms configure the daemon by hand rather
+      # than through the module.
+      node = inputs.nixpkgs.lib.nixosSystem {
+        modules = [
+          inputs.self.nixosModules.default
+          {
+            nixpkgs.hostPlatform = system;
+            system.stateVersion = lib.trivial.release;
+            services.ranet-lite = {
+              enable = true;
+              settings.node = {
+                org = "example";
+                name = "check";
+              };
+            };
+          }
+        ];
+      };
     in
     {
       checks = {
@@ -94,6 +114,16 @@
         netlink = pkgs.testers.runNixOSTest (
           import ../../integration/netlink-test.nix { inherit pkgs netlinkTests; }
         );
+        nixos-module = pkgs.runCommand "ranet-lite-nixos-module" { } ''
+          unit="${node.config.systemd.units."ranet-lite.service".unit}/ranet-lite.service"
+          grep -qF 'ExecStart=${lib.getExe config.packages.default} daemon --config ' "$unit"
+          # the runtime directory is where the control socket is bound and the
+          # group is who may then read it, so a typo in either leaves a node
+          # nobody can ask anything or one anybody can
+          grep -qF 'RuntimeDirectory=ranet-lite' "$unit"
+          grep -qF 'Group=ranet-lite' "$unit"
+          touch "$out"
+        '';
       };
     };
 }
