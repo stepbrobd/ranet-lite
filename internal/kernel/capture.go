@@ -1,6 +1,9 @@
 package kernel
 
-import "time"
+import (
+	"net/netip"
+	"time"
+)
 
 // DefaultCaptureGrace is how long a route that would capture this machine's
 // own traffic stays installed after the last live session went away. It is ten
@@ -12,27 +15,60 @@ import "time"
 // machine has no working network at all.
 const DefaultCaptureGrace = 10 * time.Second
 
-// capturesTheMachine reports a route that carries this machine's own traffic
-// rather than a prefix of it. Half the address space counts, because that is
-// how a default that does not replace the host's own is written: 0.0.0.0/1
-// with 128.0.0.0/1, or ::/1 with 8000::/1, the spelling wg-quick and the
-// tunnels on darwin use. The pair wins the lookup outright rather than
-// colliding, and a neighbor can announce one: the Update decoder bounds a
-// prefix length only at 32 and 128.
-func capturesTheMachine(r Route) bool { return r.Destination.Bits() <= 1 }
-
-// CaptureRoutes holds the rest of the routing the kernel needs before the mesh
-// may be handed this machine's own traffic, and takes it out again after. On
-// darwin that is the underlay default, see UnderlayDefaults there; nothing
-// implements it on linux, where a marked socket needs no route of its own.
+// capturesTheMachine reports a route that takes this machine's own traffic
+// rather than a prefix of it. Two arms, and each comes from a measurement
+// rather than from a rule of thumb about prefix lengths.
 //
-// Hold runs before the first capturing route is installed and Release after
-// the last one is withdrawn, so the grace below withdraws both together and
-// there is no moment in which the machine's traffic is in the tun while the
-// underlay has nothing to fall back on.
+//   - Half the address space or more. That is how a default that does not
+//     replace the host's own is written, 0.0.0.0/1 with 128.0.0.0/1 or ::/1
+//     with 8000::/1, the spelling wg-quick and the tunnels on darwin use, and
+//     a neighbor can announce one: the Update decoder bounds a prefix length
+//     only at 32 and 128.
+//
+//   - Any prefix containing the family's unspecified address, however small.
+//     That is the darwin kernel's own trigger, measured on Darwin 27.2.0 by
+//     TestZMeasureWhichSetsStrandABoundSocket and kept as
+//     TestDarwinStrandsABoundSocketOnlyThroughTheZeroAddress: a socket bound
+//     with IP_BOUND_IF loses a destination exactly when the tun's unscoped
+//     routes best-match both that destination and the all-zeros address of
+//     its family. The scoped lookup falls back to a longest-prefix match on
+//     the unspecified address and requires the answer to be on the bound
+//     interface, so a route as small as 0.0.0.0/24 out of the tun takes the
+//     fallback away. 0.0.0.0/24 with 192.0.2.0/24 strands; 64.0.0.0/2 with
+//     192.0.2.0/24 does not.
+//
+// The second arm makes this a property of the set rather than of one
+// route: no set can cover a family without some member containing that
+// family's zero address, so holding those back breaks every full cover and
+// restores the kernel's fallback. Measured: with 0.0.0.0/1 withdrawn,
+// 128.0.0.0/1 alone leaves both probes reaching.
+func capturesTheMachine(r Route) bool {
+	if r.Destination.Bits() <= 1 {
+		return true
+	}
+	return r.Destination.Contains(unspecifiedOf(r.Destination.Addr()))
+}
+
+// unspecifiedOf is the all-zeros address of a prefix's family.
+func unspecifiedOf(address netip.Addr) netip.Addr {
+	if address.Is4() {
+		return netip.IPv4Unspecified()
+	}
+	return netip.IPv6Unspecified()
+}
+
+// CaptureRoutes is the routing the underlay depends on before the mesh may be
+// handed this machine's own traffic. On darwin that is a default scoped to the
+// interface the underlay socket is bound to, see UnderlayDefaults there;
+// nothing implements it on linux, where a marked socket needs no route of its
+// own.
+//
+// Ready both repairs and reports. The reconciler calls it before installing a
+// capturing route and installs none when it answers an error, which is the
+// invariant this replaced a sequence of hopeful steps with: a capture is never
+// in the kernel while the underlay is uncovered.
 type CaptureRoutes interface {
-	Hold() error
-	Release() error
+	Ready() error
 }
 
 // captureGate decides when the mesh may be handed this machine's own traffic.
@@ -94,11 +130,18 @@ func (g *captureGate) sample(now time.Time, live int) (open, changed bool) {
 	return g.open, g.open != was
 }
 
-// deadline is when the grace expires, for a caller that has to run a pass then
-// rather than wait for its next wake-up. It reports false whenever no grace is
-// running, which includes a gate that is already shut.
+// deadline is when the next sample has to happen for the grace to be honored,
+// for a caller that would otherwise wait for its own next wake-up.
+//
+// It answers while the gate is open, not only while the grace is running. A
+// session stops counting as live because it went quiet, and nothing fires when
+// that happens, so a gate waiting for its first idle sample would not learn of
+// it until the periodic sweep: with a thirty second sweep behind a twenty
+// second liveness window, a ten second grace took about a minute. Asking to be
+// woken one grace after the last live sample bounds it at the grace plus one
+// sample instead.
 func (g *captureGate) deadline() (time.Time, bool) {
-	if !g.waiting {
+	if !g.open {
 		return time.Time{}, false
 	}
 	return g.liveAt.Add(g.grace), true

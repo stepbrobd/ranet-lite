@@ -36,7 +36,7 @@ func underlayRuntime(underlay transport.Underlay, mesh string) (transport.Runtim
 	// directory saying what this process owns, and which a RuntimeDirectory=
 	// unit clears on a clean boot.
 	state := filepath.Join(filepath.Dir(control.DefaultSocket), "underlay.json")
-	routes, err := kernel.NewUnderlayDefaults(links, state)
+	routes, err := kernel.NewUnderlayDefaults(links, links.Mesh(), state)
 	if err != nil {
 		_ = links.Close()
 		return transport.Runtime{}, nil, func() {}, err

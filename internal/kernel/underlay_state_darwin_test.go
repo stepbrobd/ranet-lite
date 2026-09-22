@@ -32,6 +32,8 @@ func reclaimFrom(t *testing.T, rib []byte, records []writtenDefault, lookup func
 	u := &UnderlayDefaults{
 		sock: sock, links: &fakeDefaults{}, statePath: state,
 		written:      make(map[writtenDefault]bool),
+		refused:      make(map[writtenDefault]bool),
+		covered:      make(map[netip.Prefix]bool),
 		warned:       make(map[netip.Prefix]bool),
 		dump:         func() ([]byte, error) { return rib, nil },
 		lookupDevice: lookup,
@@ -41,7 +43,7 @@ func reclaimFrom(t *testing.T, rib []byte, records []writtenDefault, lookup func
 		t.Fatalf("the state this test just wrote would not load: %v", err)
 	}
 	u.reclaim(loaded)
-	return sent(t, sock), u.Written(), state
+	return sent(t, sock), u.Refused(), state
 }
 
 // resolvesTo is a device lookup answering one index for every name.
@@ -343,26 +345,129 @@ func TestNoOtherProgramScopesADefaultToThePrimaryInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One subtest per family, so a family the host cannot answer for reports
+	// itself untested rather than passing. This host carries nine scoped ::/0
+	// routes on utuns and no unscoped one, and a single-bodied test skipped
+	// quietly on it while claiming the premise held for IPv6.
 	for _, destination := range defaultPrefixes {
-		primary, ok := unscopedDefaultIndex(messages, destination)
-		if !ok {
-			t.Logf("%s: this host has no default of that family", destination)
-			continue
-		}
-		scoped := 0
-		for _, message := range messages {
-			rm, ok := message.(*route.RouteMessage)
-			if !ok || rm.Type != unix.RTM_GET || rm.Flags&unix.RTF_IFSCOPE == 0 {
-				continue
+		t.Run(destination.String(), func(t *testing.T) {
+			primary, ok := unscopedDefaultIndex(messages, destination)
+			if !ok {
+				t.Skipf("this host has no default of this family, so the premise is untested for it")
 			}
-			if isDefaultKey(rm, destination) && rm.Index == primary {
-				scoped++
+			scoped := 0
+			for _, message := range messages {
+				rm, ok := message.(*route.RouteMessage)
+				if !ok || rm.Type != unix.RTM_GET || rm.Flags&unix.RTF_IFSCOPE == 0 {
+					continue
+				}
+				if isDefaultKey(rm, destination) && rm.Index == primary {
+					scoped++
+				}
 			}
+			t.Logf("the host's default is on index %d, which carries %d scoped defaults", primary, scoped)
+			if scoped != 0 {
+				t.Errorf("interface %d holds both the unscoped default and %d scoped ones, so the reclaim's last condition does not tell this tool's route from another program's on this host",
+					primary, scoped)
+			}
+		})
+	}
+}
+
+// A record reclaim refused must not be reachable by an ordinary withdrawal.
+// Every condition reclaim weighs is worth nothing if the record then joins the
+// set a later Close deletes from on the shape check alone: measured before
+// this split, the refusal was logged and the same route was withdrawn
+// milliseconds later on the first pass of every start.
+func TestRefusedRecordsAreNotReachableByAWithdrawal(t *testing.T) {
+	// The host's default has moved to another interface, so clause three
+	// refuses the record and the route stays.
+	ours := ourScoped(uplinkIndex, addr("192.168.0.1"))
+	rib := dumpRIB(t,
+		dumpEntry{
+			index: dockIndex,
+			flags: unix.RTF_UP | unix.RTF_GATEWAY | unix.RTF_STATIC,
+			dst:   v4default, gateway: routeAddr(addr("10.0.0.1")),
+		},
+		ours)
+	state := filepath.Join(t.TempDir(), "underlay.json")
+	if err := saveUnderlayState(state, []writtenDefault{ourRecord()}); err != nil {
+		t.Fatal(err)
+	}
+	sock := &fakeRouteSocket{t: t}
+	u := &UnderlayDefaults{
+		sock: sock, links: &fakeDefaults{}, statePath: state,
+		written:      make(map[writtenDefault]bool),
+		refused:      make(map[writtenDefault]bool),
+		covered:      make(map[netip.Prefix]bool),
+		warned:       make(map[netip.Prefix]bool),
+		dump:         func() ([]byte, error) { return rib, nil },
+		lookupDevice: resolvesTo(uplinkIndex),
+	}
+	records, err := loadUnderlayState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.reclaim(records)
+
+	if len(u.Refused()) != 1 {
+		t.Fatalf("the refusal did not keep the record: %+v", u.Refused())
+	}
+	if len(u.Written()) != 0 {
+		t.Fatalf("a refused record joined the set a withdrawal deletes from: %+v", u.Written())
+	}
+	// The withdrawal every start makes, which is where the record used to go.
+	if err := u.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range sent(t, sock) {
+		if message.kind == unix.RTM_DELETE {
+			t.Errorf("a record the clauses refused was withdrawn anyway: %+v", message)
 		}
-		t.Logf("%s: the host's default is on index %d, which carries %d scoped defaults", destination, primary, scoped)
-		if scoped != 0 {
-			t.Errorf("%s: interface %d holds both the unscoped default and %d scoped ones, so the reclaim's last condition does not tell this tool's route from another program's on this host",
-				destination, primary, scoped)
-		}
+	}
+	// And it survives to the next start, which is the only thing that can
+	// weigh the clauses again.
+	kept, err := loadUnderlayState(state)
+	if err != nil || len(kept) != 1 {
+		t.Errorf("the refused record was forgotten: %v (%v)", kept, err)
+	}
+}
+
+// A second daemon must not touch the record a running one owns. It reaches
+// reclaim before the control socket's lock and before the port is bound, so
+// without a lock of its own it withdrew the first process's live route, which
+// passes every clause because it is real, resolvable and on the primary, and
+// then wrote an empty record over it.
+func TestSecondProcessReclaimsNothing(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "underlay.json")
+	if err := saveUnderlayState(state, []writtenDefault{ourRecord()}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := lockState(state)
+	if err != nil {
+		t.Fatalf("the first process could not take the record: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	second, err := lockState(state)
+	if err == nil {
+		_ = second.Close()
+		t.Fatal("a second process took a record the first one holds")
+	}
+
+	// And the constructor carries on rather than refusing to start, with no
+	// record of its own to act on.
+	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
+	u, err := NewUnderlayDefaults(links, 0, state)
+	if err != nil {
+		t.Fatalf("a second process refused to start: %v", err)
+	}
+	t.Cleanup(func() { _ = u.Close() })
+	if got := len(u.Written()) + len(u.Refused()); got != 0 {
+		t.Errorf("a second process took %d records it does not own", got)
+	}
+	kept, err := loadUnderlayState(state)
+	if err != nil || len(kept) != 1 {
+		t.Errorf("a second process overwrote the record: %v (%v)", kept, err)
 	}
 }

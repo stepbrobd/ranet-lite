@@ -55,6 +55,8 @@ func testUnderlay(t *testing.T, links defaultRoutes, rib func() []byte) (*Underl
 	return &UnderlayDefaults{
 		sock: sock, links: links,
 		written:      make(map[writtenDefault]bool),
+		refused:      make(map[writtenDefault]bool),
+		covered:      make(map[netip.Prefix]bool),
 		warned:       make(map[netip.Prefix]bool),
 		dump:         func() ([]byte, error) { return rib(), nil },
 		lookupDevice: func(string) (int, error) { return uplinkIndex, nil },
@@ -131,12 +133,10 @@ func TestUnderlayDefaultsNeverDeletesAnUnscopedDefault(t *testing.T) {
 		run  func() error
 	}{
 		{"prepare", func() error { return underlay.Prepare(uplinkIndex) }},
-		{"hold", underlay.Hold},
+		{"cover", func() error { return underlay.Ready() }},
 		{"settle", func() error { return underlay.Settle(uplinkIndex) }},
 		{"move to the dock", func() error { return underlay.Prepare(dockIndex) }},
 		{"settle on the dock", func() error { return underlay.Settle(dockIndex) }},
-		{"release", underlay.Release},
-		{"release again", underlay.Release},
 		{"close", underlay.Close},
 	} {
 		if err := step.run(); err != nil {
@@ -175,7 +175,7 @@ func TestUnderlayDefaultsLeavesWhatAnEarlierProcessWrote(t *testing.T) {
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Release(); err != nil {
+	if err := underlay.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := underlay.Close(); err != nil {
@@ -201,13 +201,10 @@ func TestUnderlayDefaultsLeavesARouteItNoLongerRecognizes(t *testing.T) {
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
-		t.Fatal(err)
-	}
 	if got := len(underlay.Written()); got != 1 {
 		t.Fatalf("the hold recorded %d routes, want 1", got)
 	}
-	if err := underlay.Release(); err != nil {
+	if err := underlay.Close(); err != nil {
 		t.Fatal(err)
 	}
 	for _, message := range sent(t, sock) {
@@ -220,12 +217,25 @@ func TestUnderlayDefaultsLeavesARouteItNoLongerRecognizes(t *testing.T) {
 	}
 }
 
-// Nothing is written until the mesh is about to carry this machine's own
-// traffic. A node that never takes an exit-announced default never touches the
-// routing of the interface it reaches its peers through.
-func TestUnderlayDefaultsWritesNothingUntilTheCaptureHolds(t *testing.T) {
+// The route is written as soon as the socket is bound, and written once. Only
+// writing it when the mesh looked like it was capturing left every set that
+// slipped past that condition with nothing to fall back on; always writing it
+// removes the class. Writing it repeatedly would be the other defect, so the
+// second and third bindings have to be silent.
+func TestUnderlayDefaultsWritesOnceWhenTheSocketBinds(t *testing.T) {
 	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
-	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t) })
+	held := []dumpEntry{}
+	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, held...) })
+
+	if err := underlay.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	first := sent(t, sock)
+	if len(first) != 1 || first[0].kind != unix.RTM_ADD {
+		t.Fatalf("binding wrote %+v, want one add", first)
+	}
+	// The kernel now reports it, which every later pass reads.
+	held = append(held, ourScoped(uplinkIndex, addr("192.168.0.1")))
 	for range 3 {
 		if err := underlay.Prepare(uplinkIndex); err != nil {
 			t.Fatal(err)
@@ -234,8 +244,39 @@ func TestUnderlayDefaultsWritesNothingUntilTheCaptureHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := sent(t, sock); len(got) != 0 {
-		t.Errorf("binding alone wrote %d routes: %+v", len(got), got)
+	if got := sent(t, sock); len(got) != 1 {
+		t.Errorf("a route already in the table was written again: %+v", got)
+	}
+}
+
+// And the repair: the kernel drops this route on its own, clearing IFF_UP
+// purges it, so a record saying it was written says nothing about whether it
+// is there. A pass that finds it gone puts it back.
+func TestUnderlayDefaultsRewritesARouteTheKernelDropped(t *testing.T) {
+	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
+	held := []dumpEntry{}
+	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, held...) })
+
+	if err := underlay.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	held = append(held, ourScoped(uplinkIndex, addr("192.168.0.1")))
+	if err := underlay.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	if got := sent(t, sock); len(got) != 1 {
+		t.Fatalf("the second pass wrote %+v, want nothing", got)
+	}
+
+	// The interface goes down and comes back: the kernel purged the route and
+	// did not restore it, while this process still holds the record.
+	held = nil
+	if err := underlay.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	got := sent(t, sock)
+	if len(got) != 2 || got[1].kind != unix.RTM_ADD {
+		t.Errorf("the route the kernel dropped was not put back: %+v", got)
 	}
 }
 
@@ -244,15 +285,15 @@ func TestUnderlayDefaultsWritesNothingUntilTheCaptureHolds(t *testing.T) {
 // Any other order leaves a moment with no route the bound socket can use.
 func TestUnderlayDefaultsPreparesTheNewInterfaceBeforeClearingTheOld(t *testing.T) {
 	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
-	held := []dumpEntry{ourScoped(uplinkIndex, addr("192.168.0.1")), ourScoped(dockIndex, addr("10.0.0.1"))}
+	// The table as the kernel would report it, which the test moves under the
+	// code the way the kernel does.
+	var held []dumpEntry
 	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, held...) })
 
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
-		t.Fatal(err)
-	}
+	held = append(held, ourScoped(uplinkIndex, addr("192.168.0.1")))
 	if err := underlay.Settle(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
@@ -263,6 +304,7 @@ func TestUnderlayDefaultsPreparesTheNewInterfaceBeforeClearingTheOld(t *testing.
 	if err := underlay.Prepare(dockIndex); err != nil {
 		t.Fatal(err)
 	}
+	held = append(held, ourScoped(dockIndex, addr("10.0.0.1")))
 	if err := underlay.Settle(dockIndex); err != nil {
 		t.Fatal(err)
 	}
@@ -301,9 +343,6 @@ func TestUnderlayDefaultsSkipsAFamilyTheHostReachesElsewhere(t *testing.T) {
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
-		t.Fatal(err)
-	}
 	messages := sent(t, sock)
 	if len(messages) != 1 || messages[0].kind != unix.RTM_ADD || !messages[0].isV4 {
 		t.Fatalf("wrote %+v, want one IPv4 add", messages)
@@ -320,17 +359,16 @@ func TestUnderlayDefaultsSkipsAFamilyTheHostReachesElsewhere(t *testing.T) {
 // to go first or the add collides with it.
 func TestUnderlayDefaultsRewritesWhenTheNextHopMoves(t *testing.T) {
 	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
-	held := []dumpEntry{ourScoped(uplinkIndex, addr("192.168.0.1"))}
+	var held []dumpEntry
 	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, held...) })
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
-		t.Fatal(err)
-	}
-
-	links.v4 = hostDefault{index: uplinkIndex, gateway: addr("192.168.1.1")}
 	held = []dumpEntry{ourScoped(uplinkIndex, addr("192.168.0.1"))}
+
+	// The wifi network renumbers: the host's next hop moves while the
+	// interface does not, so the key collides and the old one has to go first.
+	links.v4 = hostDefault{index: uplinkIndex, gateway: addr("192.168.1.1")}
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
@@ -385,15 +423,21 @@ func TestScopedDefaultMessageRefusesAnythingElse(t *testing.T) {
 // default route. It is reported and the route is left where it is.
 func TestUnderlayDefaultsRefusesToWithdrawOnAnUnreadableDump(t *testing.T) {
 	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
-	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t) })
-	underlay.dump = func() ([]byte, error) { return nil, errors.New("the kernel would not answer") }
+	var held []dumpEntry
+	underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t, held...) })
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
-		t.Fatal(err)
+	if len(underlay.Written()) != 1 {
+		t.Fatalf("the route was not recorded, so this measures nothing: %+v", underlay.Written())
 	}
-	if err := underlay.Release(); err == nil {
+	// The table stops reading back after the route is recorded, which is the
+	// state a withdrawal must refuse to act in.
+	underlay.dump = func() ([]byte, error) { return nil, errors.New("the kernel would not answer") }
+	if err := underlay.Ready(); err == nil {
+		t.Error("a pass over an unreadable dump reported the underlay covered")
+	}
+	if err := underlay.Close(); err == nil {
 		t.Error("a withdrawal over an unreadable dump reported success")
 	}
 	for _, message := range sent(t, sock) {
@@ -416,19 +460,88 @@ func TestUnderlayDefaultsDoesNotOwnARouteThatWasAlreadyThere(t *testing.T) {
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
+	if err := underlay.Ready(); err != nil {
 		t.Fatalf("an add that found the route already there was reported as a failure: %v", err)
 	}
 	if got := underlay.Written(); len(got) != 0 {
 		t.Fatalf("a route that was already there was recorded as ours: %+v", got)
 	}
 	sock.err = nil
-	if err := underlay.Release(); err != nil {
+	if err := underlay.Close(); err != nil {
 		t.Fatal(err)
 	}
 	for _, message := range sent(t, sock) {
 		if message.kind == unix.RTM_DELETE {
 			t.Errorf("a route this process did not create was deleted: %+v", message)
+		}
+	}
+}
+
+// Close leaves the socket gone, so every entry point afterwards has to say so
+// rather than dereference it. Nothing reaches this from the daemon today,
+// because the reconciler always withdraws first and the hub's follower is not
+// joined, which is exactly the kind of invariant that holds until a refactor.
+func TestUnderlayDefaultsRefusesEverythingAfterClose(t *testing.T) {
+	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
+	underlay, _ := testUnderlay(t, links, func() []byte { return hostRIB(t) })
+	if err := underlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for name, call := range map[string]func() error{
+		"prepare": func() error { return underlay.Prepare(uplinkIndex) },
+		"settle":  func() error { return underlay.Settle(uplinkIndex) },
+		"ready":   underlay.Ready,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, errUnderlayClosed) {
+				t.Errorf("answered %v, want the closed error", err)
+			}
+		})
+	}
+	// And closing twice is not a second withdrawal.
+	if err := underlay.Close(); err != nil {
+		t.Errorf("a second close reported %v", err)
+	}
+}
+
+// The underlay's own route outlives the routes that depend on it. A
+// withdrawal that failed upstream leaves a capture in the kernel, and taking
+// the fallback away under it is the window the ordering exists to close.
+func TestCloseLeavesTheRouteWhileACaptureIsStillInstalled(t *testing.T) {
+	const meshIndex = 77
+	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
+	var held []dumpEntry
+	sock := &fakeRouteSocket{t: t}
+	underlay := &UnderlayDefaults{
+		sock: sock, links: links, mesh: meshIndex,
+		written:      make(map[writtenDefault]bool),
+		refused:      make(map[writtenDefault]bool),
+		covered:      make(map[netip.Prefix]bool),
+		warned:       make(map[netip.Prefix]bool),
+		dump:         func() ([]byte, error) { return hostRIB(t, held...), nil },
+		lookupDevice: resolvesTo(uplinkIndex),
+	}
+	if err := underlay.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	held = append(held, ourScoped(uplinkIndex, addr("192.168.0.1")))
+	if len(underlay.Written()) != 1 {
+		t.Fatalf("the route was not recorded: %+v", underlay.Written())
+	}
+
+	// A capture the reconciler could not withdraw, still out of the mesh
+	// device.
+	held = append(held, dumpEntry{
+		index: meshIndex,
+		flags: unix.RTF_UP | unix.RTF_STATIC,
+		dst:   prefix("0.0.0.0/1"), gateway: &route.LinkAddr{Index: meshIndex},
+	})
+	if err := underlay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range sent(t, sock) {
+		if message.kind == unix.RTM_DELETE {
+			t.Errorf("the fallback was withdrawn under a capture that is still installed: %+v", message)
 		}
 	}
 }

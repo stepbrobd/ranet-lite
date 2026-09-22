@@ -694,6 +694,10 @@ type Reconciler struct {
 	// warned holds the routes already reported as unrepresentable. It is
 	// rebuilt from each pass, so it stays bounded by the snapshot.
 	warned map[Route]bool
+	// warnedUncovered records that the last pass already said out loud that it
+	// was holding a capture back for want of a covered underlay, so a node in
+	// that state costs one line rather than one every pass.
+	warnedUncovered bool
 
 	// rules and vrfs are the optional halves of the platform, nil where it has
 	// no policy engine or no VRFs. New refuses a configuration that needs one
@@ -781,6 +785,16 @@ func New(t Table, rt Runtime, src RouteSource) (*Reconciler, error) {
 	}
 	if t.CaptureGrace <= 0 {
 		t.CaptureGrace = schema.Duration(DefaultCaptureGrace)
+	}
+	if rt.BoundUnderlay && rt.Sessions == nil {
+		// The two halves of one arrangement. A bound underlay lets this
+		// backend install an announced default where every socket can see
+		// it, and the gate is the only thing that keeps such a route out
+		// of the kernel until the mesh has proved it can carry traffic. With
+		// no session source the gate is open from the first pass, so the two
+		// together would put this machine's traffic in a tun nothing has ever
+		// answered on.
+		return nil, errors.New("kernel: a bound underlay needs a session source, or an announced default would install before the mesh has carried anything")
 	}
 	addresses := make([]netip.Prefix, 0, len(t.Addresses))
 	for _, prefix := range t.Assigned(rt.Announced) {
@@ -1119,6 +1133,7 @@ func (r *Reconciler) applyRoutes() error {
 	add, del := diffRoutes(desired, actual, r.platformScopes())
 	var errs []error
 	added, removed, skipped := 0, 0, 0
+	uncovered := false
 	// Whether this pass leaves the mesh carrying this machine's own traffic.
 	// The gate has already decided it: desired holds a capturing route only
 	// while the gate is open, so this needs no second opinion about liveness.
@@ -1136,19 +1151,32 @@ func (r *Reconciler) applyRoutes() error {
 			removed++
 		}
 	}
-	// Between the withdrawals and the installs, which is the only ordering
-	// that holds on both edges: what the underlay needs goes in before the
-	// route that would strand it, and comes out after the last one is gone.
-	if r.rt.Capture != nil {
-		if capturing {
-			if err := r.rt.Capture.Hold(); err != nil {
-				errs = append(errs, fmt.Errorf("hold the underlay route: %w", err))
-			}
-		} else if err := r.rt.Capture.Release(); err != nil {
-			errs = append(errs, fmt.Errorf("release the underlay route: %w", err))
+	// Between the withdrawals and the installs: the routing the underlay
+	// depends on has to be in the kernel before a route that would strand it,
+	// and a pass that cannot get it there installs none of them. Reported
+	// rather than retried here, because the next pass asks again.
+	covered := true
+	if capturing && r.rt.Capture != nil {
+		if err := r.rt.Capture.Ready(); err != nil {
+			covered = false
+			errs = append(errs, fmt.Errorf("cover the underlay before capturing: %w", err))
 		}
 	}
 	for _, route := range add {
+		if !covered && capturesTheMachine(route) {
+			// Left out rather than counted as skipped: skipped counts what
+			// the kernel would not take, and this is the reconciler refusing
+			// to ask. Installing it would take this node off the network with
+			// nothing to fall back on, which is the outage every part of this
+			// arrangement exists to prevent.
+			if !r.warnedUncovered {
+				slog.Warn("kernel is not installing a route that would carry this machine's own traffic",
+					"destination", route.Destination,
+					"detail", "the underlay has no route of its own, so this node would lose every network it has")
+			}
+			uncovered = true
+			continue
+		}
 		if err := r.plat.AddRoute(route); err == nil {
 			added++
 		} else if errors.Is(err, errRouteSkipped) {
@@ -1157,6 +1185,7 @@ func (r *Reconciler) applyRoutes() error {
 			errs = append(errs, fmt.Errorf("add route %s: %w", route, err))
 		}
 	}
+	r.warnedUncovered = uncovered
 	// Reported only when something moved. A route the platform refuses stays
 	// in the diff on purpose, because the install is retried on every pass
 	// until it lands, so a node holding one permanently unrepresentable route
@@ -1492,13 +1521,6 @@ func (r *Reconciler) withdraw() error {
 			errs = append(errs, fmt.Errorf("delete route %s: %w", route, err))
 		} else {
 			withdrawn++
-		}
-	}
-	// After the routes, never before: the underlay's own route keeps the
-	// socket working while a capturing route is still in the kernel.
-	if r.rt.Capture != nil {
-		if err := r.rt.Capture.Release(); err != nil {
-			errs = append(errs, fmt.Errorf("release the underlay route: %w", err))
 		}
 	}
 	// An address is removed only while the link still carries exactly what was

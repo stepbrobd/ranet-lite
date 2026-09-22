@@ -109,7 +109,7 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	}
 
 	state := filepath.Join(t.TempDir(), "underlay.json")
-	underlay, err := NewUnderlayDefaults(links, state)
+	underlay, err := NewUnderlayDefaults(links, meshDevice.Index, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,14 +117,20 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	if err := underlay.Prepare(host); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Hold(); err != nil {
-		t.Fatalf("write the underlay's own default: %v", err)
+	if err := underlay.Ready(); err != nil {
+		t.Fatalf("cover the underlay: %v", err)
 	}
 	if err := underlay.Settle(host); err != nil {
 		t.Fatal(err)
 	}
-	if got := underlay.Written(); len(got) != 1 || got[0].index != host {
-		t.Fatalf("the hold wrote %+v, want one route on interface %d", got, host)
+	if got := underlay.Written(); len(got) == 0 {
+		// The interface already carried one, which macOS writes for every
+		// secondary interface and a crashed run leaves behind. It satisfies
+		// the key and it is not ours, so there is nothing here to reclaim and
+		// this test cannot measure ownership.
+		t.Skip("this interface already carries a scoped default this process does not own")
+	} else if len(got) != 1 || got[0].index != host {
+		t.Fatalf("covering the underlay wrote %+v, want one route on interface %d", got, host)
 	}
 	if got := underlay.Written(); got[0].device != device.Name {
 		t.Errorf("the record names interface %q, want %q", got[0].device, device.Name)
@@ -142,11 +148,8 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	// A process that came back with no record of its own withdraws nothing,
 	// whatever it finds in the table.
 	empty := filepath.Join(t.TempDir(), "underlay.json")
-	restarted, err := NewUnderlayDefaults(links, empty)
+	restarted, err := NewUnderlayDefaults(links, meshDevice.Index, empty)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := restarted.Release(); err != nil {
 		t.Fatal(err)
 	}
 	if err := restarted.Close(); err != nil {
@@ -163,6 +166,14 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	underlay.sock = nil
+	// And the claim on the record, which a killed process releases with every
+	// other descriptor it held. Without this the restart below finds the lock
+	// still taken and reclaims nothing, which is the right answer to a second
+	// live daemon and the wrong model of a dead one.
+	if err := underlay.state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	underlay.state = nil
 	if err := boundReach(host, target); err != nil {
 		t.Fatalf("the killed process's route is not in the table: %v", err)
 	}
@@ -171,7 +182,7 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	}
 
 	// The restart reclaims it, because it wrote the record down.
-	reclaimed, err := NewUnderlayDefaults(links, state)
+	reclaimed, err := NewUnderlayDefaults(links, meshDevice.Index, state)
 	if err != nil {
 		t.Fatal(err)
 	}

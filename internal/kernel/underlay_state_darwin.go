@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
@@ -41,6 +42,44 @@ const (
 	// grows without end.
 	maxStateRecords = 32
 )
+
+// stateLock is the claim on the state file, held for the life of the process.
+// It makes the file this process's to read and rewrite: without it a
+// second daemon starting beside a running one reclaims the first's live route,
+// which passes every condition because the route is real, resolvable and on
+// the primary, and then persists an empty record over it before dying on the
+// port.
+type stateLock struct{ file *os.File }
+
+func (l *stateLock) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	// The flock goes with the descriptor, so closing it is the release.
+	err := l.file.Close()
+	l.file = nil
+	return err
+}
+
+// lockState takes that claim, or reports that somebody else holds it. An empty
+// path locks nothing, which is the in-memory mode a test uses.
+func lockState(path string) (*stateLock, error) {
+	if path == "" {
+		return nil, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), stateDirMode); err != nil {
+		return nil, fmt.Errorf("kernel: make the runtime directory for %s: %w", path, err)
+	}
+	file, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, stateMode)
+	if err != nil {
+		return nil, fmt.Errorf("kernel: open the lock for %s: %w", path, err)
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("kernel: another process holds the record at %s: %w", path, err)
+	}
+	return &stateLock{file: file}, nil
+}
 
 // underlayRecord is one written route as the file holds it. The interface name
 // is recorded beside the index because an index is reused across a reboot and
@@ -162,7 +201,16 @@ func saveUnderlayState(path string, held []writtenDefault) error {
 // withdraw what it wrote, and what is lost is only the ability to withdraw it
 // after a kill.
 func (u *UnderlayDefaults) persist() {
-	if err := saveUnderlayState(u.statePath, u.sorted()); err != nil {
+	// Both sets: a record reclaim refused is still a route this tool wrote,
+	// and forgetting it would leak it for good. What separates them is that
+	// nothing in this process can delete the refused one, not that it is
+	// any less ours.
+	records := u.sorted()
+	for held := range u.refused {
+		records = append(records, held)
+	}
+	slices.SortFunc(records, compareWritten)
+	if err := saveUnderlayState(u.statePath, records); err != nil {
 		slog.Warn("kernel could not record which underlay routes it wrote",
 			"path", u.statePath, "err", err,
 			"detail", "a route this process is killed while holding will be left behind")
@@ -266,11 +314,18 @@ func (u *UnderlayDefaults) reclaimable(messages []route.Message, record writtenD
 	return ""
 }
 
-// keep replaces the record and writes it out.
+// keep holds what reclaim would not act on, apart from the set an ordinary
+// withdrawal deletes from.
+//
+// This is the whole of finding three: reclaim weighed three conditions,
+// refused a record, and then handed it to written, from which the next
+// withdrawal removed it on the shape check alone, milliseconds later. Every
+// condition was worth nothing. Nothing in this process deletes from refused;
+// the next start weighs the conditions again.
 func (u *UnderlayDefaults) keep(records []writtenDefault) {
-	u.written = make(map[writtenDefault]bool, len(records))
+	u.refused = make(map[writtenDefault]bool, len(records))
 	for _, record := range records {
-		u.written[record] = true
+		u.refused[record] = true
 	}
 	u.persist()
 }

@@ -1,8 +1,10 @@
 package kernel
 
 import (
+	"errors"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,12 +107,21 @@ func TestCaptureGateAsksToBeWokenOnlyWhileTheGraceRuns(t *testing.T) {
 	if _, ok := gate.deadline(); ok {
 		t.Error("a gate that has seen nothing asked to be woken")
 	}
+	// Open, and asking to be woken one grace after the last live sample. A
+	// session stops counting as live because it went quiet and nothing fires
+	// when that happens, so a gate that waited for its own next pass to
+	// notice took the periodic sweep rather than the grace: measured at about
+	// a minute against the ten seconds the grace promises.
 	gate.sample(start, 1)
-	if _, ok := gate.deadline(); ok {
-		t.Error("a gate held open by a live session asked to be woken")
+	at, ok := gate.deadline()
+	if !ok {
+		t.Fatal("an open gate did not ask to be woken, so nothing samples it until the sweep")
+	}
+	if want := start.Add(grace); !at.Equal(want) {
+		t.Errorf("an open gate asks to be woken at %s, want %s", at, want)
 	}
 	gate.sample(start.Add(time.Second), 0)
-	at, ok := gate.deadline()
+	at, ok = gate.deadline()
 	if !ok {
 		t.Fatal("a running grace did not ask to be woken")
 	}
@@ -125,18 +136,39 @@ func TestCaptureGateAsksToBeWokenOnlyWhileTheGraceRuns(t *testing.T) {
 	}
 }
 
-// Every prefix covering half the address space or more carries this machine's
-// own traffic, whichever spelling the announcement uses.
+// The predicate's two arms, each stated as what it is for. The second is the
+// one a prefix length misses: 0.0.0.0/24 is a quarter of a thousandth of the
+// space and costs a bound socket every destination the tun also covers,
+// because the kernel's fallback is a lookup of the family's zero address.
+// TestDarwinStrandsABoundSocketOnlyThroughTheZeroAddress is the measurement.
 func TestCapturesTheMachineCoversEverySpellingOfADefault(t *testing.T) {
-	for _, destination := range []string{"0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"} {
-		if !capturesTheMachine(Route{Destination: prefix(destination)}) {
-			t.Errorf("%s does not read as carrying this machine's own traffic", destination)
-		}
+	for name, destinations := range map[string][]string{
+		"half the address space or more": {"0.0.0.0/0", "::/0", "0.0.0.0/1", "::/1"},
+		"any prefix over the zero address": {
+			"0.0.0.0/2", "0.0.0.0/8", "0.0.0.0/24", "0.0.0.0/32",
+			"::/2", "::/64", "::/128",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, destination := range destinations {
+				if !capturesTheMachine(Route{Destination: prefix(destination)}) {
+					t.Errorf("%s does not read as carrying this machine's own traffic", destination)
+				}
+			}
+		})
 	}
-	for _, destination := range []string{"10.0.0.0/8", "2000::/3", "3fff:a::/36", "0.0.0.0/2"} {
+	// The upper half is neither: measured, 128.0.0.0/1 alone leaves a bound
+	// socket reaching, and holding it back would hide half the mesh for
+	// nothing.
+	for _, destination := range []string{"10.0.0.0/8", "2000::/3", "3fff:a::/36", "64.0.0.0/2", "192.0.2.0/24"} {
 		if capturesTheMachine(Route{Destination: prefix(destination)}) {
 			t.Errorf("%s reads as carrying this machine's own traffic", destination)
 		}
+	}
+	// 128.0.0.0/1 is half the space, so the first arm holds it; what it must
+	// not be is held for the second reason.
+	if prefix("128.0.0.0/1").Contains(netip.IPv4Unspecified()) {
+		t.Error("128.0.0.0/1 contains the zero address")
 	}
 }
 
@@ -253,8 +285,8 @@ func TestReconcilerAsksToBeWokenWhenTheGraceExpires(t *testing.T) {
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := reconciler.captureDeadline(); ok {
-		t.Fatal("a reconciler carrying a live session asked to be woken")
+	if _, ok := reconciler.captureDeadline(); !ok {
+		t.Fatal("a reconciler holding a capture did not ask to be woken, so nothing samples the gate until the sweep")
 	}
 	live = 0
 	clock = start.Add(time.Second)
@@ -271,25 +303,18 @@ func TestReconcilerAsksToBeWokenWhenTheGraceExpires(t *testing.T) {
 }
 
 // recordingCapture is the routing a capturing route depends on, which on
-// darwin is the underlay's own default. It records what the kernel held at
-// each call, because the ordering is the property: the underlay's route has to
-// be in before the route that would strand it and out after.
+// darwin is the underlay's own default. It records what the kernel held when
+// it was asked, because the invariant is the property: a capture must not be
+// in the kernel while the underlay is uncovered.
 type recordingCapture struct {
 	fake *fakeKernel
 	at   []string
-	held bool
+	err  error
 }
 
-func (c *recordingCapture) Hold() error {
-	c.held = true
-	c.at = append(c.at, "hold with "+c.capturing())
-	return nil
-}
-
-func (c *recordingCapture) Release() error {
-	c.held = false
-	c.at = append(c.at, "release with "+c.capturing())
-	return nil
+func (c *recordingCapture) Ready() error {
+	c.at = append(c.at, "asked with "+c.capturing())
+	return c.err
 }
 
 // capturing describes whether the kernel currently holds a route that would
@@ -303,12 +328,9 @@ func (c *recordingCapture) capturing() string {
 	return "no default installed"
 }
 
-// The underlay's own routing goes in before the route that would strand it and
-// comes out after the last one is gone. Any other order leaves a window in
-// which this machine's traffic is in the tun while the socket carrying the tun
-// has nothing to fall back on, which is the outage the whole arrangement
-// exists to avoid.
-func TestReconcileHoldsTheUnderlayRouteAroundTheCapture(t *testing.T) {
+// The underlay's own routing is asked about before the route that depends on
+// it reaches the kernel, and only then.
+func TestReconcileCoversTheUnderlayBeforeTheCapture(t *testing.T) {
 	live := 1
 	reconciler, table, fake := harness(t,
 		Table{CaptureGrace: schema.Duration(10 * time.Second)},
@@ -323,28 +345,41 @@ func TestReconcileHoldsTheUnderlayRouteAroundTheCapture(t *testing.T) {
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if !capture.held {
-		t.Fatal("the underlay route was not held while the mesh carries the default")
-	}
-
-	// The mesh goes and the grace expires, which withdraws both together.
-	live = 0
-	clock = start.Add(11 * time.Second)
-	if err := reconciler.reconcile(); err != nil {
-		t.Fatal(err)
-	}
-	if capture.held {
-		t.Fatal("the underlay route was still held after the default was withdrawn")
-	}
-
-	want := []string{"hold with no default installed", "release with no default installed"}
+	want := []string{"asked with no default installed"}
 	if !slices.Equal(capture.at, want) {
-		t.Errorf("the calls landed as %v, want %v", capture.at, want)
+		t.Errorf("the underlay was asked about as %v, want %v", capture.at, want)
+	}
+	if !fake.has(Route{Destination: prefix("::/0"), Metric: defaultIPv6Metric}) {
+		t.Error("a covered underlay did not let the default install")
 	}
 }
 
-// A node whose mesh never announces a default never touches the routing of the
-// interface it reaches its peers through.
+// An underlay that cannot be covered stops the capture reaching the kernel at
+// all. Installing it anyway is the state every part of this arrangement exists
+// to prevent: this node's own traffic in a tun, with nothing to fall back on.
+func TestReconcileInstallsNoCaptureOverAnUncoveredUnderlay(t *testing.T) {
+	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
+	capture := &recordingCapture{fake: fake, err: errors.New("no default of its own")}
+	reconciler.rt.Capture = capture
+	reconciler.now = func() time.Time { return start }
+	table.Set(netip.Prefix{}, prefix("::/0"), nil)
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
+
+	if err := reconciler.reconcile(); err == nil {
+		t.Fatal("a pass that could not cover the underlay reported success")
+	}
+	if fake.has(Route{Destination: prefix("::/0"), Metric: defaultIPv6Metric}) {
+		t.Error("the default installed although the underlay had nothing to fall back on")
+	}
+	// The ordinary mesh prefixes are unaffected: only what would carry this
+	// machine's own traffic is held back.
+	if !fake.has(Route{Destination: prefix("3fff:a::/36"), Metric: defaultIPv6Metric}) {
+		t.Error("an ordinary mesh prefix was held back with the capture")
+	}
+}
+
+// A node whose mesh never announces a default never asks about the underlay's
+// routing, so it never touches the interface it reaches its peers through.
 func TestReconcileLeavesTheUnderlayAloneWithoutADefault(t *testing.T) {
 	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
 	capture := &recordingCapture{fake: fake}
@@ -354,30 +389,29 @@ func TestReconcileLeavesTheUnderlayAloneWithoutADefault(t *testing.T) {
 	if err := reconciler.reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if capture.held {
-		t.Error("an ordinary mesh prefix held the underlay route")
+	if len(capture.at) != 0 {
+		t.Errorf("an ordinary mesh prefix asked about the underlay: %v", capture.at)
 	}
 }
 
-// Shutdown withdraws the routes first and the underlay's own route after, for
-// the same reason a pass does.
-func TestWithdrawReleasesTheUnderlayRouteLast(t *testing.T) {
-	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
-	capture := &recordingCapture{fake: fake}
-	reconciler.rt.Capture = capture
-	reconciler.now = func() time.Time { return start }
-	table.Set(netip.Prefix{}, prefix("::/0"), nil)
-	if err := reconciler.reconcile(); err != nil {
-		t.Fatal(err)
+// A bound underlay with nothing to ask about liveness is refused at startup.
+// The two are halves of one arrangement: the binding lets an announced
+// default install where every socket sees it, and the gate is the only thing
+// keeping it out of the kernel until the mesh has carried traffic.
+func TestNewRefusesABoundUnderlayWithNoSessionSource(t *testing.T) {
+	table := netstack.NewRouteTable()
+	_, err := New(Table{}, Runtime{Interface: "lo0", BoundUnderlay: true}, table)
+	if err == nil {
+		t.Fatal("a bound underlay with no session source was accepted")
 	}
-	if err := reconciler.withdraw(); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(err.Error(), "session source") {
+		t.Errorf("the refusal reads %q", err)
 	}
-	if capture.held {
-		t.Error("shutdown left the underlay route held")
-	}
-	last := capture.at[len(capture.at)-1]
-	if last != "release with no default installed" {
-		t.Errorf("the last call was %q, so the underlay route went while the default was still in the kernel", last)
+	// And the same runtime with a session source gets past that check, so the
+	// refusal is about the pair rather than about the binding.
+	if _, err := New(Table{}, Runtime{
+		Interface: "lo0", BoundUnderlay: true, Sessions: func() int { return 0 },
+	}, table); err != nil && strings.Contains(err.Error(), "session source") {
+		t.Errorf("a bound underlay with a session source was refused for the same reason: %v", err)
 	}
 }
