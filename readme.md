@@ -909,9 +909,11 @@ fails validation changes nothing.
 - `internal/kernel/rules_linux.go` is the policy rules and the VRF, which exist
   on linux alone and are therefore optional halves of the platform rather than
   methods every backend stubs out.
-- `cmd/ranet-lite` is the production binary.
-- `cmd/*test` are standalone interop and smoke-test binaries used during
-  development (IKE, ESP, babel tests).
+- `cmd/ranet-lite` is the production binary, and the only thing under `cmd`.
+- `internal/cmd/*` are the tools this tree runs on itself: `notices`, which
+  regenerates the third-party notice file, and the standalone interop and
+  smoke-test binaries used during development (IKE, ESP, babel tests). They are
+  under `internal` so that nothing outside this repository can install them.
 
 ## Testing
 

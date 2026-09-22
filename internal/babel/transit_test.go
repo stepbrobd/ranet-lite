@@ -824,7 +824,7 @@ func TestOriginatingLearnedPrefixDoesNotLoop(t *testing.T) {
 }
 
 // Originate reaches the same purge through its own entry point. The config
-// goes through SetOriginated instead, so this covers the path cmd/babeltest
+// goes through SetOriginated instead, so this covers the path internal/cmd/babeltest
 // and any single-prefix caller takes.
 func TestOriginateAlsoDropsWhatThisNodeLearned(t *testing.T) {
 	fabric := newMeshFabric(t, Config{}, "a-b", "b-c")
