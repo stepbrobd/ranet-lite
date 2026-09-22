@@ -75,8 +75,7 @@ func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
 	// passed to Lookup is irrelevant — any placeholder works.
 	dummySrc := netip.MustParseAddr("192.0.2.1")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go speakerA.Run(ctx)
 	go speakerB.Run(ctx)
 
@@ -239,8 +238,7 @@ func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 	speakerB.Originate(extra)
 	dummySrc := netip.MustParseAddr("192.0.2.1")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go speakerA.Run(ctx)
 	bCtx, bCancel := context.WithCancel(ctx)
 	go speakerB.Run(bCtx)
