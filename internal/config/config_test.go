@@ -374,6 +374,40 @@ func TestBothDecodersRefuseTheSameConfigurations(t *testing.T) {
 			asYAML: "cap:\n  table:\n    vrf: { create: true }\n",
 			asTOML: "[cap.table.vrf]\ncreate = true\n",
 		},
+		// RTA_PREFSRC is stamped on IPv4 routes alone, and IPv6 carries no
+		// preferred source at all, so an address of the other family is a
+		// setting the reconciler would take and never apply.
+		"a preferred source of the other family": {
+			asYAML: "cap:\n  table:\n    prefsrc4: \"2001:db8::1\"\n",
+			asTOML: "[cap.table]\nprefsrc4 = \"2001:db8::1\"\n",
+		},
+		// An interface cannot carry the unspecified address, and Assigned
+		// skips it, so taking the entry is the one outcome that leaves the
+		// operator an address they wrote and this node never assigned. The
+		// length is there because the zero-length spelling is refused by a
+		// check of its own, and this one has to hold without it.
+		"an address under a length no interface can carry": {
+			asYAML: "cap:\n  table:\n    addresses: [\"::/64\"]\n",
+			asTOML: "[cap.table]\naddresses = [\"::/64\"]\n",
+		},
+		// Both intervals normalize a value at or below zero to their default,
+		// so a negative one loads into a node running on a number nobody
+		// wrote and says nothing.
+		"a negative reconcile interval": {
+			asYAML: "cap:\n  table:\n    reconcile: -1s\n",
+			asTOML: "[cap.table]\nreconcile = \"-1s\"\n",
+		},
+		"a negative capture grace": {
+			asYAML: "cap:\n  table:\n    capture_grace: -1s\n",
+			asTOML: "[cap.table]\ncapture_grace = \"-1s\"\n",
+		},
+		// A mask with no mark reaches the kernel as a rule matching every
+		// packet whose mark is zero under it, which on this fleet is the
+		// unmarked traffic the rule was written to leave alone.
+		"a rule carrying a mark mask and no mark": {
+			asYAML: "cap:\n  table:\n    rules: [{ fwmask: 0xffffffff, to: \"10.0.0.0/8\", table: 200, priority: 40 }]\n",
+			asTOML: "[cap.table]\nrules = [{ fwmask = 0xffffffff, to = \"10.0.0.0/8\", table = 200, priority = 40 }]\n",
+		},
 		"a rule selecting on a mark with no family": {
 			asYAML: "cap:\n  table:\n    rules: [{ fwmark: 0x726c, table: main, priority: 40 }]\n",
 			asTOML: "[cap.table]\nrules = [{ fwmark = 0x726c, table = \"main\", priority = 40 }]\n",
@@ -467,7 +501,11 @@ func TestBothDecodersRefuseTheSameConfigurations(t *testing.T) {
 // What the node itself has to say, and what it may not say twice.
 func TestNodeFactsAreRefusedWhenTheyCannotBeActedOn(t *testing.T) {
 	for name, body := range map[string]string{
-		"no org":   strings.Replace(nodeYAML, "  org: example\n", "", 1),
+		// The peer names an org of its own, so the peer check cannot answer
+		// for this one: without that the defaults copy the node's empty org
+		// into the peer entry and the case passes with node.org unchecked.
+		"no org": strings.Replace(strings.Replace(nodeYAML, "  org: example\n", "", 1),
+			"    - name: gateway\n", "    - { org: example, name: gateway }\n", 1),
 		"no name":  strings.Replace(nodeYAML, "  name: laptop\n", "", 1),
 		"no port":  strings.Replace(nodeYAML, "  port: 13000\n", "", 1),
 		"no key":   strings.Replace(nodeYAML, "  key: key.pem\n", "", 1),
@@ -676,6 +714,20 @@ func TestRefusalsNameTheBlockTheOperatorWrote(t *testing.T) {
 		"two rules the kernel reads as one": {
 			body:  "cap:\n  table:\n    rules:\n      - { fwmark: 0x726c, table: main, priority: 40, family: both }\n      - { fwmark: 0x726c, fwmask: 0xffffffff, table: main, priority: 40, family: both }\n",
 			names: []string{"cap.table rules", "lookup main", "family ipv4"},
+		},
+		// The entry's own source or the block's, and the refusal says so:
+		// without the check the path check below answers instead, and it
+		// describes the segment list rather than the field that is missing.
+		"a steering entry with no source anywhere": {
+			body:  "cap:\n  segment:\n    steer: [{ from: \"3fff:a::1/128\", via: [\"3fff:1:69c::1\"] }]\n",
+			names: []string{"cap.segment steer", "names no source", "3fff:a::1/128"},
+		},
+		// The word, not the shape: a family the decoder took and expansion
+		// then refused answers an operator who wrote "ipv7" by telling them
+		// to name a family, which they did.
+		"a family that is none of the three": {
+			body:  "cap:\n  table:\n    rules: [{ fwmark: 0x726c, table: main, priority: 40, family: ipv7 }]\n",
+			names: []string{"ipv7", "ipv4, ipv6 or both"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

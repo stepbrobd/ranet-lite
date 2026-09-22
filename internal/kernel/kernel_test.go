@@ -1202,6 +1202,38 @@ func TestRuleValidationRefusesWhatReadsWrong(t *testing.T) {
 	}
 }
 
+// One entry spelled "family = both" installs two rules, one per family, alike
+// in everything else. The doubling is there because keeping an underlay out of
+// a mesh table needs both halves and writing them by hand is how one of the
+// two goes missing: the fleet's own rule would silently become IPv4 only, and
+// every IPv6 datagram this node's transport sends would follow the mesh table
+// into the tunnel it is carrying.
+func TestFamilyBothInstallsOneRulePerFamily(t *testing.T) {
+	underlay := Rule{FWMark: 0x726c, Table: schema.TableMain, Priority: 40, Family: FamilyBoth}
+	expanded, err := expandRules([]Rule{underlay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Rule{
+		{FWMark: 0x726c, Table: schema.TableMain, Priority: 40, Family: FamilyIPv4},
+		{FWMark: 0x726c, Table: schema.TableMain, Priority: 40, Family: FamilyIPv6},
+	}
+	if !slices.Equal(expanded, want) {
+		t.Fatalf("one entry expanded to %v, want %v", expanded, want)
+	}
+	// And the pass installs both, since an expansion nothing installs is the
+	// same missing rule one layer up.
+	reconciler, _, fake := harness(t, Table{Rules: []Rule{underlay}})
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range want {
+		if !fake.rules[rule.canonical()] {
+			t.Errorf("the pass did not install %s, so that family still follows the mesh table", rule)
+		}
+	}
+}
+
 // The rule pass installs what is configured, removes what is not, and does
 // neither twice. The second half is the one that matters: a rule read back in
 // a different spelling than it was written in would be deleted and reinstalled
