@@ -29,7 +29,10 @@ func (c *Client) reconnectDelay() time.Duration {
 // runPeer maintains one peer connection for the client's lifetime,
 // reconnecting on any failure (network blip, peer restart, etc.) rather
 // than requiring a manual restart.
-func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Peer) {
+//
+// wake cuts the reconnect delay short, which the redial verb sends after it
+// has dropped whatever session this node held for the peer.
+func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Peer, wake <-chan struct{}) {
 	reg := c.registry()
 	name := fmt.Sprintf("%s/%s@%s", p.Org, p.Name, local.Serial)
 	// A node the registry does not name is not dialed at all. The check runs
@@ -104,6 +107,7 @@ func (c *Client) runPeer(ctx context.Context, local config.Endpoint, p config.Pe
 		select {
 		case <-ctx.Done():
 			return
+		case <-wake:
 		case <-time.After(c.reconnectDelay()):
 		}
 	}

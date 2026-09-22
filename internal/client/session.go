@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,11 +164,13 @@ type sessionSet struct {
 	// would install a session nobody is left to tell the peer about.
 	shut bool
 
-	// close is closeSession and active is (*ike.Session).Active in production.
-	// A test drives the resolution rule without standing up two real SAs by
+	// close is closeSession, active is (*ike.Session).Active and rekey is
+	// (*ike.Session).RekeyChildProactively in production. A test drives the
+	// resolution rule and the rekey verb without standing up two real SAs by
 	// replacing them.
 	close  func(*ike.Session)
 	active func(*ike.Session) bool
+	rekey  func(*ike.Session) error
 }
 
 type liveSession struct {
@@ -186,6 +189,7 @@ func newSessionSet() *sessionSet {
 		live:   make(map[string]*liveSession),
 		close:  closeSession,
 		active: (*ike.Session).Active,
+		rekey:  (*ike.Session).RekeyChildProactively,
 	}
 }
 
@@ -379,6 +383,86 @@ func (s *sessionSet) revoke(trusted func(ike.Identity) bool) []string {
 	closing.Wait()
 	slices.Sort(paths)
 	return paths
+}
+
+// closeMatching closes every live session naming one peer and reports which
+// went, which is the half of a redial this side can do about a peer holding a
+// session this node no longer has.
+//
+// The entry leaves the map before the session is closed, as revoke does, so
+// the dialer woken straight afterwards sees the path as free rather than
+// standing down behind a session that is already going. serveSession's own
+// release then finds the path held by nobody and leaves it alone.
+func (s *sessionSet) closeMatching(peer string) []string {
+	if s == nil {
+		return nil // a Client built by hand in a test carries no sessions
+	}
+	s.mu.Lock()
+	var paths []string
+	var sessions []*ike.Session
+	for path, live := range s.live {
+		if !matchesPeer(path, peer) {
+			continue
+		}
+		paths = append(paths, path)
+		sessions = append(sessions, live.session)
+		delete(s.live, path)
+	}
+	s.mu.Unlock()
+	var closing sync.WaitGroup
+	for _, sess := range sessions {
+		closing.Go(func() { s.close(sess) })
+	}
+	closing.Wait()
+	slices.Sort(paths)
+	return paths
+}
+
+// rekeyMatching asks every live session naming one peer, or every session at
+// all, to replace its Child SA, and reports which were asked.
+//
+// Each exchange runs on its own and none of them is waited for. A rekey is two
+// messages and a retransmit schedule against a peer that may be gone, so
+// waiting would make the answer to a mesh-wide ask depend on its least
+// reachable member. The new SPIs appear under Sessions as each one lands.
+func (s *sessionSet) rekeyMatching(peer string, all bool) []string {
+	if s == nil {
+		return nil
+	}
+	var paths []string
+	for _, live := range s.snapshot() {
+		if !all && !matchesPeer(live.path, peer) {
+			continue
+		}
+		paths = append(paths, live.path)
+		go func() {
+			if err := s.rekey(live.session); err != nil {
+				log.Printf("peer %s: rekey asked for on the control socket: %v", live.path, err)
+			}
+		}()
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// matchesPeer reports whether a dialer or session path names the peer somebody
+// asked about. A path is "org/name/serial@local", and the argument is compared
+// against the whole of it, against "org/name" and against the name alone, so a
+// fleet with one organization is named the short way and two nodes sharing a
+// name across organizations are still told apart.
+func matchesPeer(path, peer string) bool {
+	if path == peer {
+		return true
+	}
+	organization, rest, ok := strings.Cut(path, "/")
+	if !ok {
+		return false
+	}
+	name, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return false
+	}
+	return peer == name || peer == organization+"/"+name
 }
 
 // closeAll tells every live peer the session is ending and drops it, and shuts

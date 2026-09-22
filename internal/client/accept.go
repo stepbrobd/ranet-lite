@@ -8,6 +8,7 @@ import (
 	"log"
 	"sync"
 
+	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
@@ -44,6 +45,16 @@ func (c *Client) acceptPeers(ctx context.Context) error {
 	var serving sync.WaitGroup
 	defer serving.Wait()
 	err = responder.Serve(ctx, func(sess *ike.Session, accepted ike.Accepted) {
+		if !c.subsystemRunning(control.SubsystemResponder) {
+			// Stopped over the control socket. The handshake has already
+			// finished, which is the cost of gating here rather than in the
+			// responder, and the peer is told the SA is gone rather than left
+			// to carry one nothing on this side will serve until its own dead
+			// peer detection expires. The Delete runs under serving because it
+			// waits out its own grace.
+			serving.Go(func() { closeSession(sess) })
+			return
+		}
 		serving.Go(func() {
 			peer := accepted.Peer
 			name := fmt.Sprintf("%s/%s@%s", peer.Organization, peer.CommonName, accepted.Local.SerialNumber)

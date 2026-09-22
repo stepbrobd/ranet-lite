@@ -1366,3 +1366,50 @@ func TestFailingPassDoesNotRepublishTheLastGoodCounts(t *testing.T) {
 		t.Errorf("the failing pass republished the last good counts: %+v", got)
 	}
 }
+
+// Stopping a running reconciler takes its routes and addresses out of the
+// kernel, and starting it again puts them back on the next pass. A stop that
+// only paused would leave a table holding routes nobody maintains, the state
+// an operator reaches for the verb to get out of, and `birdc disable` on a
+// kernel protocol did not leave it either.
+func TestStoppedReconcilerWithdrawsAndStartsAgain(t *testing.T) {
+	reconciler, table, fake := harness(t, Table{
+		Addresses: prefixes(prefix("198.18.104.5/32")),
+		Reconcile: schema.Duration(10 * time.Millisecond),
+	})
+	table.Set(netip.Prefix{}, prefix("10.0.0.0/8"), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- reconciler.Run(ctx) }()
+	waitFor(t, func() bool { return fake.has(Route{Destination: prefix("10.0.0.0/8")}) })
+
+	reconciler.SetEnabled(false)
+	if reconciler.Enabled() {
+		t.Error("the reconciler reports itself as writing to the kernel after being stopped")
+	}
+	waitFor(t, func() bool { return len(fake.snapshot()) == 0 })
+	fake.mu.Lock()
+	addresses := len(fake.addrs)
+	fake.mu.Unlock()
+	if addresses != 0 {
+		t.Errorf("%d addresses survived the stop", addresses)
+	}
+	// The pass recorded after a withdrawal reads zero installed, so a
+	// diagnostic does not go on reporting the routes of the last pass that ran.
+	waitFor(t, func() bool { return reconciler.Stats().Installed == 0 })
+
+	reconciler.SetEnabled(true)
+	waitFor(t, func() bool { return fake.has(Route{Destination: prefix("10.0.0.0/8")}) })
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after cancellation")
+	}
+}

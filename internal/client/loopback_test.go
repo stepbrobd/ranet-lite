@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
@@ -314,13 +315,52 @@ func TestReloadAnnouncesNewPrefixToPeer(t *testing.T) {
 
 	writeLoopbackConfig(t, alpha, bravo, alpha.cfg.Auth.Key, alpha.cfg.Auth.Trust,
 		[]string{alpha.prefix.String(), added.String()})
-	if err := alpha.client.Reload(alpha.configPath); err != nil {
+	if err := alpha.client.ReloadFrom(alpha.configPath); err != nil {
 		t.Fatalf("adding an originated prefix was refused: %v", err)
 	}
 
 	waitFor(t, convergeBudget, "the reloaded prefix to reach the peer", func() bool {
 		peer, ok := bravo.client.Mesh.Routes.Lookup(netip.Addr{}, added.Addr().Next())
 		return ok && peer != nil
+	})
+}
+
+// A stopped responder refuses the handshakes it answers, and starting it again
+// lets the next one through. No other test executes acceptPeers, so a gate
+// checked anywhere but there passes every unit test and leaves a node still
+// answering every dial an operator told it to stop answering.
+func TestStoppedResponderRefusesLiveHandshakes(t *testing.T) {
+	alpha, bravo := newLoopbackMesh(t)
+	// Bravo answers and never dials, so the only session that can exist is the
+	// one alpha opens through the gate under test. With bravo dialing too, a
+	// session would form in the other direction whatever the gate did.
+	quiet := *bravo.cfg
+	quiet.Dial.To = nil
+	bravo.client.cfg.Store(&quiet)
+	// Short enough that alpha comes round several times inside the budget
+	// below, since each refused handshake sends it back to the delay.
+	alpha.client.dialRetry = 200 * time.Millisecond
+	if _, err := bravo.client.SetSubsystem(control.SubsystemResponder, false); err != nil {
+		t.Fatal(err)
+	}
+	run(t, alpha, bravo)
+
+	// Alpha keeps dialing and bravo keeps refusing, so neither end settles.
+	// Time rather than an event, because what is asserted is that nothing
+	// happens; the delay above bounds how many attempts that covers.
+	time.Sleep(3 * time.Second)
+	if held := len(bravo.client.sessions.paths()); held != 0 {
+		t.Errorf("a stopped responder is holding %d sessions", held)
+	}
+	if held := len(alpha.client.sessions.paths()); held != 0 {
+		t.Errorf("the dialer settled on %d sessions against a stopped responder", held)
+	}
+
+	if _, err := bravo.client.SetSubsystem(control.SubsystemResponder, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, convergeBudget, "the responder started again to answer a dial", func() bool {
+		return len(bravo.client.sessions.paths()) == 1 && len(alpha.client.sessions.paths()) == 1
 	})
 }
 

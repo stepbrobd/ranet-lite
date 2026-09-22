@@ -82,6 +82,22 @@ type Client struct {
 	egressStatus   atomic.Pointer[func() control.EgressStatus]
 	egressAnnounce atomic.Pointer[func() []netip.Prefix]
 
+	// running is the control socket's write path state: whether each named
+	// subsystem is acting. It is the record rather than the mechanism, since
+	// each subsystem keeps its own flag where its hot path can read it. A
+	// status reports this map and a second write compares against it.
+	runningMu sync.Mutex
+	running   map[control.Subsystem]bool
+	// reconcilerEnable stops and starts the route reconciler, supplied by the
+	// command that built it as SetKernelStatus is. Nil on a node with no
+	// cap.table, where the verb is refused by name rather than reported as
+	// having stopped something.
+	reconcilerEnable atomic.Pointer[func(bool)]
+	// configPath is where the daemon read this node's configuration, so the
+	// reload verb re-reads the same file SIGHUP does. Empty on a client a test
+	// built by hand, where the verb says so rather than guessing at a path.
+	configPath atomic.Pointer[string]
+
 	inboundPackets atomic.Uint64
 	inboundDropped atomic.Uint64
 	// dropReported is nanoseconds since started, read through time.Since so it
@@ -225,6 +241,7 @@ func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.R
 		workers:  max(1, runtime.GOMAXPROCS(0)),
 		ctx:      ctx, cancel: cancel,
 		dialers: make(map[string]*dialer),
+		running: startedSubsystems(),
 		started: time.Now(),
 	}
 	c.dropReported.Store(-int64(espDropReportInterval))
@@ -330,7 +347,15 @@ func (c *Client) LiveSessions() int {
 
 // dialer is one running peer loop. It is a pointer so an entry has an identity
 // a later goroutine can compare against, which a func value cannot provide.
-type dialer struct{ cancel context.CancelFunc }
+//
+// wake cuts short the reconnect delay, and is buffered so a redial arriving
+// while the loop is dialing rather than waiting is not lost and does not block
+// the caller. One place is enough: two asks that land before the loop comes
+// round are one attempt either way.
+type dialer struct {
+	cancel context.CancelFunc
+	wake   chan struct{}
+}
 
 // stopDialers refuses any further dialer before the wait below begins. It is
 // the write half of the check syncPeers makes under the same lock: without it

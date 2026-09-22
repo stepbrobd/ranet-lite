@@ -125,6 +125,53 @@ func TestSteeredPacketWithNoRouteIsCounted(t *testing.T) {
 }
 
 // sealingPeer records what a peer was handed, so a test can tell which peer a
+// A stopped steering passes the packet its policy claims, unencapsulated and
+// uncounted, so the route table decides where it goes: the node behaves as one
+// whose file carries no steer policy at all. The table stays loaded, so a
+// diagnostic still reports what was stopped.
+func TestStoppedSteeringPassesTheClaimedPacket(t *testing.T) {
+	table, err := srv6.NewSteerTable([]srv6.Steer{{
+		From: schema.PrefixFrom(segPrefix("3fff:a::17/128")),
+		Via:  []schema.Addr{schema.MustAddr("3fff:1:69c:98d6::1")},
+	}}, schema.MustAddr("3fff:1:69c:8c0::1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Mesh{Routes: NewRouteTable()}
+	m.SetSteering(table)
+	source, destination := segAddr("3fff:a::17"), segAddr("2001:4860:4860::8888")
+	// offer hands steer a buffer of its own each time, since it encapsulates
+	// in place and a second call would otherwise read the first one's work.
+	offer := func() (int, steerAction) {
+		packet := plainV6(source, destination, "payload")
+		buf := make([]byte, tunOffset+outboundPacketBufferSize)
+		copy(buf[tunOffset:], packet)
+		return m.steer(buf, len(packet), source, destination)
+	}
+
+	if _, action := offer(); action != steerSent {
+		t.Fatalf("the fixture policy did not claim the packet, so this proves nothing: %v", action)
+	}
+	m.SetSteeringEnabled(false)
+	size, action := offer()
+	if action != steerPass {
+		t.Errorf("a stopped steering acted on the packet: %v", action)
+	}
+	if want := len(plainV6(source, destination, "payload")); size != want {
+		t.Errorf("a passed packet is %d bytes, want the %d it arrived as", size, want)
+	}
+	if got := m.SegmentCounters().Steered; got != 1 {
+		t.Errorf("%d encapsulations counted, want only the one before the stop", got)
+	}
+	if m.Steering() == nil {
+		t.Error("stopping unloaded the table, so nothing can report which policies were stopped")
+	}
+	m.SetSteeringEnabled(true)
+	if _, action := offer(); action != steerSent {
+		t.Errorf("steering started again did not act on the packet: %v", action)
+	}
+}
+
 // packet went to rather than only that it left.
 func sealingPeer(t *testing.T, id string, seen chan []byte) *Peer {
 	t.Helper()

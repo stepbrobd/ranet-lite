@@ -784,6 +784,14 @@ type Reconciler struct {
 	// grace without sleeping through it.
 	now func() time.Time
 
+	// enabled is whether this reconciler is writing to the kernel at all, and
+	// wake carries a change of it to the loop. Both are touched from outside
+	// the reconcile goroutine; withdrawn is the loop's own record of having
+	// acted on a stop, and belongs to that goroutine like every field above.
+	enabled   atomic.Bool
+	wake      chan struct{}
+	withdrawn bool
+
 	// stats is the last route pass as an operator reads it. The single
 	// reconcile goroutine publishes a whole value and a reader takes one, so
 	// this needs no lock and a reader can never see half a pass.
@@ -988,7 +996,9 @@ func newReconciler(t Table, rt Runtime, rules []Rule, addresses []netip.Prefix, 
 		warned:      make(map[Route]bool),
 		gate:        captureGate{grace: t.CaptureGrace.Duration()},
 		now:         time.Now,
+		wake:        make(chan struct{}, 1),
 	}
+	r.enabled.Store(true)
 	// Nil on a platform without them, which New has already refused to
 	// configure, so every use below is reached only where the backend answers.
 	r.rules, _ = plat.(ruler)
@@ -1006,6 +1016,28 @@ func (r *Reconciler) Where() string { return r.plat.where(r.table) }
 // caller's is not the one in force and a diagnostic reporting that one names a
 // table of zero on every deployment that left it out.
 func (r *Reconciler) Table() Table { return r.table }
+
+// SetEnabled stops or starts this reconciler while it runs, which is the
+// `birdc disable` a kernel protocol took while Babel lived in BIRD. Stopping
+// withdraws every route, address and rule it installed, and starting puts them
+// back on the next pass, which is idempotent like every other pass. A table
+// left holding routes nobody maintains is the state a stop exists to avoid,
+// so the withdrawal is part of it rather than a separate ask.
+//
+// The withdrawal runs on the reconcile goroutine rather than here, because
+// every field it touches belongs to that goroutine alone. This records the
+// request and wakes the loop, so a caller returns before the kernel has
+// caught up and reads Stats to see that it has.
+func (r *Reconciler) SetEnabled(on bool) {
+	r.enabled.Store(on)
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Enabled reports whether this reconciler is writing to the kernel.
+func (r *Reconciler) Enabled() bool { return r.enabled.Load() }
 
 // Run reconciles until ctx is canceled, then withdraws everything this
 // reconciler installed and closes its netlink sockets. It is called once.
@@ -1053,19 +1085,44 @@ func (r *Reconciler) Run(ctx context.Context) error {
 
 	backoff := time.Duration(0)
 	for ctx.Err() == nil {
-		if err := r.reconcile(); err != nil {
-			backoff = min(max(2*backoff, minRetryInterval), r.table.Reconcile.Duration())
-			slog.Warn("kernel reconcile failed, retrying", "err", err, "retry_in", backoff)
-			stopTimer(retry)
-			retry.Reset(backoff)
-		} else if backoff != 0 {
-			backoff = 0
-			stopTimer(retry)
-		}
+		switch {
+		case !r.enabled.Load():
+			// Stopped over the control socket. The withdrawal happens once per
+			// stop rather than once per wake-up, and the pass recorded after
+			// it reads zero installed, so a diagnostic does not go on
+			// reporting the routes of the last pass that ran.
+			if !r.withdrawn {
+				err := r.withdraw()
+				if err != nil {
+					slog.Warn("kernel could not withdraw everything it was asked to stop holding", "err", err)
+				}
+				r.routePass = Stats{}
+				r.recordPass(err)
+				r.withdrawn = true
+				backoff = 0
+				stopTimer(retry)
+				stopTimer(grace)
+				slog.Info("kernel reconciler stopped, its routes withdrawn", "where", r.Where())
+			}
+		default:
+			if r.withdrawn {
+				r.withdrawn = false
+				slog.Info("kernel reconciler started again", "where", r.Where())
+			}
+			if err := r.reconcile(); err != nil {
+				backoff = min(max(2*backoff, minRetryInterval), r.table.Reconcile.Duration())
+				slog.Warn("kernel reconcile failed, retrying", "err", err, "retry_in", backoff)
+				stopTimer(retry)
+				retry.Reset(backoff)
+			} else if backoff != 0 {
+				backoff = 0
+				stopTimer(retry)
+			}
 
-		stopTimer(grace)
-		if at, ok := r.captureDeadline(); ok {
-			grace.Reset(max(at.Sub(r.now()), 0))
+			stopTimer(grace)
+			if at, ok := r.captureDeadline(); ok {
+				grace.Reset(max(at.Sub(r.now()), 0))
+			}
 		}
 
 		select {
@@ -1073,6 +1130,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-ticker.C:
 		case <-retry.C:
 		case <-grace.C:
+		case <-r.wake:
 		case <-changed:
 			r.settle(ctx, changed, notify)
 		case <-notify:
@@ -1080,6 +1138,11 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		}
 	}
 
+	// A reconciler stopped over the socket has already withdrawn, and this
+	// second pass then lists an empty table and removes nothing. Running it
+	// anyway rather than skipping it on the flag keeps one exit path: what the
+	// kernel holds is read back rather than remembered, so anything installed
+	// between the stop and here still leaves.
 	return errors.Join(r.withdraw(), r.plat.Close())
 }
 

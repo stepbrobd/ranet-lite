@@ -15,12 +15,13 @@ import (
 	"github.com/NickCao/ranet-lite/internal/version"
 )
 
-// This file is the runtime's side of the control socket. Every method reads
-// live state under whatever lock owns it and returns a value, so a slow
+// This file is the runtime's side of the control socket's reads. Every method
+// reads live state under whatever lock owns it and returns a value, so a slow
 // reader on the socket never holds the dataplane's lock.
 //
-// Nothing here writes. The configuration's only entry points stay the file and
-// SIGHUP, which is why the socket carries no authorization beyond its mode.
+// Nothing here writes. The verbs that do are in write.go, and none of them
+// touches the configuration either: its entry points stay the file and SIGHUP,
+// which is why the socket carries no authorization beyond its mode.
 
 // SetKernelStatus hands the control surface the route reconciler's own view of
 // its last pass. The reconciler is built by the command rather than here,
@@ -113,6 +114,7 @@ func (c *Client) Status() control.Status {
 		Segments:        segmentText(c.Mesh.Segments()),
 		Steering:        c.Mesh.Steering().Entries(),
 		SegmentCounters: segmentCounters(c.Mesh.SegmentCounters()),
+		Disabled:        c.disabledSubsystems(),
 	}
 }
 

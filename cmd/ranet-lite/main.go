@@ -141,6 +141,10 @@ func runDaemon(opts options) int {
 	}
 	defer node.Close()
 	mesh := node.Mesh
+	// The reload verb re-reads the file this daemon was started with, so the
+	// socket and SIGHUP ask for the same thing rather than the socket guessing
+	// at a default path.
+	node.SetConfigPath(*configPath)
 
 	// A separate listener from pprof: a fleet node wants metrics scraped
 	// without exposing a profiler, and a profiling run wants the profiler
@@ -193,7 +197,7 @@ func runDaemon(opts options) int {
 			case <-ctx.Done():
 				return
 			case <-reload:
-				if err := node.Reload(*configPath); err != nil {
+				if err := node.ReloadFrom(*configPath); err != nil {
 					log.Printf("reload: %v", err)
 				}
 			}
@@ -225,6 +229,7 @@ func runDaemon(opts options) int {
 		log.Printf("tun device %s ready with %d queues, reconciling its routes into %s",
 			mesh.Name, mesh.QueueCount(), routes.Where())
 		node.SetKernelStatus(func() control.KernelStatus { return kernelStatus(routes) })
+		node.SetReconcilerEnable(routes.SetEnabled)
 	} else {
 		log.Printf("tun device %s ready with %d queues, configure its addresses and kernel routes externally",
 			mesh.Name, mesh.QueueCount())

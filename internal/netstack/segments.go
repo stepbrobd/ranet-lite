@@ -48,6 +48,16 @@ func (m *Mesh) SetSteering(table *srv6.SteerTable) { m.steerTable.Store(table) }
 // Steering is the table currently installed, for a diagnostic to report.
 func (m *Mesh) Steering() *srv6.SteerTable { return m.steerTable.Load() }
 
+// SetSteeringEnabled stops or starts steering without taking the table away,
+// so a diagnostic still reports the policies that would apply and an operator
+// can see what was stopped. A packet already encapsulated is not unwound: the
+// flag decides the packets looked at after it is stored, exactly as the table
+// pointer does.
+func (m *Mesh) SetSteeringEnabled(on bool) { m.steerStopped.Store(!on) }
+
+// SteeringEnabled reports whether the policies are being acted on.
+func (m *Mesh) SteeringEnabled() bool { return !m.steerStopped.Load() }
+
 // steerAction tells the caller how to treat a packet steer has looked at.
 type steerAction uint8
 
@@ -77,7 +87,9 @@ const (
 // that is a deployment to fix rather than to carry.
 func (m *Mesh) steer(buf []byte, size int, source, destination netip.Addr) (int, steerAction) {
 	table := m.steerTable.Load()
-	if table == nil {
+	// The stop is read after the table, so a node that steers nothing pays the
+	// one load it already paid and the second is on the nodes that do steer.
+	if table == nil || m.steerStopped.Load() {
 		return size, steerPass
 	}
 	policy := table.Lookup(source, destination)
@@ -380,6 +392,10 @@ type segmentCounters struct {
 	segmentsDelivered atomic.Uint64
 	segmentsDropped   atomic.Uint64
 	steerTable        atomic.Pointer[srv6.SteerTable]
+	// steerStopped holds the policies back without unloading them. Stored as
+	// the negative so the zero Mesh steers, as every caller that never asks
+	// expects it to.
+	steerStopped      atomic.Bool
 	segmentsSteered   atomic.Uint64
 	segmentsUnsteered atomic.Uint64
 	segmentsUnrouted  atomic.Uint64

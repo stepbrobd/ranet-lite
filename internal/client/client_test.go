@@ -478,7 +478,7 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 	c.reg.Store(&reg)
 	defer func() { cancel(); c.peers.Wait() }()
 
-	if err := c.Reload(configPath); err != nil {
+	if err := c.ReloadFrom(configPath); err != nil {
 		t.Fatalf("reloading on the key this node started with: %v", err)
 	}
 	// Rotated in place, which is how one is staged, so the path in the config
@@ -488,13 +488,13 @@ func TestReloadRefusesARotatedPrivateKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeKey(t, keyPath, rotated)
-	if err := c.Reload(configPath); err == nil {
+	if err := c.ReloadFrom(configPath); err == nil {
 		t.Error("a reload reported success while the node kept signing with the key it started on")
 	}
 	if err := os.Remove(keyPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Reload(configPath); err == nil {
+	if err := c.ReloadFrom(configPath); err == nil {
 		t.Error("a key file that no longer exists reported a successful reload")
 	}
 }
@@ -526,7 +526,7 @@ func TestReloadRefusesAssignedAddressChanges(t *testing.T) {
 			if _, err := config.Load(path); err != nil {
 				t.Fatalf("invalid reload fixture: %v", err)
 			}
-			if err := c.Reload(path); err == nil {
+			if err := c.ReloadFrom(path); err == nil {
 				t.Fatal("reload accepted an assigned address change")
 			}
 			if !slices.Equal(c.config().Routes().Announce, old.Routes().Announce) {
@@ -1052,7 +1052,7 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	writeConfig(t, configPath, &next)
 
-	if err := c.Reload(configPath); err != nil {
+	if err := c.ReloadFrom(configPath); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if got := len(c.config().Dial.To); got != 2 {
@@ -1387,7 +1387,7 @@ func TestReloadSkipsPeerRegistryNoLongerNames(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	writeConfig(t, configPath, cfg)
 
-	if err := c.Reload(configPath); err != nil {
+	if err := c.ReloadFrom(configPath); err != nil {
 		t.Fatalf("one stale peer refused the whole reload: %v", err)
 	}
 	if _, _, ok := c.registry().FindNode("example", "fourth"); !ok {
@@ -1505,7 +1505,7 @@ func TestDialerGivesUpOnAPeerItCannotReach(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			done := make(chan struct{})
-			go func() { defer close(done); c.runPeer(ctx, cfg.Link.Endpoints[0], peer) }()
+			go func() { defer close(done); c.runPeer(ctx, cfg.Link.Endpoints[0], peer, nil) }()
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
@@ -1761,7 +1761,7 @@ func TestDialerRepeatingOneFailureSaysItOnce(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(previous) })
 
 	done := make(chan struct{})
-	go func() { c.runPeer(ctx, cfg.Link.Endpoints[0], cfg.Dial.To[0]); close(done) }()
+	go func() { c.runPeer(ctx, cfg.Link.Endpoints[0], cfg.Dial.To[0], nil); close(done) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for written.count("reconnecting in") == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -1864,7 +1864,7 @@ func TestDialerGivesUpOnAPeerWithNoAddress(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			done := make(chan struct{})
-			go func() { c.runPeer(ctx, cfg.Link.Endpoints[0], peer); close(done) }()
+			go func() { c.runPeer(ctx, cfg.Link.Endpoints[0], peer, nil); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
@@ -1981,7 +1981,7 @@ func TestDialerGivesUpOnANodeAReloadRemoved(t *testing.T) {
 	unresolvable := "gateway.invalid"
 	reg[0].Nodes[1].Endpoints[0].Address = &unresolvable
 	done := make(chan struct{})
-	go func() { c.runPeer(ctx, local, named); close(done) }()
+	go func() { c.runPeer(ctx, local, named, nil); close(done) }()
 
 	// Still dialing while the registry names it.
 	select {

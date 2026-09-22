@@ -55,7 +55,7 @@ func (c *Client) syncPeers() {
 				continue
 			}
 			ctx, cancel := context.WithCancel(c.ctx)
-			running := &dialer{cancel: cancel}
+			running := &dialer{cancel: cancel, wake: make(chan struct{}, 1)}
 			c.dialers[path] = running
 			c.peers.Go(func() {
 				defer cancel()
@@ -65,7 +65,7 @@ func (c *Client) syncPeers() {
 				// skips it. The document is rewritten whenever any node joins,
 				// so a peer briefly absent from it is ordinary.
 				defer c.forgetDialer(path, running)
-				c.runPeer(ctx, local, peer)
+				c.runPeer(ctx, local, peer, running.wake)
 			})
 		}
 	}
@@ -79,17 +79,21 @@ func (c *Client) syncPeers() {
 	}
 }
 
-// Reload re-reads the configuration and the trust document and applies what
-// can be applied without dropping the tunnels this node is carrying: the
-// document itself, the peers we dial, and the prefixes we announce. ranet
-// reconciles the same way rather than restarting, and it matters here because
-// the document is rewritten every time any node joins the mesh.
+// ReloadFrom re-reads the configuration and the trust document at path and
+// applies what can be applied without dropping the tunnels this node is
+// carrying: the document itself, the peers we dial, and the prefixes we
+// announce. ranet reconciles the same way rather than restarting, and it
+// matters here because the document is rewritten every time any node joins the
+// mesh.
 //
 // Everything a reload cannot reach is refused rather than applied, because
 // each such change alters what peers have already authenticated or what the
 // dataplane is attached to, so a restart is the honest way to change them and
 // a half-applied reload would be worse than none.
-func (c *Client) Reload(path string) error {
+//
+// SIGHUP calls this, and so does the control socket's reload verb through
+// Reload, which supplies the path the daemon was started with.
+func (c *Client) ReloadFrom(path string) error {
 	cfg, err := config.Load(path)
 	if err != nil {
 		return err
