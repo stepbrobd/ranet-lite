@@ -1,7 +1,24 @@
-// Package control is the read-only view of a running node and the client that
-// reads it. The daemon serves JSON over a unix socket and the same binary's
-// subcommands render it, which is the answer to `birdc show babel neighbors`
-// and `birdc show route` once Babel has moved out of BIRD.
+// Package control is the wire format of a running node's read-only view, the
+// client that reads it and the server that answers. The daemon serves JSON
+// over a unix socket and the same binary's subcommands render it, which is the
+// answer to `birdc show babel neighbors` and `birdc show route` once Babel has
+// moved out of BIRD.
+//
+// # What a caller uses
+//
+// A monitor or a control plane dials [DefaultSocket] with [Dial] and reads
+// [Client.Status], [Client.Neighbors], [Client.Routes], [Client.Sessions] and
+// [Client.Peers], each of which returns the types declared here. A program
+// that holds a node of its own instead implements [Source] and hands it to
+// [Serve] over a listener from [Listen]. The daemon in this repository is one
+// such program and takes no privileged path of its own. The Render functions
+// write the same values as the text the subcommands print.
+//
+// Nothing outside this package is needed to speak the protocol: the types are
+// plain structs over [net/netip] addresses and a [Duration] that marshals as a
+// Go duration string, and the paths are named constants. This package imports
+// nothing else in this repository, so a caller takes it without taking the
+// daemon.
 //
 // # Read-only
 //
@@ -13,10 +30,11 @@
 //
 // # Versioning
 //
-// Paths carry a /v0 prefix. The shape below is this repository's own and is
-// consumed by this repository's own client, so v0 promises only that a client
-// and a daemon from the same build agree. A field may be added at any time; a
-// client ignores what it does not know.
+// Paths carry a /v0 prefix. v0 promises that a client and a daemon built from
+// the same revision agree, and nothing wider: a field may be added at any
+// time, and a caller ignores what it does not know rather than refusing it. A
+// removal or a change of meaning takes a new prefix, so a caller pinned to
+// /v0 keeps reading what it read.
 package control
 
 import (

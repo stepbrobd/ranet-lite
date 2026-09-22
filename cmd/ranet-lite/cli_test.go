@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/control"
 )
 
 // stubSource stands in for a running node, so the subcommands are exercised
@@ -50,7 +50,7 @@ func serveStub(t *testing.T) string {
 }
 
 // socketPath names a socket short enough to bind. See the same helper in
-// internal/control/server_test.go for what t.TempDir() costs on darwin.
+// control/server_test.go for what t.TempDir() costs on darwin.
 func socketPath(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "rl")

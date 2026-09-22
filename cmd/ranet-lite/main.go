@@ -26,9 +26,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/client"
 	"github.com/NickCao/ranet-lite/internal/config"
-	"github.com/NickCao/ranet-lite/internal/control"
 	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 )

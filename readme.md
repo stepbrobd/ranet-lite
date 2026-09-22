@@ -650,10 +650,10 @@ other, so a mark is unnecessary there as well. What the reconciler computes, the
 set of prefixes the mesh reaches and the source prefix each one is for, maps
 onto those lists directly; what it will not have is a table to put them in.
 
-The control surface is platform-neutral by construction. `internal/control`
-holds the types and the handler and speaks no transport of its own, so the unix
-socket is how linux and darwin reach it and a mobile app reads the same JSON
-over the extension's own channel.
+The control surface is platform-neutral by construction. `control` holds the
+types and the handler and speaks no transport of its own, so the unix socket is
+how linux and darwin reach it and a mobile app reads the same JSON over the
+extension's own channel.
 
 ## Control socket
 
@@ -882,9 +882,22 @@ fails validation changes nothing.
 
 ## Repository layout
 
+A package outside `internal` is an API other programs may import, and carries a
+package doc that says what a caller calls. The rule that decides membership is
+mechanical: a package can only sit outside `internal` if everything it imports
+does too, so the import graph fixes the order in which anything else follows.
+
+- `control` is the read-only control socket, its wire types, and the client the
+  subcommands read it with. It is the surface a control plane or a third-party
+  monitor talks to, and it imports nothing else in this repository.
+- `esp` is userspace ESP AEAD encap and decap with anti-replay.
+- `sadr` is the immutable source and destination routing trie, with snapshot
+  iteration.
+
+The rest is this program's own assembly, or is held inside by one import:
+
 - `internal/ike` is the IKEv2 initiator and responder.
 - `internal/client` owns the runtime, peer reconnection, and the ESP pipeline.
-- `esp` is userspace ESP AEAD encap and decap with anti-replay.
 - `internal/transport` is the shared UDP socket mux, separating IKE from ESP
   framing.
 - `internal/netstack` owns the TUN device and the `(source, destination)` route
@@ -894,18 +907,17 @@ fails validation changes nothing.
   routing table it owns on linux, or on darwin into the single table that
   platform has, and assigns the TUN's addresses.
 - `internal/packet` validates TUN and decrypted IP packets.
-- `sadr` is the immutable source and destination routing trie, with snapshot
-  iteration.
 - `internal/registry` reads a ranet-compatible `registry.json` and Ed25519 key
   loading.
+- `internal/schema` holds the scalar spellings the configuration file uses, with
+  the decoder pair each one needs.
 - `internal/config` is ranet-lite's own config format.
-- `internal/control` is the read-only control socket, its wire types, and the
-  client the subcommands read it with.
 - `internal/srv6` is segment routing: the header, the encapsulation, and the two
   behaviors this mesh uses, all in this process rather than in a kernel.
 - `internal/egress` is the exit node and subnet router capability: the source
   translation, the nftables table it owns, and the advertisement it withholds
   while that table does not hold the rules the configuration asks for.
+- `internal/notices` is the third-party notice file the binary carries.
 - `internal/kernel/rules_linux.go` is the policy rules and the VRF, which exist
   on linux alone and are therefore optional halves of the platform rather than
   methods every backend stubs out.

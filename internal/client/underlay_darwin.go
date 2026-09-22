@@ -5,7 +5,7 @@ package client
 import (
 	"path/filepath"
 
-	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/transport"
 )

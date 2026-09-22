@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/NickCao/ranet-lite/internal/control"
+	"github.com/NickCao/ranet-lite/control"
 	"github.com/NickCao/ranet-lite/internal/notices"
 	"github.com/NickCao/ranet-lite/internal/version"
 )

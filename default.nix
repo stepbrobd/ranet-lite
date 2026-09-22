@@ -18,8 +18,11 @@ buildGoApplication (
       toSource {
         root = ./.;
         fileset = unions [
-          # code
+          # code. This is an allow list, so a package promoted out of internal
+          # has to be named here in the same commit that moves it, or the
+          # sandbox builds a tree that cannot compile.
           ./cmd
+          ./control
           ./esp
           ./internal
           ./sadr
