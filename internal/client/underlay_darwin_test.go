@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/ike"
 	"github.com/NickCao/ranet-lite/transport"
 )
 

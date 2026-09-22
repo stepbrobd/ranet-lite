@@ -961,10 +961,12 @@ does too, so the import graph fixes the order in which anything else follows.
   H.Encaps, and the End and End.DT46 behaviors, taking bytes and returning bytes
   so that a caller acts on the header without a kernel. It imports `sadr` and
   `schema`.
+- `ike` is the IKEv2 initiator and responder, one set of modern transforms and
+  no others, negotiating the Child SA `esp` carries over a `transport` hub. It
+  imports `esp`, `transport` and `schema`.
 
 The rest is this program's own assembly, or is held inside by one import:
 
-- `internal/ike` is the IKEv2 initiator and responder.
 - `internal/client` owns the runtime, peer reconnection, and the ESP pipeline.
 - `internal/netstack` owns the TUN device and the `(source, destination)` route
   table.
@@ -989,10 +991,11 @@ The rest is this program's own assembly, or is held inside by one import:
   smoke-test binaries used during development (IKE, ESP, babel tests). They are
   under `internal` so that nothing outside this repository can install them.
 
-`internal/ike` follows, a minimal IKEv2 initiator and responder that named the
-configuration vocabulary in an exported signature and was blocked on it alone.
-`internal/babel` and `internal/kernel` are blocked on `internal/netstack`, the
-daemon's dataplane, which is a wider move.
+`internal/babel` and `internal/kernel` are the two worth promoting next, an RFC
+8966 speaker with SADR and RTT and a route reconciler with real ownership
+semantics on two platforms. Both are blocked on `internal/netstack`, the
+daemon's dataplane, so moving them means promoting it too or cutting what each
+takes from it down to an interface, which is a wider move than any of these.
 
 The nix half follows the same layout as [inc](https://github.com/stepbrobd/inc),
 over [autopilot](https://github.com/stepbrobd/autopilot), which loads `lib/` and

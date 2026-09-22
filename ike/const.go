@@ -1,13 +1,47 @@
-// Package ike implements a minimal RFC 7815 style IKEv2 initiator, scoped to
-// exactly what is needed to interoperate with a strongSwan responder using
-// modern cryptography: raw Ed25519 public key authentication (RFC 7427
-// Digital Signature, ASN1_DN identity), X25519/AES-GCM or ChaCha20-Poly1305,
-// forced UDP encapsulation, and 0.0.0.0/0::/0 tunnel-mode traffic selectors.
+// Package ike is an IKEv2 initiator and responder in the minimal shape
+// [RFC 7815] describes, negotiating a tunnel-mode Child SA that
+// [github.com/NickCao/ranet-lite/esp] then carries. It offers one set of
+// transforms and no others: raw Ed25519 public key authentication ([RFC 7427]
+// Digital Signature with an ASN1_DN identity), X25519, AES-GCM or
+// ChaCha20-Poly1305, UDP encapsulation forced on, and 0.0.0.0/0 with ::/0 as
+// the traffic selectors. It interoperates with a strongSwan responder
+// configured the same way.
 //
-// The responder role is in scope in this fork, because two ranet-lite nodes
-// have to be able to reach each other; see responder.go. Still out of scope
-// by design: certificates, EAP, MOBIKE, legacy transforms (CBC ciphers, MODP
-// DH groups, SHA-1/MD5).
+// Certificates, EAP, MOBIKE and the legacy transforms, CBC ciphers, MODP
+// groups and SHA-1 or MD5, are left out rather than unfinished, and a peer
+// proposing only those is refused.
+//
+// # What a caller uses
+//
+// Both roles run over a [github.com/NickCao/ranet-lite/transport] hub, which
+// the caller binds and hands in, because IKE and the ESP it negotiates share
+// one UDP port.
+//
+//   - Dialing. [Initiate] or [InitiateContext] take a [PeerConfig] naming both
+//     identities and both keys, and return a [Session] holding the negotiated
+//     [ChildSA]. [Session.Run] then drives that SA for its lifetime, answering
+//     the peer's liveness checks and deletes and rekeying before a key
+//     expires. [Session.SetChildHandler] and [Session.SetChildRetireHandler]
+//     are where a rekey hands the caller the replacement keys and takes the
+//     old SPI back, so the caller's dataplane swaps without dropping a packet.
+//   - Answering. [NewResponder] takes a [ResponderConfig] whose Lookup
+//     resolves an initiator's asserted identity to the key that has to verify
+//     it, and [Responder.Serve] calls back with a [Session] and an [Accepted]
+//     for each peer that authenticates. One responder serves every peer, and
+//     holds no state for one until IDi is verified.
+//   - Timing. [Crypto] is the cap.crypto capability, carrying yaml, json and
+//     toml tags and the replay window alongside the rekey intervals, since a
+//     session captures all of them when it is set up. Its durations come from
+//     [github.com/NickCao/ranet-lite/schema], and the Default constants below
+//     give the values an absent block runs with.
+//
+// The message, payload and transform codecs are exported beside those, so a
+// caller can build or read one exchange without driving a session. [RFC 7296]
+// numbers every constant here, and each declaration names its section.
+//
+// [RFC 7296]: https://www.rfc-editor.org/rfc/rfc7296
+// [RFC 7427]: https://www.rfc-editor.org/rfc/rfc7427
+// [RFC 7815]: https://www.rfc-editor.org/rfc/rfc7815
 package ike
 
 // Exchange types, RFC 7296 §3.1.

@@ -40,7 +40,7 @@ func TestDERLengthMustBeMinimal(t *testing.T) {
 // The word size decides the outcome, so on amd64 this passes with the bound in
 // derElement deleted: the later length test produces the same message. On 386
 // it does not, and deleting the bound panics on the slice rather than
-// refusing. `CGO_ENABLED=0 GOARCH=386 go test ./internal/ike/ -run TestDER`
+// refusing. `CGO_ENABLED=0 GOARCH=386 go test ./ike/ -run TestDER`
 // on x86_64-linux holds it; do not read a green run here as proof.
 func TestDERLengthBeyondTheBufferIsRefusedNotSliced(t *testing.T) {
 	for name, raw := range map[string][]byte{

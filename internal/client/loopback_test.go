@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/control"
+	"github.com/NickCao/ranet-lite/ike"
 	"github.com/NickCao/ranet-lite/internal/config"
-	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )

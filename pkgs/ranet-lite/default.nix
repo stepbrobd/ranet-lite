@@ -29,6 +29,7 @@ buildGoApplication (
           (root + "/cmd")
           (root + "/control")
           (root + "/esp")
+          (root + "/ike")
           (root + "/internal")
           (root + "/sadr")
           (root + "/schema")

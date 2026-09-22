@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
-	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 

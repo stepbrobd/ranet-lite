@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
-	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/ike"
 )
 
 func loadPriv(path string) ed25519.PrivateKey {

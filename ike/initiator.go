@@ -16,10 +16,11 @@ import (
 	"github.com/NickCao/ranet-lite/transport"
 )
 
-// PeerConfig describes everything needed to establish one IKEv2 SA with a
-// single ranet-provisioned strongSwan node: raw Ed25519 pubkey auth (RFC
-// 7427, ASN1_DN identity), 0.0.0.0/0::/0 tunnel-mode Child SA, forced UDP
-// encapsulation. See ike/const.go for the modern-only crypto this offers.
+// PeerConfig describes one peer this node dials and everything establishing an
+// IKEv2 SA with it takes: raw Ed25519 pubkey auth (RFC 7427, ASN1_DN
+// identity), a 0.0.0.0/0::/0 tunnel-mode Child SA and forced UDP
+// encapsulation. The package doc lists the transforms this offers, which are
+// the only ones it proposes or accepts.
 type PeerConfig struct {
 	Organization string
 

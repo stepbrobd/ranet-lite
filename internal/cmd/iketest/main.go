@@ -1,6 +1,6 @@
 // iketest is a throwaway interop-test harness: it runs one IKEv2 initiator
 // handshake against a real strongSwan responder and prints the negotiated
-// Child SA. Used to validate internal/ike against the netns test rig before
+// Child SA. Used to validate package ike against the netns test rig before
 // wiring it into the real client.
 package main
 
@@ -16,7 +16,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/ike"
 )
 
 func loadPriv(path string) ed25519.PrivateKey {
