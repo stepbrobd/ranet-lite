@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"slices"
 	"sync"
@@ -75,6 +74,9 @@ import (
 type UnderlayDefaults struct {
 	mu   sync.Mutex
 	sock rtSocket
+	// host is the machine this writes to and reads back, the running kernel
+	// unless the caller named another; see Host.
+	host Host
 	// closed is set by Close. Every entry point refuses afterwards rather than
 	// dereferencing a socket that is gone.
 	closed bool
@@ -158,22 +160,23 @@ var errUnderlayClosed = errors.New("kernel: the underlay defaults are closed")
 // finds the lock held, says so, and carries on with no record of its own. A
 // state file that cannot be read is reported and treated as empty, because a
 // node that will not start is worse than a route left behind.
-func NewUnderlayDefaults(links defaultRoutes, mesh int, statePath string) (*UnderlayDefaults, error) {
+func NewUnderlayDefaults(host Host, links defaultRoutes, mesh int, statePath string) (*UnderlayDefaults, error) {
 	if links == nil {
 		return nil, errors.New("kernel: the underlay defaults need a link source")
 	}
-	sock, err := dialRouteSocket()
+	host = hostOr(host)
+	sock, err := routeSocket(host)
 	if err != nil {
 		return nil, err
 	}
 	u := &UnderlayDefaults{
-		sock: sock, links: links, mesh: mesh, statePath: statePath,
+		sock: sock, host: host, links: links, mesh: mesh, statePath: statePath,
 		written:      make(map[writtenDefault]bool),
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),
 		warned:       make(map[netip.Prefix]bool),
-		dump:         func() ([]byte, error) { return route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0) },
-		lookupDevice: deviceIndex,
+		dump:         func() ([]byte, error) { return host.Dump(int(route.RIBTypeRoute), 0) },
+		lookupDevice: host.InterfaceIndex,
 	}
 	// Before the file is read, so nothing below can act on a record another
 	// live process is still keeping.
@@ -522,11 +525,7 @@ func (u *UnderlayDefaults) removeOne(held writtenDefault) error {
 // deviceName is the name of one interface index, which the record carries so
 // that a reused index cannot be mistaken for the device that was recorded.
 func (u *UnderlayDefaults) deviceName(index int) (string, error) {
-	device, err := net.InterfaceByIndex(index)
-	if err != nil {
-		return "", fmt.Errorf("kernel: name interface %d: %w", index, err)
-	}
-	return device.Name, nil
+	return hostOr(u.host).InterfaceName(index)
 }
 
 // stillOurs reports whether the kernel holds a default at this destination

@@ -20,7 +20,7 @@ import (
 // rather than behind RANET_LITE_DARWIN_NETTEST. A host with no default route
 // is the one honest reason to skip.
 func TestDefaultInterfaceNamesALinkThisHostHas(t *testing.T) {
-	links, err := WatchLinks(0)
+	links, err := WatchLinks(nil, 0)
 	if err != nil {
 		t.Fatalf("open the link watcher: %v", err)
 	}

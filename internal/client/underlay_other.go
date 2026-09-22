@@ -11,7 +11,8 @@ import (
 // the mesh's routing with a socket mark and a policy rule, which needs neither
 // a lookup nor a route of its own, and every other platform refuses both
 // spellings by name in internal/transport rather than opening a socket that
-// does neither.
-func underlayRuntime(transport.Underlay, string) (transport.Runtime, kernel.CaptureRoutes, func(), error) {
+// does neither. The host is taken and ignored for the same reason: this
+// platform reads no routing table of its own here.
+func underlayRuntime(transport.Underlay, string, kernel.Host) (transport.Runtime, kernel.CaptureRoutes, func(), error) {
 	return transport.Runtime{}, nil, func() {}, nil
 }

@@ -43,7 +43,12 @@ type Client struct {
 	// needs nothing. It lives here rather than in main because it shares the
 	// link watcher the transport binds through, and the two have to agree
 	// about which interface the underlay is on.
-	capture  kernel.CaptureRoutes
+	capture kernel.CaptureRoutes
+	// host is the machine the underlay and the route reconciler read and
+	// write, nil for the one this process is running on. It is kept so the
+	// reconciler this client hands the command is built against the same
+	// machine the underlay was opened on.
+	host     kernel.Host
 	sessions *sessionSet
 	workers  int
 	ctx      context.Context
@@ -170,7 +175,7 @@ func New(cfg *config.Config) (_ *Client, err error) {
 			mesh.Close()
 		}
 	}()
-	return newClient(cfg, privateKey, reg, mesh)
+	return newClient(cfg, privateKey, reg, mesh, nil)
 }
 
 // steeredMTU is the device MTU once the largest configured segment list has
@@ -183,9 +188,11 @@ func steeredMTU(steering *srv6.SteerTable) (int, error) {
 }
 
 // newClient is New with the loading done, so a test can stand up a client
-// around a mesh it built itself rather than a privileged TUN.
-func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.Registry, mesh *netstack.Mesh) (_ *Client, err error) {
-	underlay, capture, closeUnderlay, err := underlayRuntime(cfg.Link.Underlay, mesh.Name)
+// around a mesh it built itself rather than a privileged TUN. host is the
+// machine the underlay reads and writes, nil for the one this process is
+// running on, as New passes and as a deployment gets.
+func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.Registry, mesh *netstack.Mesh, host kernel.Host) (_ *Client, err error) {
+	underlay, capture, closeUnderlay, err := underlayRuntime(cfg.Link.Underlay, mesh.Name, host)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +220,7 @@ func newClient(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.R
 	c := &Client{
 		Mesh: mesh, privateKey: privateKey,
 		speaker: speaker, hub: hub, closeUnderlay: closeUnderlay, capture: capture,
+		host:     host,
 		sessions: newSessionSet(),
 		workers:  max(1, runtime.GOMAXPROCS(0)),
 		ctx:      ctx, cancel: cancel,
@@ -274,6 +282,33 @@ func (c *Client) Close() {
 // this machine's own traffic, or nil where the platform needs nothing. The
 // command that builds the reconciler hands it to kernel.Config.
 func (c *Client) CaptureRoutes() kernel.CaptureRoutes { return c.capture }
+
+// KernelRuntime is everything cap.table is handed rather than told: the device
+// the mesh actually got, the addresses the transport has to keep reaching, the
+// prefixes cap.route announces, and the two halves of link.underlay that only
+// a running node knows. None of it is a fact an operator writes down, which is
+// why none of it is in the capability.
+//
+// It is assembled here rather than in the command because four of the six are
+// this client's own and the fifth is the setting under which it opened them.
+// The command builds the reconciler from it; see kernel.Runtime for what each
+// field decides.
+func (c *Client) KernelRuntime() kernel.Runtime {
+	cfg := c.config()
+	return kernel.Runtime{
+		Interface: c.Mesh.Name,
+		Underlay:  c.Underlay,
+		Announced: cfg.Routes().Announced(),
+		Sessions:  c.LiveSessions,
+		// One setting decides both halves, so they cannot be set against each
+		// other: the transport binds its socket off the forwarding table, and
+		// the reconciler stops hiding an announced default from every socket
+		// that did not ask for the tun by name.
+		BoundUnderlay: cfg.Link.Underlay.Bind,
+		Capture:       c.CaptureRoutes(),
+		Host:          c.host,
+	}
+}
 
 // LiveSessions is how many of this node's sessions have recently proved their
 // peer is there. The route reconciler reads it before it hands this machine's

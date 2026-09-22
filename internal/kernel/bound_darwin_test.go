@@ -47,7 +47,7 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	links, err := WatchLinks(meshDevice.Index)
+	links, err := WatchLinks(nil, meshDevice.Index)
 	if err != nil {
 		t.Fatalf("open the link watcher: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	}
 
 	state := filepath.Join(t.TempDir(), "underlay.json")
-	underlay, err := NewUnderlayDefaults(links, meshDevice.Index, state)
+	underlay, err := NewUnderlayDefaults(nil, links, meshDevice.Index, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	// A process that came back with no record of its own withdraws nothing,
 	// whatever it finds in the table.
 	empty := filepath.Join(t.TempDir(), "underlay.json")
-	restarted, err := NewUnderlayDefaults(links, meshDevice.Index, empty)
+	restarted, err := NewUnderlayDefaults(nil, links, meshDevice.Index, empty)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	}
 
 	// The restart reclaims it, because it wrote the record down.
-	reclaimed, err := NewUnderlayDefaults(links, meshDevice.Index, state)
+	reclaimed, err := NewUnderlayDefaults(nil, links, meshDevice.Index, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +283,7 @@ func TestDefaultInterfaceIgnoresTheMeshItself(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	links, err := WatchLinks(device.Index)
+	links, err := WatchLinks(nil, device.Index)
 	if err != nil {
 		t.Fatal(err)
 	}

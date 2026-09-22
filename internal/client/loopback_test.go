@@ -139,7 +139,7 @@ func tryLoopbackMesh(t *testing.T) (_, _ *loopbackNode, err error) {
 		peer := nodes[1-i]
 		node.configPath = filepath.Join(dir, node.name+".yaml")
 		node.cfg = writeLoopbackConfig(t, node, peer, keyPath, registryPath, []string{node.prefix.String()})
-		client, err := newClient(node.cfg, private, reg, netstack.NewRoutesOnly())
+		client, err := newClient(node.cfg, private, reg, netstack.NewRoutesOnly(), nil)
 		if err != nil {
 			for _, built := range nodes[:i] {
 				built.client.Close()

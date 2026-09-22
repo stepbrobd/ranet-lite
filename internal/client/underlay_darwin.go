@@ -21,14 +21,15 @@ import (
 // mesh is this node's own tun, which the lookup must never answer with: once
 // the mesh holds a route covering the address space, an ordinary lookup for
 // the unspecified address names the tun, and binding to that would put every
-// datagram this node sends inside its own tunnel.
+// datagram this node sends inside its own tunnel. host is the machine both
+// halves read and write, nil for the one this process is running on.
 //
 // The returned close is always safe to call.
-func underlayRuntime(underlay transport.Underlay, mesh string) (transport.Runtime, kernel.CaptureRoutes, func(), error) {
+func underlayRuntime(underlay transport.Underlay, mesh string, host kernel.Host) (transport.Runtime, kernel.CaptureRoutes, func(), error) {
 	if !underlay.Bind {
 		return transport.Runtime{}, nil, func() {}, nil
 	}
-	links, err := kernel.WatchLinksOn(mesh)
+	links, err := kernel.WatchLinksOn(host, mesh)
 	if err != nil {
 		return transport.Runtime{}, nil, func() {}, err
 	}
@@ -36,7 +37,7 @@ func underlayRuntime(underlay transport.Underlay, mesh string) (transport.Runtim
 	// directory saying what this process owns, and which a RuntimeDirectory=
 	// unit clears on a clean boot.
 	state := filepath.Join(filepath.Dir(control.DefaultSocket), "underlay.json")
-	routes, err := kernel.NewUnderlayDefaults(links, links.Mesh(), state)
+	routes, err := kernel.NewUnderlayDefaults(host, links, links.Mesh(), state)
 	if err != nil {
 		_ = links.Close()
 		return transport.Runtime{}, nil, func() {}, err

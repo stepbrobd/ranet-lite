@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 
 	"golang.org/x/net/route"
@@ -53,10 +52,11 @@ type routePlatform struct {
 	rt    Runtime
 	index int
 
-	sock     rtSocket
-	control4 int
-	control6 int
-	monitor  *routeMonitor
+	// host is the machine this writes to and reads back, the running kernel
+	// unless the caller named another; see Host.
+	host    Host
+	sock    rtSocket
+	watcher Watcher
 
 	// scoped remembers the source behind each route installed with
 	// RTF_IFSCOPE, which the FIB cannot store, and an invalid prefix for a
@@ -138,16 +138,16 @@ func newPlatform(t Table, rt Runtime) (platform, error) {
 	if len(rt.Interface) >= unix.IFNAMSIZ {
 		return nil, fmt.Errorf("kernel: interface name %q does not fit an ifreq", rt.Interface)
 	}
+	host := hostOr(rt.Host)
 	// the index is resolved once: netstack owns the utun for the whole process
 	// lifetime, so a changed index means a different device and the routes of
 	// the old one went with it.
-	device, err := net.InterfaceByName(rt.Interface)
+	index, err := host.InterfaceIndex(rt.Interface)
 	if err != nil {
-		return nil, fmt.Errorf("kernel: look up interface %s: %w", rt.Interface, err)
+		return nil, err
 	}
 	plat := &routePlatform{
-		table: t, rt: rt, index: device.Index,
-		control4: -1, control6: -1,
+		table: t, rt: rt, index: index, host: host,
 		scoped:   make(map[netip.Prefix]netip.Prefix),
 		warned:   make(map[Route]bool),
 		occupied: make(map[occupiedKey]bool),
@@ -162,22 +162,16 @@ func newPlatform(t Table, rt Runtime) (platform, error) {
 	return plat, nil
 }
 
-// open takes the descriptors the platform holds for its whole lifetime. The
-// address ioctls are dispatched by the domain of the socket they arrive on, so
-// IPv4 and IPv6 each need one of their own.
+// open takes the descriptors the platform holds for its whole lifetime: the
+// route socket every install goes out of, and the watcher that says when
+// somebody else changed this interface's routing.
 func (p *routePlatform) open() error {
-	sock, err := dialRouteSocket()
+	sock, err := routeSocket(p.host)
 	if err != nil {
 		return err
 	}
 	p.sock = sock
-	if p.control4, err = controlSocket(unix.AF_INET); err != nil {
-		return err
-	}
-	if p.control6, err = controlSocket(unix.AF_INET6); err != nil {
-		return err
-	}
-	p.monitor, err = newRouteMonitor(p.index, 0, false)
+	p.watcher, err = p.host.Watch(p.index, 0, false)
 	return err
 }
 
@@ -190,21 +184,15 @@ func controlSocket(family int) (int, error) {
 	return fd, nil
 }
 
-func (p *routePlatform) Notify() <-chan struct{} { return p.monitor.signal }
+func (p *routePlatform) Notify() <-chan struct{} { return p.watcher.Changed() }
 
 // Close tolerates a partly opened platform, because newPlatform unwinds
 // through it when one of the descriptors cannot be taken.
 func (p *routePlatform) Close() error {
 	var errs []error
-	if p.monitor != nil {
-		errs = append(errs, p.monitor.Close())
-		p.monitor = nil
-	}
-	for _, fd := range []*int{&p.control4, &p.control6} {
-		if *fd >= 0 {
-			errs = append(errs, unix.Close(*fd))
-			*fd = -1
-		}
+	if p.watcher != nil {
+		errs = append(errs, p.watcher.Close())
+		p.watcher = nil
 	}
 	if p.sock != nil {
 		errs = append(errs, p.sock.Close())
@@ -250,7 +238,7 @@ func (p *routePlatform) Routes() ([]Route, error) {
 	if p.rt.Underlay != nil {
 		p.underlay = p.rt.Underlay()
 	}
-	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
+	rib, err := p.host.Dump(int(route.RIBTypeRoute), 0)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the routing table: %w", err)
 	}
@@ -740,7 +728,7 @@ func (p *routePlatform) Addrs() ([]netip.Prefix, error) {
 	if p.addrs != nil {
 		return p.addrs()
 	}
-	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeInterface, p.index)
+	rib, err := p.host.Dump(int(route.RIBTypeInterface), p.index)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the addresses of %s: %w", p.rt.Interface, err)
 	}
@@ -783,38 +771,19 @@ func (p *routePlatform) interfaceAddrs(rib []byte) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// AddAddr names the ioctl in its error, because the two families take
-// different requests down different control sockets and an errno on its own
-// does not say which one answered.
+// AddAddr puts one configured address on the device. Which ioctl that is, and
+// which control socket carries it, is the host's business; see
+// runningKernel.Assign.
 func (p *routePlatform) AddAddr(prefix netip.Prefix) error {
-	name, fd, number := "SIOCAIFADDR", p.control4, uintptr(unix.SIOCAIFADDR)
-	build := aliasRequest4
-	if !prefix.Addr().Is4() {
-		name, fd, number, build = "SIOCAIFADDR_IN6", p.control6, siocAIfAddrIn6, aliasRequest6
-	}
-	request, err := build(p.rt.Interface, prefix)
-	if err != nil {
-		return err
-	}
-	if err := ioctlRequest(fd, number, request); err != nil {
-		return fmt.Errorf("%s on %s: %w", name, p.rt.Interface, err)
-	}
-	return nil
+	return p.host.Assign(true, p.rt.Interface, prefix)
 }
 
 // DelAddr removes one address, and is reached only for an address the
-// reconciler added itself in this process lifetime.
+// reconciler added itself in this process lifetime. An address that is already
+// gone is not a failure: the next pass would do nothing about it either.
 func (p *routePlatform) DelAddr(prefix netip.Prefix) error {
-	// The builder is selected and then called, never called before the family
-	// is known: deleteRequest4 reads the address as four bytes and panics on a
-	// v6 prefix. AddAddr above has the same shape for the same reason.
-	name, fd, number := "SIOCDIFADDR", p.control4, uintptr(unix.SIOCDIFADDR)
-	build := deleteRequest4
-	if !prefix.Addr().Is4() {
-		name, fd, number, build = "SIOCDIFADDR_IN6", p.control6, siocDIfAddrIn6, deleteRequest6
-	}
-	if err := ioctlRequest(fd, number, build(p.rt.Interface, prefix)); err != nil && !gone(err) {
-		return fmt.Errorf("%s on %s: %w", name, p.rt.Interface, err)
+	if err := p.host.Assign(false, p.rt.Interface, prefix); err != nil && !gone(err) {
+		return err
 	}
 	return nil
 }

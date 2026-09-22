@@ -458,7 +458,7 @@ func TestSecondProcessReclaimsNothing(t *testing.T) {
 	// And the constructor carries on rather than refusing to start, with no
 	// record of its own to act on.
 	links := &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}}
-	u, err := NewUnderlayDefaults(links, 0, state)
+	u, err := NewUnderlayDefaults(nil, links, 0, state)
 	if err != nil {
 		t.Fatalf("a second process refused to start: %v", err)
 	}

@@ -228,6 +228,12 @@ type Runtime struct {
 	// It is opened by whatever owns the link watcher, so it is handed here
 	// rather than written in cap.table.
 	Capture CaptureRoutes
+	// Host is the machine this reconciler reads and writes, nil for the one
+	// this process is running on, as a daemon passes. A test hands
+	// in a recorded routing table so the path from a configuration file to a
+	// route on the wire can be run without a kernel; see Host. Only the darwin
+	// backend reads it.
+	Host Host
 }
 
 // Name is the master device, empty for a table bound to none.

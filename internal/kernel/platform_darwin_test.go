@@ -73,7 +73,7 @@ func testPlatform(t *testing.T, tbl Table, rt Runtime) (*routePlatform, *fakeRou
 	sock := &fakeRouteSocket{t: t}
 	return &routePlatform{
 		table: tbl, rt: rt, index: testIndex, sock: sock,
-		control4: -1, control6: -1,
+		host:     runningKernel{},
 		warned:   make(map[Route]bool),
 		pending:  make(map[Route]bool),
 		scoped:   make(map[netip.Prefix]netip.Prefix),

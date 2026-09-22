@@ -27,14 +27,41 @@ type rtSocket interface {
 	Close() error
 }
 
-// pfRoute is one PF_ROUTE socket carrying RTM_ADD and RTM_DELETE. The
-// reconcile loop is its only caller, so seq needs no lock; notifications
-// arrive on the monitor's separate socket precisely so an unsolicited message
-// can never be mistaken for a reply.
-type pfRoute struct {
-	fd  int
-	seq int
+// stampedSocket is rtSocket over a RouteWriter: it numbers each message and
+// encodes it, and what is left underneath is a write of bytes. The reconcile
+// loop is the only caller of one of these, so seq needs no lock;
+// notifications arrive on the monitor's separate socket precisely so an
+// unsolicited message can never be mistaken for a reply.
+type stampedSocket struct {
+	writer RouteWriter
+	seq    int
 }
+
+// routeSocket opens the write side a host offers and puts the stamping in
+// front of it.
+func routeSocket(host Host) (rtSocket, error) {
+	writer, err := host.RouteSocket()
+	if err != nil {
+		return nil, err
+	}
+	return &stampedSocket{writer: writer}, nil
+}
+
+func (s *stampedSocket) WriteRoute(message *route.RouteMessage) error {
+	s.seq++
+	message.Version = unix.RTM_VERSION
+	message.ID, message.Seq = uintptr(os.Getpid()), s.seq
+	raw, err := message.Marshal()
+	if err != nil {
+		return fmt.Errorf("encode routing message: %w", err)
+	}
+	return s.writer.WriteRoute(raw)
+}
+
+func (s *stampedSocket) Close() error { return s.writer.Close() }
+
+// pfRoute is one PF_ROUTE socket carrying RTM_ADD and RTM_DELETE.
+type pfRoute struct{ fd int }
 
 func dialRouteSocket() (*pfRoute, error) {
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
@@ -54,17 +81,10 @@ func dialRouteSocket() (*pfRoute, error) {
 	return &pfRoute{fd: fd}, nil
 }
 
-func (s *pfRoute) WriteRoute(message *route.RouteMessage) error {
-	s.seq++
-	message.Version = unix.RTM_VERSION
-	message.ID, message.Seq = uintptr(os.Getpid()), s.seq
-	raw, err := message.Marshal()
-	if err != nil {
-		return fmt.Errorf("encode routing message: %w", err)
-	}
+func (s *pfRoute) WriteRoute(raw []byte) error {
 	// route_output reports its result as the errno of the write itself, so
 	// there is no reply to correlate and nothing to read back.
-	_, err = unix.Write(s.fd, raw)
+	_, err := unix.Write(s.fd, raw)
 	return err
 }
 
@@ -394,6 +414,10 @@ func (m *routeMonitor) wakesOn(message []byte) bool {
 	refused := binary.NativeEndian.Uint32(message[rtmErrnoOffset:]) != 0
 	return !ours || !refused
 }
+
+// Changed carries one coalesced wake-up per batch, for a follower or a
+// reconcile loop to select on.
+func (m *routeMonitor) Changed() <-chan struct{} { return m.signal }
 
 // wake never blocks: a reader that misses one coalesced signal sees the change
 // on the next one, or on the periodic sweep.

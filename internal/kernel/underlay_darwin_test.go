@@ -46,6 +46,22 @@ func (f *fakeDefaults) Default(family netip.Addr) (int, netip.Addr, error) {
 	return held.index, held.gateway, nil
 }
 
+// namedDevices is the interface list these tests decide, so the two indexes
+// below name the same devices on every machine the suite runs on. Only the
+// naming half of Host is reachable from here; everything else goes through the
+// fake socket and the recorded table.
+type namedDevices struct{ Host }
+
+func (namedDevices) InterfaceName(index int) (string, error) {
+	switch index {
+	case uplinkIndex:
+		return "uplink0", nil
+	case dockIndex:
+		return "dock0", nil
+	}
+	return "", errors.New("no such interface")
+}
+
 // testUnderlay wires the owner onto a fake route socket and a routing table
 // the test writes, so every assertion is about the messages that reached the
 // kernel rather than about the bookkeeping beside them.
@@ -53,7 +69,7 @@ func testUnderlay(t *testing.T, links defaultRoutes, rib func() []byte) (*Underl
 	t.Helper()
 	sock := &fakeRouteSocket{t: t}
 	return &UnderlayDefaults{
-		sock: sock, links: links,
+		sock: sock, links: links, host: namedDevices{},
 		written:      make(map[writtenDefault]bool),
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),

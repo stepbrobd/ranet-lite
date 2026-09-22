@@ -31,7 +31,7 @@ func TestDarwinStrandsABoundSocketOnlyThroughTheZeroAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	links, err := WatchLinks(device.Index)
+	links, err := WatchLinks(nil, device.Index)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestDarwinScopedDefaultUnstrandsEverySetThatStranded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	links, err := WatchLinks(device.Index)
+	links, err := WatchLinks(nil, device.Index)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestDarwinScopedDefaultUnstrandsEverySetThatStranded(t *testing.T) {
 	}
 
 	before := defaultRoutesOnHost(t)
-	underlay, err := NewUnderlayDefaults(links, device.Index, "")
+	underlay, err := NewUnderlayDefaults(nil, links, device.Index, "")
 	if err != nil {
 		t.Fatal(err)
 	}

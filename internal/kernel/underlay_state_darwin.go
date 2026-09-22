@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -357,14 +356,4 @@ func unscopedDefaultIndex(messages []route.Message, destination netip.Prefix) (i
 		}
 	}
 	return 0, false
-}
-
-// deviceIndex resolves an interface name, which reclaim uses to tell a reused
-// index from the device that was recorded.
-func deviceIndex(name string) (int, error) {
-	device, err := net.InterfaceByName(name)
-	if err != nil {
-		return 0, err
-	}
-	return device.Index, nil
 }
