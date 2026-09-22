@@ -822,7 +822,7 @@ func TestCapabilityIsOnBecauseItsBlockIsThere(t *testing.T) {
 // uncommenting "table:" and leaving its fields commented gave a mesh with no
 // routes, no rules and no message.
 func TestBlockPresenceAgreesAcrossDecoders(t *testing.T) {
-	caps := reflect.TypeOf(Caps{})
+	caps := reflect.TypeFor[Caps]()
 	for i := range caps.NumField() {
 		key, _, _ := strings.Cut(caps.Field(i).Tag.Get("yaml"), ",")
 		// Either the block is on, or the capability refused the empty block by
@@ -1068,7 +1068,7 @@ func TestBareScalarKeyIsNotAWrittenZero(t *testing.T) {
 				return
 			}
 			field := reflect.ValueOf(cfg).Elem()
-			for _, key := range strings.Split(path, ".") {
+			for key := range strings.SplitSeq(path, ".") {
 				if field.Kind() == reflect.Pointer {
 					field = field.Elem()
 				}
@@ -1109,8 +1109,7 @@ func pointerScalars(ty reflect.Type, prefix string) []string {
 		return nil
 	}
 	var out []string
-	for i := range ty.NumField() {
-		field := ty.Field(i)
+	for field := range ty.Fields() {
 		if !field.IsExported() {
 			continue
 		}

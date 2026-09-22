@@ -294,8 +294,7 @@ func tomlField(structure reflect.Type, key string) (reflect.StructField, bool) {
 	if structure.Kind() != reflect.Struct {
 		return reflect.StructField{}, false
 	}
-	for i := range structure.NumField() {
-		field := structure.Field(i)
+	for field := range structure.Fields() {
 		if !field.IsExported() {
 			continue
 		}
