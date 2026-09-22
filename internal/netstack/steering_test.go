@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/internal/srv6"
+	"github.com/NickCao/ranet-lite/schema"
 	"golang.zx2c4.com/wireguard/tun"
 )
 

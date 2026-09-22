@@ -10,8 +10,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/egress"
 	"github.com/NickCao/ranet-lite/internal/kernel"
 	"github.com/NickCao/ranet-lite/internal/netstack"
-	"github.com/NickCao/ranet-lite/internal/schema"
 	"github.com/NickCao/ranet-lite/internal/srv6"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 // A field added to the dataplane's counters and not to the wire's is a number

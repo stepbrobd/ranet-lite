@@ -21,7 +21,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 func loadPriv(path string) ed25519.PrivateKey {

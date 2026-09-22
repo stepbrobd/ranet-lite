@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 // Routes is the cap.route capability: what this node puts into the mesh, and

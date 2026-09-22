@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 	"golang.org/x/sys/unix"
 )
 

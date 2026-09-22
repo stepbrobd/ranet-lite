@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/netstack"
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 // wireSpeakerPair connects two Speakers via a plain in-memory relay (no

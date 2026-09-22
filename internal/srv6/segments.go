@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 	"gopkg.in/yaml.v3"
 )
 

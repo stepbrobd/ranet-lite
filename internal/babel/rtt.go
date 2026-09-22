@@ -3,7 +3,7 @@ package babel
 import (
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 // nowMicros is a 32-bit microsecond clock for RFC 9616 Timestamp sub-TLVs

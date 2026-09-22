@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/netstack"
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 func prefix(s string) netip.Prefix { return netip.MustParsePrefix(s) }

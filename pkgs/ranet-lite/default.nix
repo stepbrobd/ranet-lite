@@ -31,6 +31,7 @@ buildGoApplication (
           (root + "/esp")
           (root + "/internal")
           (root + "/sadr")
+          (root + "/schema")
           (root + "/transport")
           # the example is parsed by a test, so it has to be in the source the
           # checks see or that test passes only outside the sandbox

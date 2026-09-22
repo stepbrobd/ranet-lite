@@ -442,8 +442,8 @@ members are `internal/srv6`'s, and `internal/babel` takes `cap.babel` and
 `cap.route` directly. `internal/config` holds the node's own facts and the
 checks that span two capabilities, such as a SID that is also an address the
 reconciler assigns. The scalar spellings, a duration, a prefix, an address, a
-table and an announcement, live in `internal/schema` and carry both decoders, so
-a field parses the same way whichever extension the file has.
+table and an announcement, live in `schema` and carry both decoders, so a field
+parses the same way whichever extension the file has.
 
 **Your trust document and private key are sensitive.** They identify and
 authenticate a real node in a real mesh. Never commit real copies of either;
@@ -952,11 +952,14 @@ does too, so the import graph fixes the order in which anything else follows.
 - `esp` is userspace ESP AEAD encap and decap with anti-replay.
 - `sadr` is the immutable source and destination routing trie, with snapshot
   iteration.
+- `schema` is the scalar vocabulary a configuration file is written in: a
+  duration, a prefix, an address, a routing table and one announcement, each
+  carrying the decoder pair and the emptiness test that yaml, json and toml
+  between them ask for. It imports nothing else in this repository.
 
 The rest is this program's own assembly, or is held inside by one import:
 
-- `internal/ike` is the IKEv2 initiator and responder. It is held inside by
-  `internal/schema`, which its rekey intervals are spelled in.
+- `internal/ike` is the IKEv2 initiator and responder.
 - `internal/client` owns the runtime, peer reconnection, and the ESP pipeline.
 - `internal/netstack` owns the TUN device and the `(source, destination)` route
   table.
@@ -967,13 +970,9 @@ The rest is this program's own assembly, or is held inside by one import:
 - `internal/packet` validates TUN and decrypted IP packets.
 - `internal/registry` reads a ranet-compatible `registry.json` and Ed25519 key
   loading.
-- `internal/schema` holds the scalar spellings the configuration file uses, with
-  the decoder pair each one needs.
 - `internal/config` is ranet-lite's own config format.
 - `internal/srv6` is segment routing: the header, the encapsulation, and the two
-  behaviors this mesh uses, all in this process rather than in a kernel. It too
-  is held inside by `internal/schema`, which its segments and steering entries
-  are spelled in.
+  behaviors this mesh uses, all in this process rather than in a kernel.
 - `internal/egress` is the exit node and subnet router capability: the source
   translation, the nftables table it owns, and the advertisement it withholds
   while that table does not hold the rules the configuration asks for.
@@ -989,10 +988,9 @@ The rest is this program's own assembly, or is held inside by one import:
 
 `internal/ike` and `internal/srv6` are the two worth promoting next, a minimal
 IKEv2 initiator and responder and an RFC 8754 and RFC 8986 implementation that
-acts on a segment routing header in userspace. Both are blocked on
-`internal/schema` alone, which they carry in exported signatures, so either one
-moves when the configuration vocabulary is a public commitment or when those
-signatures stop naming it. `internal/babel` and `internal/kernel` are blocked on
+acts on a segment routing header in userspace. Each named the configuration
+vocabulary in an exported signature and was blocked on it alone, which no longer
+holds either one inside. `internal/babel` and `internal/kernel` are blocked on
 `internal/netstack`, the daemon's dataplane, which is a wider move.
 
 The nix half follows the same layout as [inc](https://github.com/stepbrobd/inc),

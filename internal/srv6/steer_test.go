@@ -6,7 +6,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 // The file spellings of the two, for an entry of the capability itself.

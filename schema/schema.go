@@ -1,18 +1,49 @@
-// Package schema holds the scalar spellings a configuration file uses: a
-// duration, a prefix, an address, a routing table and one announcement. Every
-// capability takes its fields from here, so a duration is written the same way
-// wherever it appears and a later generator or DSL has one definition of each
-// to target.
+// Package schema holds the scalar spellings a configuration file is written
+// in: a duration, a prefix, an address, a routing table and one announcement.
+// Every capability takes its fields from here, which fixes one spelling per
+// scalar wherever it appears and gives a later generator or DSL one definition
+// of each to target. A configuration file commits to these spellings, and
+// changing one changes what an operator may already have written down.
 //
-// Each type carries two decoders, because the two this tree reads dispatch
-// differently. yaml.v3 asks a type for [yaml.Unmarshaler] and never for
-// [encoding.TextUnmarshaler]; BurntSushi/toml asks for the text one and never
-// for the yaml one. A type carrying one and not the other is a field that
-// parses under one file extension and is refused under the other, which is the
-// worst of the failures a second decoder can introduce.
+// # What a caller uses
 //
-// Nothing here imports the rest of this tree, so a capability package can take
-// it whatever else that package holds.
+// [Duration], [Prefix], [Addr], [TableID] and [Announce] are the vocabulary
+// itself. A capability declares them by value in its own struct, beside the
+// yaml, json and toml tags that name the key. [ParsePrefix], [ParseAddr] and
+// the Must forms build one from a literal, [PrefixFrom] and [AddrFrom] carry
+// in a value [net/netip] already parsed, and [ComparePrefix] and [CompareAddr]
+// put a list whose order the subsystem does not read into one order, which is
+// how two files writing the same set compare equal across a reload.
+//
+// This package imports nothing else in this repository, so a capability
+// package takes it without taking the daemon.
+//
+// # Adding a scalar
+//
+// A capability with a scalar of its own, a behavior or a link quality, writes
+// five methods on it. The three encoders this tree reads and writes dispatch
+// differently, and a method left out is found by an operator rather than by
+// the compiler.
+//
+//   - UnmarshalText and UnmarshalYAML. yaml.v3 asks a type for
+//     [yaml.Unmarshaler] and never for [encoding.TextUnmarshaler];
+//     BurntSushi/toml asks for the text one and never for the yaml one. A type
+//     carrying one alone parses under one file extension and is refused under
+//     the other. [Scalar] routes the yaml half into the text half, which
+//     leaves both decoders reading the same spellings and only the wrapping
+//     differing.
+//   - MarshalText and MarshalYAML, for the same split going the other way. A
+//     type whose written form is a mapping rather than a word takes the yaml
+//     one alone, and [Announce] records why.
+//   - IsZero, when the type wraps a struct. yaml.v3 decides omitempty for a
+//     struct by asking for IsZero and otherwise walking the exported fields,
+//     and a [net/netip] value exports none, so a prefix holding 10.0.0.0/8 is
+//     dropped on the way out rather than written. encoding/json fails the
+//     other way around: omitempty never drops a struct at all, which is why an
+//     omitempty json tag here carries omitzero beside it, the option under
+//     which json does ask for IsZero.
+//
+// Each of those three has cost this tree a round of debugging already.
 package schema
 
 import (

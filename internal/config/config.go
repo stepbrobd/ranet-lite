@@ -435,7 +435,7 @@ func fieldByKey(target reflect.Value, key string) reflect.Value {
 }
 
 // decodesItself reports a type that reads its own yaml. Everything in
-// internal/schema does, and each of them spells one scalar, so the walk above
+// package schema does, and each of them spells one scalar, so the walk above
 // stops rather than taking the fields behind the spelling for keys.
 func decodesItself(t reflect.Type) bool {
 	if t.Kind() != reflect.Pointer {

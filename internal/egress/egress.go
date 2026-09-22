@@ -49,7 +49,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/NickCao/ranet-lite/internal/schema"
+	"github.com/NickCao/ranet-lite/schema"
 )
 
 const (
