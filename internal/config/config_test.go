@@ -17,8 +17,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/babel"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/kernel"
-	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/schema"
+	"github.com/NickCao/ranet-lite/srv6"
 	"github.com/NickCao/ranet-lite/transport"
 )
 

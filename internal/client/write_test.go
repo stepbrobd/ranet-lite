@@ -13,8 +13,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
-	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/schema"
+	"github.com/NickCao/ranet-lite/srv6"
 )
 
 // writable builds a node with all three subsystems configured, so a test below

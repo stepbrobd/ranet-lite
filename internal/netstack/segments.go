@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
-	"github.com/NickCao/ranet-lite/internal/srv6"
+	"github.com/NickCao/ranet-lite/srv6"
 )
 
 // This file is where segment routing meets the dataplane. The decision itself
-// is in internal/srv6, which takes bytes and returns bytes; here is the part
+// is in package srv6, which takes bytes and returns bytes; here is the part
 // that knows about peers, about the tun and about backpressure.
 //
 // It sits on the inbound path rather than on the kernel's forwarding table

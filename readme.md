@@ -438,12 +438,12 @@ The capabilities, each documented in full in the example:
 
 A capability is defined once, by the package that implements it, and validates
 itself there: `cap.table` is the type `internal/kernel` takes, `cap.segment`'s
-members are `internal/srv6`'s, and `internal/babel` takes `cap.babel` and
-`cap.route` directly. `internal/config` holds the node's own facts and the
-checks that span two capabilities, such as a SID that is also an address the
-reconciler assigns. The scalar spellings, a duration, a prefix, an address, a
-table and an announcement, live in `schema` and carry both decoders, so a field
-parses the same way whichever extension the file has.
+members are `srv6`'s, and `internal/babel` takes `cap.babel` and `cap.route`
+directly. `internal/config` holds the node's own facts and the checks that span
+two capabilities, such as a SID that is also an address the reconciler assigns.
+The scalar spellings, a duration, a prefix, an address, a table and an
+announcement, live in `schema` and carry both decoders, so a field parses the
+same way whichever extension the file has.
 
 **Your trust document and private key are sensitive.** They identify and
 authenticate a real node in a real mesh. Never commit real copies of either;
@@ -488,7 +488,7 @@ dataplane. A packet leaving a node is read off the tun here, routed here and
 sealed into ESP here, so pushing an outer IPv6 header and a routing header in
 front of it is one more step on a path that already copies. A packet arriving is
 decrypted here before anything else sees it, so a segment addressed to this node
-is acted on before it reaches the tun. `internal/srv6` implements
+is acted on before it reaches the tun. `srv6` implements
 [RFC 8754](https://www.rfc-editor.org/rfc/rfc8754)'s header and
 [RFC 8986](https://www.rfc-editor.org/rfc/rfc8986)'s H.Encaps, End and End.DT46,
 and the same code runs on every platform.
@@ -497,7 +497,8 @@ and the same code runs on every platform.
 packet to its next segment and sends it on; `End.DT46` strips the outer header
 and hands what was inside to the stack. The spelling is the one
 `ip route ... encap seg6local action` takes, so a fleet's own SIDs move across
-unchanged.
+unchanged. The AS10779 fleet writes `End` at `<base>6::2` and `End.DT46` at
+`<base>6::1`, with `<base>6::3` a second `End.DT46` into the egress VRF.
 
 `cap.segment.steer` is which of this node's own packets go through a segment
 list. It is keyed by source and destination prefix together, the pair the
@@ -531,8 +532,8 @@ check holds: the client steers through a SID the gateway answers for with
 `seg6local`, `tcpdump` parses the header as `RT6 (len=2, type=4, segleft=0)`,
 and removing the SID leaves the encapsulated packet arriving with nothing coming
 out of it. The other direction, a header the kernel writes and this tree acts
-on, is held by the unit tests in `internal/srv6` against a reconstruction of
-what `__seg6_do_srh_encap` produces, and by no VM arm: no arm configures
+on, is held by the unit tests in `srv6` against a reconstruction of what
+`__seg6_do_srh_encap` produces, and by no VM arm: no arm configures
 `cap.segment.local`, so `End` and `End.DT46` have no end-to-end coverage.
 
 ## Exit nodes and subnet routers
@@ -956,6 +957,10 @@ does too, so the import graph fixes the order in which anything else follows.
   duration, a prefix, an address, a routing table and one announcement, each
   carrying the decoder pair and the emptiness test that yaml, json and toml
   between them ask for. It imports nothing else in this repository.
+- `srv6` is segment routing over IPv6 in userspace: the RFC 8754 header,
+  H.Encaps, and the End and End.DT46 behaviors, taking bytes and returning bytes
+  so that a caller acts on the header without a kernel. It imports `sadr` and
+  `schema`.
 
 The rest is this program's own assembly, or is held inside by one import:
 
@@ -971,8 +976,6 @@ The rest is this program's own assembly, or is held inside by one import:
 - `internal/registry` reads a ranet-compatible `registry.json` and Ed25519 key
   loading.
 - `internal/config` is ranet-lite's own config format.
-- `internal/srv6` is segment routing: the header, the encapsulation, and the two
-  behaviors this mesh uses, all in this process rather than in a kernel.
 - `internal/egress` is the exit node and subnet router capability: the source
   translation, the nftables table it owns, and the advertisement it withholds
   while that table does not hold the rules the configuration asks for.
@@ -986,12 +989,10 @@ The rest is this program's own assembly, or is held inside by one import:
   smoke-test binaries used during development (IKE, ESP, babel tests). They are
   under `internal` so that nothing outside this repository can install them.
 
-`internal/ike` and `internal/srv6` are the two worth promoting next, a minimal
-IKEv2 initiator and responder and an RFC 8754 and RFC 8986 implementation that
-acts on a segment routing header in userspace. Each named the configuration
-vocabulary in an exported signature and was blocked on it alone, which no longer
-holds either one inside. `internal/babel` and `internal/kernel` are blocked on
-`internal/netstack`, the daemon's dataplane, which is a wider move.
+`internal/ike` follows, a minimal IKEv2 initiator and responder that named the
+configuration vocabulary in an exported signature and was blocked on it alone.
+`internal/babel` and `internal/kernel` are blocked on `internal/netstack`, the
+daemon's dataplane, which is a wider move.
 
 The nix half follows the same layout as [inc](https://github.com/stepbrobd/inc),
 over [autopilot](https://github.com/stepbrobd/autopilot), which loads `lib/` and

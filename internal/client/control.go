@@ -11,8 +11,8 @@ import (
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
-	"github.com/NickCao/ranet-lite/internal/srv6"
 	"github.com/NickCao/ranet-lite/internal/version"
+	"github.com/NickCao/ranet-lite/srv6"
 )
 
 // This file is the runtime's side of the control socket's reads. Every method

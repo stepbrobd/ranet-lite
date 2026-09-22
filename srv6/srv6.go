@@ -1,42 +1,53 @@
-// Package srv6 is segment routing over IPv6 done in this process rather than
-// by a kernel.
+// Package srv6 implements segment routing over IPv6 in userspace: the routing
+// header of [RFC 8754], H.Encaps of [RFC 8986] section 5.1, and the two
+// endpoint behaviors a mesh needs, End, a waypoint that forwards to the next
+// segment, and End.DT46, an exit that strips the outer header and delivers
+// what was inside.
 //
-// # Why here
-//
-// The fleet's SRv6 today is `ip route ... encap seg6local`, which is a linux
-// facility and only a linux facility: darwin has no segment routing, and a
+// Nothing here touches a socket, a route table or a kernel. Every entry point
+// takes bytes and returns bytes, so a process that already carries the packet
+// acts on the header itself, identically on every platform and under a test
+// that needs no privileges. That is the reason to reach for this rather than
+// linux's seg6local: darwin has no segment routing at all, and a
 // NEPacketTunnelProvider or a VpnService is handed a tun and a list of routes
-// and never sees a forwarding table at all. Waiting for each platform's kernel
-// would mean segment routing on one of the four.
+// and never sees a forwarding table.
 //
-// It does not have to be the kernel's, because this process is already the
-// dataplane. A packet leaving a node is read off the tun here, routed here and
-// sealed into ESP here, so pushing an outer IPv6 header and a routing header
-// in front of it is one more step on a path that already copies. A packet
-// arriving is decrypted here before anything else sees it, so a segment
-// addressed to this node can be acted on before it is written to the tun. The
-// same code then runs on every platform, and a converted fleet needs no
-// seg6local routes at all.
+// # What a caller uses
 //
-// # What it implements
+// Three entry points, one per direction a packet takes.
 //
-// [RFC 8754] for the header and [RFC 8986] for the two behaviors this mesh
-// uses: End, a waypoint that forwards to the next segment, and End.DT46, an
-// exit that strips the outer header and delivers what was inside. The fleet
-// spells those as `<base>6::2` and `<base>6::1`, with `<base>6::3` a second
-// End.DT46 into the egress VRF, and the encapsulation this package performs is
-// H.Encaps of RFC 8986 section 5.1.
+//   - Sending. [Encapsulate] puts an outer IPv6 header and a routing header in
+//     front of an inner packet, and [EncapsulateInPlace] does it in a buffer
+//     the caller already owns. [Overhead] sizes the result beforehand and
+//     [CheckPath] refuses a path before anything is built from it.
+//   - Receiving, for a segment this node answers for. [NewLocalTable] takes
+//     the [Segment] list and [LocalTable.Handle] returns a [Result] saying
+//     whether to pass the packet on untouched, forward it to the [Result.Next]
+//     segment, deliver the [Result.Inner] packet, or drop it. [End] and
+//     [Decap] are those two behaviors on their own.
+//   - Choosing. [NewSteerTable] takes the [Steer] list and [SteerTable.Lookup]
+//     answers which [Policy], if any, one of this node's own packets takes.
 //
-// Nothing here touches a socket or a route table. It takes bytes and returns
-// bytes, which makes it testable without a kernel and identical on every
-// platform.
+// A nil [LocalTable] or [SteerTable] answers for nothing rather than panicking,
+// which is the node configuring no segment routing, so a caller never has to
+// ask first.
+//
+// [Segments] is the serialized form of both tables together, carrying yaml,
+// json and toml tags and validating itself, and [Segments.Tables] builds the
+// pair from it. Its scalars come from
+// [github.com/NickCao/ranet-lite/schema].
+//
+// [Parse] reads a routing header on its own, and [TimeExceeded] and
+// [ParameterProblem] build the ICMPv6 errors RFC 8986's pseudocode answers a
+// refused packet with, which is how a waypoint stays visible to traceroute.
+// Whether such an answer is sent, and how often, stays with the caller.
 //
 // # What it does not read
 //
 // A routing header is found only where it is the first extension header, which
-// is where H.Encaps puts it and where every encapsulation on this mesh has it.
-// A packet that reached a segment of this node's behind a hop-by-hop or
-// destination options header is refused rather than acted on, where
+// is where H.Encaps puts it and where every encapsulation this package
+// produces has it. A packet that reached a local segment behind a hop-by-hop
+// or destination options header is refused rather than acted on, where
 // ipv6_find_hdr would have walked to it.
 //
 // [RFC 8754]: https://www.rfc-editor.org/rfc/rfc8754
