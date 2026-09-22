@@ -686,6 +686,64 @@ func TestBlockPresenceAgreesAcrossDecoders(t *testing.T) {
 	}
 }
 
+// link.underlay mark and cap.table rules are two halves of one setting, in two
+// blocks, with nothing in either to say the other is missing. A node that sets
+// the mark and forgets the rule marks its ESP socket, nothing reads the mark,
+// and the underlay follows the mesh table: on a live leaf that put this node's
+// own IKE into the tun carrying it, 52 datagrams in eight seconds, with no
+// message. The refusal names both halves and writes the rule out.
+func TestUnderlayMarkNeedsTheRuleThatReadsIt(t *testing.T) {
+	// The mark goes inside the link block the base node already writes, since
+	// a second "link:" key is a different refusal entirely.
+	markedYAML := strings.Replace(nodeYAML, "  endpoints:", "  underlay: { mark: 0x726c }\n  endpoints:", 1)
+	markedTOML := nodeTOML + "[link.underlay]\nmark = 0x726c\n"
+	for name, pair := range map[string]struct{ asYAML, asTOML string }{
+		"no rule selects on it": {
+			asYAML: "cap:\n  table: {}\n",
+			asTOML: "[cap.table]\n",
+		},
+		"a rule sends it back into the mesh table": {
+			asYAML: "cap:\n  table:\n    id: 200\n    rules: [{ fwmark: 0x726c, table: 200, priority: 40, family: both }]\n",
+			asTOML: "[cap.table]\nid = 200\nrules = [{ fwmark = 0x726c, table = 200, priority = 40, family = \"both\" }]\n",
+		},
+		"a rule's mask masks it out": {
+			asYAML: "cap:\n  table:\n    rules: [{ fwmark: 0x726c, fwmask: 0xff0000, table: main, priority: 40, family: both }]\n",
+			asTOML: "[cap.table]\nrules = [{ fwmark = 0x726c, fwmask = 0xff0000, table = \"main\", priority = 40, family = \"both\" }]\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for extension, body := range map[string]string{
+				".yaml": markedYAML + pair.asYAML,
+				".toml": markedTOML + pair.asTOML,
+			} {
+				_, err := load(t, extension, body)
+				if err == nil {
+					t.Fatalf("%s took a mark nothing selects on", extension)
+				}
+				for _, named := range []string{"link.underlay mark", "cap.table rules", "0x726c", `table = "main"`} {
+					if !strings.Contains(err.Error(), named) {
+						t.Errorf("%s: the refusal reads %q and does not name %s", extension, err, named)
+					}
+				}
+			}
+		})
+	}
+	// The rule examples/config.toml documents satisfies it, whichever spelling
+	// the table is written in.
+	for _, table := range []string{"main", "254"} {
+		body := markedYAML + "cap:\n  table:\n    rules: [{ fwmark: 0x726c, table: " + table + ", priority: 40, family: both }]\n"
+		if _, err := loadYAML(t, body); err != nil {
+			t.Errorf("the documented rule was refused with table %s: %v", table, err)
+		}
+	}
+	// A node that writes no cap.table writes no rules either, so the rule is
+	// installed by whatever configures its routes and this file cannot see it.
+	// Refusing here would refuse a fleet node that works.
+	if _, err := loadYAML(t, markedYAML); err != nil {
+		t.Errorf("a mark on a node that configures its routes elsewhere was refused: %v", err)
+	}
+}
+
 // One level down, where the rule holds the same way: a cap.table.vrf naming no
 // device is refused by name under either decoder, rather than read as no VRF
 // under one of them.

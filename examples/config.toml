@@ -48,7 +48,8 @@ endpoints = [{ serial = "0", family = "ip4" }]
 # has no meaning for it.
 #
 # mark is SO_MARK on the socket, linux only. The reconciler writes the matching
-# rule itself, see cap.table.rules below.
+# rule itself, see cap.table.rules below, and a mark no rule there selects on is
+# refused: a marked socket nothing reads follows the mesh table anyway.
 #
 # bind is IP_BOUND_IF and IPV6_BOUND_IF on the interface the host's own default
 # route leaves by, darwin only. It also gives that interface a default of its

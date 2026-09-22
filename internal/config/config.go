@@ -440,6 +440,9 @@ func (c *Config) validateNode() error {
 // validateAcrossCapabilities is the part no capability can check alone,
 // because each half is in a different block.
 func (c *Config) validateAcrossCapabilities() error {
+	if err := c.validateUnderlayMark(); err != nil {
+		return err
+	}
 	// A SID this node also carries as an ordinary address would go dark: the
 	// inbound seam acts on a packet by its destination before the tun sees it,
 	// so every packet to that address would be refused as carrying no routing
@@ -459,4 +462,25 @@ func (c *Config) validateAcrossCapabilities() error {
 		}
 	}
 	return nil
+}
+
+// validateUnderlayMark refuses a mark nothing looks at. The two halves of the
+// setting are written in different blocks: link.underlay mark puts SO_MARK on
+// the one socket carrying IKE and ESP, and a cap.table rules entry selecting
+// that mark sends it to a table the mesh does not write. With only the first,
+// the marked socket follows the mesh table exactly as an unmarked one
+// would, and a default an exit announced there routes this node's own IKE into
+// the tun carrying it. Measured on a live leaf: 52 IKE datagrams entered the
+// tun in eight seconds, none of those sessions could establish, and nothing
+// said so.
+//
+// Only where cap.table is written, because that is the only place this file
+// can put a rule. A deployment configuring its routes elsewhere writes the
+// rule elsewhere too, and refusing that would refuse a node that works.
+func (c *Config) validateUnderlayMark() error {
+	mark := c.Link.Underlay.Mark
+	if mark == 0 || c.Cap.Table == nil || c.Cap.Table.ReadsMark(mark) {
+		return nil
+	}
+	return fmt.Errorf("config: link.underlay mark %#x is selected by no cap.table rules entry, so the marked socket still follows the mesh table: add { fwmark = %#x, table = \"main\", priority = 40, family = \"both\" } to cap.table rules, or take the mark out", mark, mark)
 }

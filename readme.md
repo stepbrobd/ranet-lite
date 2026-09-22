@@ -74,7 +74,12 @@ underlay into the tun carrying it.
 
 `link.underlay.mark` is `SO_MARK`, linux only, and the reconciler installs the
 rule matching it: write it under `cap.table.rules`, as
-`{ fwmark = 0x726c, table = "main", priority = 40, family = "both" }`.
+`{ fwmark = 0x726c, table = "main", priority = 40, family = "both" }`. The two
+halves are one setting written in two blocks, so a node that writes `cap.table`
+and leaves that rule out is refused by name: a marked socket no rule selects on
+follows the mesh table exactly as an unmarked one would. A node configuring its
+routes elsewhere writes no `cap.table`, and the rule goes wherever those routes
+do.
 
 `link.underlay.bind` is `IP_BOUND_IF` and `IPV6_BOUND_IF`, darwin only, set to
 the interface the host's own default route leaves by and moved with `setsockopt`
