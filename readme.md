@@ -914,16 +914,26 @@ tests that write to a real routing table, and `internal/egress` one that writes
 into a real packet filter. Both unshare a network namespace and refuse to
 continue unless it is empty, and both skip unless run as root, on darwin unless
 `RANET_LITE_DARWIN_NETTEST=1` is also set, because that machine is on a live
-mesh. The `netlink` VM check runs both binaries as root against a real kernel,
-which is the only place the `nf_tables` encoding is checked against something
-other than the decoder it was written beside. Protocol-level interoperability is
-covered by the NixOS VM tests exposed by `flake.nix`. Each boots separate client
-and gateway VMs; the client runs the packaged, user-facing `ranet-lite` binary
-with a real TUN device, while the gateway runs `charon-systemd`/`swanctl`, BIRD,
-and iperf3. The default test verifies an Ed25519-authenticated IKEv2 and Child
-SA negotiation across asymmetric local and remote UDP ports, checks Babel route
-exchange in both directions, and measures TCP bandwidth through the negotiated
-ESP tunnel:
+mesh.
+
+`internal/kernel` names the machine it reads and writes, `kernel.Host`, so the
+darwin backend can be driven without either. `internal/client`'s
+`daemon_darwin_test.go` uses that to run a configuration file all the way to a
+daemon against a recorded routing table: the transport binds, the underlay
+writes the default its bound socket depends on, and the reconciler holds an
+announced default out of the kernel until a session is live, all asserted on the
+routes that arrive rather than on the calls that made them. It needs no
+privilege, and the one thing it leaves with the running kernel is `IP_BOUND_IF`
+on the transport's own UDP socket. The `netlink` VM check runs both binaries as
+root against a real kernel, which is the only place the `nf_tables` encoding is
+checked against something other than the decoder it was written beside.
+Protocol-level interoperability is covered by the NixOS VM tests exposed by
+`flake.nix`. Each boots separate client and gateway VMs; the client runs the
+packaged, user-facing `ranet-lite` binary with a real TUN device, while the
+gateway runs `charon-systemd`/`swanctl`, BIRD, and iperf3. The default test
+verifies an Ed25519-authenticated IKEv2 and Child SA negotiation across
+asymmetric local and remote UDP ports, checks Babel route exchange in both
+directions, and measures TCP bandwidth through the negotiated ESP tunnel:
 
 ```sh
 nix build .#checks.x86_64-linux.integration -L
