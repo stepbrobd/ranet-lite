@@ -1,10 +1,12 @@
 package kernel
 
 import (
+	"context"
 	"errors"
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -415,6 +417,40 @@ func TestNewRefusesABoundUnderlayWithNoSessionSource(t *testing.T) {
 	}, table); err != nil && strings.Contains(err.Error(), "session source") {
 		t.Errorf("a bound underlay with a session source was refused for the same reason: %v", err)
 	}
+}
+
+// The deadline is an answer nobody has to ask for: the run loop arms a timer
+// from it, and nothing else wakes at the moment the grace expires, because the
+// mesh has stopped changing and that silence is why the grace is running.
+// Driven through the real loop with the sweep a minute out, so the grace timer
+// is the only thing that can reach the withdrawal.
+func TestRunWithdrawsTheCaptureOnTheGraceRatherThanTheSweep(t *testing.T) {
+	var live atomic.Int64
+	live.Store(1)
+	reconciler, table, fake := harness(t,
+		Table{Reconcile: schema.Duration(time.Minute), CaptureGrace: schema.Duration(MinCaptureGrace)},
+		Runtime{Sessions: func() int { return int(live.Load()) }})
+	capture := Route{Destination: prefix("::/0"), Metric: defaultIPv6Metric}
+	table.Set(netip.Prefix{}, capture.Destination, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- reconciler.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waitFor(t, func() bool { return fake.has(capture) })
+
+	// The change this test made before the loop started drives one pass of its
+	// own, so the sessions go quiet after it rather than under it: from here
+	// the route source never changes again and the platform never notifies,
+	// and the sweep is a minute out.
+	installed := reconciler.Stats().At
+	waitFor(t, func() bool { return reconciler.Stats().At.After(installed) })
+
+	live.Store(0)
+	waitFor(t, func() bool { return !fake.has(capture) })
 }
 
 // The grace must not set the reconcile rate. The gate is open whenever a

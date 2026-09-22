@@ -838,6 +838,39 @@ func TestSessionSetReportsEstablishedPath(t *testing.T) {
 	}
 }
 
+// The count the route reconciler gates this machine's own traffic on is the
+// narrow one: a peer that has recently proved it is there, not a session
+// object in a map. A peer that rebooted leaves an entry looking established
+// for over a minute, and counting it opens the gate on a mesh that carries
+// nothing, which installs an announced default out of a dead tun and takes the
+// machine's network with it.
+func TestLiveCountCountsOnlyWhatProvedItsPeerIsThere(t *testing.T) {
+	set := newSessionSet()
+	set.close = func(*ike.Session) {}
+	proving, stale := &ike.Session{}, &ike.Session{}
+	set.active = func(sess *ike.Session) bool { return sess == proving }
+	if got := set.liveCount(); got != 0 {
+		t.Fatalf("an empty set counted %d", got)
+	}
+	// Both installed, so a count of the map alone answers two.
+	for path, sess := range map[string]*ike.Session{"proving": proving, "stale": stale} {
+		if _, adopted := set.adoptPreferred(path, sess, true, nil); !adopted {
+			t.Fatalf("the %s session was not adopted", path)
+		}
+	}
+	if len(set.live) != 2 {
+		t.Fatalf("the set holds %d sessions, so the two cases are not both in it", len(set.live))
+	}
+	if got := set.liveCount(); got != 1 {
+		t.Errorf("the count is %d, want only the session that proved its peer is there", got)
+	}
+	// And none once the one that was proving stops.
+	set.active = func(*ike.Session) bool { return false }
+	if got := set.liveCount(); got != 0 {
+		t.Errorf("a set where nothing proves its peer counted %d", got)
+	}
+}
+
 // A peer that reboots leaves an SA on this side that looks established until
 // dead peer detection reaps it, a minute or more later. Declining its fresh
 // handshake in favor of that one locks it out for the whole of that minute,
