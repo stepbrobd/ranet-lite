@@ -1,7 +1,7 @@
 {
   pkgs,
   ranetLite,
-  benchmarkIperf ? import ./iperf3.nix { inherit pkgs; },
+  benchmarkIperf ? pkgs.callPackage ../pkgs/iperf3-benchmark { },
 }:
 
 {

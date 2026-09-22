@@ -939,6 +939,21 @@ moves when the configuration vocabulary is a public commitment or when those
 signatures stop naming it. `internal/babel` and `internal/kernel` are blocked on
 `internal/netstack`, the daemon's dataplane, which is a wider move.
 
+The nix half follows the same layout as [inc](https://github.com/stepbrobd/inc),
+over [autopilot](https://github.com/stepbrobd/autopilot), which loads `lib/` and
+`modules/flake/` by directory so `flake.nix` names inputs and nothing else:
+
+- `lib/` holds nix helpers, one per file, kebab-case on disk and camelCase in
+  `lib`. They are adapted from inc and say so.
+- `modules/flake/` holds one flake-parts module per output: `packages.nix`,
+  `checks.nix`, `shell.nix`, `formatter.nix`, `overlays.nix`, `modules.nix`, and
+  `integration.nix`, which holds the VM test helper the checks and the profiling
+  packages share.
+- `pkgs/` holds one directory per package, imported into `overlays.default` by
+  `lib.importPackagesTree`. `pkgs.ranet-lite` is the daemon and
+  `pkgs.iperf3-benchmark` is the patched iperf the namespace benchmark needs.
+- `integration/` holds the NixOS VM tests and the namespace benchmark.
+
 ## Testing
 
 ```sh
@@ -963,13 +978,13 @@ privilege, and the one thing it leaves with the running kernel is `IP_BOUND_IF`
 on the transport's own UDP socket. The `netlink` VM check runs both binaries as
 root against a real kernel, which is the only place the `nf_tables` encoding is
 checked against something other than the decoder it was written beside.
-Protocol-level interoperability is covered by the NixOS VM tests exposed by
-`flake.nix`. Each boots separate client and gateway VMs; the client runs the
-packaged, user-facing `ranet-lite` binary with a real TUN device, while the
-gateway runs `charon-systemd`/`swanctl`, BIRD, and iperf3. The default test
-verifies an Ed25519-authenticated IKEv2 and Child SA negotiation across
-asymmetric local and remote UDP ports, checks Babel route exchange in both
-directions, and measures TCP bandwidth through the negotiated ESP tunnel:
+Protocol-level interoperability is covered by the NixOS VM tests in
+`modules/flake/checks.nix`. Each boots separate client and gateway VMs; the
+client runs the packaged, user-facing `ranet-lite` binary with a real TUN
+device, while the gateway runs `charon-systemd`/`swanctl`, BIRD, and iperf3. The
+default test verifies an Ed25519-authenticated IKEv2 and Child SA negotiation
+across asymmetric local and remote UDP ports, checks Babel route exchange in
+both directions, and measures TCP bandwidth through the negotiated ESP tunnel:
 
 ```sh
 nix build .#checks.x86_64-linux.integration -L
