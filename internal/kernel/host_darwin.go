@@ -75,6 +75,18 @@ func (runningKernel) Watch(index, skip int, quiet bool) (Watcher, error) {
 	return newRouteMonitor(index, skip, quiet)
 }
 
+// controlSocket is one socket of a family, which is all the address ioctls
+// need: they are dispatched by the domain of the socket they arrive on and
+// read nothing off it.
+func controlSocket(family int) (int, error) {
+	fd, err := unix.Socket(family, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		return -1, fmt.Errorf("kernel: open an address control socket: %w", err)
+	}
+	unix.CloseOnExec(fd)
+	return fd, nil
+}
+
 // Assign sends the one ioctl of the four that names this family and this
 // direction, down a control socket of that family: the request structures are
 // dispatched by the domain of the socket they arrive on, so each family needs

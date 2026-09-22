@@ -42,9 +42,10 @@ import (
 // bound to it, so it names a device that need not exist.
 const meshDeviceIndex = 424
 
-// The two prefixes the mesh announces to this node. One takes the machine and
-// the other does not, which is the distinction the whole capture gate rests
-// on.
+// What the mesh announces to this node, what this node announces back, and
+// where the machine under it reaches the world. capturingPrefix takes the
+// machine and ordinaryPrefix does not, which is the distinction the whole
+// capture gate rests on.
 var (
 	capturingPrefix = netip.MustParsePrefix("::/0")
 	ordinaryPrefix  = netip.MustParsePrefix("2001:db8:2::/64")
@@ -351,8 +352,8 @@ func TestCaptureIsHeldBackForAFamilyTheUnderlayCannotFallBackOn(t *testing.T) {
 	d.live(t)
 	// The IPv4 half is covered, so a capturing route of that family installs.
 	// It arrives scoped, because it also covers this node's own peer endpoint,
-	// which is the separate question TestPrefixCoveringAPeerEndpointIsScoped
-	// asks; what this one measures is that it arrives at all.
+	// the separate question TestPrefixCoveringAPeerEndpointIsScopedEvenWithABoundSocket
+	// asks; this one measures only that it arrives.
 	v4capture := netip.MustParsePrefix("0.0.0.0/0")
 	d.announce(v4capture)
 	waitForKernel(t, "the IPv4 default reaches the kernel", func() bool {

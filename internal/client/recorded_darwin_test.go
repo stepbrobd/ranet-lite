@@ -404,9 +404,10 @@ func addrFrom(addr route.Addr) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// recordedWatcher never wakes on its own: the tests below drive the reconcile
-// loop through the route source instead, so no pass happens that the test did
-// not ask for.
+// recordedWatcher never fires. What drives the reconcile loop in these tests
+// is the route source a test announces into, plus the interval the
+// configuration names, so a pass follows something the test did rather than
+// something the machine underneath happened to do.
 type recordedWatcher struct {
 	k      *recordedKernel
 	signal chan struct{}

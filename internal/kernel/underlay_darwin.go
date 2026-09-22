@@ -154,6 +154,9 @@ var errUnderlayClosed = errors.New("kernel: the underlay defaults are closed")
 // interleaved with the reconciler's on one sequence number, and reclaims what
 // a previous instance recorded writing before anything else happens.
 //
+// host is the machine it writes to and reads back, nil for the one this
+// process is running on.
+//
 // statePath is where that record lives; empty keeps it in memory for this
 // process only. The file is locked before it is read, so a second daemon
 // starting beside a running one reclaims nothing and overwrites nothing: it
@@ -175,7 +178,7 @@ func NewUnderlayDefaults(host Host, links defaultRoutes, mesh int, statePath str
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),
 		warned:       make(map[netip.Prefix]bool),
-		dump:         func() ([]byte, error) { return host.Dump() },
+		dump:         host.Dump,
 		lookupDevice: host.InterfaceIndex,
 	}
 	// Before the file is read, so nothing below can act on a record another

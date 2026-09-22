@@ -175,15 +175,6 @@ func (p *routePlatform) open() error {
 	return err
 }
 
-func controlSocket(family int) (int, error) {
-	fd, err := unix.Socket(family, unix.SOCK_DGRAM, 0)
-	if err != nil {
-		return -1, fmt.Errorf("kernel: open an address control socket: %w", err)
-	}
-	unix.CloseOnExec(fd)
-	return fd, nil
-}
-
 func (p *routePlatform) Notify() <-chan struct{} { return p.watcher.Changed() }
 
 // Close tolerates a partly opened platform, because newPlatform unwinds

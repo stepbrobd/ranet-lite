@@ -289,10 +289,10 @@ func (c *Client) CaptureRoutes() kernel.CaptureRoutes { return c.capture }
 // a running node knows. None of it is a fact an operator writes down, which is
 // why none of it is in the capability.
 //
-// It is assembled here rather than in the command because four of the six are
-// this client's own and the fifth is the setting under which it opened them.
-// The command builds the reconciler from it; see kernel.Runtime for what each
-// field decides.
+// It is assembled here rather than in the command because five of the seven
+// are this client's own and the other two are the settings it opened them
+// under. The command builds the reconciler from it; see kernel.Runtime for
+// what each field decides.
 func (c *Client) KernelRuntime() kernel.Runtime {
 	cfg := c.config()
 	return kernel.Runtime{
