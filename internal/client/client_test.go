@@ -903,24 +903,31 @@ func TestSyncPeersRestartsDialerThatGaveUp(t *testing.T) {
 		Link: config.Link{Endpoints: []config.Endpoint{{Serial: "0", Family: "ip4"}}},
 		Dial: config.Dial{To: []config.Peer{{Org: "example", Name: "a", Serial: "1"}}},
 	})
-	reg := registry.Registry{}
-	c.reg.Store(&reg)
+	empty := registry.Registry{}
+	c.reg.Store(&empty)
 
 	c.syncPeers()
 	c.peers.Wait()
-	c.dialersMu.Lock()
-	remaining := len(c.dialers)
-	c.dialersMu.Unlock()
-	if remaining != 0 {
+	if remaining := dialerCount(c); remaining != 0 {
 		t.Fatalf("a dialer that returned left %d entries behind", remaining)
 	}
 
-	// The registry now names the node, and a reload has to pick it up.
+	// The registry now names the node, carrying an address, and a reload has
+	// to pick it up. The address holds the count below still: a dialer with
+	// nowhere to dial returns on its first statement and drops its own entry,
+	// so a run that read the map after that goroutine was scheduled read one.
+	// It is also the difference the entry had to be dropped for, since an
+	// entry still reading "running" makes this reload skip the peer outright.
+	loopback := "127.0.0.1"
+	named := registry.Registry{{Organization: "example", Nodes: []registry.Node{{
+		CommonName: "a",
+		Endpoints: []registry.Endpoint{
+			{SerialNumber: "1", AddressFamily: "ip4", Address: &loopback, Port: 13000},
+		},
+	}}}}
+	c.reg.Store(&named)
 	c.syncPeers()
-	c.dialersMu.Lock()
-	started := len(c.dialers)
-	c.dialersMu.Unlock()
-	if started != 1 {
+	if started := dialerCount(c); started != 1 {
 		t.Errorf("a reload started %d dialers for a peer that had given up, want 1", started)
 	}
 	cancel()
@@ -942,16 +949,19 @@ func TestSyncPeersNoticesChangedSerialNumber(t *testing.T) {
 			Dial: config.Dial{To: []config.Peer{{Org: "example", Name: "a", Serial: serial}}},
 		}
 	}
-	// The peer is in the registry with no address yet, so each dialer retries
-	// rather than giving up. A dialer that gives up drops its own entry, which
-	// would race this test's read of the map it just filled.
+	// Both endpoints carry an address, so each dialer stays in its retry loop
+	// against a port nothing answers on. An endpoint with no address is one no
+	// dial can use, which runPeer reports and returns from on its first
+	// statement, and the dialer then drops its own entry out from under the
+	// read below.
+	loopback := "127.0.0.1"
 	reg := registry.Registry{{
 		Organization: "example",
 		Nodes: []registry.Node{{
 			CommonName: "a",
 			Endpoints: []registry.Endpoint{
-				{SerialNumber: "1", AddressFamily: "ip4"},
-				{SerialNumber: "2", AddressFamily: "ip4"},
+				{SerialNumber: "1", AddressFamily: "ip4", Address: &loopback, Port: 13000},
+				{SerialNumber: "2", AddressFamily: "ip4", Address: &loopback, Port: 13000},
 			},
 		}},
 	}}
@@ -980,6 +990,16 @@ func TestSyncPeersNoticesChangedSerialNumber(t *testing.T) {
 // a file on disk, the way SIGHUP does.
 func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	cfg, privateKey, reg := runtimeFixture(t)
+	// Every endpoint carries an address, so the dialers this starts stay in
+	// their retry loops. The fixture's endpoints carry none, and a dialer with
+	// nowhere to dial returns on its first statement and drops its own entry,
+	// which is a count that shrinks under the read at the end of this test.
+	loopback := "127.0.0.1"
+	for i := range reg[0].Nodes {
+		for j := range reg[0].Nodes[i].Endpoints {
+			reg[0].Nodes[i].Endpoints[j].Address = &loopback
+		}
+	}
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
 	writeRegistry(t, registryPath, reg)
@@ -1001,6 +1021,10 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	c := &Client{
 		ctx: ctx, cancel: cancel, privateKey: privateKey,
 		speaker: speaker, dialers: make(map[string]*dialer),
+		// A dialer that resolves its peer asks the set whether that path is
+		// already held, and this fixture's organization carries a public key,
+		// so a dialer gets that far.
+		sessions: newSessionSet(),
 	}
 	c.cfg.Store(cfg)
 	c.reg.Store(&reg)
@@ -1022,7 +1046,7 @@ func TestReloadAppliesRegistryPeersAndOriginations(t *testing.T) {
 	grown := slices.Clone(reg)
 	grown[0].Nodes = append(slices.Clone(reg[0].Nodes), registry.Node{
 		CommonName: "third",
-		Endpoints:  []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Port: 13000}},
+		Endpoints:  []registry.Endpoint{{SerialNumber: "1", AddressFamily: "ip4", Address: &loopback, Port: 13000}},
 	})
 	writeRegistry(t, registryPath, grown)
 	configPath := filepath.Join(dir, "config.yaml")
