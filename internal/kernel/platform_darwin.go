@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
@@ -619,12 +620,7 @@ func holdsAgainstTheFIB(r Route) bool { return r.Unreachable }
 // holding a peer's endpoint does it as surely as ::/0. An empty list falls
 // back to the destination's own length.
 func coversAny(prefix netip.Prefix, addresses []netip.Addr) bool {
-	for _, address := range addresses {
-		if prefix.Contains(address) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(addresses, prefix.Contains)
 }
 
 func (p *routePlatform) DelRoute(r Route) error {

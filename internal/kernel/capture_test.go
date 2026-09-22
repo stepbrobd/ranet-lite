@@ -323,10 +323,8 @@ func (c *recordingCapture) Ready() (Covered, error) {
 // capturing describes whether the kernel currently holds a route that would
 // carry this machine's own traffic.
 func (c *recordingCapture) capturing() string {
-	for _, route := range c.fake.snapshot() {
-		if capturesTheMachine(route) {
-			return "the default installed"
-		}
+	if slices.ContainsFunc(c.fake.snapshot(), capturesTheMachine) {
+		return "the default installed"
 	}
 	return "no default installed"
 }

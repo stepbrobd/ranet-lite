@@ -4,6 +4,7 @@ package kernel
 
 import (
 	"encoding/binary"
+	"maps"
 	"slices"
 	"testing"
 
@@ -20,10 +21,7 @@ func ruleAttrs(t *testing.T, body []byte) (hdr []byte, attrs map[uint16][]byte) 
 		t.Fatalf("a rule message is %d bytes, shorter than its header", len(body))
 	}
 	message := nlMessage{Data: body}
-	attrs = make(map[uint16][]byte)
-	for kind, value := range message.attributes(sizeofFibRuleHdr) {
-		attrs[kind] = value
-	}
+	attrs = maps.Collect(message.attributes(sizeofFibRuleHdr))
 	return body[:sizeofFibRuleHdr], attrs
 }
 
