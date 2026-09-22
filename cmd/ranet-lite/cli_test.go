@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -34,6 +35,10 @@ func (stubSource) Sessions() []control.Session {
 
 func (stubSource) Peers() []control.Peer {
 	return []control.Peer{{Path: "example/gateway/@0", Organization: "example", CommonName: "gateway", Connected: true}}
+}
+
+func (stubSource) Metrics(w io.Writer) {
+	io.WriteString(w, "ranet_lite_babel_routes_selected 15\n")
 }
 
 // serveStub starts a control socket for one test and returns its path.
@@ -114,6 +119,20 @@ func TestJSONPrintsTheWireForm(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("status --json printed %q, want it to carry %q", out, want)
 		}
+	}
+}
+
+// The scrape comes over the control socket, so a node is read without binding
+// a metrics listener for it. The exposition format goes out as it arrived
+// rather than through a renderer, because a monitoring system parses it.
+func TestMetricsComeOverTheControlSocket(t *testing.T) {
+	socket := serveStub(t)
+	out, err := execute(t, "metrics", "--control", socket)
+	if err != nil {
+		t.Fatalf("metrics failed: %v", err)
+	}
+	if out != "ranet_lite_babel_routes_selected 15\n" {
+		t.Errorf("metrics printed %q, want the daemon's own scrape", out)
 	}
 }
 

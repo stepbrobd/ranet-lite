@@ -39,6 +39,10 @@ func (fakeSource) Peers() []Peer {
 	return []Peer{{Path: "example/gateway/@0", Organization: "example", CommonName: "gateway", Generated: true}}
 }
 
+func (fakeSource) Metrics(w io.Writer) {
+	io.WriteString(w, "ranet_lite_sessions 1\n")
+}
+
 // Every path answers, and each answers with its own subsystem rather than
 // with whatever the previous registration happened to close over.
 func TestHandlerServesEveryReadAsJSON(t *testing.T) {

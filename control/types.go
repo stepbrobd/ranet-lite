@@ -64,19 +64,22 @@ package control
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/netip"
 	"time"
 )
 
 // Paths the handler serves, named so the client and the server cannot drift.
-// The first five answer a GET and the rest a POST; see the package doc for
-// why the method rather than the prefix separates them.
+// The reads in the first group answer a GET and the verbs in the second a
+// POST; see the package doc for why the method rather than the prefix
+// separates them.
 const (
 	PathStatus    = "/v0/status"
 	PathNeighbors = "/v0/neighbors"
 	PathRoutes    = "/v0/routes"
 	PathSessions  = "/v0/sessions"
 	PathPeers     = "/v0/peers"
+	PathMetrics   = "/v0/metrics"
 
 	PathDisable = "/v0/disable"
 	PathEnable  = "/v0/enable"
@@ -99,6 +102,13 @@ type Source interface {
 	Routes() []Route
 	Sessions() []Session
 	Peers() []Peer
+	// Metrics writes the Prometheus text exposition format. It is served here
+	// as well as on the metrics listener, so a node can be scraped by hand
+	// without an operator having to bind a port to do it, and it is written
+	// rather than returned because the daemon already renders it that way.
+	// The handler writes into a buffer first, so a slow reader on the socket
+	// does not hold whatever locks a render takes.
+	Metrics(io.Writer)
 }
 
 // Subsystem names one part of a node that can be stopped and started again.

@@ -231,6 +231,28 @@ func TestClientRoundTripsEveryVerb(t *testing.T) {
 	}
 }
 
+// The scrape is a read, so it answers a GET and refuses a POST like the rest
+// of them, and it is served as the exposition format rather than as JSON.
+func TestMetricsAreServedAsTheExpositionFormat(t *testing.T) {
+	server := httptest.NewServer(Handler(fakeSource{}))
+	defer server.Close()
+	response, err := http.Get(server.URL + PathMetrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("the scrape is served as %q", got)
+	}
+	body, _ := io.ReadAll(response.Body)
+	if !strings.Contains(string(body), "ranet_lite_sessions 1") {
+		t.Errorf("the scrape reads %q", body)
+	}
+	if refused := post(t, server.URL+PathMetrics, "{}"); refused.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("a POST to the scrape answered %s, want 405", refused.Status)
+	}
+}
+
 // A subsystem somebody stopped is reported, because the node is then running
 // less than its file says and nothing else on the status says so.
 func TestStatusNamesStoppedSubsystems(t *testing.T) {

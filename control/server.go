@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,12 +22,14 @@ import (
 // neither the path nor the limit, so the check is here instead.
 const MaxSocketPath = 103
 
-// socketMode is the permission the socket is left at. Group readable rather
+// socketMode is the permission the socket is left at. Group reachable rather
 // than owner only, so an operator in the daemon's group runs the subcommands
 // without root: the unit names that group, since nothing here changes the
-// socket's owner. Nothing on the socket writes, so read access is the whole
-// grant. dirMode lets that same group traverse the directory holding it, and
-// lockMode is owner-only because only the daemon takes the lock.
+// socket's owner. This mode is the whole authorization story, the verbs
+// included, because no verb reaches past what the node's own file already
+// decides; see the package doc. dirMode lets that same group traverse the
+// directory holding it, and lockMode is owner-only because only the daemon
+// takes the lock.
 const (
 	socketMode = 0o660
 	dirMode    = 0o750
@@ -157,9 +160,9 @@ func (l *ownedListener) Close() error {
 	return errors.Join(l.Listener.Close(), l.lock.Close())
 }
 
-// Handler serves src. Every answer is JSON, built and encoded outside whatever
-// lock src took, because a slow reader must not be able to hold the
-// dataplane's lock open.
+// Handler serves src. Every answer is built whole before anything reaches the
+// socket, JSON and the scrape alike, because a slow reader must not be able to
+// hold the dataplane's lock open.
 //
 // The reads are always served. The writes are served when src also implements
 // [Sink], and refused by name when it does not, rather than answering 404 on a
@@ -171,6 +174,7 @@ func Handler(src Source) http.Handler {
 	answer(mux, PathRoutes, func() any { return src.Routes() })
 	answer(mux, PathSessions, func() any { return src.Sessions() })
 	answer(mux, PathPeers, func() any { return src.Peers() })
+	scrape(mux, PathMetrics, src)
 	sink, _ := src.(Sink)
 	act(mux, PathDisable, sink, func(s Sink, r Request) (Result, error) { return s.SetSubsystem(r.Subsystem, false) })
 	act(mux, PathEnable, sink, func(s Sink, r Request) (Result, error) { return s.SetSubsystem(r.Subsystem, true) })
@@ -197,6 +201,25 @@ func answer(mux *http.ServeMux, path string, read func() any) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(append(body, '\n'))
+	})
+}
+
+// scrape registers the one read that is not JSON. A scrape belongs on this
+// socket because a node nobody can ask is a node nobody can diagnose, and
+// binding a port to read one's own counters is a listener a fleet then has to
+// firewall. The render goes into a buffer before anything reaches the socket,
+// for the reason [Source] gives.
+func scrape(mux *http.ServeMux, path string, src Source) {
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "this is a read, so it takes a GET", http.StatusMethodNotAllowed)
+			return
+		}
+		var body bytes.Buffer
+		src.Metrics(&body)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Write(body.Bytes())
 	})
 }
 

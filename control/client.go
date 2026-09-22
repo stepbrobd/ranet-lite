@@ -73,6 +73,26 @@ func (c *Client) Rekey(peer string, all bool) (Result, error) {
 
 func (c *Client) Reload() (Result, error) { return c.call(PathReload, Request{}) }
 
+// Metrics is the Prometheus text this node would serve on a metrics listener,
+// read over the socket instead so a scrape costs no bound port. It comes back
+// as text rather than a decoded value, since a monitoring system parses the
+// exposition format itself.
+func (c *Client) Metrics() (string, error) {
+	response, err := c.http.Get("http://control" + PathMetrics)
+	if err != nil {
+		return "", c.explain(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<20))
+	if err != nil {
+		return "", fmt.Errorf("control: reading %s: %w", PathMetrics, err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("control: %s: %s: %s", PathMetrics, response.Status, trimLine(body))
+	}
+	return string(body), nil
+}
+
 // read fetches and decodes one path. A body is bounded, because a client
 // reading a daemon it cannot verify still should not be made to allocate
 // without limit.

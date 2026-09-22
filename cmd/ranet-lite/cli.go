@@ -85,6 +85,7 @@ func newRoot() *cobra.Command {
 				}
 				return emit(w, asJSON, peers, func() { control.RenderPeers(w, peers) })
 			}),
+		metricsCommand(r),
 		versionCommand(r),
 		licensesCommand(),
 		completionCommand(root),
@@ -116,6 +117,29 @@ func (r *reader) flags(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.StringVar(&r.socket, "control", control.DefaultSocket, "path to the daemon's control socket")
 	f.BoolVar(&r.asJSON, "json", false, "print the wire form instead of a table")
+}
+
+// metricsCommand prints the scrape this node would serve on a metrics
+// listener, read over the control socket instead, so an operator reads a
+// node's counters without it having to bind a port a fleet then has to
+// firewall. It takes no --json, since a monitoring system already parses the
+// exposition format.
+func metricsCommand(r *reader) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "metrics",
+		Short: "print this node's prometheus scrape, without the daemon binding a metrics listener",
+		Args:  noArguments,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			text, err := control.Dial(r.socket).Metrics()
+			if err != nil {
+				return err
+			}
+			_, err = io.WriteString(cmd.OutOrStdout(), text)
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&r.socket, "control", control.DefaultSocket, "path to the daemon's control socket")
+	return cmd
 }
 
 // versionCommand prints the version this binary was built from, and with
