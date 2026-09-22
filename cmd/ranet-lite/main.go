@@ -39,8 +39,7 @@ import (
 // not written a second time.
 func main() {
 	if err := newRoot().Execute(); err != nil {
-		var code exitCode
-		if errors.As(err, &code) {
+		if code, ok := errors.AsType[exitCode](err); ok {
 			os.Exit(int(code))
 		}
 		fmt.Fprintln(os.Stderr, err)
