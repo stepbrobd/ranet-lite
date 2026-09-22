@@ -29,8 +29,16 @@ func hostOr(h Host) Host {
 
 func (runningKernel) RouteSocket() (RouteWriter, error) { return dialRouteSocket() }
 
-func (runningKernel) Dump(kind, index int) ([]byte, error) {
-	return route.FetchRIB(unix.AF_UNSPEC, route.RIBType(kind), index)
+func (runningKernel) Dump() ([]byte, error) {
+	return route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeRoute, 0)
+}
+
+func (runningKernel) Addresses(index int) ([]netip.Prefix, error) {
+	rib, err := route.FetchRIB(unix.AF_UNSPEC, route.RIBTypeInterface, index)
+	if err != nil {
+		return nil, fmt.Errorf("kernel: dump the addresses of interface %d: %w", index, err)
+	}
+	return interfaceAddrs(index, rib)
 }
 
 func (runningKernel) Lookup(destination, mask netip.Addr) (RouteAnswer, error) {
@@ -70,23 +78,38 @@ func (runningKernel) Watch(index, skip int, quiet bool) (Watcher, error) {
 // Assign sends the one ioctl of the four that names this family and this
 // direction, down a control socket of that family: the request structures are
 // dispatched by the domain of the socket they arrive on, so each family needs
-// its own. The socket is opened per call because an assignment happens when an
+// its own. The ioctl is named in the error, because an errno alone does not
+// say which of the four answered.
+//
+// The request is built inside the branch that knows the family, never before
+// it: deleteRequest4 reads the address as four bytes and panics on a v6
+// prefix. The socket is opened per call because an assignment happens when an
 // address is missing and at no other time, which on a settled node is never.
 func (runningKernel) Assign(add bool, device string, prefix netip.Prefix) error {
-	family, name, number := unix.AF_INET, "SIOCAIFADDR", uintptr(unix.SIOCAIFADDR)
-	build := func() ([]byte, error) { return aliasRequest4(device, prefix) }
-	switch v6 := !prefix.Addr().Is4(); {
-	case add && v6:
-		family, name, number = unix.AF_INET6, "SIOCAIFADDR_IN6", siocAIfAddrIn6
-		build = func() ([]byte, error) { return aliasRequest6(device, prefix) }
-	case !add && v6:
-		family, name, number = unix.AF_INET6, "SIOCDIFADDR_IN6", siocDIfAddrIn6
-		build = func() ([]byte, error) { return deleteRequest6(device, prefix), nil }
-	case !add:
-		name, number = "SIOCDIFADDR", uintptr(unix.SIOCDIFADDR)
-		build = func() ([]byte, error) { return deleteRequest4(device, prefix), nil }
+	var (
+		family  = unix.AF_INET
+		name    string
+		number  uintptr
+		request []byte
+		err     error
+	)
+	if !prefix.Addr().Is4() {
+		family = unix.AF_INET6
 	}
-	request, err := build()
+	switch v6 := family == unix.AF_INET6; {
+	case add && v6:
+		name, number = "SIOCAIFADDR_IN6", siocAIfAddrIn6
+		request, err = aliasRequest6(device, prefix)
+	case add:
+		name, number = "SIOCAIFADDR", uintptr(unix.SIOCAIFADDR)
+		request, err = aliasRequest4(device, prefix)
+	case v6:
+		name, number = "SIOCDIFADDR_IN6", siocDIfAddrIn6
+		request = deleteRequest6(device, prefix)
+	default:
+		name, number = "SIOCDIFADDR", uintptr(unix.SIOCDIFADDR)
+		request = deleteRequest4(device, prefix)
+	}
 	if err != nil {
 		return err
 	}

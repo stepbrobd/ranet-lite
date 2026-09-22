@@ -1,6 +1,9 @@
 package kernel
 
-import "net/netip"
+import (
+	"errors"
+	"net/netip"
+)
 
 // Host is the machine a reconciler reads and writes: the routing socket it
 // sends on, the tables it reads back, the interface list it resolves names
@@ -24,9 +27,15 @@ type Host interface {
 	// reconciler and the underlay defaults take one each, so the sequence
 	// numbers of the two never interleave. The caller closes it.
 	RouteSocket() (RouteWriter, error)
-	// Dump reads one of the platform's tables back, in the wire form the
-	// platform's own parser reads. kind and index are the platform's own.
-	Dump(kind, index int) ([]byte, error)
+	// Dump reads the whole routing table back, in the wire form the platform's
+	// own parser reads. It crosses this seam encoded because deciding which of
+	// those routes belong to this reconciler is the backend's own work and has
+	// to stay under it.
+	Dump() ([]byte, error)
+	// Addresses reports every address one interface carries, whoever put it
+	// there. Decoded, unlike Dump, because nothing is decided from the
+	// encoding on this side.
+	Addresses(index int) ([]netip.Prefix, error)
 	// Lookup asks where one destination of one family goes. An exact mask asks
 	// for that key alone rather than for a longest-prefix match; see
 	// Links.Default for why the difference decides the answer here.
@@ -42,6 +51,13 @@ type Host interface {
 	// Assign puts prefix on device, or takes it off again.
 	Assign(add bool, device string, prefix netip.Prefix) error
 }
+
+// ErrNoDefaultRoute is a host with no way off itself of the family asked
+// about, which is an ordinary state on a laptop between two networks rather
+// than a failure. A Host answers Lookup with it, and every caller above tells
+// it apart from a lookup that went wrong: a family the host reaches nowhere
+// costs nothing, and a lookup that failed is reported.
+var ErrNoDefaultRoute = errors.New("kernel: the host has no default route")
 
 // RouteAnswer is the kernel's answer about one destination: the interface it
 // would leave by and the next hop it points at, the address invalid where it

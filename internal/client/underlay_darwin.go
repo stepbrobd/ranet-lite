@@ -10,6 +10,17 @@ import (
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
+// underlayStatePath is where the record of the routes this process wrote
+// outlives it, beside the control socket's lock: the two are the files in that
+// directory saying what this process owns, and a RuntimeDirectory= unit clears
+// both on a clean boot.
+//
+// It is a variable rather than a constant because the record is an ownership
+// claim over routes on an interface the whole machine shares, and a test that
+// took the real one would reclaim a running daemon's. Nothing in the daemon
+// writes it.
+var underlayStatePath = filepath.Join(filepath.Dir(control.DefaultSocket), "underlay.json")
+
 // underlayRuntime opens what the transport needs to keep the one UDP socket
 // out of the mesh's own routing. On darwin that means binding the socket to
 // the interface the host's default route leaves by, and writing that
@@ -33,11 +44,7 @@ func underlayRuntime(underlay transport.Underlay, mesh string, host kernel.Host)
 	if err != nil {
 		return transport.Runtime{}, nil, func() {}, err
 	}
-	// Beside the control socket's lock, which is the other file in that
-	// directory saying what this process owns, and which a RuntimeDirectory=
-	// unit clears on a clean boot.
-	state := filepath.Join(filepath.Dir(control.DefaultSocket), "underlay.json")
-	routes, err := kernel.NewUnderlayDefaults(host, links, links.Mesh(), state)
+	routes, err := kernel.NewUnderlayDefaults(host, links, links.Mesh(), underlayStatePath)
 	if err != nil {
 		_ = links.Close()
 		return transport.Runtime{}, nil, func() {}, err

@@ -27,7 +27,7 @@ func TestDefaultInterfaceNamesALinkThisHostHas(t *testing.T) {
 	t.Cleanup(func() { _ = links.Close() })
 
 	index, err := links.DefaultInterface()
-	if errors.Is(err, errNoDefaultRoute) {
+	if errors.Is(err, ErrNoDefaultRoute) {
 		t.Skip("this host has no default route, so there is nothing to bind to")
 	}
 	if err != nil {
@@ -52,7 +52,7 @@ func TestDefaultInterfaceNamesALinkThisHostHas(t *testing.T) {
 // left, has to answer the same interface the default did.
 func TestDefaultInterfaceResolvesANextHopToItsLink(t *testing.T) {
 	answer, err := routeTo(netip.IPv4Unspecified())
-	if errors.Is(err, errNoDefaultRoute) {
+	if errors.Is(err, ErrNoDefaultRoute) {
 		t.Skip("this host has no IPv4 default route")
 	}
 	if err != nil {
@@ -71,7 +71,7 @@ func TestDefaultInterfaceResolvesANextHopToItsLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve the next hop %s: %v", nextHop, err)
 	}
-	if _, err := gatewayIndex(answer, false); !errors.Is(err, errNoDefaultRoute) {
+	if _, err := gatewayIndex(answer, false); !errors.Is(err, ErrNoDefaultRoute) {
 		t.Errorf("a next hop resolved without recursing, reporting %v", err)
 	}
 	direct, err := interfaceIndexFor(nextHop, false)
@@ -87,7 +87,7 @@ func TestDefaultInterfaceResolvesANextHopToItsLink(t *testing.T) {
 // read each other's answers off a socket the whole machine shares.
 func TestRouteLookupsCarryDistinctSequenceNumbers(t *testing.T) {
 	first, err := routeTo(netip.IPv4Unspecified())
-	if errors.Is(err, errNoDefaultRoute) {
+	if errors.Is(err, ErrNoDefaultRoute) {
 		t.Skip("this host has no IPv4 default route")
 	}
 	if err != nil {

@@ -238,7 +238,7 @@ func (p *routePlatform) Routes() ([]Route, error) {
 	if p.rt.Underlay != nil {
 		p.underlay = p.rt.Underlay()
 	}
-	rib, err := p.host.Dump(int(route.RIBTypeRoute), 0)
+	rib, err := p.host.Dump()
 	if err != nil {
 		return nil, fmt.Errorf("kernel: dump the routing table: %w", err)
 	}
@@ -728,17 +728,17 @@ func (p *routePlatform) Addrs() ([]netip.Prefix, error) {
 	if p.addrs != nil {
 		return p.addrs()
 	}
-	rib, err := p.host.Dump(int(route.RIBTypeInterface), p.index)
+	assigned, err := p.host.Addresses(p.index)
 	if err != nil {
-		return nil, fmt.Errorf("kernel: dump the addresses of %s: %w", p.rt.Interface, err)
+		return nil, fmt.Errorf("kernel: read the addresses of %s: %w", p.rt.Interface, err)
 	}
-	return p.interfaceAddrs(rib)
+	return assigned, nil
 }
 
 // interfaceAddrs reports every address on the interface, whoever put it there,
 // which the reconciler needs to decide that a configured address is
 // already present. It removes nothing and decides nothing.
-func (p *routePlatform) interfaceAddrs(rib []byte) ([]netip.Prefix, error) {
+func interfaceAddrs(index int, rib []byte) ([]netip.Prefix, error) {
 	messages, err := route.ParseRIB(route.RIBTypeInterface, rib)
 	if err != nil {
 		return nil, fmt.Errorf("kernel: parse the address dump: %w", err)
@@ -746,7 +746,7 @@ func (p *routePlatform) interfaceAddrs(rib []byte) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, message := range messages {
 		am, ok := message.(*route.InterfaceAddrMessage)
-		if !ok || am.Index != p.index || len(am.Addrs) <= unix.RTAX_IFA {
+		if !ok || am.Index != index || len(am.Addrs) <= unix.RTAX_IFA {
 			continue
 		}
 		address, ok := addressFromRouteAddr(am.Addrs[unix.RTAX_IFA])

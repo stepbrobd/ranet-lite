@@ -70,10 +70,6 @@ func (l *Links) Close() error             { return l.watcher.Close() }
 // Mesh is the interface index no answer may name.
 func (l *Links) Mesh() int { return l.mesh }
 
-// errNoDefaultRoute is a host with no way off itself, which is an ordinary
-// state on a laptop between two networks rather than a failure.
-var errNoDefaultRoute = errors.New("kernel: the host has no default route")
-
 // Default is the host's own default route of one family: the interface it
 // leaves by and the next hop it points at, invalid where it leaves through a
 // link instead.
@@ -93,7 +89,7 @@ func (l *Links) Default(family netip.Addr) (index int, gateway netip.Addr, err e
 	if answer.Index == l.mesh {
 		// The only entry covering the unspecified address of this family is
 		// one of ours, so the host has no default of its own to fall back to.
-		return 0, netip.Addr{}, errNoDefaultRoute
+		return 0, netip.Addr{}, ErrNoDefaultRoute
 	}
 	return answer.Index, answer.Gateway, nil
 }
@@ -120,7 +116,7 @@ func (l *Links) DefaultInterface() (int, error) {
 		}
 		errs = append(errs, err)
 	}
-	return 0, errors.Join(append(errs, errNoDefaultRoute)...)
+	return 0, errors.Join(append(errs, ErrNoDefaultRoute)...)
 }
 
 // lookupSeq numbers the RTM_GET requests this process makes, so a reply can be
@@ -202,7 +198,7 @@ func routeRequest(destination, mask netip.Addr) (*route.RouteMessage, error) {
 		// ESRCH is the kernel saying it has no route at all, which is the
 		// answer rather than a failure of the mechanism.
 		if gone(err) {
-			return nil, errNoDefaultRoute
+			return nil, ErrNoDefaultRoute
 		}
 		return nil, fmt.Errorf("kernel: ask for the route to %s: %w", destination, err)
 	}
@@ -233,27 +229,27 @@ func routeRequest(destination, mask netip.Addr) (*route.RouteMessage, error) {
 // gatewayIndex reads the interface off one RTM_GET answer.
 func gatewayIndex(rm *route.RouteMessage, canRecurse bool) (int, error) {
 	if len(rm.Addrs) <= unix.RTAX_GATEWAY {
-		return 0, errNoDefaultRoute
+		return 0, ErrNoDefaultRoute
 	}
 	switch gateway := rm.Addrs[unix.RTAX_GATEWAY].(type) {
 	case *route.LinkAddr:
 		if gateway.Index == 0 {
-			return 0, errNoDefaultRoute
+			return 0, ErrNoDefaultRoute
 		}
 		return gateway.Index, nil
 	case *route.Inet4Addr:
 		if !canRecurse {
-			return 0, errNoDefaultRoute
+			return 0, ErrNoDefaultRoute
 		}
 		return interfaceIndexFor(netip.AddrFrom4(gateway.IP), false)
 	case *route.Inet6Addr:
 		if !canRecurse {
-			return 0, errNoDefaultRoute
+			return 0, ErrNoDefaultRoute
 		}
 		// The zone the kernel embeds in a link-local gateway is dropped the
 		// way addressFromRouteAddr drops it, because the lookup that follows
 		// is keyed on the address alone.
 		return interfaceIndexFor(netip.AddrFrom16(gateway.IP), false)
 	}
-	return 0, errNoDefaultRoute
+	return 0, ErrNoDefaultRoute
 }

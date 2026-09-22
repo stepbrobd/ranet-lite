@@ -175,7 +175,7 @@ func NewUnderlayDefaults(host Host, links defaultRoutes, mesh int, statePath str
 		refused:      make(map[writtenDefault]bool),
 		covered:      make(map[netip.Prefix]bool),
 		warned:       make(map[netip.Prefix]bool),
-		dump:         func() ([]byte, error) { return host.Dump(int(route.RIBTypeRoute), 0) },
+		dump:         func() ([]byte, error) { return host.Dump() },
 		lookupDevice: host.InterfaceIndex,
 	}
 	// Before the file is read, so nothing below can act on a record another
@@ -360,7 +360,7 @@ func (u *UnderlayDefaults) ensure() error {
 	for _, destination := range defaultPrefixes {
 		index, gateway, err := u.links.Default(destination.Addr())
 		switch {
-		case errors.Is(err, errNoDefaultRoute):
+		case errors.Is(err, ErrNoDefaultRoute):
 			// Nothing of this family to fall back to, which is ordinary on a
 			// single-stack host and is not a failure of this family alone.
 			u.report(destination, "the host has no default of this family, so the underlay socket has none scoped to it either",

@@ -435,7 +435,7 @@ func TestDarwinInterfaceAddrsKeepsTheirHostBits(t *testing.T) {
 	// an address on another interface is not this interface's business.
 	rib = append(rib, ifaMessage(t, testIndex+1, prefix("203.0.113.1/24"))...)
 
-	got, err := plat.interfaceAddrs(rib)
+	got, err := interfaceAddrs(plat.index, rib)
 	if err != nil {
 		t.Fatalf("decode the address dump: %v", err)
 	}

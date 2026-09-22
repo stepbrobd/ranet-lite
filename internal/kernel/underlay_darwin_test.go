@@ -41,7 +41,7 @@ func (f *fakeDefaults) Default(family netip.Addr) (int, netip.Addr, error) {
 		held = f.v6
 	}
 	if held.index == 0 {
-		return 0, netip.Addr{}, errNoDefaultRoute
+		return 0, netip.Addr{}, ErrNoDefaultRoute
 	}
 	return held.index, held.gateway, nil
 }
