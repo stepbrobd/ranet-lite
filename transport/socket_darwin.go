@@ -180,7 +180,7 @@ func reportBoundReach(index int, routed bool) {
 	}
 	var unreachable []string
 	for _, probe := range offLinkProbes {
-		if err := reachesWhenBound(index, probe); err != nil {
+		if err := boundReachProbe(index, probe); err != nil {
 			unreachable = append(unreachable, probe.String())
 		}
 	}
@@ -199,6 +199,11 @@ func reportBoundReach(index int, routed bool) {
 		"interface_index", index, "probes", strings.Join(unreachable, " "),
 		"detail", "nothing here writes that interface's routing, so give it a default scoped to it, route -n add -net 0.0.0.0/0 <next hop> -ifscope <interface>")
 }
+
+// boundReachProbe is reachesWhenBound in production. A test replaces it,
+// because what a host answers about an off-link address is the host's own
+// business and this report's rules have to hold whatever it says.
+var boundReachProbe = reachesWhenBound
 
 // reachesWhenBound resolves one route the way the bound socket would. It opens
 // its own descriptor rather than using the live one, because connect on the

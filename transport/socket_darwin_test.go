@@ -5,7 +5,9 @@ package transport
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -259,9 +261,158 @@ func TestBoundReachProbeAnswersForBothFamilies(t *testing.T) {
 			t.Errorf("probing %s answered %v, which is not a routing answer", probe, err)
 		}
 	}
-	// Index zero is the unbound socket, which nothing should be warned about.
-	reportBoundReach(0, false)
-	reportBoundReach(0, true)
+}
+
+// lockedLog is a log sink two goroutines may use. The link follower reports
+// from its own, and a test watching for that report reads while it writes, so
+// the plain buffer the rest of this package captures into would be a race.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+func (l *lockedLog) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf.Reset()
+}
+
+func captureBoundReachLogs(t *testing.T) *lockedLog {
+	t.Helper()
+	logs := &lockedLog{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return logs
+}
+
+// answering replaces the probe with one the test decides, per family, and puts
+// the real one back afterwards.
+func answering(t *testing.T, reaches map[bool]error) {
+	t.Helper()
+	previous := boundReachProbe
+	t.Cleanup(func() { boundReachProbe = previous })
+	boundReachProbe = func(_ int, target netip.Addr) error { return reaches[target.Is4()] }
+}
+
+// An unreachable socket is reported rather than refused, so the report is the
+// whole of what this mechanism does and every rule it holds is a rule about
+// what it says.
+//
+// Warning per family would warn on every single-stack uplink, which is an
+// ordinary host and not a fault, so the report is made only where neither
+// family can get off the link. And the two messages differ, because a scoped
+// default this tool wrote and did not help is a different thing to go looking
+// at than an interface whose routing nothing here writes.
+func TestBoundReachIsReportedOnlyWhenNeitherFamilyWorks(t *testing.T) {
+	unreach := unix.ENETUNREACH
+	for name, test := range map[string]struct {
+		reaches map[bool]error
+		index   int
+		routed  bool
+		want    string
+	}{
+		"neither family reaches, and nothing wrote that interface's routing": {
+			reaches: map[bool]error{true: unreach, false: unreach},
+			index:   7,
+			want:    "cannot reach off",
+		},
+		"neither family reaches although the scoped default was written": {
+			reaches: map[bool]error{true: unreach, false: unreach},
+			index:   7, routed: true,
+			want: "still cannot reach off",
+		},
+		"only IPv6 reaches, which is an ordinary IPv6-only uplink": {
+			reaches: map[bool]error{true: unreach},
+			index:   7,
+		},
+		"only IPv4 reaches, which is an ordinary IPv4-only uplink": {
+			reaches: map[bool]error{false: unreach},
+			index:   7,
+		},
+		"both reach": {reaches: map[bool]error{}, index: 7},
+		// Zero is the socket that was never bound, so the forwarding table is
+		// answering for it as it does for every other socket on the machine.
+		"an unbound socket": {
+			reaches: map[bool]error{true: unreach, false: unreach},
+			index:   0,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			answering(t, test.reaches)
+			logs := captureBoundReachLogs(t)
+			reportBoundReach(test.index, test.routed)
+			got := logs.String()
+			switch {
+			case test.want == "" && got != "":
+				t.Errorf("nothing was wrong and the report reads %s", got)
+			case test.want == "":
+			case !strings.Contains(got, test.want):
+				t.Errorf("the report reads %s, want it to say %q", got, test.want)
+			}
+			if test.want == "" {
+				return
+			}
+			// Both probes named, since an operator reading this has to know
+			// which destinations were asked about.
+			for _, probe := range offLinkProbes {
+				if !strings.Contains(got, probe.String()) {
+					t.Errorf("the report does not name the probe %s: %s", probe, got)
+				}
+			}
+			// And the other message is not the one that was made.
+			other := "still cannot reach off"
+			if test.routed {
+				other = `msg="transport bound the underlay socket to an interface it cannot reach off"`
+			}
+			if strings.Contains(got, other) {
+				t.Errorf("the report says %q as well, so routed decides nothing: %s", other, got)
+			}
+		})
+	}
+}
+
+// The report is made where the socket is bound, on both paths that bind one:
+// the first binding at startup, which is the one a node starting next to the
+// default a previous run installed depends on, and every rebind the link
+// follower makes afterwards.
+func TestBindingReportsWhatTheSocketCanReach(t *testing.T) {
+	first, second := twoInterfaces(t)
+	answering(t, map[bool]error{true: unix.ENETUNREACH, false: unix.ENETUNREACH})
+
+	logs := captureBoundReachLogs(t)
+	links := newFakeLinks(first)
+	hub, err := NewHub(":0", Underlay{Bind: true}, Runtime{Links: links})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+	if got := logs.String(); !strings.Contains(got, "cannot reach off") {
+		t.Errorf("the first binding said nothing about a socket that reaches nothing: %s", got)
+	}
+
+	logs.Reset()
+	links.move(second, nil)
+	waitFor(t, hub.bind.(*darwinBind), second)
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(logs.String(), "cannot reach off") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := logs.String(); !strings.Contains(got, "cannot reach off") {
+		t.Errorf("the rebind said nothing about a socket that reaches nothing: %s", got)
+	}
 }
 
 // Binding needs something to say which interface to bind to. A caller that
