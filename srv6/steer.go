@@ -56,10 +56,10 @@ type Steer struct {
 	// From and To select the packets. An omitted prefix matches every address
 	// of the family the other one names, and an entry naming neither would
 	// steer this node's own underlay into its own tunnel, so it is refused.
-	From schema.Prefix `yaml:"from,omitempty" json:"from,omitempty,omitzero" toml:"from,omitempty"`
-	To   schema.Prefix `yaml:"to,omitempty" json:"to,omitempty,omitzero" toml:"to,omitempty"`
+	From schema.Prefix `yaml:"from,omitempty" json:"from,omitzero" toml:"from,omitempty"`
+	To   schema.Prefix `yaml:"to,omitempty" json:"to,omitzero" toml:"to,omitempty"`
 	// Source overrides the block's own outer source for this entry alone.
-	Source schema.Addr `yaml:"source,omitempty" json:"source,omitempty,omitzero" toml:"source,omitempty"`
+	Source schema.Addr `yaml:"source,omitempty" json:"source,omitzero" toml:"source,omitempty"`
 	// Via is the segments the packet visits, in that order, so an operator
 	// writes the waypoints and then the exit.
 	Via []schema.Addr `yaml:"via" json:"via" toml:"via"`

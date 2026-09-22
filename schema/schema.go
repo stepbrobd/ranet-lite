@@ -39,9 +39,9 @@
 //     struct by asking for IsZero and otherwise walking the exported fields,
 //     and a [net/netip] value exports none, so a prefix holding 10.0.0.0/8 is
 //     dropped on the way out rather than written. encoding/json fails the
-//     other way around: omitempty never drops a struct at all, which is why an
-//     omitempty json tag here carries omitzero beside it, the option under
-//     which json does ask for IsZero.
+//     other way around: omitempty never drops a struct at all, so a struct
+//     field here spells its json tag omitzero rather than omitempty, the one
+//     option under which json asks for IsZero.
 //
 // Each of those three has cost this tree a round of debugging already.
 package schema
@@ -274,7 +274,7 @@ func (t TableID) MarshalYAML() (any, error) { return t.String(), nil }
 // protocol carrying them.
 type Announce struct {
 	Prefix Prefix `yaml:"prefix" json:"prefix" toml:"prefix"`
-	From   Prefix `yaml:"from,omitempty" json:"from,omitempty,omitzero" toml:"from,omitempty"`
+	From   Prefix `yaml:"from,omitempty" json:"from,omitzero" toml:"from,omitempty"`
 }
 
 func (a Announce) String() string {

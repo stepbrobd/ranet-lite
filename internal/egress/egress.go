@@ -94,8 +94,8 @@ type Egress struct {
 	// per family. See Source: "auto" is the address this node's own routes
 	// would have used, which is the only answer available to a deployment that
 	// owns no address block.
-	Source4 Source `yaml:"source4,omitempty" json:"source4,omitempty,omitzero" toml:"source4,omitempty"`
-	Source6 Source `yaml:"source6,omitempty" json:"source6,omitempty,omitzero" toml:"source6,omitempty"`
+	Source4 Source `yaml:"source4,omitempty" json:"source4,omitzero" toml:"source4,omitempty"`
+	Source6 Source `yaml:"source6,omitempty" json:"source6,omitzero" toml:"source6,omitempty"`
 	// Return translates the other direction too: a packet arriving from one of
 	// the advertised prefixes and leaving through the mesh goes out under this
 	// node's own mesh address. A subnet router needs it where the mesh has no

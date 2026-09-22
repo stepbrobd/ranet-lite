@@ -138,7 +138,7 @@ type Table struct {
 	// PrefSrc4 is RTA_PREFSRC on every installed IPv4 route, the attribute
 	// BIRD sets from krt_prefsrc. IPv6 routes carry no preferred source;
 	// source-specific IPv6 routes carry RTA_SRC instead.
-	PrefSrc4 schema.Addr `yaml:"prefsrc4,omitempty" json:"prefsrc4,omitempty,omitzero" toml:"prefsrc4,omitempty"`
+	PrefSrc4 schema.Addr `yaml:"prefsrc4,omitempty" json:"prefsrc4,omitzero" toml:"prefsrc4,omitempty"`
 	// Addresses are assigned to the device when absent and removed again at
 	// shutdown; only addresses the reconciler added itself are ever removed.
 	Addresses []schema.Prefix `yaml:"addresses,omitempty" json:"addresses,omitempty" toml:"addresses,omitempty"`
@@ -497,8 +497,8 @@ type Rule struct {
 	// To is FRA_DST and From is FRA_SRC, each optional. A rule naming neither
 	// selects on a mark alone and has to name its Family, because a mark
 	// belongs to no address family.
-	To   schema.Prefix `yaml:"to,omitempty" json:"to,omitempty,omitzero" toml:"to,omitempty"`
-	From schema.Prefix `yaml:"from,omitempty" json:"from,omitempty,omitzero" toml:"from,omitempty"`
+	To   schema.Prefix `yaml:"to,omitempty" json:"to,omitzero" toml:"to,omitempty"`
+	From schema.Prefix `yaml:"from,omitempty" json:"from,omitzero" toml:"from,omitempty"`
 	// FWMark and FWMask are FRA_FWMARK and FRA_FWMASK. A zero mark means the
 	// rule does not select on one, and a zero mask with a nonzero mark is an
 	// exact match, which is how the kernel reads an absent FRA_FWMASK. A hex

@@ -20,7 +20,7 @@ type Segments struct {
 	// Source is the outer source address an encapsulation is sent from, which
 	// the fleet sets once per node with `ip sr tunsrc`. A steering entry
 	// inherits it unless it names its own.
-	Source schema.Addr `yaml:"source,omitempty" json:"source,omitempty,omitzero" toml:"source,omitempty"`
+	Source schema.Addr `yaml:"source,omitempty" json:"source,omitzero" toml:"source,omitempty"`
 	// Local is the segments this node answers for.
 	Local []Segment `yaml:"local,omitempty" json:"local,omitempty" toml:"local,omitempty"`
 	// Steer decides which of this node's own packets go through a segment
