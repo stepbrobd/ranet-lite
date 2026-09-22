@@ -1,9 +1,11 @@
 package config
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -604,6 +606,86 @@ func TestCapabilityIsOnBecauseItsBlockIsThere(t *testing.T) {
 	}
 	if cfg.Cap.Table == nil {
 		t.Error("an empty cap.table left the reconciler off")
+	}
+}
+
+// Every spelling of "this block is written" says the same thing, under both
+// decoders and for every capability there is. The capabilities are read off
+// Caps rather than listed here, so one added later is covered without anybody
+// remembering to, and the spellings cover the empty block each decoder allows:
+// a bare key, an empty mapping and an explicit null under yaml, a table header
+// and an inline table under toml. The spelling this was found through is the
+// bare key, which decoded to the same nil as a capability nobody asked for, so
+// uncommenting "table:" and leaving its fields commented gave a mesh with no
+// routes, no rules and no message.
+func TestBlockPresenceAgreesAcrossDecoders(t *testing.T) {
+	caps := reflect.TypeOf(Caps{})
+	for i := range caps.NumField() {
+		key, _, _ := strings.Cut(caps.Field(i).Tag.Get("yaml"), ",")
+		// Either the block is on, or the capability refused the empty block by
+		// name. Never off, which is the outcome an operator cannot see.
+		outcome := func(t *testing.T, extension, body string) string {
+			t.Helper()
+			cfg, err := load(t, extension, body)
+			switch {
+			case err != nil && !strings.Contains(err.Error(), "cap."+key):
+				t.Errorf("cap.%s was refused without naming itself: %v", key, err)
+				return "refused: " + err.Error()
+			case err != nil:
+				return "refused: " + err.Error()
+			case reflect.ValueOf(cfg.Cap).Field(i).IsNil():
+				return "off, with nothing said"
+			}
+			return "on"
+		}
+		t.Run(key, func(t *testing.T) {
+			spellings := map[string]string{
+				"yaml bare key":       ".yaml\x00" + nodeYAML + "cap:\n  " + key + ":\n",
+				"yaml empty mapping":  ".yaml\x00" + nodeYAML + "cap:\n  " + key + ": {}\n",
+				"yaml explicit null":  ".yaml\x00" + nodeYAML + "cap:\n  " + key + ": null\n",
+				"toml table header":   ".toml\x00" + nodeTOML + "[cap." + key + "]\n",
+				"toml inline mapping": ".toml\x00" + nodeTOML + "[cap]\n" + key + " = {}\n",
+			}
+			want, wanted := "", ""
+			for _, how := range slices.Sorted(maps.Keys(spellings)) {
+				extension, body, _ := strings.Cut(spellings[how], "\x00")
+				got := outcome(t, extension, body)
+				if got == "off, with nothing said" {
+					t.Errorf("cap.%s written as a %s is %s", key, how, got)
+				}
+				if wanted == "" {
+					want, wanted = got, how
+					continue
+				}
+				if got != want {
+					t.Errorf("cap.%s is %q written as a %s and %q written as a %s", key, got, how, want, wanted)
+				}
+			}
+		})
+	}
+}
+
+// One level down, where the rule holds the same way: a cap.table.vrf naming no
+// device is refused by name under either decoder, rather than read as no VRF
+// under one of them.
+func TestNestedBlockPresenceAgreesAcrossDecoders(t *testing.T) {
+	spellings := map[string]string{
+		"yaml bare key":      ".yaml\x00" + nodeYAML + "cap:\n  table:\n    vrf:\n",
+		"yaml empty mapping": ".yaml\x00" + nodeYAML + "cap:\n  table:\n    vrf: {}\n",
+		"yaml explicit null": ".yaml\x00" + nodeYAML + "cap:\n  table:\n    vrf: null\n",
+		"toml table header":  ".toml\x00" + nodeTOML + "[cap.table.vrf]\n",
+		"toml inline table":  ".toml\x00" + nodeTOML + "[cap.table]\nvrf = {}\n",
+	}
+	for _, how := range slices.Sorted(maps.Keys(spellings)) {
+		extension, body, _ := strings.Cut(spellings[how], "\x00")
+		cfg, err := load(t, extension, body)
+		if err == nil {
+			t.Errorf("cap.table.vrf written as a %s loaded, and it names no device: %+v", how, cfg.Cap.Table.VRF)
+			continue
+		}
+		if !strings.Contains(err.Error(), "cap.table vrf") {
+			t.Errorf("cap.table.vrf written as a %s was refused without naming itself: %v", how, err)
+		}
 	}
 }
 

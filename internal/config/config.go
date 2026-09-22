@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -237,7 +238,99 @@ func decodeYAML(body []byte, c *Config) error {
 	case !emptyDocument(&trailing):
 		return errors.New("a second document follows the first")
 	}
+	return blocksWritten(body, c)
+}
+
+// blocksWritten turns a capability block an operator wrote into the capability
+// it names, whatever stands under it. yaml.v3 leaves a pointer field nil for a
+// key whose value is empty, so "table:" with its fields still commented out
+// decodes to the same nil as no cap.table at all, while "[cap.table]" under
+// the other decoder turns the reconciler on. Presence is therefore read off
+// the document rather than off the value the decode produced, and a key that
+// is present is present under either decoder.
+//
+// The strict decode above has already refused an unknown key and a value of
+// the wrong shape, so this pass has only to find the keys and fill in the
+// pointers an empty one left nil.
+func blocksWritten(body []byte, c *Config) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(body, &document); err != nil {
+		return err
+	}
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 {
+		return nil
+	}
+	fillBlocks(document.Content[0], reflect.ValueOf(c).Elem())
 	return nil
+}
+
+// fillBlocks walks the document beside the value it decoded to and allocates
+// every block a written key left nil, at whatever depth: cap.table.vrf obeys
+// the same rule cap.table does. It descends by the yaml key rather than by
+// field order, and stops at a type that reads its own yaml, since such a type
+// spells a scalar and carries no block under it.
+func fillBlocks(node *yaml.Node, target reflect.Value) {
+	for node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	if decodesItself(target.Type()) {
+		return
+	}
+	if target.Kind() == reflect.Pointer {
+		// A pointer to a scalar is left alone. An explicit null there asks for
+		// the default rather than for a zero, and TOML cannot write a key with
+		// no value at all, so there is no second spelling to agree with.
+		if target.Type().Elem().Kind() != reflect.Struct {
+			return
+		}
+		if target.IsNil() {
+			target.Set(reflect.New(target.Type().Elem()))
+		}
+		target = target.Elem()
+	}
+	switch {
+	case target.Kind() == reflect.Struct && node.Kind == yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if field := fieldByKey(target, node.Content[i].Value); field.IsValid() {
+				fillBlocks(node.Content[i+1], field)
+			}
+		}
+	case target.Kind() == reflect.Slice && node.Kind == yaml.SequenceNode:
+		for i := 0; i < len(node.Content) && i < target.Len(); i++ {
+			fillBlocks(node.Content[i], target.Index(i))
+		}
+	}
+}
+
+// fieldByKey finds the field a written key names, under the same tag the
+// decoder read it by. An absent field answers the zero Value, which happens
+// for a key the decode consumed some other way.
+func fieldByKey(target reflect.Value, key string) reflect.Value {
+	structure := target.Type()
+	for i := range structure.NumField() {
+		field := structure.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("yaml"), ",")
+		if name == "" {
+			name = strings.ToLower(field.Name)
+		}
+		if name == key {
+			return target.Field(i)
+		}
+	}
+	return reflect.Value{}
+}
+
+// decodesItself reports a type that reads its own yaml. Everything in
+// internal/schema does, and each of them spells one scalar, so the walk above
+// stops rather than taking the fields behind the spelling for keys.
+func decodesItself(t reflect.Type) bool {
+	if t.Kind() != reflect.Pointer {
+		t = reflect.PointerTo(t)
+	}
+	return t.Implements(reflect.TypeFor[yaml.Unmarshaler]())
 }
 
 // emptyDocument reports a document carrying nothing, which a file ending in a
