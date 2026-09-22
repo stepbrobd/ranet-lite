@@ -592,6 +592,11 @@ func expandRules(rules []Rule) ([]Rule, error) {
 	return out, nil
 }
 
+// String is the rule as an operator wrote it, which is how every refusal and
+// every log line names one. The table is spelled the way the file spells it,
+// since an operator who wrote "main" does not recognize 254, and the family is
+// there because a message about two rules that differ only in it identifies
+// neither without it.
 func (r Rule) String() string {
 	parts := []string{fmt.Sprintf("priority %d", r.Priority)}
 	if r.From.IsValid() {
@@ -607,7 +612,10 @@ func (r Rule) String() string {
 		}
 		parts = append(parts, mark)
 	}
-	return strings.Join(append(parts, fmt.Sprintf("lookup %d", r.Table)), " ")
+	if r.Family != FamilyUnset {
+		parts = append(parts, "family "+string(r.Family))
+	}
+	return strings.Join(append(parts, "lookup "+r.Table.String()), " ")
 }
 
 // canonical is the rule as the kernel reports it back. Two spellings can reach
@@ -665,7 +673,7 @@ func (r Rule) canonical() Rule {
 // start rather than a rule installed against a live fleet.
 func (r Rule) validate() error {
 	if r.Family != FamilyIPv4 && r.Family != FamilyIPv6 {
-		return fmt.Errorf("kernel: rule %s: family must be ipv4 or ipv6", r)
+		return fmt.Errorf("kernel: cap.table rules %s: family must be ipv4 or ipv6", r)
 	}
 	for _, named := range []struct {
 		name   string
@@ -675,30 +683,30 @@ func (r Rule) validate() error {
 			continue
 		}
 		if familyOf(named.prefix.Addr()) != r.Family {
-			return fmt.Errorf("kernel: rule %s: %s %s is not of the rule's family", r, named.name, named.prefix)
+			return fmt.Errorf("kernel: cap.table rules %s: %s %s is not of the rule's family", r, named.name, named.prefix)
 		}
 		if named.prefix.Masked() != named.prefix {
-			return fmt.Errorf("kernel: rule %s: %s %s has bits set below its prefix length", r, named.name, named.prefix)
+			return fmt.Errorf("kernel: cap.table rules %s: %s %s has bits set below its prefix length", r, named.name, named.prefix)
 		}
 		if named.prefix.Bits() == 0 {
 			// The kernel emits no FRA_DST or FRA_SRC for a zero-length
 			// selector, so a rule carrying one never matches its own readback
 			// and the pass reinstalls it forever. Whatever else the rule
 			// selects on is the honest way to write it.
-			return fmt.Errorf("kernel: rule %s: %s %s selects every address, which the kernel reports back as no selector at all", r, named.name, named.prefix)
+			return fmt.Errorf("kernel: cap.table rules %s: %s %s selects every address, which the kernel reports back as no selector at all", r, named.name, named.prefix)
 		}
 	}
 	if !r.To.IsValid() && !r.From.IsValid() && r.FWMark == 0 {
-		return fmt.Errorf("kernel: rule %s selects nothing, so it would match every packet", r)
+		return fmt.Errorf("kernel: cap.table rules %s selects nothing, so it would match every packet", r)
 	}
 	if r.FWMark == 0 && r.FWMask != 0 {
-		return fmt.Errorf("kernel: rule %s carries a mark mask and no mark", r)
+		return fmt.Errorf("kernel: cap.table rules %s carries a mark mask and no mark", r)
 	}
 	if r.Priority == 0 {
-		return fmt.Errorf("kernel: rule %s: priority 0 belongs to the local table", r)
+		return fmt.Errorf("kernel: cap.table rules %s: priority 0 belongs to the local table", r)
 	}
 	if r.Table == 0 {
-		return fmt.Errorf("kernel: rule %s: table is required", r)
+		return fmt.Errorf("kernel: cap.table rules %s: table is required", r)
 	}
 	return nil
 }
@@ -895,7 +903,7 @@ func (t Table) Normalized() Table {
 // routing problem for a day.
 func refuseWhatThePlatformLacks(t Table, plat platform) error {
 	if _, ok := plat.(ruler); !ok && len(t.Rules) > 0 {
-		return fmt.Errorf("kernel: %d policy rules are configured and this platform has no policy routing: %s", len(t.Rules), rulesUnavailable)
+		return fmt.Errorf("kernel: %d cap.table rules are configured and this platform has no policy routing: %s", len(t.Rules), rulesUnavailable)
 	}
 	if _, ok := plat.(vrfMaker); !ok && t.Name() != "" {
 		return errors.New("kernel: cap.table vrf is set and this platform has no VRFs: there is one forwarding table here and the reconciler already writes it")

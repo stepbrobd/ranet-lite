@@ -635,6 +635,63 @@ func TestConfigurationEndingInASeparatorIsTaken(t *testing.T) {
 	}
 }
 
+// A refusal names the block and the field an operator wrote, and the value
+// they wrote there. Each of these used to name none of the three: "intervals
+// must be between 10ms and 10m55.35s" says nothing about which line to change,
+// and "rule priority 40 ... lookup 254" answers an operator who wrote "main"
+// with a number and leaves out the family that tells two expanded rules apart.
+func TestRefusalsNameTheBlockTheOperatorWrote(t *testing.T) {
+	for name, refusal := range map[string]struct {
+		body  string
+		names []string
+	}{
+		"an interval past what the protocol can carry": {
+			body:  "cap:\n  babel:\n    hello: 11m\n",
+			names: []string{"cap.babel hello", "11m0s"},
+		},
+		"the other interval, which defaults off the first": {
+			body:  "cap:\n  babel:\n    update: 11m\n",
+			names: []string{"cap.babel update", "11m0s"},
+		},
+		"a cost that saturates": {
+			body:  "cap:\n  babel:\n    cost: { rx: 65000, rtt: { weight: 1024 } }\n",
+			names: []string{"cap.babel cost rx", "65000", "1024"},
+		},
+		"an rtt window written backwards": {
+			body:  "cap:\n  babel:\n    cost: { rtt: { min: 2s, max: 1s } }\n",
+			names: []string{"cap.babel cost rtt min", "2s", "1s"},
+		},
+		"a steering selector with host bits": {
+			body:  "cap:\n  segment:\n    source: \"3fff:1:69c:8c0::1\"\n    steer: [{ from: \"3fff:a::1/128\", to: \"2001:db8::1/32\", via: [\"3fff:1:69c::1\"] }]\n",
+			names: []string{"cap.segment steer to", "2001:db8::1/32"},
+		},
+		"a local segment written twice": {
+			body:  "cap:\n  segment:\n    local:\n      - { sid: \"3fff:1:69c:8c6::1\", behavior: End }\n      - { sid: \"3fff:1:69c:8c6::1\", behavior: \"End.DT46\" }\n",
+			names: []string{"cap.segment local", "3fff:1:69c:8c6::1"},
+		},
+		"a rule at the local table's priority": {
+			body:  "cap:\n  table:\n    rules: [{ fwmark: 0x726c, table: main, priority: 0, family: both }]\n",
+			names: []string{"cap.table rules", "lookup main", "family ipv4", "0x726c"},
+		},
+		"two rules the kernel reads as one": {
+			body:  "cap:\n  table:\n    rules:\n      - { fwmark: 0x726c, table: main, priority: 40, family: both }\n      - { fwmark: 0x726c, fwmask: 0xffffffff, table: main, priority: 40, family: both }\n",
+			names: []string{"cap.table rules", "lookup main", "family ipv4"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadYAML(t, nodeYAML+refusal.body)
+			if err == nil {
+				t.Fatalf("%q was taken", refusal.body)
+			}
+			for _, named := range refusal.names {
+				if !strings.Contains(err.Error(), named) {
+					t.Errorf("the refusal reads %q and does not name %s", err, named)
+				}
+			}
+		})
+	}
+}
+
 // A key whose spelling differs from the tag in case alone is refused by name,
 // under the decoder that would otherwise fold it. BurntSushi matches a field
 // case-insensitively when the exact spelling misses and records the key as

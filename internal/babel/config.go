@@ -91,20 +91,30 @@ func (c Config) Effective() Effective {
 // Validate checks the capability, defaults included, so a bad rx cost fails
 // where the file is read rather than at speaker construction.
 func (c Config) Validate() error {
-	for _, interval := range []time.Duration{c.HelloInterval(), c.UpdateInterval()} {
-		if interval < 10*time.Millisecond || interval > maxInterval {
-			return fmt.Errorf("babel: intervals must be between 10ms and %s", maxInterval)
+	// Named one at a time, and by the interval in force rather than as the
+	// file spells it: update defaults to four hellos, so a hello an operator
+	// wrote is refused through update as often as through itself, and a
+	// message naming neither field nor value says nothing about which line to
+	// change.
+	for _, named := range []struct {
+		field    string
+		interval time.Duration
+	}{{"hello", c.HelloInterval()}, {"update", c.UpdateInterval()}} {
+		if named.interval < 10*time.Millisecond || named.interval > maxInterval {
+			return fmt.Errorf("babel: cap.babel %s is %s, and an interval is between 10ms and %s",
+				named.field, named.interval, maxInterval)
 		}
 	}
 	cost := c.CostEffective()
 	if cost.RTT.Min < 0 || cost.RTT.Max < cost.RTT.Min {
-		return fmt.Errorf("babel: cost rtt min must be nonnegative and no larger than rtt max")
+		return fmt.Errorf("babel: cap.babel cost rtt min %s is negative or larger than rtt max %s", cost.RTT.Min, cost.RTT.Max)
 	}
 	// A link whose cost saturates is a link a neighbor cannot use at all, so a
 	// configuration that reaches infinity at rtt max is rejected rather than
 	// silently making the peer unreachable.
 	if cost.RxCost == 0 || saturatingAdd(cost.RxCost, cost.RTT.Weight) == MetricInfinity {
-		return fmt.Errorf("babel: cost rx plus rtt weight must be between 1 and %d", MetricInfinity-1)
+		return fmt.Errorf("babel: cap.babel cost rx %d plus rtt weight %d must be between 1 and %d",
+			cost.RxCost, cost.RTT.Weight, MetricInfinity-1)
 	}
 	return nil
 }

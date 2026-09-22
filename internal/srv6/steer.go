@@ -105,7 +105,7 @@ func NewSteerTable(entries []Steer, source schema.Addr) (*SteerTable, error) {
 		from, to := entry.From.Prefix, entry.To.Prefix
 		policy := entry.policy(source)
 		if !policy.Source.IsValid() {
-			return nil, fmt.Errorf("srv6: steering entry %s needs a source, its own or the block's", steerName(entry, &policy))
+			return nil, fmt.Errorf("srv6: cap.segment steer %s names no source, its own or the block's", steerName(entry, &policy))
 		}
 		if err := CheckPath(policy.Source, policy.Path); err != nil {
 			return nil, err
@@ -114,10 +114,10 @@ func NewSteerTable(entries []Steer, source schema.Addr) (*SteerTable, error) {
 			// Every packet this node sends is matched, the babel traffic that
 			// carries the mesh's own routing included, so the steering would
 			// take out the adjacency that makes its own segments reachable.
-			return nil, fmt.Errorf("srv6: a steering entry selecting neither a source nor a destination would steer every packet this node sends")
+			return nil, fmt.Errorf("srv6: a cap.segment steer entry selecting neither from nor to would steer every packet this node sends")
 		}
 		if from.IsValid() && to.IsValid() && from.Addr().Is4() != to.Addr().Is4() {
-			return nil, fmt.Errorf("srv6: steering entry from %s to %s names two address families", from, to)
+			return nil, fmt.Errorf("srv6: cap.segment steer from %s to %s names two address families", from, to)
 		}
 		for _, named := range [2]struct {
 			field  string
@@ -165,7 +165,7 @@ func NewSteerTable(entries []Steer, source schema.Addr) (*SteerTable, error) {
 		// diagnostic goes on reporting both.
 		selector := [2]netip.Prefix{from, destination}
 		if seen[selector] {
-			return nil, fmt.Errorf("srv6: two steering entries select %s", steerName(entry, &policy))
+			return nil, fmt.Errorf("srv6: two cap.segment steer entries select %s", steerName(entry, &policy))
 		}
 		seen[selector] = true
 		policy.name = steerName(entry, &policy)

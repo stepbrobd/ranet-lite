@@ -87,13 +87,13 @@ func NewLocalTable(segments []Segment) (*LocalTable, error) {
 	entries := make(map[netip.Addr]Behavior, len(segments))
 	for _, segment := range segments {
 		if !Usable(segment.SID.Addr) {
-			return nil, fmt.Errorf("srv6: local segment %s cannot address a segment routed packet", segment.SID)
+			return nil, fmt.Errorf("srv6: cap.segment local %s cannot address a segment routed packet", segment.SID)
 		}
 		if segment.Behavior != BehaviorEnd && segment.Behavior != BehaviorEndDT46 {
-			return nil, fmt.Errorf("srv6: local segment %s: %s is not implemented", segment.SID, segment.Behavior)
+			return nil, fmt.Errorf("srv6: cap.segment local %s: %s is not implemented", segment.SID, segment.Behavior)
 		}
 		if existing, dup := entries[segment.SID.Addr]; dup {
-			return nil, fmt.Errorf("srv6: local segment %s is configured as both %s and %s", segment.SID, existing, segment.Behavior)
+			return nil, fmt.Errorf("srv6: cap.segment local %s is configured as both %s and %s", segment.SID, existing, segment.Behavior)
 		}
 		entries[segment.SID.Addr] = segment.Behavior
 	}
