@@ -49,6 +49,13 @@ const lockSuffix = ".lock"
 //
 // A path that is not a socket is refused by name rather than removed: it is
 // not this daemon's to take away from whoever put it there.
+//
+// The lock file outlives the process on purpose. Unlinking it at exit races:
+// a second instance can open it and block on the lock, and an unlink between
+// those two steps leaves that instance holding a lock on an unlinked inode
+// while a third creates the path afresh and locks that, so both believe they
+// own the socket. An empty file is the cheaper end of that trade, and a unit
+// with RuntimeDirectory set clears it anyway.
 func Listen(path string) (net.Listener, error) {
 	if len(path) > MaxSocketPath {
 		return nil, fmt.Errorf("control: socket path is %d bytes, over the %d a unix socket holds: %s", len(path), MaxSocketPath, path)
