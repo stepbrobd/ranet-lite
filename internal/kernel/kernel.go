@@ -326,6 +326,10 @@ func (t Table) Validate() error {
 	if t.CaptureGrace < 0 {
 		return fmt.Errorf("kernel: cap.table capture_grace %s is not an interval", t.CaptureGrace)
 	}
+	if t.CaptureGrace > 0 && t.CaptureGrace.Duration() < MinCaptureGrace {
+		return fmt.Errorf("kernel: cap.table capture_grace %s is shorter than %s, which the reconciler cannot honor: the gate is sampled once a pass and a pass reads the routing table",
+			t.CaptureGrace, MinCaptureGrace)
+	}
 	expanded, err := expandRules(t.Rules)
 	if err != nil {
 		return err
@@ -747,10 +751,12 @@ type Reconciler struct {
 	// warned holds the routes already reported as unrepresentable. It is
 	// rebuilt from each pass, so it stays bounded by the snapshot.
 	warned map[Route]bool
-	// warnedUncovered records that the last pass already said out loud that it
-	// was holding a capture back for want of a covered underlay, so a node in
-	// that state costs one line rather than one every pass.
-	warnedUncovered bool
+	// uncovered records what the last pass found the underlay able to fall
+	// back on, so holding a capture back costs one line per transition rather
+	// than one per pass, and capturing says whether this pass left one
+	// installed, the only state whose grace needs a wake-up of its own.
+	uncovered Covered
+	capturing bool
 
 	// rules and vrfs are the optional halves of the platform, nil where it has
 	// no policy engine or no VRFs. New refuses a configuration that needs one
@@ -1144,8 +1150,21 @@ func (r *Reconciler) sampleCapture() {
 		"detail", "no session has been live for that long, so this node falls back to its own uplink")
 }
 
-// captureDeadline is when a pass has to run for the grace to expire on time.
-func (r *Reconciler) captureDeadline() (time.Time, bool) { return r.gate.deadline() }
+// captureDeadline is when a pass has to run for the grace to expire on time,
+// and nothing at all while no capturing route is installed or wanted.
+//
+// The condition matters more than it looks. The gate is open whenever a
+// session is live, which on an ordinary node is always, so arming the wake
+// from that alone made the grace the reconcile rate: a full pass, both dumps
+// and on darwin a table read and two route lookups, once per grace rather than
+// once per reconcile interval. Measured at 239 passes in 300 ms with a one
+// millisecond grace, against two.
+func (r *Reconciler) captureDeadline() (time.Time, bool) {
+	if !r.capturing {
+		return time.Time{}, false
+	}
+	return r.gate.deadline()
+}
 
 // recordPass publishes the pass applyRoutes counted, with the whole pass's
 // error rather than the route half's. A pass that failed before applyRoutes
@@ -1238,14 +1257,23 @@ func (r *Reconciler) applyRoutes() error {
 		return fmt.Errorf("list routes: %w", err)
 	}
 	desired := r.desired(r.src.Snapshot())
+	// Before the diff, not after it. A capturing route whose family has
+	// nothing to fall back on is dropped from what this pass wants, so it is
+	// neither installed nor kept: gating only the install list left one
+	// already in the kernel exactly where it was when the host's default
+	// moved to another interface.
+	desired, coverErr := r.covered(desired)
 	add, del := diffRoutes(desired, actual, r.platformScopes())
 	var errs []error
+	if coverErr != nil {
+		errs = append(errs, coverErr)
+	}
 	added, removed, skipped := 0, 0, 0
-	uncovered := false
 	// Whether this pass leaves the mesh carrying this machine's own traffic.
 	// The gate has already decided it: desired holds a capturing route only
-	// while the gate is open, so this needs no second opinion about liveness.
-	capturing := slices.ContainsFunc(desired, capturesTheMachine)
+	// while the gate is open and its family is covered, so this needs no
+	// second opinion about either.
+	r.capturing = slices.ContainsFunc(desired, capturesTheMachine)
 	// Withdraw before installing. An install refuses a key another writer
 	// already holds rather than taking it over, so a route of ours that
 	// changed only in an attribute the kernel does not key on, a preferred
@@ -1259,32 +1287,7 @@ func (r *Reconciler) applyRoutes() error {
 			removed++
 		}
 	}
-	// Between the withdrawals and the installs: the routing the underlay
-	// depends on has to be in the kernel before a route that would strand it,
-	// and a pass that cannot get it there installs none of them. Reported
-	// rather than retried here, because the next pass asks again.
-	covered := true
-	if capturing && r.rt.Capture != nil {
-		if err := r.rt.Capture.Ready(); err != nil {
-			covered = false
-			errs = append(errs, fmt.Errorf("cover the underlay before capturing: %w", err))
-		}
-	}
 	for _, route := range add {
-		if !covered && capturesTheMachine(route) {
-			// Left out rather than counted as skipped: skipped counts what
-			// the kernel would not take, and this is the reconciler refusing
-			// to ask. Installing it would take this node off the network with
-			// nothing to fall back on, which is the outage every part of this
-			// arrangement exists to prevent.
-			if !r.warnedUncovered {
-				slog.Warn("kernel is not installing a route that would carry this machine's own traffic",
-					"destination", route.Destination,
-					"detail", "the underlay has no route of its own, so this node would lose every network it has")
-			}
-			uncovered = true
-			continue
-		}
 		if err := r.plat.AddRoute(route); err == nil {
 			added++
 		} else if errors.Is(err, errRouteSkipped) {
@@ -1293,7 +1296,6 @@ func (r *Reconciler) applyRoutes() error {
 			errs = append(errs, fmt.Errorf("add route %s: %w", route, err))
 		}
 	}
-	r.warnedUncovered = uncovered
 	// Reported only when something moved. A route the platform refuses stays
 	// in the diff on purpose, because the install is retried on every pass
 	// until it lands, so a node holding one permanently unrepresentable route
@@ -1314,6 +1316,47 @@ func (r *Reconciler) applyRoutes() error {
 		Removed:   removed,
 	}
 	return errors.Join(errs...)
+}
+
+// covered drops every capturing route whose own family the underlay cannot
+// fall back on, and repairs that routing on the way.
+//
+// It runs once a pass and only where a capturing route is wanted, so a node
+// announcing ordinary prefixes never asks and never pays for the answer.
+func (r *Reconciler) covered(desired []Route) ([]Route, error) {
+	if r.rt.Capture == nil || !slices.ContainsFunc(desired, capturesTheMachine) {
+		r.uncovered = Covered{V4: true, V6: true}
+		return desired, nil
+	}
+	covered, err := r.rt.Capture.Ready()
+	if err != nil {
+		err = fmt.Errorf("cover the underlay before capturing: %w", err)
+	}
+	out := desired[:0:0]
+	held := false
+	for _, route := range desired {
+		if capturesTheMachine(route) && !covered.Has(route.Destination.Addr()) {
+			// Left out of the pass rather than counted as skipped: skipped
+			// counts what the kernel would not take, and this is the
+			// reconciler refusing to ask. Installing it, or leaving one
+			// installed, takes this node off the network for that family with
+			// nothing to fall back on.
+			if r.uncovered.Has(route.Destination.Addr()) {
+				slog.Warn("kernel is holding back a route that would carry this machine's own traffic",
+					"destination", route.Destination,
+					"detail", "the underlay has no route of its own for that family, so this node would lose every network it has there")
+			}
+			held = true
+			continue
+		}
+		out = append(out, route)
+	}
+	if !held {
+		r.uncovered = Covered{V4: true, V6: true}
+		return out, err
+	}
+	r.uncovered = covered
+	return out, err
 }
 
 // desired projects one forwarding table snapshot onto the routes the kernel

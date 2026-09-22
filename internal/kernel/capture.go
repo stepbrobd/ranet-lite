@@ -63,13 +63,40 @@ func unspecifiedOf(address netip.Addr) netip.Addr {
 // nothing implements it on linux, where a marked socket needs no route of its
 // own.
 //
-// Ready both repairs and reports. The reconciler calls it before installing a
-// capturing route and installs none when it answers an error, which is the
-// invariant this replaced a sequence of hopeful steps with: a capture is never
-// in the kernel while the underlay is uncovered.
+// Ready both repairs and reports, per family. The reconciler calls it once a
+// pass and drops from that pass every capturing route whose own family is
+// uncovered, so such a route is neither installed nor left behind: a capture
+// is never in the kernel while the family it captures has nothing to fall back
+// on, on either edge.
 type CaptureRoutes interface {
-	Ready() error
+	Ready() (Covered, error)
 }
+
+// Covered is which families the underlay can fall back on.
+//
+// It is per family because the fallback is: a socket bound with IP_BOUND_IF
+// resolves the unspecified address of the destination's own family, so a
+// covered IPv4 does nothing for a socket carrying ESP to an IPv6 peer. A node
+// whose host default is IPv4 on the bound interface and IPv6 on another is an
+// ordinary dual-stack laptop, and answering "covered" for it installed ::/0
+// out of the tun with nothing behind it.
+type Covered struct{ V4, V6 bool }
+
+// Has reports whether the family an address belongs to is covered.
+func (c Covered) Has(address netip.Addr) bool {
+	if address.Is4() {
+		return c.V4
+	}
+	return c.V6
+}
+
+// MinCaptureGrace is the shortest grace a configuration may name. The gate is
+// sampled once a reconcile pass and a pass is a route dump, an address dump
+// and, where the underlay has routing of its own, a table read and two route
+// lookups, so a grace shorter than this cannot be honored and only sets how
+// often that happens. A second is already far below the twenty a session
+// takes to stop counting as live.
+const MinCaptureGrace = time.Second
 
 // captureGate decides when the mesh may be handed this machine's own traffic.
 //

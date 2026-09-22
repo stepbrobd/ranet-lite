@@ -197,10 +197,17 @@ func (h *Hub) settleLinks(changed <-chan struct{}) bool {
 }
 
 // moveUnderlay puts the socket on one interface in the order that leaves it
-// usable throughout: the interface it is going to is made ready first, then
-// the socket moves, then whatever the interface it left needed comes down. A
-// Prepare that fails stops the move, because moving onto an interface that is
-// not ready is the outage this sequence exists to avoid.
+// usable throughout: the interface it is going to is prepared first, then the
+// socket moves, then whatever the interface it left needed comes down.
+//
+// A Prepare that fails stops the move, because a move onto an interface whose
+// routing could not be written is one this node cannot undo. What it does not
+// do is refuse an interface that simply needs nothing written, or one whose
+// family the host reaches another way: the socket still belongs there, since
+// that is where the host's own traffic goes, and the alternative is leaving it
+// bound to an interface that may be gone. Whether a capture may then be
+// installed is a separate question, asked separately, and UnderlayRoutes
+// answers it per family rather than here.
 func (h *Hub) moveUnderlay(index int, routes UnderlayRoutes) error {
 	if routes != nil {
 		// Unconditionally, even where the index has not changed. The kernel

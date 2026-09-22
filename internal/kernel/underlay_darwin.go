@@ -223,29 +223,30 @@ func (u *UnderlayDefaults) Settle(index int) error {
 	return u.remove(func(held writtenDefault) bool { return held.index != index })
 }
 
-// Ready repairs the underlay's own routing and reports whether it is covered.
-// The reconciler calls it before installing a route that would carry this
-// machine's own traffic and installs none when it answers an error, so a
-// capture is never in the kernel while the underlay has nothing to fall back
-// on.
-func (u *UnderlayDefaults) Ready() error {
+// Ready repairs the underlay's own routing and reports, per family, what it
+// can fall back on. The reconciler drops from its pass every capturing route
+// whose own family is uncovered, so such a route is neither installed nor left
+// behind.
+//
+// Per family because the fallback is: a socket bound with IP_BOUND_IF resolves
+// the unspecified address of the destination's own family. A host reaching
+// IPv4 through the bound interface and IPv6 through another is an ordinary
+// dual-stack laptop, and one answer for the machine let ::/0 install over an
+// IPv6 underlay with nothing behind it.
+func (u *UnderlayDefaults) Ready() (Covered, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.closed {
-		return errUnderlayClosed
+		return Covered{}, errUnderlayClosed
 	}
 	if u.on == 0 {
-		return errors.New("kernel: the underlay socket is on no interface")
+		return Covered{}, errors.New("kernel: the underlay socket is on no interface")
 	}
-	if err := u.ensure(); err != nil {
-		return err
-	}
-	for _, destination := range defaultPrefixes {
-		if u.covered[destination] {
-			return nil
-		}
-	}
-	return fmt.Errorf("kernel: interface %d carries no default of its own to fall back on", u.on)
+	err := u.ensure()
+	return Covered{
+		V4: u.covered[netip.PrefixFrom(netip.IPv4Unspecified(), 0)],
+		V6: u.covered[netip.PrefixFrom(netip.IPv6Unspecified(), 0)],
+	}, err
 }
 
 // Close removes what this process wrote, unless a capture is still in the

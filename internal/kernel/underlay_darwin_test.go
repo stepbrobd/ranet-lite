@@ -133,7 +133,7 @@ func TestUnderlayDefaultsNeverDeletesAnUnscopedDefault(t *testing.T) {
 		run  func() error
 	}{
 		{"prepare", func() error { return underlay.Prepare(uplinkIndex) }},
-		{"cover", func() error { return underlay.Ready() }},
+		{"cover", func() error { _, err := underlay.Ready(); return err }},
 		{"settle", func() error { return underlay.Settle(uplinkIndex) }},
 		{"move to the dock", func() error { return underlay.Prepare(dockIndex) }},
 		{"settle on the dock", func() error { return underlay.Settle(dockIndex) }},
@@ -434,7 +434,7 @@ func TestUnderlayDefaultsRefusesToWithdrawOnAnUnreadableDump(t *testing.T) {
 	// The table stops reading back after the route is recorded, which is the
 	// state a withdrawal must refuse to act in.
 	underlay.dump = func() ([]byte, error) { return nil, errors.New("the kernel would not answer") }
-	if err := underlay.Ready(); err == nil {
+	if _, err := underlay.Ready(); err == nil {
 		t.Error("a pass over an unreadable dump reported the underlay covered")
 	}
 	if err := underlay.Close(); err == nil {
@@ -460,8 +460,8 @@ func TestUnderlayDefaultsDoesNotOwnARouteThatWasAlreadyThere(t *testing.T) {
 	if err := underlay.Prepare(uplinkIndex); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Ready(); err != nil {
-		t.Fatalf("an add that found the route already there was reported as a failure: %v", err)
+	if covered, err := underlay.Ready(); err != nil || !covered.V4 {
+		t.Fatalf("an add that found the route already there was reported as a failure: %+v %v", covered, err)
 	}
 	if got := underlay.Written(); len(got) != 0 {
 		t.Fatalf("a route that was already there was recorded as ours: %+v", got)
@@ -490,7 +490,7 @@ func TestUnderlayDefaultsRefusesEverythingAfterClose(t *testing.T) {
 	for name, call := range map[string]func() error{
 		"prepare": func() error { return underlay.Prepare(uplinkIndex) },
 		"settle":  func() error { return underlay.Settle(uplinkIndex) },
-		"ready":   underlay.Ready,
+		"ready":   func() error { _, err := underlay.Ready(); return err },
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := call(); !errors.Is(err, errUnderlayClosed) {
@@ -543,5 +543,45 @@ func TestCloseLeavesTheRouteWhileACaptureIsStillInstalled(t *testing.T) {
 		if message.kind == unix.RTM_DELETE {
 			t.Errorf("the fallback was withdrawn under a capture that is still installed: %+v", message)
 		}
+	}
+}
+
+// Prepare covers what it can and moves the socket either way. An interface
+// whose family the host reaches another way, or reaches through a link with no
+// next hop to name, is still where this node's own traffic goes, so the socket
+// belongs there; refusing the move would leave it bound to an interface that
+// may be gone. What must not happen is a capture installing over it, and Ready
+// answers that, per family.
+//
+// The comment on moveUnderlay used to claim the opposite, that a Prepare which
+// covered nothing stopped the move. It did not, and holding it would have been
+// the worse behaviour.
+func TestPrepareMovesOntoAnInterfaceItCannotCover(t *testing.T) {
+	for name, links := range map[string]*fakeDefaults{
+		"the host reaches this family another way": {
+			v4: hostDefault{index: dockIndex, gateway: addr("10.0.0.1")},
+		},
+		"the host reaches it through a link with no next hop": {
+			v4: hostDefault{index: uplinkIndex},
+		},
+		"the host has no default at all": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			underlay, sock := testUnderlay(t, links, func() []byte { return hostRIB(t) })
+			if err := underlay.Prepare(uplinkIndex); err != nil {
+				t.Errorf("preparing an interface it cannot cover refused the move: %v", err)
+			}
+			if got := sent(t, sock); len(got) != 0 {
+				t.Errorf("it wrote %+v on an interface it cannot cover", got)
+			}
+			// And the separate question gets the honest answer.
+			covered, err := underlay.Ready()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if covered.V4 || covered.V6 {
+				t.Errorf("an interface it covered nothing on reports %+v", covered)
+			}
+		})
 	}
 }

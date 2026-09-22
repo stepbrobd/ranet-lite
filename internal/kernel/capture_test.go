@@ -307,14 +307,15 @@ func TestReconcilerAsksToBeWokenWhenTheGraceExpires(t *testing.T) {
 // it was asked, because the invariant is the property: a capture must not be
 // in the kernel while the underlay is uncovered.
 type recordingCapture struct {
-	fake *fakeKernel
-	at   []string
-	err  error
+	fake    *fakeKernel
+	at      []string
+	covered Covered
+	err     error
 }
 
-func (c *recordingCapture) Ready() error {
+func (c *recordingCapture) Ready() (Covered, error) {
 	c.at = append(c.at, "asked with "+c.capturing())
-	return c.err
+	return c.covered, c.err
 }
 
 // capturing describes whether the kernel currently holds a route that would
@@ -335,7 +336,7 @@ func TestReconcileCoversTheUnderlayBeforeTheCapture(t *testing.T) {
 	reconciler, table, fake := harness(t,
 		Table{CaptureGrace: schema.Duration(10 * time.Second)},
 		Runtime{Sessions: func() int { return live }})
-	capture := &recordingCapture{fake: fake}
+	capture := &recordingCapture{fake: fake, covered: Covered{V4: true, V6: true}}
 	reconciler.rt.Capture = capture
 	clock := start
 	reconciler.now = func() time.Time { return clock }
@@ -382,7 +383,7 @@ func TestReconcileInstallsNoCaptureOverAnUncoveredUnderlay(t *testing.T) {
 // routing, so it never touches the interface it reaches its peers through.
 func TestReconcileLeavesTheUnderlayAloneWithoutADefault(t *testing.T) {
 	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
-	capture := &recordingCapture{fake: fake}
+	capture := &recordingCapture{fake: fake, covered: Covered{V4: true, V6: true}}
 	reconciler.rt.Capture = capture
 	reconciler.now = func() time.Time { return start }
 	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
@@ -413,5 +414,120 @@ func TestNewRefusesABoundUnderlayWithNoSessionSource(t *testing.T) {
 		Interface: "lo0", BoundUnderlay: true, Sessions: func() int { return 0 },
 	}, table); err != nil && strings.Contains(err.Error(), "session source") {
 		t.Errorf("a bound underlay with a session source was refused for the same reason: %v", err)
+	}
+}
+
+// The grace must not set the reconcile rate. The gate is open whenever a
+// session is live, which on an ordinary node is always, so arming the wake
+// from that alone made a full pass run once per grace: measured at 239 passes
+// in 300 ms with a one millisecond grace against two, and at the shipped
+// defaults three times as often as reconcile says.
+//
+// The wake is needed only while a capturing route is installed or wanted,
+// which is the state whose withdrawal nothing else would schedule.
+func TestGraceWakesOnlyWhileACaptureIsInPlay(t *testing.T) {
+	for name, announce := range map[string]netip.Prefix{
+		"nothing capturing announced": prefix("3fff:a::/36"),
+		"a capture announced":         prefix("::/0"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			reconciler, table, _ := harness(t,
+				Table{CaptureGrace: schema.Duration(time.Second)},
+				Runtime{Sessions: func() int { return 1 }})
+			reconciler.now = func() time.Time { return start }
+			table.Set(netip.Prefix{}, announce, nil)
+			if err := reconciler.reconcile(); err != nil {
+				t.Fatal(err)
+			}
+			_, armed := reconciler.captureDeadline()
+			if want := announce.Bits() == 0; armed != want {
+				t.Errorf("the grace wake is armed %v with %s announced, want %v", armed, announce, want)
+			}
+		})
+	}
+}
+
+// And a grace too short to honor is refused by name rather than spun on. The
+// gate is sampled once a pass and a pass reads the routing table, so a
+// millisecond grace only sets how often that happens.
+func TestCaptureGraceBelowTheFloorIsRefused(t *testing.T) {
+	for name, grace := range map[string]time.Duration{
+		"a millisecond":       time.Millisecond,
+		"just under a second": MinCaptureGrace - time.Nanosecond,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := Table{CaptureGrace: schema.Duration(grace)}.Validate()
+			if err == nil {
+				t.Fatal("a grace the reconciler cannot honor was accepted")
+			}
+			if !strings.Contains(err.Error(), "capture_grace") {
+				t.Errorf("the refusal reads %q", err)
+			}
+		})
+	}
+	// The floor itself and the default are both fine, and an omitted one still
+	// means the default rather than an error.
+	for _, grace := range []time.Duration{0, MinCaptureGrace, DefaultCaptureGrace} {
+		if err := (Table{CaptureGrace: schema.Duration(grace)}).Validate(); err != nil {
+			t.Errorf("a grace of %s was refused: %v", grace, err)
+		}
+	}
+}
+
+// Readiness is per family, because the fallback is: a socket bound with
+// IP_BOUND_IF resolves the unspecified address of the destination's own
+// family. A host reaching IPv4 through the bound interface and IPv6 through
+// another is an ordinary dual-stack laptop, and one answer for the machine let
+// ::/0 install with nothing behind it.
+func TestCaptureIsGatedOnItsOwnFamily(t *testing.T) {
+	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
+	capture := &recordingCapture{fake: fake, covered: Covered{V4: true}}
+	reconciler.rt.Capture = capture
+	reconciler.now = func() time.Time { return start }
+	table.Set(netip.Prefix{}, prefix("0.0.0.0/0"), nil)
+	table.Set(netip.Prefix{}, prefix("::/0"), nil)
+
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.has(Route{Destination: prefix("0.0.0.0/0")}) {
+		t.Error("the covered family's default was held back")
+	}
+	if fake.has(Route{Destination: prefix("::/0"), Metric: defaultIPv6Metric}) {
+		t.Error("the uncovered family's default installed anyway")
+	}
+}
+
+// A capture already in the kernel has to go when its family stops being
+// covered. Gating only the install list left one exactly where it was when the
+// host's default moved to another interface, which is a dock or a wifi roam.
+func TestCaptureIsWithdrawnWhenItsFamilyStopsBeingCovered(t *testing.T) {
+	reconciler, table, fake := harness(t, Table{}, Runtime{Sessions: func() int { return 1 }})
+	capture := &recordingCapture{fake: fake, covered: Covered{V4: true, V6: true}}
+	reconciler.rt.Capture = capture
+	reconciler.now = func() time.Time { return start }
+	table.Set(netip.Prefix{}, prefix("::/0"), nil)
+	table.Set(netip.Prefix{}, prefix("3fff:a::/36"), nil)
+
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	installed := Route{Destination: prefix("::/0"), Metric: defaultIPv6Metric}
+	if !fake.has(installed) {
+		t.Fatal("the default did not install while the underlay was covered")
+	}
+
+	// The host's default moves to another interface, so the underlay has
+	// nothing to fall back on for that family any more.
+	capture.covered = Covered{V4: true}
+	if err := reconciler.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.has(installed) {
+		t.Error("a capture whose family lost its fallback was left in the kernel")
+	}
+	// And the ordinary mesh prefixes are untouched throughout.
+	if !fake.has(Route{Destination: prefix("3fff:a::/36"), Metric: defaultIPv6Metric}) {
+		t.Error("an ordinary mesh prefix went with the capture")
 	}
 }

@@ -117,8 +117,8 @@ func TestDarwinBoundSocketNeedsAScopedDefault(t *testing.T) {
 	if err := underlay.Prepare(host); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Ready(); err != nil {
-		t.Fatalf("cover the underlay: %v", err)
+	if covered, err := underlay.Ready(); err != nil || !covered.V4 {
+		t.Fatalf("cover the underlay: covered %+v, err %v", covered, err)
 	}
 	if err := underlay.Settle(host); err != nil {
 		t.Fatal(err)

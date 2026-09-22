@@ -163,8 +163,8 @@ func TestDarwinScopedDefaultUnstrandsEverySetThatStranded(t *testing.T) {
 	if err := underlay.Prepare(host); err != nil {
 		t.Fatal(err)
 	}
-	if err := underlay.Ready(); err != nil {
-		t.Fatalf("the underlay reports itself uncovered: %v", err)
+	if covered, err := underlay.Ready(); err != nil || !covered.V4 {
+		t.Fatalf("the underlay reports itself uncovered: %+v %v", covered, err)
 	}
 
 	for _, set := range [][]string{
