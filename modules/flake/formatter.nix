@@ -11,7 +11,7 @@
         root="$(${lib.getExe pkgs.git} rev-parse --show-toplevel)"
         pushd "$root" > /dev/null
 
-        ${lib.getExe pkgs.deno} fmt **/*.md
+        ${lib.getExe pkgs.deno} fmt **/*.md examples/*.json
         ${lib.getExe pkgs.nixfmt-tree} .
 
         ${lib.getExe pkgs.go} fmt ./...

@@ -1,0 +1,18 @@
+{
+  "node": { "org": "example", "name": "my-laptop" },
+  "auth": {
+    "key": "/etc/ranet-lite/key.pem",
+    "trust": "/etc/ranet-lite/trust.json"
+  },
+  "link": {
+    "port": 13000,
+    "endpoints": [{ "serial": "0", "family": "ip4" }]
+  },
+  "dial": {
+    "to": [{ "name": "gateway", "serial": "0" }]
+  },
+  "cap": {
+    "route": { "announce": ["10.66.0.5/32"] },
+    "babel": { "hello": "4s", "update": "16s" }
+  }
+}

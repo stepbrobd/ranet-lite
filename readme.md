@@ -384,8 +384,14 @@ ranet-lite needs two files:
   than sniffed. Both decoders are strict, so an unknown key is an error under
   either: a mistyped capability that silently does nothing is the worst failure
   a configuration file has. See [`examples/config.toml`](examples/config.toml)
-  for the annotated reference and [`examples/config.yaml`](examples/config.yaml)
-  for the same schema in YAML.
+  for the annotated reference, [`examples/config.yaml`](examples/config.yaml)
+  for the same schema in YAML, and
+  [`examples/config.json`](examples/config.json) for it in JSON. All three
+  describe one node, which a test holds by loading each and comparing the three
+  whole. JSON carries no comment and the decoder refuses an unknown key, so that
+  example cannot annotate itself and cannot smuggle an explanation in under a
+  spare key either; it is the form a generator or a control plane writes, and
+  the TOML file is where the keys are explained.
 
 The top level says what the node **is**. Everything it **does** lives under
 `cap`, one block per capability, and writing the block turns that capability on.

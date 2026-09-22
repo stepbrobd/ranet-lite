@@ -91,7 +91,7 @@
             ''
               cd ${../../.}
               export DENO_DIR="$TMPDIR/deno"
-              deno fmt --check readme.md
+              deno fmt --check readme.md examples/config.json
               # found rather than globbed, so a directory added under modules,
               # lib or pkgs cannot quietly drop out of the check. The count
               # tells a narrowed walk from a tree that lost files, the same

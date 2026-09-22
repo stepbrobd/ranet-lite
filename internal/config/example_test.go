@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,15 +13,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// The two shipped examples, one per decoder. An operator copies one of them,
-// so a change to how a field is spelled is checked against the file they will
-// copy rather than against a fixture written next to the change.
+// The three shipped examples, one per extension a configuration may carry. An
+// operator copies one of them, so a change to how a field is spelled is
+// checked against the file they will copy rather than against a fixture
+// written next to the change.
 var examples = map[string]struct {
 	path string
 	// commented matches the optional lines the file documents, so the test can
 	// enable all of them at once. Removing the marker and nothing else has to
 	// leave a configuration that still loads, or the documentation is wrong
-	// about what it says an operator may turn on.
+	// about what it says an operator may turn on. It is nil where the format
+	// has no comment syntax and so documents nothing.
 	commented *regexp.Regexp
 	enabled   string
 }{
@@ -34,7 +37,15 @@ var examples = map[string]struct {
 		commented: regexp.MustCompile(`(?m)^([ ]*)# ([ ]*(?:[a-z_][a-z0-9_]*:|-[ ]).*)$`),
 		enabled:   `${1}${2}`,
 	},
+	"json": {path: filepath.Join("..", "..", "examples", "config.json")},
 }
+
+// The extensions whose format carries no comment, so their example documents
+// no optional line and the half of TestShippedExamplesParse that enables one
+// has nothing to work on. Named here rather than read off a nil commented
+// pattern, because a yaml entry that lost its pattern would then skip that
+// half without saying so.
+var uncommentable = map[string]bool{"json": true}
 
 // Both the shipped defaults and the optional lines get copied into real
 // configurations, so neither may hide an invalid field or a duplicate block.
@@ -44,15 +55,19 @@ func TestShippedExamplesParse(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read the example: %v", err)
 		}
-		for which, variant := range map[string][]byte{
-			"shipped":             body,
-			"all options enabled": example.commented.ReplaceAll(body, []byte(example.enabled)),
-		} {
+		variants := map[string][]byte{"shipped": body}
+		if !uncommentable[name] {
+			variants["all options enabled"] = example.commented.ReplaceAll(body, []byte(example.enabled))
+		}
+		for which, variant := range variants {
 			t.Run(name+" "+which, func(t *testing.T) {
 				if _, err := loadExample(t, name, variant); err != nil {
 					t.Fatalf("the example no longer loads: %v", err)
 				}
 			})
+		}
+		if uncommentable[name] {
+			continue
 		}
 		if enabled := example.commented.ReplaceAll(body, []byte(example.enabled)); string(enabled) == string(body) {
 			t.Errorf("%s documents no optional line, so half of this test proves nothing", name)
@@ -60,9 +75,10 @@ func TestShippedExamplesParse(t *testing.T) {
 	}
 }
 
-// Both examples describe one node, so an operator picking either extension
-// gets the same daemon. Only the two files' own contents differ: the yaml one
-// is the short form, so the comparison is on what both of them write.
+// All three examples describe one node, so an operator picking any extension
+// gets the same daemon. Only the files' own contents differ: the toml one
+// carries the documentation and the other two are the short form, so the
+// comparison is on what all of them write.
 func TestShippedExamplesAgreeOnTheNode(t *testing.T) {
 	loaded := make(map[string]*Config, len(examples))
 	for name, example := range examples {
@@ -76,14 +92,22 @@ func TestShippedExamplesAgreeOnTheNode(t *testing.T) {
 		}
 		loaded[name] = cfg
 	}
-	fromTOML, fromYAML := loaded["toml"], loaded["yaml"]
 	// Compared whole rather than field by field. Counting two slices let the
 	// toml example ship a live "::/0 from 2001:db8:1::/48" while the yaml one
 	// announced a single address, so copying the annotated reference started a
 	// node claiming to be an exit.
-	if !reflect.DeepEqual(fromTOML, fromYAML) {
-		t.Errorf("the two examples describe different nodes:\ntoml %s\nyaml %s",
-			rendered(t, fromTOML), rendered(t, fromYAML))
+	//
+	// The toml file is the reference because it is the annotated one, so a
+	// mismatch reads as the shorter file having drifted from it.
+	reference := loaded["toml"]
+	for name, cfg := range loaded {
+		if name == "toml" {
+			continue
+		}
+		if !reflect.DeepEqual(reference, cfg) {
+			t.Errorf("the toml and %s examples describe different nodes:\ntoml %s\n%s %s",
+				name, rendered(t, reference), name, rendered(t, cfg))
+		}
 	}
 	// Neither of them is an exit. The reference is the ordinary case, and an
 	// exit is described in prose beside the line it would change.
@@ -93,6 +117,26 @@ func TestShippedExamplesAgreeOnTheNode(t *testing.T) {
 				t.Errorf("the %s example announces %s, so copying it starts an exit node", name, announced)
 			}
 		}
+	}
+}
+
+// A .json file goes to the YAML decoder, which accepts a great deal that JSON
+// does not. So every other check in this file would pass on an examples
+// config.json holding plain YAML, while jq, a control plane and anything else
+// an operator points at the file would refuse it.
+func TestShippedJSONExampleIsJSONAndNotOnlyYAML(t *testing.T) {
+	body, err := os.ReadFile(examples["json"].path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(body, &document); err != nil {
+		t.Errorf("the json example is not valid json: %v", err)
+	}
+	// The same document in the spelling this test exists to refuse, so a
+	// change that made the check vacuous fails here rather than passing.
+	if err := json.Unmarshal([]byte("node:\n  org: example\n"), &document); err == nil {
+		t.Error("json.Unmarshal took a yaml mapping, so this test would pass on a yaml file")
 	}
 }
 
