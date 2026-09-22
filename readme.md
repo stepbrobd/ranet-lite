@@ -543,6 +543,16 @@ refused by name where there is no packet filter to write into, because a node
 that accepted the configuration and translated nothing would advertise itself
 and then drop every flow that took it.
 
+A translating node needs both shapes of policy rule, not only the one selecting
+on its own source. Conntrack reverses the translation before the reply is
+routed, so the reply is addressed into the mesh and has to meet a rule sending
+it to the mesh table. Without that rule the outbound half works and looks right,
+the translation counter moves, and every reply leaves by the physical uplink
+instead, which presents as an exit that answers nothing rather than as a rule
+that is missing. Measured on two nodes on one switch: with the `from` rule alone
+the counter reported the flow and the ping lost every packet; adding the `to`
+rule made it 4 of 4.
+
 Both interfaces are matched, never one. A packet that arrives on the TUN and
 leaves by it again is mesh transit, and rewriting its source would put this
 node's address on a packet it is only relaying. A packet this host generated

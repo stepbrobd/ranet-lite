@@ -215,6 +215,13 @@ update = "16s"
 # family, so an exit that cannot translate stops attracting traffic it would
 # drop. Do not name one of these under cap.route as well, which would announce
 # it either way.
+#
+# A node that translates needs both of the cap.table.rules shapes above, not
+# only the "from" one: conntrack reverses the translation before the reply is
+# routed, so the reply is addressed to the mesh and has to find a rule sending
+# it to the mesh table. Without the "to" rule the outbound half works, the
+# nftables counter moves, and every reply leaves by the physical uplink and is
+# lost, which reads as a dead exit rather than as a missing rule.
 # [cap.egress]
 # advertise = ["198.51.100.0/24", "2001:db8:2::/48"]
 
