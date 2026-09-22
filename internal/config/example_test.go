@@ -3,10 +3,13 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // The two shipped examples, one per decoder. An operator copies one of them,
@@ -74,15 +77,35 @@ func TestShippedExamplesAgreeOnTheNode(t *testing.T) {
 		loaded[name] = cfg
 	}
 	fromTOML, fromYAML := loaded["toml"], loaded["yaml"]
-	if fromTOML.Node != fromYAML.Node || fromTOML.Auth != fromYAML.Auth {
-		t.Errorf("the two examples describe different nodes: %+v and %+v", fromTOML.Node, fromYAML.Node)
+	// Compared whole rather than field by field. Counting two slices let the
+	// toml example ship a live "::/0 from 2001:db8:1::/48" while the yaml one
+	// announced a single address, so copying the annotated reference started a
+	// node claiming to be an exit.
+	if !reflect.DeepEqual(fromTOML, fromYAML) {
+		t.Errorf("the two examples describe different nodes:\ntoml %s\nyaml %s",
+			rendered(t, fromTOML), rendered(t, fromYAML))
 	}
-	if fromTOML.Link.Port != fromYAML.Link.Port || len(fromTOML.Link.Endpoints) != len(fromYAML.Link.Endpoints) {
-		t.Errorf("the two examples bind differently: %+v and %+v", fromTOML.Link, fromYAML.Link)
+	// Neither of them is an exit. The reference is the ordinary case, and an
+	// exit is described in prose beside the line it would change.
+	for name, cfg := range loaded {
+		for _, announced := range cfg.Routes().Announce {
+			if announced.From.IsValid() {
+				t.Errorf("the %s example announces %s, so copying it starts an exit node", name, announced)
+			}
+		}
 	}
-	if len(fromTOML.Dial.To) != len(fromYAML.Dial.To) {
-		t.Errorf("the two examples dial differently: %+v and %+v", fromTOML.Dial, fromYAML.Dial)
+}
+
+// rendered puts a configuration back into the file's own spelling, so a
+// mismatch above reads as the two files rather than as two struct dumps full
+// of pointers.
+func rendered(t *testing.T, cfg *Config) string {
+	t.Helper()
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return "\n" + string(body)
 }
 
 // The integration harness writes sub-second intervals, which is the one

@@ -77,9 +77,12 @@ to = [{ name = "gateway", serial = "0" }]
 # What this node puts into the mesh. A node that announces nothing consumes
 # routes and originates none.
 [cap.route]
-# Either a bare prefix or a prefix and the source it is reachable from, which
-# is how an exit announces a default out of its own transit prefix.
-announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
+# Either a bare prefix or a prefix and the source it is reachable from. The
+# second spelling is how an exit announces a default out of its own transit
+# prefix. An exit node adds { prefix = "::/0", from = "2001:db8:1::/48" } to
+# the list beside its own address; an ordinary node announces its own address
+# and nothing else, as this file does.
+announce = ["10.66.0.5/32"]
 
 # Relay the routes this node learns, so it offers to carry the mesh. On unless
 # written out. Turn it off on a leaf: a node that redistributes is offering
@@ -87,10 +90,11 @@ announce = ["10.66.0.5/32", { prefix = "::/0", from = "2001:db8:1::/48" }]
 # transit = false
 
 # The babel speaker's own timers and costs. Omitted, each keeps the default
-# below, the value RFC 8966 Appendix B and BIRD use.
+# below, the value RFC 8966 Appendix B and BIRD use. The two written out here
+# are those defaults, so a node that deletes them runs the same speaker.
 [cap.babel]
-# hello = "4s"
-# update = "16s"
+hello = "4s"
+update = "16s"
 
 # How a link's Hello loss becomes a cost, RFC 8966 Appendix A.2, spelled the
 # way BIRD spells it: "etx", which the fleet runs on these same tunnels, or
