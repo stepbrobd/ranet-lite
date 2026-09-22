@@ -305,8 +305,7 @@ func TestSpentSequenceSpaceAsksForAReplacementAndKeepsTheSession(t *testing.T) {
 // because closeAll has already swept by the time the node's context is
 // canceled, and that sweep exists so that no peer is told twice.
 func TestOnlyADroppedDialerTellsItsPeer(t *testing.T) {
-	live, cancelLive := context.WithCancel(context.Background())
-	defer cancelLive()
+	live := t.Context()
 	dropped, cancelDropped := context.WithCancel(context.Background())
 	cancelDropped()
 	node, stopNode := context.WithCancel(context.Background())

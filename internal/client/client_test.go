@@ -1835,7 +1835,7 @@ func (b *syncBuffer) lines(phrase string) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var found []string
-	for _, line := range strings.Split(b.buf.String(), "\n") {
+	for line := range strings.SplitSeq(b.buf.String(), "\n") {
 		if strings.Contains(line, phrase) {
 			found = append(found, line)
 		}

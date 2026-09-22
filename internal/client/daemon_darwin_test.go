@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -244,12 +245,7 @@ func TestBoundUnderlayConfigurationInstallsACaptureOnlyOnceASessionIsLive(t *tes
 	// And the address the file announces is assigned to the device the mesh
 	// got, which is the only thing cap.route's announcements do to the kernel.
 	waitForKernel(t, "the announced address is assigned to the mesh device", func() bool {
-		for _, held := range d.host.addresses(meshDeviceIndex) {
-			if held == announcedAddress {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(d.host.addresses(meshDeviceIndex), announcedAddress)
 	})
 
 	// The default the mesh is announcing is not installed, because no session
