@@ -23,8 +23,9 @@ type Config struct {
 	Quality LinkQuality `yaml:"quality,omitempty" json:"quality,omitempty" toml:"quality,omitempty"`
 	// Cost is the link cost, named after the BIRD babel interface options it
 	// mirrors: a fixed rx cost plus up to rtt.weight scaled linearly between
-	// rtt.min and rtt.max.
-	Cost CostParams `yaml:"cost,omitempty" json:"cost,omitempty" toml:"cost,omitempty"`
+	// rtt.min and rtt.max. Each of the four keeps the speaker's default on its
+	// own, so writing one of them leaves the other three alone.
+	Cost CostOptions `yaml:"cost,omitempty" json:"cost,omitempty" toml:"cost,omitempty"`
 }
 
 // Runtime is the half the speaker is handed rather than told: the router id
@@ -65,26 +66,26 @@ func (c Config) UpdateInterval() time.Duration {
 	return c.Update.Duration()
 }
 
-// CostEffective is the link cost in force, the package defaults filled in and
-// the estimator carried into it from the block above.
+// CostEffective is the link cost in force, each omitted field filled in with
+// the package default and the estimator carried into it from the block above.
 func (c Config) CostEffective() CostParams {
-	cost := c.Cost
-	if cost == (CostParams{}) {
-		cost = DefaultCostParams()
-	}
+	cost := c.Cost.Params()
 	cost.Quality = c.Quality
 	return cost
 }
 
-// WithDefaults is the configuration the speaker runs, every unset field filled
-// in, so a reload can tell a changed speaker from a rewritten file.
-func (c Config) WithDefaults() Config {
-	return Config{
-		Hello:   schema.Duration(c.HelloInterval()),
-		Update:  schema.Duration(c.UpdateInterval()),
-		Quality: c.Quality,
-		Cost:    c.CostEffective(),
-	}
+// Effective is the speaker a block describes, every omitted field filled in.
+// A reload compares two configurations through this rather than as they were
+// written, since an omitted field and one spelled out as its own default
+// describe the same speaker.
+type Effective struct {
+	Hello  time.Duration
+	Update time.Duration
+	Cost   CostParams
+}
+
+func (c Config) Effective() Effective {
+	return Effective{Hello: c.HelloInterval(), Update: c.UpdateInterval(), Cost: c.CostEffective()}
 }
 
 // Validate checks the capability, defaults included, so a bad rx cost fails

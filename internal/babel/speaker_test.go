@@ -537,7 +537,6 @@ func TestStalledNeighborDoesNotHoldOthers(t *testing.T) {
 // threshold of section 3.7.2, both of which the config decides.
 func TestNewSpeakerCarriesItsConfigurationIntoTheRouteTable(t *testing.T) {
 	cfg := Config{Hello: dur(4 * time.Second), Update: dur(16 * time.Second)}
-	cfg.Cost = DefaultCostParams()
 	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
 	speaker, err := New(cfg, Routes{}, Runtime{}, mesh)
 	if err != nil {
@@ -874,7 +873,8 @@ func TestDefaultsMatchFleetTheyReplace(t *testing.T) {
 // exactly, so a flapping challenger takes the route on its first good sample;
 // with the trigger at zero every metric fluctuation earns a triggered update.
 func TestRouteTableTakesHysteresisFromConfig(t *testing.T) {
-	cfg := Config{Hello: dur(3 * time.Second), Cost: CostParams{RxCost: 77, RTT: RTTCost{Max: dur(time.Second)}}}
+	rx, max := uint16(77), dur(time.Second)
+	cfg := Config{Hello: dur(3 * time.Second), Cost: CostOptions{Rx: &rx, RTT: RTTOptions{Max: &max}}}
 	speaker, err := New(cfg, Routes{}, Runtime{}, &netstack.Mesh{Routes: netstack.NewRouteTable()})
 	if err != nil {
 		t.Fatal(err)

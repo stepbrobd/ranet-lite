@@ -380,7 +380,7 @@ func TestReloadRefusesChangesItCannotApply(t *testing.T) {
 		"endpoints": func(c *config.Config) {
 			c.Link.Endpoints = []config.Endpoint{{Serial: "1", Family: "ip6"}}
 		},
-		"cap.babel":  func(c *config.Config) { c.Cap.Babel = &babel.Config{Cost: babel.CostParams{RxCost: rxcost}} },
+		"cap.babel":  func(c *config.Config) { c.Cap.Babel = &babel.Config{Cost: babel.CostOptions{Rx: &rxcost}} },
 		"cap.route":  func(c *config.Config) { c.Cap.Route = &babel.Routes{Transit: new(bool)} },
 		"cap.table":  func(c *config.Config) { c.Cap.Table = &kernel.Table{ID: 201} },
 		"cap.crypto": func(c *config.Config) { c.Cap.Crypto = &ike.Crypto{Replay: &window} },
@@ -1109,7 +1109,11 @@ func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 		// what turns it on and adding one is a change by itself.
 		Cap: config.Caps{Table: &kernel.Table{}},
 	}
-	defaults := base.Babel().CostEffective()
+	// Spelled out in full as an operator would, one pointer per field, so the
+	// comparison has to resolve them rather than read the block as written.
+	params := base.Babel().CostEffective()
+	defaults := babel.CostOptions{Rx: &params.RxCost, RTT: babel.RTTOptions{
+		Weight: &params.RTT.Weight, Min: &params.RTT.Min, Max: &params.RTT.Max}}
 
 	for name, write := range map[string]func(*config.Config){
 		"babel costs": func(c *config.Config) {
@@ -1130,7 +1134,8 @@ func TestReloadAcceptsDefaultWrittenOutInFull(t *testing.T) {
 
 	// A real change is still refused, or the comparison would be useless.
 	louder := defaults
-	louder.RxCost++
+	raised := params.RxCost + 1
+	louder.Rx = &raised
 	changed := *base
 	changed.Cap.Babel = &babel.Config{Cost: louder}
 	if err := reloadable(base, &changed); err == nil {

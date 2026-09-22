@@ -196,6 +196,8 @@ func TestRenderedCapabilitiesParseBackToThemselves(t *testing.T) {
 		}
 	}
 	transit := false
+	rxcost, weight := uint16(96), uint16(1024)
+	rttMin, rttMax := schema.Duration(10*time.Millisecond), schema.Duration(1024*time.Millisecond)
 	replay := uint32(2048)
 	child := schema.Duration(90 * time.Minute)
 	retry := schema.Duration(7 * time.Second)
@@ -215,10 +217,10 @@ func TestRenderedCapabilitiesParseBackToThemselves(t *testing.T) {
 				Hello:   schema.Duration(4 * time.Second),
 				Update:  schema.Duration(16 * time.Second),
 				Quality: babel.LinkQualityNone,
-				Cost: babel.CostParams{RxCost: 96, RTT: babel.RTTCost{
-					Weight: 1024,
-					Min:    schema.Duration(10 * time.Millisecond),
-					Max:    schema.Duration(1024 * time.Millisecond),
+				Cost: babel.CostOptions{Rx: &rxcost, RTT: babel.RTTOptions{
+					Weight: &weight,
+					Min:    &rttMin,
+					Max:    &rttMax,
 				}},
 			}
 		},
@@ -720,6 +722,46 @@ func TestBabelCostFieldsReachTheSpeaker(t *testing.T) {
 	// Omitted, the speaker's own defaults stand, matching BIRD.
 	if bare := (babel.Config{}).CostEffective(); bare != babel.DefaultCostParams() {
 		t.Errorf("an empty block changed the defaults to %+v", bare)
+	}
+}
+
+// One cost line written leaves the other three at the speaker's default, the
+// promise internal/babel's doc comment makes and the one examples/config.toml
+// invites by documenting each on its own line. Writing "rx = 96", the default
+// spelled out, used to replace the block whole and take the round-trip term
+// down to zero with it, so a 10 ms link and a 1 s link cost the same and the
+// round-trip ranking the fleet run in rtt_penalty_placement found was gone.
+func TestOneCostLineLeavesTheRestAtTheDefault(t *testing.T) {
+	defaults := babel.DefaultCostParams()
+	for _, written := range []struct {
+		yaml, toml string
+		want       babel.CostParams
+	}{
+		{"rx: 96", "rx = 96", defaults},
+		{"rtt: { weight: 1024 }", "rtt = { weight = 1024 }", defaults},
+		{"rtt: { min: 10ms }", "rtt = { min = \"10ms\" }", defaults},
+		{"rtt: { max: 1024ms }", "rtt = { max = \"1024ms\" }", defaults},
+		// A weight written out as zero is taken as written, which is the half
+		// a plain value cannot spell: it turns the round-trip term off rather
+		// than asking for the default.
+		{"rtt: { weight: 0 }", "rtt = { weight = 0 }",
+			babel.CostParams{RxCost: defaults.RxCost, RTT: babel.RTTCost{Min: defaults.RTT.Min, Max: defaults.RTT.Max}}},
+	} {
+		t.Run(written.toml, func(t *testing.T) {
+			fromYAML, err := loadYAML(t, nodeYAML+"cap:\n  babel:\n    cost:\n      "+written.yaml+"\n")
+			if err != nil {
+				t.Fatalf("yaml: %v", err)
+			}
+			fromTOML, err := loadTOML(t, nodeTOML+"[cap.babel.cost]\n"+written.toml+"\n")
+			if err != nil {
+				t.Fatalf("toml: %v", err)
+			}
+			for name, cfg := range map[string]*Config{"yaml": fromYAML, "toml": fromTOML} {
+				if got := cfg.Babel().CostEffective(); got != written.want {
+					t.Errorf("%s: %q gives %+v, want %+v", name, written.yaml, got, written.want)
+				}
+			}
+		})
 	}
 }
 

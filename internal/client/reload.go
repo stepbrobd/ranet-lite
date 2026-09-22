@@ -186,7 +186,7 @@ func reloadable(old, next *config.Config) error {
 		// The listener answers to one identity per local endpoint and builds
 		// that set once, and each endpoint runs its own dialers.
 		return fmt.Errorf("config: link.endpoints changed, restart to apply")
-	case old.Babel().WithDefaults() != next.Babel().WithDefaults():
+	case old.Babel().Effective() != next.Babel().Effective():
 		// The speaker is built once, so a changed interval or cost would be
 		// read back from the file and never reach it. Refusing says so instead
 		// of reporting a reload that did nothing. The comparison is on the

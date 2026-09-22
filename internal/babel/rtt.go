@@ -24,25 +24,69 @@ func microDelta(b, a uint32) time.Duration {
 	return time.Duration(int32(b-a)) * time.Microsecond
 }
 
-// CostParams is the cost block of the cap.babel capability, RFC 9616 costing
-// as the file spells it: a fixed base rx cost plus up to RTT.Weight more,
-// scaled linearly between RTT.Min and RTT.Max. Defaults mirror a typical
-// tunnel-mesh deployment, see the internal/babel doc comment.
+// CostOptions is the cost block of the cap.babel capability as a file writes
+// it, named after the BIRD babel interface options it mirrors. Every field is
+// a pointer because an omitted field takes the default below and one written
+// out is taken as written, an rtt weight of zero included, and a plain value
+// cannot tell those two apart. CostOptions.Params fills the omitted ones in
+// one at a time.
+type CostOptions struct {
+	Rx  *uint16    `yaml:"rx,omitempty" json:"rx,omitempty" toml:"rx,omitempty"`
+	RTT RTTOptions `yaml:"rtt,omitempty" json:"rtt,omitempty" toml:"rtt,omitempty"`
+}
+
+// RTTOptions is the round-trip half of the block, as a file writes it.
+type RTTOptions struct {
+	Weight *uint16          `yaml:"weight,omitempty" json:"weight,omitempty" toml:"weight,omitempty"`
+	Min    *schema.Duration `yaml:"min,omitempty" json:"min,omitempty" toml:"min,omitempty"`
+	Max    *schema.Duration `yaml:"max,omitempty" json:"max,omitempty" toml:"max,omitempty"`
+}
+
+// Params is the mapping in force: RFC 9616 costing with a fixed base rx cost
+// plus up to RTT.Weight more, scaled linearly between RTT.Min and RTT.Max,
+// each field the file left out filled in with the default it stands for.
+//
+// One field at a time, because the block used to be replaced whole the moment
+// any of it was written: "rx = 96", the default spelled out, left weight, min
+// and max at zero, which takes the round-trip term out entirely and puts every
+// node back to advertising one cost whatever its round trip. That was measured
+// on the fleet once already, and internal/babel's own doc promises against it.
+func (o CostOptions) Params() CostParams {
+	params := DefaultCostParams()
+	if o.Rx != nil {
+		params.RxCost = *o.Rx
+	}
+	if o.RTT.Weight != nil {
+		params.RTT.Weight = *o.RTT.Weight
+	}
+	if o.RTT.Min != nil {
+		params.RTT.Min = *o.RTT.Min
+	}
+	if o.RTT.Max != nil {
+		params.RTT.Max = *o.RTT.Max
+	}
+	return params
+}
+
+// CostParams is the mapping the speaker runs on, every field resolved. It is
+// separate from CostOptions because a running cost has no absent field and
+// because comparing two of them decides whether a reload changed the speaker,
+// which a struct of pointers cannot answer.
 type CostParams struct {
-	RxCost uint16  `yaml:"rx,omitempty" json:"rx,omitempty" toml:"rx,omitempty"`
-	RTT    RTTCost `yaml:"rtt,omitempty" json:"rtt,omitempty" toml:"rtt,omitempty"`
+	RxCost uint16
+	RTT    RTTCost
 	// Quality is carried in from cap.babel's own quality rather than written
 	// inside the cost block, because the estimator is a property of the link
 	// and the rest of this struct is a property of the mapping. Config.Validate
 	// and the speaker resolve it; nothing reads it out of a file.
-	Quality LinkQuality `yaml:"-" json:"-" toml:"-"`
+	Quality LinkQuality
 }
 
-// RTTCost is the round-trip half of the mapping.
+// RTTCost is the round-trip half of the mapping in force.
 type RTTCost struct {
-	Weight uint16          `yaml:"weight,omitempty" json:"weight,omitempty" toml:"weight,omitempty"`
-	Min    schema.Duration `yaml:"min,omitempty" json:"min,omitempty" toml:"min,omitempty"`
-	Max    schema.Duration `yaml:"max,omitempty" json:"max,omitempty" toml:"max,omitempty"`
+	Weight uint16
+	Min    schema.Duration
+	Max    schema.Duration
 }
 
 func DefaultCostParams() CostParams {
