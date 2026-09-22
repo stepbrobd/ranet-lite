@@ -3,9 +3,12 @@
 package kernel
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
+	"syscall"
 	"testing"
 
 	"golang.org/x/net/route"
@@ -205,50 +208,238 @@ func TestReclaimForgetsARecordWhoseRouteIsGone(t *testing.T) {
 	}
 }
 
+// loadInto writes one body to a state file and reads it back the way a start
+// does, then drives the constructor path over whatever came back. A node
+// starting depends on that path surviving, and no unreadable file may ever
+// reach a delete, so both are asserted for every body below.
+func loadInto(t *testing.T, body string) ([]writtenDefault, error) {
+	t.Helper()
+	state := filepath.Join(t.TempDir(), "underlay.json")
+	if err := os.WriteFile(state, []byte(body), stateMode); err != nil {
+		t.Fatal(err)
+	}
+	records, err := loadUnderlayState(state)
+	sock := &fakeRouteSocket{t: t}
+	u := &UnderlayDefaults{
+		sock: sock, links: &fakeDefaults{}, statePath: state,
+		written:      make(map[writtenDefault]bool),
+		refused:      make(map[writtenDefault]bool),
+		covered:      make(map[netip.Prefix]bool),
+		warned:       make(map[netip.Prefix]bool),
+		dump:         func() ([]byte, error) { return dumpRIB(t), nil },
+		lookupDevice: resolvesTo(uplinkIndex),
+	}
+	u.reclaim(records)
+	for _, message := range sent(t, sock) {
+		t.Errorf("a file the load did not take whole produced %+v", message)
+	}
+	return records, err
+}
+
+// goodRecord is ourRecord as the file spells it, the one every case below
+// pairs its bad record with.
+const goodRecord = `{"destination":"0.0.0.0/0","index":16,"interface":"en0","gateway":"192.168.0.1"}`
+
 // A state file this tool cannot read must not stop a node starting, and must
 // not be turned into a delete. A daemon that will not come up is worse than a
 // route left behind, and a delete built from a file that would not parse is
 // worse than both.
-func TestUnreadableStateNeitherStopsTheStartNorDeletes(t *testing.T) {
+//
+// The error is asserted rather than logged: a load that swallowed it would
+// report a clean first start over a file that says this node owns a route on
+// the interface the whole machine shares, and the difference between the two
+// is the whole of what the record is for.
+func TestFileThatWillNotParseIsRefusedAndDeletesNothing(t *testing.T) {
 	for name, body := range map[string]string{
-		"empty":                     "",
-		"truncated":                 `[{"destination":"0.0.0.0/0","index":16,`,
-		"not json at all":           "this is not a state file",
-		"json of the wrong shape":   `{"destination":"0.0.0.0/0"}`,
-		"a record naming no prefix": `[{"destination":"","index":16,"interface":"en0","gateway":"192.168.0.1"}]`,
-		"a record naming a prefix rather than a default": `[{"destination":"10.0.0.0/8","index":16,"interface":"en0","gateway":"192.168.0.1"}]`,
-		"a record naming no interface":                   `[{"destination":"0.0.0.0/0","index":0,"interface":"","gateway":"192.168.0.1"}]`,
-		"a record naming an unparseable next hop":        `[{"destination":"0.0.0.0/0","index":16,"interface":"en0","gateway":"not an address"}]`,
-		"a record whose next hop is of another family":   `[{"destination":"0.0.0.0/0","index":16,"interface":"en0","gateway":"2001:db8::1"}]`,
+		"empty":                   "",
+		"truncated":               `[{"destination":"0.0.0.0/0","index":16,`,
+		"not json at all":         "this is not a state file",
+		"json of the wrong shape": `{"destination":"0.0.0.0/0"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			records, err := loadInto(t, body)
+			if err == nil {
+				t.Error("a file that does not parse was reported as a clean start")
+			}
+			if len(records) != 0 {
+				t.Errorf("it yielded %+v anyway", records)
+			}
+		})
+	}
+}
+
+// One record this tool cannot read does not discard the others, which may each
+// name a route that is still there. The file holds one record per family, so
+// throwing the file away over the second leaks the first for good.
+//
+// Each case is its bad record beside the one good one, so the cases stay
+// distinguishable: a decoder that refuses a different clause than the case
+// names still has to hand back exactly the good record and nothing else.
+func TestRecordThatWillNotDecodeIsDroppedAndTheOthersKept(t *testing.T) {
+	for name, bad := range map[string]string{
+		"naming no prefix":                      `{"destination":"","index":16,"interface":"en0","gateway":"192.168.0.1"}`,
+		"naming a prefix rather than a default": `{"destination":"10.0.0.0/8","index":16,"interface":"en0","gateway":"192.168.0.1"}`,
+		"naming no interface index":             `{"destination":"::/0","index":0,"interface":"en1","gateway":"2001:db8::1"}`,
+		// A lookup resolves the name, so a record without one can never be
+		// weighed against the kernel and would be held for good.
+		"naming no interface":                 `{"destination":"::/0","index":19,"interface":"","gateway":"2001:db8::1"}`,
+		"naming an unparseable next hop":      `{"destination":"::/0","index":16,"interface":"en0","gateway":"not an address"}`,
+		"whose next hop is of another family": `{"destination":"0.0.0.0/0","index":16,"interface":"en0","gateway":"2001:db8::1"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for order, body := range map[string]string{
+				"the bad record first":  "[" + bad + "," + goodRecord + "]",
+				"the good record first": "[" + goodRecord + "," + bad + "]",
+			} {
+				t.Run(order, func(t *testing.T) {
+					records, err := loadInto(t, body)
+					if err != nil {
+						t.Errorf("one record this tool cannot read refused the whole file: %v", err)
+					}
+					if want := []writtenDefault{ourRecord()}; !slices.Equal(records, want) {
+						t.Errorf("the load yielded %+v, want only %+v", records, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// watchingSocket answers WriteRoute after telling the test what the state file
+// held at the moment the message left, which is the only way to see an
+// ordering the process that dies between the two lines cannot report.
+type watchingSocket struct {
+	*fakeRouteSocket
+	state string
+	held  [][]writtenDefault
+}
+
+func (w *watchingSocket) WriteRoute(message *route.RouteMessage) error {
+	w.fakeRouteSocket.t.Helper()
+	records, _ := loadUnderlayState(w.state)
+	w.held = append(w.held, records)
+	return w.fakeRouteSocket.WriteRoute(message)
+}
+
+// The record is on disk before the route is in the kernel, never after. A
+// process dying between the two leaves a record for a route that does not
+// exist, which the next start's readback discards; the other order leaves a
+// route on the interface the whole machine shares with no record, and rule one
+// says nothing may ever remove that.
+func TestRecordIsOnDiskBeforeTheRouteReachesTheKernel(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "underlay.json")
+	sock := &watchingSocket{fakeRouteSocket: &fakeRouteSocket{t: t}, state: state}
+	u := &UnderlayDefaults{
+		sock: sock, host: namedDevices{}, statePath: state,
+		links:        &fakeDefaults{v4: hostDefault{index: uplinkIndex, gateway: addr("192.168.0.1")}},
+		written:      make(map[writtenDefault]bool),
+		refused:      make(map[writtenDefault]bool),
+		covered:      make(map[netip.Prefix]bool),
+		warned:       make(map[netip.Prefix]bool),
+		dump:         func() ([]byte, error) { return hostRIB(t), nil },
+		lookupDevice: resolvesTo(uplinkIndex),
+	}
+	if err := u.Prepare(uplinkIndex); err != nil {
+		t.Fatal(err)
+	}
+	if len(sock.held) != 1 {
+		t.Fatalf("the pass sent %d messages, want the one route it had to write", len(sock.held))
+	}
+	want := writtenDefault{
+		destination: v4default, index: uplinkIndex,
+		device: "uplink0", gateway: addr("192.168.0.1"),
+	}
+	if got := sock.held[0]; !slices.Contains(got, want) {
+		t.Errorf("the file held %+v when the route was written, want %+v already in it", got, want)
+	}
+}
+
+// A table that will not read back says nothing about whether the recorded
+// routes are still there, so the records are kept rather than forgotten.
+// Dropping them would leak one scoped default per start on an interface no
+// later run has any claim to, which is the leak the file exists to close.
+func TestReclaimKeepsItsRecordsWhenTheTableWillNotReadBack(t *testing.T) {
+	for name, dump := range map[string]func() ([]byte, error){
+		"the dump fails": func() ([]byte, error) { return nil, errors.New("no route socket") },
+		// A message declaring more bytes than the buffer holds, as a read cut
+		// short by a full socket buffer leaves.
+		"the dump will not parse": func() ([]byte, error) { return []byte{0x20, 0x00, 0x05, 0x01, 0x00, 0x00}, nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			state := filepath.Join(t.TempDir(), "underlay.json")
-			if err := os.WriteFile(state, []byte(body), 0o600); err != nil {
+			if err := saveUnderlayState(state, []writtenDefault{ourRecord()}); err != nil {
 				t.Fatal(err)
 			}
-			// The load may refuse the file; what it must never do is hand
-			// back something a delete could be built from.
-			records, err := loadUnderlayState(state)
-			t.Logf("load reported %v with %d records", err, len(records))
-			if len(records) != 0 {
-				t.Errorf("an unreadable state file yielded %+v", records)
-			}
-
-			// And the whole constructor path survives it, which is the
-			// half a node starting depends on.
 			sock := &fakeRouteSocket{t: t}
 			u := &UnderlayDefaults{
 				sock: sock, links: &fakeDefaults{}, statePath: state,
 				written:      make(map[writtenDefault]bool),
+				refused:      make(map[writtenDefault]bool),
+				covered:      make(map[netip.Prefix]bool),
 				warned:       make(map[netip.Prefix]bool),
-				dump:         func() ([]byte, error) { return dumpRIB(t), nil },
+				dump:         dump,
 				lookupDevice: resolvesTo(uplinkIndex),
 			}
-			u.reclaim(records)
+			u.reclaim([]writtenDefault{ourRecord()})
+
 			for _, message := range sent(t, sock) {
-				t.Errorf("an unreadable state file produced %+v", message)
+				t.Errorf("a table that would not read back produced %+v", message)
+			}
+			if want := []writtenDefault{ourRecord()}; !slices.Equal(u.Refused(), want) {
+				t.Errorf("the pass kept %+v, want %+v held for the next start", u.Refused(), want)
+			}
+			// And on disk, which is where the next start reads it.
+			got, err := loadUnderlayState(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := []writtenDefault{ourRecord()}; !slices.Equal(got, want) {
+				t.Errorf("the file holds %+v, want %+v", got, want)
 			}
 		})
+	}
+}
+
+// The file is replaced rather than rewritten, so a process dying mid-write
+// leaves the previous record rather than a truncated one, which loads as no
+// record at all and leaks whatever it named. A rename gives the path a new
+// inode and a write in place does not, which is the difference read here.
+func TestStateFileIsReplacedRatherThanRewrittenInPlace(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "underlay.json")
+	inode := func() uint64 {
+		t.Helper()
+		info, err := os.Stat(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatalf("stat answered %T, which names no inode", info.Sys())
+		}
+		return stat.Ino
+	}
+	if err := saveUnderlayState(state, []writtenDefault{ourRecord()}); err != nil {
+		t.Fatal(err)
+	}
+	first := inode()
+	if err := saveUnderlayState(state, []writtenDefault{
+		ourRecord(),
+		{destination: v6default, index: uplinkIndex, device: "en0", gateway: addr("2001:db8::1")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if second := inode(); second == first {
+		t.Errorf("both writes landed on inode %d, so the second truncated the file the first had left", second)
+	}
+	// And the temporary file it renamed over is not left beside it.
+	entries, err := os.ReadDir(filepath.Dir(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != filepath.Base(state) {
+			t.Errorf("the replacement left %s behind", entry.Name())
+		}
 	}
 }
 
