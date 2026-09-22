@@ -382,8 +382,7 @@ func TestLocalRequestIsPickedUpWithoutPolling(t *testing.T) {
 	defer responder.Mux().Close()
 	<-h.identities
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go initiator.Run(ctx)
 	go responder.Run(ctx)
 
@@ -792,8 +791,7 @@ func TestAnsweredExchangeRefreshesLivenessClock(t *testing.T) {
 	defer responder.Mux().Close()
 	<-h.identities
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = initiator.Run(ctx) }()
 	go func() { _ = responder.Run(ctx) }()
 

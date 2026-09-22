@@ -8,7 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1363,17 +1363,15 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 	go func() { runDone <- s.Run(context.Background()) }()
 	var wg sync.WaitGroup
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if _, err := s.request(INFORMATIONAL, nil); err != nil {
 				t.Errorf("request: %v", err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	<-peerDone
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	if len(ids) != 2 || ids[0] != 2 || ids[1] != 3 {
 		t.Fatalf("local message IDs = %v, want [2 3]", ids)
 	}
