@@ -24,6 +24,9 @@ type fakeNetlink struct {
 	}
 	replies []nlMessage
 	err     error
+	// vrfs is the table each VRF device is bound to. A name missing here has
+	// no such device, which is the state before a Create makes one.
+	vrfs map[string]uint32
 }
 
 func (f *fakeNetlink) execute(kind, flags uint16, body []byte) ([]nlMessage, error) {
@@ -36,7 +39,11 @@ func (f *fakeNetlink) execute(kind, flags uint16, body []byte) ([]nlMessage, err
 
 func (f *fakeNetlink) link(string) (uint32, uint32, error) { return 0, 0, nil }
 func (f *fakeNetlink) linkName(uint32) (string, error)     { return "", nil }
-func (f *fakeNetlink) Close() error                        { return nil }
+func (f *fakeNetlink) vrfTable(name string) (uint32, bool, error) {
+	table, ok := f.vrfs[name]
+	return table, ok, nil
+}
+func (f *fakeNetlink) Close() error { return nil }
 
 func writePlatform(t *testing.T) (*netlinkPlatform, *fakeNetlink) {
 	t.Helper()
@@ -173,6 +180,39 @@ func TestLinuxForeignWritersDumpsBothFamilies(t *testing.T) {
 	}
 	if !slices.Contains(families, uint8(unix.AF_INET)) || !slices.Contains(families, uint8(unix.AF_INET6)) {
 		t.Errorf("the dump asked for families %v, want both AF_INET and AF_INET6", families)
+	}
+}
+
+// The filter is told whether the table is its own VRF's, and the platform
+// has to find that out from the kernel: a VRF that existed first keeps
+// whatever table it was bound to, so a configured name proves nothing. A
+// platform that trusted the name would pass every case of the filter and
+// still hide another VRF sharing this table, so the wiring is held here.
+func TestLinuxForeignWritersAsksWhichTableTheVRFIsBoundTo(t *testing.T) {
+	for name, test := range map[string]struct {
+		bound map[string]uint32
+		want  []string
+	}{
+		"bound to this table":    {bound: map[string]uint32{"mesh": 200}, want: []string{"bird (12)"}},
+		"bound to another table": {bound: map[string]uint32{"mesh": 300}, want: []string{"kernel (2)", "bird (12)"}},
+		"not created yet":        {want: []string{"kernel (2)", "bird (12)"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plat, conn := writePlatform(t)
+			plat.table.VRF = &VRF{Name: "mesh"}
+			conn.vrfs = test.bound
+			conn.replies = []nlMessage{
+				routeDump(200, unix.RTPROT_KERNEL, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.0.0/24")),
+				routeDump(200, unix.RTPROT_BIRD, unix.RTN_UNICAST, 7, netip.MustParsePrefix("10.99.1.0/24")),
+			}
+			got, err := plat.foreignWriters()
+			if err != nil {
+				t.Fatalf("dump: %v", err)
+			}
+			if !slices.Equal(got, test.want) {
+				t.Errorf("reported %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 

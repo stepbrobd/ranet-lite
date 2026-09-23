@@ -25,6 +25,9 @@ type netlinkConn interface {
 	execute(kind, flags uint16, body []byte) ([]nlMessage, error)
 	link(name string) (index, master uint32, err error)
 	linkName(index uint32) (string, error)
+	// vrfTable reports the table a VRF device is bound to, and false when no
+	// device of that name exists or it is not a VRF.
+	vrfTable(name string) (table uint32, ok bool, err error)
 	Close() error
 }
 
@@ -541,6 +544,17 @@ func notificationTable(message nlMessage) uint32 {
 // difference between a migration that looks fine and one that is visibly
 // sharing a table.
 func (p *netlinkPlatform) foreignWriters() ([]string, error) {
+	// Read from the kernel rather than taken from the configuration: a VRF
+	// that existed before this process keeps whatever table it was bound to,
+	// so naming one does not make this table its table.
+	ownVRF := false
+	if p.table.VRF != nil {
+		bound, ok, err := p.conn.vrfTable(p.table.VRF.Name)
+		if err != nil {
+			return nil, err
+		}
+		ownVRF = ok && bound == uint32(p.table.ID)
+	}
 	seen := map[uint8]bool{}
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
 		body := make([]byte, unix.SizeofRtMsg)
@@ -549,7 +563,7 @@ func (p *netlinkPlatform) foreignWriters() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		collectForeignWriters(replies, uint32(p.table.ID), p.table.Proto, seen)
+		collectForeignWriters(replies, uint32(p.table.ID), p.table.Proto, ownVRF, seen)
 	}
 	// Labeled here rather than by the caller, because rt_proto is a linux
 	// registry and kernel.go is the portable half. Returning the numbers bare
@@ -564,8 +578,9 @@ func (p *netlinkPlatform) foreignWriters() ([]string, error) {
 
 // protocolLabel names a routing protocol the way iproute2 prints it, from the
 // rt_protos registry, and falls back to the bare number for one nothing has
-// claimed. The two a fleet node meets in table 200 are bird and the kernel's
-// own entries for the links enslaved to the VRF.
+// claimed. The one a fleet node meets in table 200 is bird, during a
+// migration; the kernel's own entries appear there only when some other VRF is
+// bound to that table.
 func protocolLabel(protocol uint8) string {
 	var name string
 	switch protocol {
@@ -608,8 +623,9 @@ func protocolLabel(protocol uint8) string {
 }
 
 // collectForeignWriters is the filter half of foreignWriters, split out so the
-// rule can be tested without a netlink socket.
-func collectForeignWriters(replies []nlMessage, table uint32, ours uint8, seen map[uint8]bool) {
+// rule can be tested without a netlink socket. ownVRF says the table is the
+// one this reconciler's configured VRF is bound to.
+func collectForeignWriters(replies []nlMessage, table uint32, ours uint8, ownVRF bool, seen map[uint8]bool) {
 	for _, reply := range replies {
 		if reply.Kind != unix.RTM_NEWROUTE || len(reply.Data) < unix.SizeofRtMsg {
 			continue
@@ -623,15 +639,20 @@ func collectForeignWriters(replies []nlMessage, table uint32, ours uint8, seen m
 				routeTable = binary.NativeEndian.Uint32(value)
 			}
 		}
-		// RTPROT_KERNEL is excluded only in the main table, where it is the
-		// kernel's own plumbing for the machine's addresses. In any other
-		// table, and a VRF table is the case that matters, those same entries
-		// belong to whoever put the interface in the VRF, which an install must
-		// not take over.
 		if routeTable != table {
 			continue
 		}
-		if protocol == unix.RTPROT_KERNEL && table == unix.RT_TABLE_MAIN {
+		// RTPROT_KERNEL marks the kernel's own entries, and two tables hold
+		// them by construction: the main table, where they are the plumbing
+		// for the machine's addresses, and the table this reconciler's own VRF
+		// is bound to, where the kernel files the connected routes of every
+		// link enslaved to that VRF. The second is present on every node of
+		// that profile, so reporting it told each one to take a table of its
+		// own, advice the profile cannot follow. Nothing is lost by leaving it
+		// out: an install asks for its key exclusively and never takes one of
+		// these over, and a key it is refused is reported on its own route. In
+		// any other table the same entries mean another VRF is bound there.
+		if protocol == unix.RTPROT_KERNEL && (table == unix.RT_TABLE_MAIN || ownVRF) {
 			continue
 		}
 		seen[protocol] = true

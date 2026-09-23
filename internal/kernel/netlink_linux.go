@@ -9,6 +9,7 @@ import (
 	"iter"
 	"net/netip"
 	"slices"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -260,6 +261,61 @@ func putAttrU32(buf []byte, kind uint16, value uint32) []byte {
 	var raw [4]byte
 	binary.NativeEndian.PutUint32(raw[:], value)
 	return putAttr(buf, kind, raw[:])
+}
+
+// vrfTable reads the table a VRF device is bound to out of its link
+// attributes, with a keyed RTM_GETLINK like link. A name nothing holds and a
+// device of another kind both answer false, which is also the state before a
+// Create has made the device.
+func (c *nlConn) vrfTable(name string) (uint32, bool, error) {
+	body := make([]byte, unix.SizeofIfInfomsg)
+	body = putAttrString(body, unix.IFLA_IFNAME, name)
+	replies, err := c.execute(unix.RTM_GETLINK, 0, body)
+	if errors.Is(err, unix.ENODEV) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	for _, reply := range replies {
+		if reply.Kind == unix.RTM_NEWLINK && len(reply.Data) >= unix.SizeofIfInfomsg {
+			table, ok := linkVRFTable(reply)
+			return table, ok, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// linkVRFTable finds IFLA_VRF_TABLE two levels down in one RTM_NEWLINK, inside
+// IFLA_INFO_DATA inside IFLA_LINKINFO, and only when IFLA_INFO_KIND names a
+// VRF. Split from the socket so the nesting is checked without one. The nest
+// flag is masked off because the kernel is free to set it on either level.
+func linkVRFTable(reply nlMessage) (uint32, bool) {
+	for kind, info := range reply.attributes(unix.SizeofIfInfomsg) {
+		if kind&^unix.NLA_F_NESTED != unix.IFLA_LINKINFO {
+			continue
+		}
+		vrf := false
+		var data []byte
+		for kind, value := range (nlMessage{Data: info}).attributes(0) {
+			switch kind &^ unix.NLA_F_NESTED {
+			case unix.IFLA_INFO_KIND:
+				vrf = strings.TrimSuffix(string(value), "\x00") == "vrf"
+			case unix.IFLA_INFO_DATA:
+				data = value
+			}
+		}
+		if !vrf {
+			return 0, false
+		}
+		for kind, value := range (nlMessage{Data: data}).attributes(0) {
+			if kind == unix.IFLA_VRF_TABLE && len(value) == 4 {
+				return binary.NativeEndian.Uint32(value), true
+			}
+		}
+		return 0, false
+	}
+	return 0, false
 }
 
 func putAttrString(buf []byte, kind uint16, value string) []byte {

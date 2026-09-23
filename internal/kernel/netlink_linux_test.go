@@ -502,6 +502,15 @@ func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
 	if _, _, err := conn.link("gravitytest"); err != nil {
 		t.Fatalf("the vrf is not there after being created: %v", err)
 	}
+	// The binding the shared-table audit reads back, decoded from this
+	// kernel's own encoding rather than from a hand-built message: the nest
+	// flags and the terminator on the kind are whatever it sends.
+	if table, ok, err := conn.vrfTable("gravitytest"); err != nil || !ok || table != DefaultTable {
+		t.Fatalf("the vrf read back as bound to %d (ok %v, err %v), want %d", table, ok, err, DefaultTable)
+	}
+	if _, ok, err := conn.vrfTable("lo"); err != nil || ok {
+		t.Fatalf("lo read back as a vrf (ok %v, err %v)", ok, err)
+	}
 	// A second call finds it and says so, which is the answer that keeps
 	// shutdown from removing a device this process did not make.
 	if created, err := plat.EnsureVRF("gravitytest", DefaultTable); err != nil || created {
@@ -515,5 +524,8 @@ func TestNetlinkRulesAndVRFInNetworkNamespace(t *testing.T) {
 	}
 	if _, _, err := conn.link("gravitytest"); err == nil {
 		t.Fatal("the vrf survived its removal")
+	}
+	if _, ok, err := conn.vrfTable("gravitytest"); err != nil || ok {
+		t.Fatalf("a removed vrf still read back as bound (ok %v, err %v)", ok, err)
 	}
 }
