@@ -424,6 +424,9 @@ type auditor interface {
 	// labeled for an operator rather than numbered, since the numbering is
 	// the platform's own registry.
 	foreignWriters() ([]string, error)
+	// vrfBinding reports the table the configured VRF is bound to, and false
+	// when none is configured or nothing of that name is a VRF yet.
+	vrfBinding() (table uint32, ok bool, err error)
 }
 
 // ruler is implemented by a platform that has a policy routing engine. linux
@@ -1068,20 +1071,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	// settings it refuses to honor.
 	slog.Info("kernel reconciler started", "interface", r.rt.Interface, "where", r.Where())
 
-	// An install refuses a key another writer already holds, so sharing a table
-	// with another daemon means the routes it refuses are routes the mesh
-	// wanted. Say so once at startup: on a fleet node mid-migration the other
-	// writer is BIRD in table 200, which is the intended overlap and still
-	// worth seeing.
-	if audit, ok := r.plat.(auditor); ok {
-		if writers, err := audit.foreignWriters(); err != nil {
-			slog.Warn("kernel could not check the table for other writers", "err", err)
-		} else if len(writers) > 0 {
-			slog.Warn("kernel is sharing its table with another routing protocol",
-				"table", uint32(r.table.ID), "protocols", strings.Join(writers, ", "),
-				"detail", "an install refuses a key another writer already holds, so give this reconciler a table of its own")
-		}
-	}
+	r.audit()
 
 	backoff := time.Duration(0)
 	for ctx.Err() == nil {
@@ -1246,6 +1236,48 @@ func (r *Reconciler) recordPass(err error) {
 		stats.Err = err.Error()
 	}
 	r.stats.Store(&stats)
+}
+
+// audit reports, once at startup, what in the space this reconciler is about
+// to take over would defeat it without anything failing.
+func (r *Reconciler) audit() {
+	audit, ok := r.plat.(auditor)
+	if !ok {
+		return
+	}
+	// An install refuses a key another writer already holds, so sharing a table
+	// with another daemon means the routes it refuses are routes the mesh
+	// wanted. Say so once at startup: on a fleet node mid-migration the other
+	// writer is BIRD in table 200, which is the intended overlap and still
+	// worth seeing.
+	if writers, err := audit.foreignWriters(); err != nil {
+		slog.Warn("kernel could not check the table for other writers", "err", err)
+	} else if len(writers) > 0 {
+		slog.Warn("kernel is sharing its table with another routing protocol",
+			"table", uint32(r.table.ID), "protocols", strings.Join(writers, ", "),
+			"detail", "an install refuses a key another writer already holds, so give this reconciler a table of its own")
+	}
+	// A VRF that existed before this process keeps the table it was bound to,
+	// since applyVRF never rebinds one. Traffic inside a VRF is looked up in
+	// the VRF's own table, so when that is another table the routes installed
+	// here are never consulted from inside it unless a policy rule sends the
+	// lookup here, and the mesh comes up looking complete. A warning rather
+	// than a refusal, as with the l3mdev sysctls the client checks: the device
+	// can be recreated while this process runs, and with create set the next
+	// pass makes it bound to this table.
+	bound, ok, err := audit.vrfBinding()
+	switch {
+	case err != nil:
+		slog.Warn("kernel could not read which table its vrf is bound to", "vrf", r.table.Name(), "err", err)
+	case ok && bound != uint32(r.table.ID):
+		fix := "recreate the device bound to this table, or set cap.table id to the vrf's table"
+		if r.table.creates() {
+			fix = "delete the device and the next pass recreates it bound to this table, or set cap.table id to the vrf's table"
+		}
+		slog.Warn("kernel's vrf is bound to another table than the one it writes",
+			"vrf", r.table.Name(), "vrf_table", bound, "table", uint32(r.table.ID),
+			"detail", "traffic in the vrf looks up the vrf's own table and misses the routes installed here unless a policy rule sends it here; "+fix)
+	}
 }
 
 // applyVRF creates the master device when the configuration asked for one and

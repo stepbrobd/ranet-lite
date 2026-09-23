@@ -470,6 +470,59 @@ func captureKernelLogs(t *testing.T) *bytes.Buffer {
 	return &logs
 }
 
+// auditingKernel is the fake with a startup audit, answering the VRF half of
+// it as each case sets and reporting no other writer.
+type auditingKernel struct {
+	*fakeKernel
+	bound uint32
+	isVRF bool
+	err   error
+}
+
+func (a *auditingKernel) foreignWriters() ([]string, error) { return nil, nil }
+func (a *auditingKernel) vrfBinding() (uint32, bool, error) { return a.bound, a.isVRF, a.err }
+
+// A VRF that existed first keeps its own table, and traffic inside it never
+// looks at this one, so the mesh comes up looking complete and carries nothing
+// from inside the VRF. The audit says so, only when the two tables differ, and
+// names both, since either one is the setting an operator changes.
+func TestAuditSaysWhenTheVRFIsBoundToAnotherTable(t *testing.T) {
+	for name, test := range map[string]struct {
+		bound  uint32
+		isVRF  bool
+		err    error
+		create bool
+		want   []string
+	}{
+		"bound to this table": {bound: DefaultTable, isVRF: true},
+		"bound to another table": {bound: 300, isVRF: true, want: []string{
+			"bound to another table", `"vrf_table":300`, fmt.Sprintf(`"table":%d`, DefaultTable),
+			"recreate the device bound to this table",
+		}},
+		"bound to another table with create set": {bound: 300, isVRF: true, create: true, want: []string{
+			"bound to another table", "the next pass recreates it",
+		}},
+		"not a vrf yet": {},
+		"unreadable":    {err: errors.New("netlink went away"), want: []string{"could not read", "netlink went away"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reconciler, _, fake := harness(t, Table{VRF: &VRF{Name: "mesh", Create: test.create}})
+			reconciler.plat = &auditingKernel{fakeKernel: fake, bound: test.bound, isVRF: test.isVRF, err: test.err}
+			logs := captureKernelLogs(t)
+			reconciler.audit()
+			got := logs.String()
+			if len(test.want) == 0 && got != "" {
+				t.Errorf("the audit said %s", got)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("the audit said %q, want it to include %s", got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestReconcileCountsOnlyAppliedRoutes(t *testing.T) {
 	logs := captureKernelLogs(t)
 	reconciler, table, fake := harness(t, Table{})

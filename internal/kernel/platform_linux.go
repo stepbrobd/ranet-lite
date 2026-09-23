@@ -547,14 +547,11 @@ func (p *netlinkPlatform) foreignWriters() ([]string, error) {
 	// Read from the kernel rather than taken from the configuration: a VRF
 	// that existed before this process keeps whatever table it was bound to,
 	// so naming one does not make this table its table.
-	ownVRF := false
-	if p.table.VRF != nil {
-		bound, ok, err := p.conn.vrfTable(p.table.VRF.Name)
-		if err != nil {
-			return nil, err
-		}
-		ownVRF = ok && bound == uint32(p.table.ID)
+	bound, ok, err := p.vrfBinding()
+	if err != nil {
+		return nil, err
 	}
+	ownVRF := ok && bound == uint32(p.table.ID)
 	seen := map[uint8]bool{}
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
 		body := make([]byte, unix.SizeofRtMsg)
@@ -574,6 +571,16 @@ func (p *netlinkPlatform) foreignWriters() ([]string, error) {
 		labels = append(labels, protocolLabel(protocol))
 	}
 	return labels, nil
+}
+
+// vrfBinding reports the table the configured VRF is bound to, read from the
+// kernel. It answers false when no VRF is configured or nothing of that name
+// is a VRF yet, which is the state before the first pass creates one.
+func (p *netlinkPlatform) vrfBinding() (uint32, bool, error) {
+	if p.table.VRF == nil {
+		return 0, false, nil
+	}
+	return p.conn.vrfTable(p.table.VRF.Name)
 }
 
 // protocolLabel names a routing protocol the way iproute2 prints it, from the

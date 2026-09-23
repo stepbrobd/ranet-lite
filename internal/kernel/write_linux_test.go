@@ -216,6 +216,20 @@ func TestLinuxForeignWritersAsksWhichTableTheVRFIsBoundTo(t *testing.T) {
 	}
 }
 
+// With no VRF configured there is nothing to ask the kernel, and a configured
+// one is looked up by the name the operator wrote rather than by any other.
+func TestLinuxVRFBindingAsksForTheConfiguredDevice(t *testing.T) {
+	plat, conn := writePlatform(t)
+	conn.vrfs = map[string]uint32{"mesh": 300, "other": 200}
+	if _, ok, err := plat.vrfBinding(); err != nil || ok {
+		t.Errorf("with no vrf configured the binding read ok=%v err=%v", ok, err)
+	}
+	plat.table.VRF = &VRF{Name: "mesh"}
+	if table, ok, err := plat.vrfBinding(); err != nil || !ok || table != 300 {
+		t.Errorf("the configured vrf read as %d ok=%v err=%v, want 300", table, ok, err)
+	}
+}
+
 // The report reaches an operator through slog, whose text handler quotes
 // anything shaped like a byte slice rather than listing it, so a []uint8 of
 // protocols 2 and 12 arrived on a live fleet node as protocols="\x02\f" and
